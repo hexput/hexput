@@ -601,3 +601,41 @@ fn never_panics_on_awkward_input() {
         let _ = tokenize(source);
     }
 }
+
+// --- Story 1.8: the producer sweep ---
+
+/// Every `lex.*` code, reached from real source, with the text its span must slice out.
+///
+/// Story 1.8's acceptance is that a span points at the offending construct, and the only proof
+/// of that is slicing the original source with it. A code added to the lexer belongs here —
+/// `tests/shared.rs` pins the full list of code strings.
+#[test]
+fn every_lexical_code_spans_the_offending_source() {
+    let cases: [(&str, Code, &str); 7] = [
+        ("let s = \"abc", Code::UNTERMINATED_STRING, "\""),
+        ("let x = 1;\n/* x", Code::UNTERMINATED_COMMENT, "/*"),
+        ("a $ b", Code::UNKNOWN_CHARACTER, "$"),
+        ("café = 1", Code::NON_ASCII_IDENTIFIER, "é"),
+        (r#""a\q""#, Code::INVALID_ESCAPE, r"\q"),
+        (r#""\u{}""#, Code::INVALID_UNICODE_ESCAPE, r"\u{}"),
+        ("1e999", Code::INVALID_NUMBER, "1e999"),
+    ];
+    for (source, code, offending) in cases {
+        let d = err(source);
+        assert_eq!(d.category, Category::Lexical, "{source}: {d}");
+        assert_eq!(d.code, code, "{source}: {d}");
+        assert_eq!(&source[d.span.range()], offending, "{source}: {d}");
+        // The line and column must agree with the offset, or rendering would mark the wrong
+        // place: re-derive them from the source and compare.
+        assert_eq!(
+            hexput_tests::line_and_column(source, d.span.offset),
+            (d.span.line, d.span.column),
+            "{source}: {d}"
+        );
+    }
+    for (i, (_, code, _)) in cases.iter().enumerate() {
+        for (_, other, _) in &cases[i + 1..] {
+            assert_ne!(code, other, "the sweep must reach each code once");
+        }
+    }
+}

@@ -4,7 +4,12 @@
 //! cloning and inspecting deeply nested source safe without recursive ownership. IDs belong to
 //! their enclosing [`Program`]; consumers must not mix IDs from different programs.
 
-pub use hexput_shared::diagnostics::{Category, Code, Diagnostic, Span};
+/// The diagnostics shape and its rendering, re-exported because `hexput-parser` and
+/// `hexput-interpreter` depend on this crate alone — a direct `hexput-shared` edge from either
+/// is a dependency the crate-graph check rejects.
+pub use hexput_shared::diagnostics::{
+    Category, Code, Diagnostic, RenderOptions, Severity, Span, render_diagnostic,
+};
 
 /// An index into [`Program::expressions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

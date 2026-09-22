@@ -1321,3 +1321,124 @@ fn many_blocks_evaluate() {
     );
     assert_eq!(num(&nested), n as f64);
 }
+
+// --- Story 1.8: the producer sweep ---
+
+/// Every runtime code, reached from real source, with the text its span must slice out.
+///
+/// Story 1.8's acceptance is that a span points at the offending construct, and the only proof
+/// of that is slicing the original source with it. A code added to the interpreter belongs here
+/// — `tests/shared.rs` pins the full list of code strings.
+#[test]
+fn every_runtime_code_spans_the_offending_source() {
+    let deep = countdown(hexput_interpreter::CALL_DEPTH_LIMIT);
+    let cases: [(&str, Category, Code, &str); 15] = [
+        (
+            r#"return "abc" * 2;"#,
+            Category::Type,
+            Code::OPERAND_MISMATCH,
+            r#""abc""#,
+        ),
+        (
+            "let o = {}; o[0] = 1;",
+            Category::Type,
+            Code::INVALID_INDEX,
+            "0",
+        ),
+        (
+            "let n = 1; n.x = 1;",
+            Category::Type,
+            Code::INVALID_PROPERTY_ACCESS,
+            ".x",
+        ),
+        (
+            "let a = []; a[0] = a; return a;",
+            Category::Type,
+            Code::CYCLIC_RESULT,
+            "a",
+        ),
+        ("let x = 1; x();", Category::Type, Code::NOT_CALLABLE, "()"),
+        (
+            "return fn(x) { return x; };",
+            Category::Type,
+            Code::FUNCTION_RESULT,
+            "fn(x) { return x; }",
+        ),
+        (
+            "return nope;",
+            Category::Reference,
+            Code::UNDECLARED_IDENTIFIER,
+            "nope",
+        ),
+        (
+            "nope = 1;",
+            Category::Reference,
+            Code::UNDECLARED_ASSIGNMENT,
+            "nope",
+        ),
+        (
+            "let a = null; return a.b;",
+            Category::Reference,
+            Code::NULL_ACCESS,
+            ".b",
+        ),
+        (
+            "let a = []; a[1] = 0;",
+            Category::Reference,
+            Code::INDEX_OUT_OF_RANGE,
+            "1",
+        ),
+        (
+            "let a = [1]; for (x in a) { a[1] = 2; };",
+            Category::Reference,
+            Code::COLLECTION_MUTATED,
+            "for",
+        ),
+        (
+            "return 1 / 0;",
+            Category::Arithmetic,
+            Code::DIVISION_BY_ZERO,
+            "0",
+        ),
+        (
+            "return 1e308 * 10;",
+            Category::Arithmetic,
+            Code::NON_FINITE,
+            "*",
+        ),
+        (
+            "fn none() { }; return none(1);",
+            Category::Arity,
+            Code::ARGUMENT_COUNT,
+            "(1)",
+        ),
+        (
+            deep.as_str(),
+            Category::Depth,
+            Code::CALL_DEPTH_EXCEEDED,
+            "(n - 1)",
+        ),
+    ];
+    for (source, category, code, offending) in cases {
+        let d = assert_error(source, category, code, offending);
+        assert_eq!(
+            hexput_tests::line_and_column(source, d.span.offset),
+            (d.span.line, d.span.column),
+            "{source}: {d}"
+        );
+    }
+    for (i, (_, _, code, _)) in cases.iter().enumerate() {
+        for (_, _, other, _) in &cases[i + 1..] {
+            assert_ne!(code, other, "the sweep must reach each code once");
+        }
+    }
+}
+
+/// A span that crosses lines still slices the offending construct, and its recorded line and
+/// column are those of where the construct *opened* — a string literal legally spans lines.
+#[test]
+fn a_multi_line_construct_keeps_its_opening_location() {
+    let source = "let x = 1;\nreturn \"a\nb\" * 2;";
+    let d = assert_error(source, Category::Type, Code::OPERAND_MISMATCH, "\"a\nb\"");
+    assert_eq!((d.span.line, d.span.column), (2, 8));
+}

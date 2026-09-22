@@ -1,9 +1,14 @@
-//! Category, Code, Diagnostic, Span — the one error/finding shape shared by the language
-//! (LANGUAGE-REFERENCE §7) and by `hexput-port`'s error responses.
+//! Category, Code, Diagnostic, Severity, Span — the one error/finding shape shared by the
+//! language (LANGUAGE-REFERENCE §7) and by `hexput-port`'s error responses — plus
+//! [`render_diagnostic`], the one terminal rendering the CLI, the check pass and the language
+//! server all reuse.
 //!
-//! Story 1.2 lands the shape itself; Story 1.8 owns *rendering* it (source line, caret) and must
-//! be able to do so without re-scanning the source, which is why [`Span`] carries a line and a
-//! column alongside the byte offset.
+//! Story 1.2 lands the shape itself; Story 1.8 lands the rendering, which never re-scans the
+//! source to find *where* a diagnostic is — that is why [`Span`] carries a line and a column
+//! alongside the byte offset. Rendering is a pure function of `(&Diagnostic, &str, options)`:
+//! no file reads, no stdout, no colour, no TTY detection. Colour belongs to the CLI, layered
+//! over this plain text. The structured fields stay public and primary; this is one consumer of
+//! them, never the only access path.
 
 use core::fmt;
 
@@ -224,10 +229,43 @@ impl fmt::Display for Code {
     }
 }
 
+/// How much a diagnostic matters: whether it stops the work or merely reports on it.
+///
+/// One shape carries both, so Story 1.10's warnings (an unused local can never reject a script)
+/// and the language server's diagnostics reuse [`Diagnostic`] rather than wrapping it in a
+/// second, almost-identical type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Severity {
+    /// The work stopped here. Every lexical, syntax and runtime failure is an error.
+    #[default]
+    Error,
+    /// Something worth telling the author, which does not stop anything.
+    Warning,
+}
+
+impl Severity {
+    /// The severity's wire spelling — the word `Display` and [`render_diagnostic`] print.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One failure or static-check finding: what kind, which specific one, what to tell a human, and
 /// where in the source it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
+    /// Whether this stops the work ([`Severity::Error`]) or only reports on it.
+    pub severity: Severity,
     /// The §7 category.
     pub category: Category,
     /// The stable code within that category.
@@ -239,10 +277,11 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    /// Build a diagnostic.
+    /// Build a [`Severity::Error`] diagnostic — every failure the language produces.
     #[must_use]
     pub fn new(category: Category, code: Code, message: impl Into<String>, span: Span) -> Self {
         Self {
+            severity: Severity::Error,
             category,
             code,
             message: message.into(),
@@ -255,16 +294,240 @@ impl Diagnostic {
     pub fn lexical(code: Code, message: impl Into<String>, span: Span) -> Self {
         Self::new(Category::Lexical, code, message, span)
     }
+
+    /// Build a [`Severity::Warning`] diagnostic — a finding that reports without rejecting.
+    #[must_use]
+    pub fn warning(category: Category, code: Code, message: impl Into<String>, span: Span) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::new(category, code, message, span)
+        }
+    }
 }
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} error [{}] at {}: {}",
-            self.category, self.code, self.span, self.message
+            "{} {} [{}] at {}: {}",
+            self.category, self.severity, self.code, self.span, self.message
         )
     }
 }
 
 impl core::error::Error for Diagnostic {}
+
+/// What the caller wants added to a rendered diagnostic beyond the diagnostic itself.
+///
+/// A struct rather than a bare `Option<&str>` so Story 1.9's colour and the language server's
+/// needs can be added without breaking every call site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct RenderOptions<'a> {
+    /// A file or Script name for the location line. Absent, the line starts at `line:column`.
+    pub origin: Option<&'a str>,
+}
+
+impl<'a> RenderOptions<'a> {
+    /// Options with no origin label.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { origin: None }
+    }
+
+    /// Label the location line with a file or Script name.
+    #[must_use]
+    pub const fn with_origin(self, origin: &'a str) -> Self {
+        Self {
+            origin: Some(origin),
+        }
+    }
+}
+
+/// The indent the source line and its marker share. Both carry it, so the marker still sits at
+/// the span's true column relative to the printed line.
+const SNIPPET_INDENT: &str = "    ";
+
+/// Render `diagnostic` for a terminal against the source it came from.
+///
+/// Three lines — so a check pass emitting many findings at once stays scannable:
+///
+/// ```text
+/// rules.hxp:3:9: error type[type.operand_mismatch]: cannot multiply a string by a number
+///     let y = "abc" * 2;
+///             ^^^^^
+/// ```
+///
+/// The location is `line:column` for a span on one line and `line:column-line:column` for one
+/// that crosses lines, so a multi-line span never loses where the construct ran to. The end of
+/// that range is **one past the span's last character** — the exclusive convention
+/// [`Span::end`] uses — so a consumer highlighting the range does not have to guess. The source
+/// line is printed **in full** — never windowed or elided, because a windowed line is no longer
+/// the literal source — and the terminal may wrap it.
+///
+/// Alignment is exact for tabs (copied through into the marker, before and inside the span) and
+/// for a leading BOM (not printed, because the lexer does not count it as a column). It is
+/// **not** exact for double-width or combining characters: a column is one Unicode scalar here,
+/// as it is everywhere else in [`Span`], so an emoji or a CJK scalar shifts the marker one cell
+/// where the terminal draws two. Measuring display width needs a Unicode width table, and
+/// `hexput-shared` is dependency-free by design — an accepted limitation, not an oversight.
+///
+/// Total, for any `(diagnostic, source)` pair including a mismatched one: this returns a
+/// `String`, never panics, never slices a non-boundary byte index, and never reads outside
+/// `source`. A span that does not fit the source renders as the location line alone.
+#[must_use]
+pub fn render_diagnostic(
+    diagnostic: &Diagnostic,
+    source: &str,
+    options: RenderOptions<'_>,
+) -> String {
+    let span = diagnostic.span;
+    let location = match end_location(source, span) {
+        Some((line, column)) if line != span.line => {
+            format!("{}:{}-{line}:{column}", span.line, span.column)
+        }
+        _ => format!("{}:{}", span.line, span.column),
+    };
+    let origin = match options.origin {
+        Some(origin) => format!("{origin}:"),
+        None => String::new(),
+    };
+    let mut rendered = format!(
+        "{origin}{location}: {} {}[{}]: {}",
+        diagnostic.severity, diagnostic.category, diagnostic.code, diagnostic.message
+    );
+    if let Some((line, marker)) = snippet(source, span) {
+        rendered.push('\n');
+        rendered.push_str(SNIPPET_INDENT);
+        rendered.push_str(line);
+        rendered.push('\n');
+        rendered.push_str(SNIPPET_INDENT);
+        rendered.push_str(&marker);
+    }
+    rendered
+}
+
+/// `true` where the lexer would end a line: `\n`, `\r\n`, or a lone `\r` (§2). Agreeing with the
+/// lexer matters — a lone `\r` really does start a new line in a recorded span.
+fn ends_line(current: char, next: Option<char>) -> bool {
+    current == '\n' || (current == '\r' && next != Some('\n'))
+}
+
+/// The smallest char-boundary index `>=` `index`, after clamping `index` to the end of `source`.
+/// `index` may be neither a boundary nor within the source.
+fn snap_forward(source: &str, mut index: usize) -> usize {
+    index = index.min(source.len());
+    while !source.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Whether the span describes a region of *this* source: it starts on a character of it and
+/// does not run past its end. A caller that rendered against the wrong source fails here.
+fn fits(source: &str, span: Span) -> bool {
+    span.offset.saturating_add(span.len) <= source.len() && source.is_char_boundary(span.offset)
+}
+
+/// The line and column **one past the span's last character** — the same exclusive convention
+/// `Span::end()` uses — walking the span's text with the lexer's line rules. `None` when the
+/// span does not fit `source`.
+fn end_location(source: &str, span: Span) -> Option<(usize, usize)> {
+    if !fits(source, span) {
+        return None;
+    }
+    let end = snap_forward(source, span.offset.saturating_add(span.len));
+    let (mut line, mut column) = (span.line, span.column);
+    // Iterate the rest of the source, not just the span's own text, and stop at the span's end:
+    // a span ending exactly on the `\r` of a `\r\n` pair must still see that `\n` and count the
+    // pair as one break, or it would be reported as crossing a line it does not.
+    let mut chars = source[span.offset..].chars().peekable();
+    let mut consumed = 0;
+    while consumed < end - span.offset {
+        let Some(c) = chars.next() else { break };
+        consumed += c.len_utf8();
+        if ends_line(c, chars.peek().copied()) {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    Some((line, column))
+}
+
+/// The byte range of the line containing `offset`, excluding its terminator.
+///
+/// Both line terminators are one byte, so `+ 1` lands on a boundary. Searching for either means
+/// a lone `\r` opens a line here exactly as it does in the lexer, and the `\r` of a `\r\n` pair
+/// ends the line *before* it — so an extracted line never carries a `\r`.
+fn line_bounds(source: &str, offset: usize) -> (usize, usize) {
+    let start = source[..offset].rfind(['\n', '\r']).map_or(0, |i| i + 1);
+    let end = source[start..]
+        .find(['\n', '\r'])
+        .map_or(source.len(), |i| start + i);
+    (start, end)
+}
+
+/// The text of the line the span opens on, and the marker that goes under it. `None` when the
+/// span does not fit `source`, which is the mismatched-source case: the caller prints the
+/// location line alone rather than guessing at a snippet.
+fn snippet(source: &str, span: Span) -> Option<(&str, String)> {
+    if !fits(source, span) {
+        return None;
+    }
+    let (mut start, mut end) = line_bounds(source, span.offset);
+    let mut line = &source[start..end];
+    // `None` once the fallback below applies: the column then comes from the line's own length,
+    // which can only be counted after a leading BOM is out of it.
+    let mut column = Some(span.column);
+
+    if start == end && start > 0 && span.len == 0 && span.offset == source.len() {
+        // End of input on the empty line after a trailing newline — the common case, since
+        // virtually every file ends with one. There is nothing to show on that line, so show
+        // the line before it and mark one past its last scalar. The header keeps the span's
+        // own `line:column`: the diagnostic really is at the start of the line after.
+        let mut text_end = start - 1;
+        if source[..text_end].ends_with('\r') {
+            text_end -= 1;
+        }
+        (start, end) = line_bounds(source, text_end);
+        line = &source[start..end];
+        column = None;
+    }
+    if start == 0 {
+        // The lexer does not count a leading BOM as a column, so the printed line must not
+        // carry one either, or every marker on line 1 would sit one scalar too far right.
+        line = line.strip_prefix('\u{feff}').unwrap_or(line);
+    }
+    let column = column.unwrap_or_else(|| line.chars().count() + 1);
+
+    // The span may run past this line (a multi-line span); the marker stops at the line's end.
+    // Under the fallback above the span starts past this line entirely, so nothing is marked
+    // and the single caret below is what points at the end of input.
+    let stop = snap_forward(source, span.offset.saturating_add(span.len).min(end));
+    let marked = &source[span.offset..stop.max(span.offset)];
+
+    let mut marker = String::new();
+    let mut before = line.chars();
+    for _ in 1..column {
+        // Copy a tab through as a tab: the marker can only stay under the span if it is
+        // indented by whatever the terminal indented the source line by.
+        marker.push(if before.next() == Some('\t') {
+            '\t'
+        } else {
+            ' '
+        });
+    }
+    let mut marked_anything = false;
+    for c in marked.chars() {
+        // Same reason inside the span as before it: a caret under a tab would underrun the
+        // construct by however wide the terminal draws that tab.
+        marker.push(if c == '\t' { '\t' } else { '^' });
+        marked_anything = true;
+    }
+    if !marked_anything {
+        // A zero-length span (end of input) still has to point somewhere.
+        marker.push('^');
+    }
+    Some((line, marker))
+}

@@ -1632,3 +1632,43 @@ fn missing_object_entry_value_does_not_offer_a_closing_brace() {
     );
     assert_eq!(error.span, Span::new(11, 0, 1, 12));
 }
+
+// --- Story 1.8: the producer sweep ---
+
+/// Every `syntax.*` code, reached from real source, with the text its span must slice out.
+///
+/// Story 1.8's acceptance is that a span points at the offending construct, and the only proof
+/// of that is slicing the original source with it. A code added to the parser belongs here —
+/// `tests/shared.rs` pins the full list of code strings.
+#[test]
+fn every_syntax_code_spans_the_offending_source() {
+    let cases: [(&str, Code, &str); 5] = [
+        ("a + b[c)", Code::EXPECTED_SYNTAX, ")"),
+        ("a + b = 3", Code::INVALID_ASSIGNMENT_TARGET, "a + b"),
+        ("let x = 1; let x = 2", Code::DUPLICATE_DECLARATION, "x"),
+        ("break;", Code::LOOP_CONTROL_OUTSIDE_LOOP, "break"),
+        ("let o = {a:1, a:2};", Code::DUPLICATE_OBJECT_KEY, "a"),
+    ];
+    for (source, code, offending) in cases {
+        let d = parse(source).unwrap_err();
+        assert_eq!(d.category, Category::Syntax, "{source}: {d}");
+        assert_eq!(d.code, code, "{source}: {d}");
+        assert_eq!(&source[d.span.range()], offending, "{source}: {d}");
+        assert_eq!(
+            hexput_tests::line_and_column(source, d.span.offset),
+            (d.span.line, d.span.column),
+            "{source}: {d}"
+        );
+    }
+    for (i, (_, code, _)) in cases.iter().enumerate() {
+        for (_, other, _) in &cases[i + 1..] {
+            assert_ne!(code, other, "the sweep must reach each code once");
+        }
+    }
+    // The two duplicate codes must point at the *second* occurrence — the one to delete —
+    // which slicing alone cannot distinguish when both spellings are the same text.
+    let source = "let x = 1; let x = 2";
+    assert_eq!(parse(source).unwrap_err().span.offset, 15);
+    let source = "let o = {a:1, a:2};";
+    assert_eq!(parse(source).unwrap_err().span.offset, 14);
+}

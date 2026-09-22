@@ -232,6 +232,20 @@ Every failure carries a category, a stable code, a message, and a source span (E
 
 **[DECISION]** Scripts cannot catch errors in v2 — there is no `try`/`catch`. Any error terminates the execution and is reported to the Backend. Host-side errors from a Registered Function (§8) reach the script the same way and are equally uncatchable.
 
+**[DECISION, 2026-09-22] Severity is part of the shape.** A diagnostic carries a severity — `error` or `warning` — alongside its category, code, message and span. Every lexical, syntax and runtime failure is an `error`; the static check's unused-local findings (§10) are `warning`s, which can never reject a script. One shape carries both, so the check and the language server reuse the diagnostic rather than wrapping it in a second, almost-identical type. The severity word appears in every rendering.
+
+**[DECISION, 2026-09-22] The rendered form is compact, not a rustc-style block.** A diagnostic renders for a terminal as three lines — a location line `origin:line:col: severity category[code]: message` (the `origin:` prefix only when the caller supplies a file or Script name), the offending source line, then a marker line of carets beneath the span:
+
+```text
+rules.hxp:3:9: error type[type.operand_mismatch]: cannot multiply a string by a number
+    let y = "abc" * 2;
+            ^^^^^
+```
+
+A span crossing lines reports both ends in the location line (`line:col-line:col`) and its marker runs to the end of the line it opens on, so no location is lost. The end of that range is **one past the span's last character**, the same exclusive convention the span's own byte range uses, so a consumer highlighting it is not off by one. Three lines per diagnostic keeps a check pass emitting many findings at once scannable. The rendering is plain text: colour belongs to the CLI, layered over it. The marker aligns exactly for tabs and a leading BOM, but **not** for double-width or combining characters — a column is one Unicode scalar throughout, so an emoji or a CJK scalar shifts the marker one cell where the terminal draws two; measuring display width would need a Unicode width table, and the crate that renders is dependency-free by design.
+
+**[DECISION, 2026-09-22] Long lines are never truncated or windowed.** The offending source line is always printed in full and the terminal may wrap it; the marker keeps its true column. A windowing rule would make the printed line no longer the literal source, and correctness of the text beats fitting the viewport.
+
 ## 8. Host interaction
 
 A script reaches the host only by calling a Registered Function by its registered name, as an ordinary call expression (FR-6, FR-7):

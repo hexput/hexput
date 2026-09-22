@@ -1,5 +1,5 @@
 use hexput_ast::{Category, Code, Diagnostic};
-use hexput_interpreter::{Value, evaluate};
+use hexput_interpreter::{Array, Object, Value, evaluate, evaluate_with_variables};
 use hexput_parser::parse;
 
 fn eval(source: &str) -> Result<Value, Diagnostic> {
@@ -1441,4 +1441,211 @@ fn a_multi_line_construct_keeps_its_opening_location() {
     let source = "let x = 1;\nreturn \"a\nb\" * 2;";
     let d = assert_error(source, Category::Type, Code::OPERAND_MISMATCH, "\"a\nb\"");
     assert_eq!((d.span.line, d.span.column), (2, 8));
+}
+
+// --- starting variables (Story 1.9) ---
+
+/// Evaluate `source` with caller-supplied starting variables bound in its root scope.
+fn eval_with(source: &str, variables: Vec<(&str, Value)>) -> Result<Value, Diagnostic> {
+    let program = parse(source).unwrap_or_else(|e| panic!("`{source}` should parse: {e}"));
+    evaluate_with_variables(&program, variables)
+}
+
+fn ok_with(source: &str, variables: Vec<(&str, Value)>) -> Value {
+    eval_with(source, variables).unwrap_or_else(|e| panic!("`{source}` should evaluate: {e}"))
+}
+
+#[test]
+fn no_starting_variables_is_exactly_evaluate() {
+    assert_eq!(
+        ok_with("return 2 + 3;", Vec::new()).as_number(),
+        ok("return 2 + 3;").as_number()
+    );
+    // An empty set does not declare anything either: an unbound name is still undeclared.
+    let e = eval_with("return n;", Vec::new()).expect_err("`n` is not declared");
+    assert_eq!(e.code, Code::UNDECLARED_IDENTIFIER);
+}
+
+#[test]
+fn each_of_the_six_types_binds_and_reads_back() {
+    assert!(ok_with("return v;", vec![("v", Value::Null)]).is_null());
+    assert_eq!(
+        ok_with("return v;", vec![("v", Value::Bool(true))]).as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        ok_with("return v;", vec![("v", Value::Number(2.5))]).as_number(),
+        Some(2.5)
+    );
+    assert_eq!(
+        ok_with("return v;", vec![("v", Value::String("hi".into()))]).as_str(),
+        Some("hi")
+    );
+
+    let array = Value::Array(Array::from_values(vec![
+        Value::Number(1.0),
+        Value::String("x".into()),
+    ]));
+    let out = ok_with("return v;", vec![("v", array)]);
+    let out = out.as_array().expect("an array comes back an array");
+    assert_eq!(out.len(), 2);
+    assert_eq!(out.get(0).and_then(Value::as_number), Some(1.0));
+    assert_eq!(out.get(1).and_then(Value::as_str), Some("x"));
+
+    let object = Value::Object(Object::from_entries([
+        ("a", Value::Number(1.0)),
+        ("b", Value::Bool(false)),
+    ]));
+    let out = ok_with("return v;", vec![("v", object)]);
+    let out = out.as_object().expect("an object comes back an object");
+    assert_eq!(out.len(), 2);
+    assert_eq!(out.get("a").and_then(Value::as_number), Some(1.0));
+    // Insertion order is part of the type (§3), so it survives the round trip.
+    assert_eq!(
+        out.entries()
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+}
+
+#[test]
+fn a_bound_collection_is_a_live_collection_inside_the_execution() {
+    let array = Value::Array(Array::from_values(vec![Value::Number(1.0)]));
+    // Appending at the length is the one legal out-of-range write (§7), so the binding really is
+    // the execution's own array, not a frozen copy.
+    let out = ok_with("v[1] = 2; return v[0] + v[1];", vec![("v", array)]);
+    assert_eq!(out.as_number(), Some(3.0));
+
+    let object = Value::Object(Object::from_entries([("a", Value::Number(1.0))]));
+    let out = ok_with("v.b = 2; return v.a + v.b;", vec![("v", object)]);
+    assert_eq!(out.as_number(), Some(3.0));
+}
+
+#[test]
+fn a_nested_starting_variable_reads_through() {
+    let inner = Value::Array(Array::from_values(vec![Value::Number(7.0)]));
+    let outer = Value::Object(Object::from_entries([("xs", inner)]));
+    assert_eq!(
+        ok_with("return v.xs[0];", vec![("v", outer)]).as_number(),
+        Some(7.0)
+    );
+}
+
+#[test]
+fn a_starting_variable_behaves_like_a_top_level_binding() {
+    // Assignable — it is a binding, not a constant.
+    assert_eq!(
+        ok_with("n = n + 1; return n;", vec![("n", Value::Number(1.0))]).as_number(),
+        Some(2.0)
+    );
+    // Shadowable by an inner block, with the outer binding intact afterwards (§5).
+    assert_eq!(
+        ok_with("{ let n = 9; }; return n;", vec![("n", Value::Number(1.0))]).as_number(),
+        Some(1.0)
+    );
+    // Captured by reference by a closure, like any other binding (§6).
+    assert_eq!(
+        ok_with(
+            "let f = fn() { return n; }; n = 5; return f();",
+            vec![("n", Value::Number(1.0))]
+        )
+        .as_number(),
+        Some(5.0)
+    );
+}
+
+#[test]
+fn a_name_the_scripts_own_top_level_declares_is_reported_never_discarded() {
+    // §5: `let`, named functions and parameters share one block namespace, and a starting
+    // variable is a top-level binding — so either of these really is a redeclaration in one
+    // block. Binding one and silently dropping the other is what this rejects.
+    for (source, declaration) in [
+        ("let n = 3; return n;", "n = 3"),
+        ("fn n() { return 3; }; return n();", "n()"),
+    ] {
+        let e = eval_with(source, vec![("n", Value::Number(9.0))])
+            .expect_err("a starting variable the script redeclares");
+        assert_eq!(e.category, Category::Syntax, "{source}: {e}");
+        assert_eq!(e.code, Code::DUPLICATE_DECLARATION, "{source}: {e}");
+        // Spanned on the colliding declaration's name.
+        assert_eq!(&source[e.span.range()], "n", "{source}: {e}");
+        assert!(source.contains(declaration));
+    }
+    // A name the script declares in an *inner* block is ordinary shadowing, not a collision.
+    assert_eq!(
+        ok_with("{ let n = 3; }; return n;", vec![("n", Value::Number(9.0))]).as_number(),
+        Some(9.0)
+    );
+}
+
+#[test]
+fn a_repeated_name_keeps_the_last_value() {
+    // Rejecting a repeat belongs to the caller, which knows where the two came from; the
+    // interpreter binds in order.
+    assert_eq!(
+        ok_with(
+            "return n;",
+            vec![("n", Value::Number(1.0)), ("n", Value::Number(2.0))]
+        )
+        .as_number(),
+        Some(2.0)
+    );
+}
+
+#[test]
+fn a_starting_variable_may_be_returned_unchanged() {
+    let object = Value::Object(Object::from_entries([(
+        "xs",
+        Value::Array(Array::from_values(vec![Value::Number(1.0)])),
+    )]));
+    let out = ok_with("return v;", vec![("v", object)]);
+    assert_eq!(
+        out.as_object()
+            .and_then(|o| o.get("xs"))
+            .and_then(Value::as_array)
+            .map(Array::len),
+        Some(1)
+    );
+}
+
+#[test]
+fn an_adversarially_nested_object_starting_variable_does_not_overflow_the_host_stack() {
+    // The object path is a different walk from the array path in both flat traversals: keys are
+    // carried separately in `Heap::attach`, and separately again on the way back out.
+    let mut value = Value::Object(Object::from_entries(Vec::<(&str, Value)>::new()));
+    for _ in 0..20_000 {
+        value = Value::Object(Object::from_entries([("inner", value)]));
+    }
+    let out = ok_with("return v;", vec![("v", value)]);
+    let mut depth = 0;
+    let mut level = out;
+    while let Some(inner) = level.as_object().and_then(|o| o.get("inner")).cloned() {
+        depth += 1;
+        level = inner;
+    }
+    assert_eq!(depth, 20_000);
+}
+
+#[test]
+fn an_adversarially_nested_starting_variable_does_not_overflow_the_host_stack() {
+    let mut value = Value::Array(Array::from_values(Vec::new()));
+    for _ in 0..20_000 {
+        value = Value::Array(Array::from_values(vec![value]));
+    }
+    // Attaching it into the heap, reading through it, and detaching it again are all flat walks.
+    let out = ok_with("return v;", vec![("v", value)]);
+    let mut depth = 0;
+    let mut level = out;
+    while let Some(array) = level.as_array().map(|a| a.to_vec()) {
+        match array.into_iter().next() {
+            Some(inner) => {
+                depth += 1;
+                level = inner;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(depth, 20_000);
 }

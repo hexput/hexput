@@ -19,6 +19,10 @@ rust-version = "1.98.1"
 undocumented_unsafe_blocks = "deny"
 
 [workspace.dependencies]
+# Pinned once here and inherited; no member ever re-pins a version. `clap` parses every CLI's
+# arguments — the `hexput` eval/check commands and the daemon's own `--config` (AD-7) — so one
+# parser and one usage style serve all of them. The Spine's Stack table records it too.
+clap = { version = "4.6.7", features = ["derive"] }
 tokio = "1.53.1"
 tokio-tungstenite = "0.30.0"
 rustls = "0.23.45"

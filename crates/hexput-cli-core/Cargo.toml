@@ -12,6 +12,12 @@ hexput-lexer = { path = "../hexput-lexer" }
 hexput-parser = { path = "../hexput-parser" }
 hexput-interpreter = { path = "../hexput-interpreter" }
 hexput-check = { path = "../hexput-check" }
+# The only non-workspace dependency this crate may grow — a review rule, not a mechanical one:
+# `scripts/check-crate-graph.py` asserts the four workspace edges above (it reads only workspace
+# members), so a fifth third-party crate added here would pass CI. Diagnostics come through a
+# re-export from `hexput-parser`/`hexput-interpreter`, never a direct `hexput-shared` or
+# `hexput-ast` edge, and that part the graph check does catch.
+clap = { workspace = true }
 
 [lints]
 workspace = true

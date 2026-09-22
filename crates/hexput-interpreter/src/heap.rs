@@ -346,6 +346,62 @@ impl Heap {
         out.pop().ok_or(DetachFailure::Cycle)
     }
 
+    /// Copy an owned [`Value`] into this heap and return the handle — the inverse of
+    /// [`Heap::detach`], used to bind a caller-supplied starting variable before the Script runs.
+    ///
+    /// Walks with an explicit stack, so an adversarially nested input never grows the host stack.
+    /// Structure the input shares (the same `Arc` reached twice) expands into separate slots, so
+    /// the two are distinct collections inside the execution. That is unobservable in the same
+    /// way sharing is on the way out: a detached value has no identity (§4.2 identity exists only
+    /// within one execution), so nothing could have told the caller they were the same.
+    pub(crate) fn attach(&mut self, root: &Value) -> RtValue {
+        enum Visit {
+            Enter(Value),
+            /// `[e0 … eN-1]` on the output stack → one array handle.
+            FinishArray(usize),
+            /// `[v0 … vN-1]` → one object handle, taking the keys back in order.
+            FinishObject(Vec<Arc<str>>),
+        }
+        let mut work = vec![Visit::Enter(root.clone())];
+        let mut out: Vec<RtValue> = Vec::new();
+        while let Some(visit) = work.pop() {
+            match visit {
+                Visit::Enter(value) => match value {
+                    Value::Null => out.push(RtValue::Null),
+                    Value::Bool(b) => out.push(RtValue::Bool(b)),
+                    Value::Number(n) => out.push(RtValue::Number(n)),
+                    Value::String(s) => out.push(RtValue::String(s)),
+                    Value::Array(array) => {
+                        let items = array.to_vec();
+                        work.push(Visit::FinishArray(items.len()));
+                        // Reversed so children are entered, and land on `out`, in order.
+                        work.extend(items.into_iter().rev().map(Visit::Enter));
+                    }
+                    Value::Object(object) => {
+                        let entries = object.entries();
+                        work.push(Visit::FinishObject(
+                            entries.iter().map(|(key, _)| Arc::clone(key)).collect(),
+                        ));
+                        work.extend(entries.into_iter().rev().map(|(_, v)| Visit::Enter(v)));
+                    }
+                },
+                Visit::FinishArray(len) => {
+                    let at = out.len().saturating_sub(len);
+                    let items = out.split_off(at);
+                    let array = self.new_array(items);
+                    out.push(array);
+                }
+                Visit::FinishObject(keys) => {
+                    let at = out.len().saturating_sub(keys.len());
+                    let values = out.split_off(at);
+                    let object = self.new_object(keys.into_iter().zip(values).collect());
+                    out.push(object);
+                }
+            }
+        }
+        out.pop().unwrap_or(RtValue::Null)
+    }
+
     /// Number of slots ever allocated (live or free).
     #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {

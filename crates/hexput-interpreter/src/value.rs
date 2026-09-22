@@ -140,6 +140,15 @@ impl Array {
         Self(Arc::new(Elements(items)))
     }
 
+    /// Build a detached array from its elements, in order.
+    ///
+    /// The way a caller outside this crate supplies an array as a starting variable
+    /// ([`crate::evaluate_with_variables`]); the execution's own arrays are never built this way.
+    #[must_use]
+    pub fn from_values(items: Vec<Value>) -> Self {
+        Self::new(items)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.0.len()
@@ -166,6 +175,20 @@ impl Array {
 impl Object {
     pub(crate) fn new(entries: IndexMap<Arc<str>, Value>) -> Self {
         Self(Arc::new(Entries(entries)))
+    }
+
+    /// Build a detached object from its entries, which keep the order they are given in (§3).
+    ///
+    /// `indexmap` stays out of the signature: insertion order is part of the language, not a
+    /// container a caller should have to name. A key given twice keeps its first position and
+    /// takes the last value — the caller is the one who can reject a repeat, and an object
+    /// literal already does (§3).
+    ///
+    /// The way a caller outside this crate supplies an object as a starting variable
+    /// ([`crate::evaluate_with_variables`]).
+    #[must_use]
+    pub fn from_entries<K: Into<Arc<str>>>(entries: impl IntoIterator<Item = (K, Value)>) -> Self {
+        Self::new(entries.into_iter().map(|(k, v)| (k.into(), v)).collect())
     }
 
     #[must_use]

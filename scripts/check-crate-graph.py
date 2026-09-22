@@ -54,6 +54,16 @@ EXACT_DEPENDENCIES = {
     "hexput-ast": {"hexput-shared"},
     "hexput-lexer": {"hexput-shared"},
     "hexput-parser": {"hexput-lexer", "hexput-ast"},
+    # Story 1.9: the CLI reaches diagnostics through a re-export from the parser and the
+    # interpreter. A direct `hexput-shared` or `hexput-ast` edge is not in the Spine's graph and
+    # would otherwise only be caught by a reviewer's eye. `hexput-check` is listed because
+    # Story 1.10's check command needs it; it is unused until then.
+    "hexput-cli-core": {
+        "hexput-lexer",
+        "hexput-parser",
+        "hexput-interpreter",
+        "hexput-check",
+    },
 }
 
 

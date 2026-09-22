@@ -7,6 +7,14 @@ use hexput_ast::*;
 use hexput_lexer::{Token, TokenKind, tokenize};
 use std::collections::HashSet;
 
+/// The parse result and the diagnostics shape with its rendering, re-exported so a consumer of
+/// [`parse`] — the CLI in particular — can hold and report what it returns without a
+/// `hexput-shared` or `hexput-ast` edge, neither of which the Spine's crate graph lists for it.
+pub use hexput_ast::{
+    Category, Code, Diagnostic, Program, RenderOptions, Severity, Span, Statement, StatementKind,
+    render_diagnostic,
+};
+
 mod expressions;
 mod statements;
 use expressions::{ExpressionState, Pending};

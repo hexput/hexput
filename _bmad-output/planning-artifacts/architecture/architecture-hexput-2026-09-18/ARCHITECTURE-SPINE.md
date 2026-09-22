@@ -130,6 +130,9 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 | moka | 0.12.16 |
 | criterion | 0.8.2 |
 | tracing | 0.1.44 |
+| clap (`derive`) | 4.6.7 |
+
+**[Amended 2026-09-22, Epic 1 Story 1.9 decision 1]** `clap` is added: `hexput-cli-core` needs an argument parser for the eval command, and Story 1.10's check command and the daemon's own `--config` flag (AD-7) then inherit the same one rather than each hand-rolling a parser. It is pinned here and in `[workspace.dependencies]` like every other row. Adding it to this table is deliberate: "nothing not listed is permitted" governs *crate edges* in the dependency graph below, while the Stack table is the one place a third-party version lives.
 
 ## Structural Seed
 

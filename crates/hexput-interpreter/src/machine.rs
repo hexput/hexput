@@ -177,6 +177,20 @@ pub(crate) struct Machine<'p> {
 
 impl<'p> Machine<'p> {
     pub(crate) fn new(program: &'p Program) -> Self {
+        Self::with_variables(program, Vec::<(&str, Value)>::new())
+    }
+
+    /// A machine whose root scope already binds `variables`, each attached into the fresh heap.
+    ///
+    /// The bindings land **between** allocating the root scope and [`Machine::open`]'s hoisting of
+    /// the top-level named functions, because `let`, named functions and parameters share one
+    /// block namespace (§5): binding afterwards would let a starting variable silently shadow a
+    /// top-level `fn`, and binding before means the `fn` wins, exactly as a redeclaration in
+    /// source would be rejected outright.
+    pub(crate) fn with_variables<N: AsRef<str>>(
+        program: &'p Program,
+        variables: impl IntoIterator<Item = (N, Value)>,
+    ) -> Self {
         let mut heap = Heap::default();
         let scope = heap.push_scope(None);
         let mut machine = Self {
@@ -189,6 +203,10 @@ impl<'p> Machine<'p> {
             definitions: HashMap::new(),
             depth: 0,
         };
+        for (name, value) in variables {
+            let attached = machine.heap.attach(&value);
+            machine.heap.declare(scope, name.as_ref(), attached);
+        }
         machine.open(&program.statements);
         machine
     }

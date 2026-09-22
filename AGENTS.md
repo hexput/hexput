@@ -17,9 +17,9 @@ BMAD mirrors this — `_bmad/custom/config.user.toml` pins `communication_langua
 
 ## Project Status
 
-_Last updated: 2026-09-19._
+_Last updated: 2026-09-22._
 
-**Epic 1 Stories 1.1–1.6 are done; Stories 1.7–1.10 are `backlog`.** The Cargo workspace has 23 crates under `crates/`. `hexput-lexer` tokenizes source; `hexput-shared::diagnostics` defines shared errors and stable codes; `hexput-ast` holds owned, spanned syntax in flat expression and block arenas; `hexput-parser::parse` parses the whole Epic 1 grammar (expressions, declarations, assignments, member access, blocks, conditionals, loops, functions, calls, objects, arrays). `hexput-interpreter::evaluate` runs a `Program` on an explicit continuation stack (no recursion on input nesting): values, §4 operators and conversions, optional access, §7 absent-data/reference rules, block scoping, `let`, assignment, and top-level `return`. Control flow, functions, and calls still return a crate-private `temporary.not_yet_implemented` diagnostic until Story 1.7 replaces it. Tests live in `hexput-tests`. The check pass and daemon crates remain stubs. This is a from-scratch v2 rewrite; there is no v1 code in this repository.
+**Epic 1 Stories 1.1–1.7 are done; Stories 1.8–1.10 are `backlog`.** The Cargo workspace has 23 crates under `crates/`. `hexput-lexer` tokenizes source; `hexput-shared::diagnostics` defines shared errors and stable codes; `hexput-ast` holds owned, spanned syntax in flat expression and block arenas; `hexput-parser::parse` parses the whole Epic 1 grammar (expressions, declarations, assignments, member access, blocks, conditionals, loops, functions, calls, objects, arrays). `hexput-interpreter::evaluate` now runs the **whole language** on an explicit continuation stack — no host recursion from input nesting, iteration count, or call depth: values, §4 operators and conversions, optional access, §7 absent-data/reference rules, block scoping, `let`, assignment, `if`/`else`, `while`, `for … in`, `break`/`continue`, named and anonymous functions, closures (captured by reference), calls, and `return`. Call depth is bounded by the documented `hexput_interpreter::CALL_DEPTH_LIMIT` (1024). A function cannot be the Script result (`type.function_result`), as a function has no wire representation. Tests live in `hexput-tests`. The check pass and daemon crates remain stubs. This is a from-scratch v2 rewrite; there is no v1 code in this repository.
 
 See [Build, Lint, Test](#build-lint-test) below for the commands that actually work today.
 
@@ -34,7 +34,7 @@ Planning is complete and final:
 
 Three amendments landed after the PRD and spine were first marked final, all recorded in their `.memlog.md` files: **FR-26** (optional, Backend-configured static check before execution), **AD-8** with the `hexput-check` crate, and — largest of the three — the **crate split**: the Structural Seed is no longer one crate with an internal module tree but a Cargo workspace (22 crates at the time, plus `hexput-tests` since), one crate per module plus language (`hexput-ast`/`hexput-lexer`/`hexput-parser`/`hexput-interpreter`) and tooling crates, every crate a `lib`, with exactly one binary-producing crate (`hexput-bin`). Several Architecture Decisions (AD-1, AD-3, AD-4, AD-5, AD-8) are now compiler-enforced by which crate depends on which — see the spine's "Crate dependency graph" subsection for the exact mapping before writing any crate's `Cargo.toml`.
 
-**Next step:** implement Story 1.7 (execute control flow, functions, and callbacks) via `bmad-build`. Keep this section honest as stories land.
+**Next step:** implement Story 1.8 (report errors with precise source locations) via `bmad-build`. Keep this section honest as stories land.
 
 ## Build, Lint, Test
 

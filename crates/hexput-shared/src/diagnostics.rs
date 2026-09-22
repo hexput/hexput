@@ -168,12 +168,15 @@ impl Code {
     // --- runtime codes (Story 1.6) ---
 
     /// An operator's operand has no conversion §4.2/§4.3 performs — a non-numeric string or a
-    /// collection in arithmetic, a collection concatenated to a string. Category `type`.
+    /// collection in arithmetic, a collection concatenated to a string. Also the operand of
+    /// `for … in` when it is neither an array nor an object. Category `type`.
     pub const OPERAND_MISMATCH: Self = Self::new("type.operand_mismatch");
     /// An index of the wrong type for its receiver: a non-number on an array, a non-string on
-    /// an object, or any index on a value that is not a collection. Category `type`.
+    /// an object, or any index on a value that is not a collection (including a function).
+    /// Category `type`.
     pub const INVALID_INDEX: Self = Self::new("type.invalid_index");
-    /// `.name` on a value that is not an object (number, bool, string, array). Category `type`.
+    /// `.name` on a value that is not an object (number, bool, string, array, function).
+    /// Category `type`.
     pub const INVALID_PROPERTY_ACCESS: Self = Self::new("type.invalid_property_access");
     /// A Script returned a value that is, or contains, a value referring back to itself
     /// (`a[0] = a; return a;` or `return [1, a];`): its reachable graph has a cycle and so no
@@ -194,6 +197,25 @@ impl Code {
     pub const DIVISION_BY_ZERO: Self = Self::new("arithmetic.division_by_zero");
     /// An operation whose result would be infinite or `NaN`. Category `arithmetic`.
     pub const NON_FINITE: Self = Self::new("arithmetic.non_finite");
+
+    // --- runtime codes (Story 1.7) ---
+
+    /// A call whose callee is not a function — `let x = 1; x();`, or `o.missing()` where the
+    /// property reads as `null`. There is no optional call form to suppress it. Category `type`.
+    pub const NOT_CALLABLE: Self = Self::new("type.not_callable");
+    /// A Script returned a function, or a value containing one (`return fn(x) { … };`,
+    /// `return [f];`). A Script result must be data the Backend can receive, and a function has
+    /// no wire representation. Category `type`.
+    pub const FUNCTION_RESULT: Self = Self::new("type.function_result");
+    /// A call passed more or fewer arguments than the function declares parameters: parameters
+    /// are positional, with no `null` padding and no variadic collection (§6). Category `arity`.
+    pub const ARGUMENT_COUNT: Self = Self::new("arity.argument_count");
+    /// Nested calls exceeded the interpreter's call-depth limit — unbounded recursion ends here
+    /// rather than in a host stack overflow (§6). Category `depth`.
+    pub const CALL_DEPTH_EXCEEDED: Self = Self::new("depth.call_depth_exceeded");
+    /// The collection a `for … in` loop is iterating was mutated by its own body (§5). Mutating
+    /// a collection *nested* inside it is fine. Category `reference`.
+    pub const COLLECTION_MUTATED: Self = Self::new("reference.collection_mutated");
 }
 
 impl fmt::Display for Code {

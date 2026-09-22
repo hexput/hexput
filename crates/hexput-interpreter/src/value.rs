@@ -20,7 +20,10 @@ use indexmap::IndexMap;
 
 /// One detached Hexput value.
 ///
-/// `#[non_exhaustive]` because Story 1.7 adds functions as values.
+/// There is deliberately no function variant: a function is a value *inside* an execution (§6)
+/// but has no wire representation, so returning one is a `type` error (`type.function_result`)
+/// rather than something a Backend could receive. `#[non_exhaustive]` leaves room for a later
+/// re-triggerable callable handle to widen that error into a value without breaking callers.
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum Value {

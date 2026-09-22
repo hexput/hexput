@@ -51,6 +51,11 @@ fn runtime_codes_are_stable_and_distinct() {
         (Code::INDEX_OUT_OF_RANGE, "reference.index_out_of_range"),
         (Code::DIVISION_BY_ZERO, "arithmetic.division_by_zero"),
         (Code::NON_FINITE, "arithmetic.non_finite"),
+        (Code::NOT_CALLABLE, "type.not_callable"),
+        (Code::FUNCTION_RESULT, "type.function_result"),
+        (Code::ARGUMENT_COUNT, "arity.argument_count"),
+        (Code::CALL_DEPTH_EXCEEDED, "depth.call_depth_exceeded"),
+        (Code::COLLECTION_MUTATED, "reference.collection_mutated"),
     ];
     for (i, (code, text)) in codes.iter().enumerate() {
         assert_eq!(code.as_str(), *text);

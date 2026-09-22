@@ -9,18 +9,19 @@
 //! The `Machine` (heap and value stack included) must stay `Send`, so a future Executor can hold
 //! a suspended evaluation across an `.await` (Story 3.1); a test asserts it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hexput_ast::{
-    AccessKind, AccessLink, BinaryOperator, Category, Code, Diagnostic, ExprId, ExpressionKind,
-    Identifier, Literal, ObjectEntry, Program, Span, Spanned, Statement, StatementKind,
-    UnaryOperator,
+    AccessKind, AccessLink, BinaryOperator, Block, BlockId, Category, Code, ConditionalBranch,
+    Diagnostic, ElseBranch, ExprId, ExpressionKind, Function, Identifier, Literal, ObjectEntry,
+    Program, Span, Spanned, Statement, StatementKind, UnaryOperator,
 };
 use indexmap::IndexMap;
 
 use crate::convert::{number_to_string, to_number, to_string};
-use crate::heap::{Heap, RtValue, SlotId};
-use crate::{NOT_YET_IMPLEMENTED, Value};
+use crate::heap::{DetachFailure, Heap, RtValue, SlotId};
+use crate::{CALL_DEPTH_LIMIT, Value};
 
 /// A pending unit of work. Frames that consume values document the value-stack shape they
 /// expect on entry, top last.
@@ -82,6 +83,81 @@ enum Frame<'p> {
         prefix: &'p [AccessLink],
         link: &'p AccessLink,
     },
+    /// `[condition]` → runs `branches[index]`'s body, tests the next branch, or takes the
+    /// `else`. Only the taken branch's body is ever scheduled.
+    Branch {
+        branches: &'p [ConditionalBranch],
+        index: usize,
+        else_branch: &'p Option<ElseBranch>,
+    },
+    /// A loop's control boundary: it sits directly below the running body for the whole loop, so
+    /// `break` and `continue` can unwind to it. Popping it advances the loop by one iteration.
+    Loop(Box<LoopFrame<'p>>),
+    /// `[condition]` → runs one `while` iteration or ends the loop.
+    LoopTest(Box<LoopFrame<'p>>),
+    /// `[iterable]` → opens a `for` loop over it.
+    ForStart {
+        keyword: Span,
+        binding: &'p Identifier,
+        iterable: ExprId,
+        body: BlockId,
+    },
+    /// `[callee, a0 … aN-1]` → binds a fresh call scope and runs the body.
+    Invoke {
+        base: ExprId,
+        links: &'p [AccessLink],
+        index: usize,
+        in_target: bool,
+        arguments: usize,
+    },
+    /// A call's boundary: `return` unwinds to it, and popping it is a body that ran off its end,
+    /// which yields `null` (§6). Either way it restores what the call replaced and resumes the
+    /// access chain the call sits in.
+    CallEnd {
+        outer_scope: SlotId,
+        values: usize,
+        base: ExprId,
+        links: &'p [AccessLink],
+        index: usize,
+        in_target: bool,
+    },
+}
+
+/// What a loop needs to run and to be unwound to. Boxed inside [`Frame`] so one loop's state
+/// does not widen every frame.
+struct LoopFrame<'p> {
+    /// The scope in effect outside the loop; each iteration's scope hangs off it.
+    outer_scope: SlotId,
+    /// The value-stack depth outside the loop, restored by `break` and `continue`.
+    values: usize,
+    kind: LoopKind<'p>,
+}
+
+enum LoopKind<'p> {
+    While {
+        condition: ExprId,
+        body: &'p Block,
+    },
+    /// The collection is snapshotted by handle at the loop's start, together with its mutation
+    /// counter: each iteration re-checks the counter, so mutating the iterated collection is an
+    /// error rather than undefined behaviour (§5). `keys` is `None` for an array.
+    For {
+        keyword: Span,
+        binding: &'p Identifier,
+        body: &'p Block,
+        collection: SlotId,
+        version: u64,
+        index: usize,
+        keys: Option<Vec<Arc<str>>>,
+    },
+}
+
+impl<'p> LoopKind<'p> {
+    const fn body(&self) -> &'p Block {
+        match self {
+            Self::While { body, .. } | Self::For { body, .. } => body,
+        }
+    }
 }
 
 pub(crate) struct Machine<'p> {
@@ -90,21 +166,77 @@ pub(crate) struct Machine<'p> {
     values: Vec<RtValue>,
     heap: Heap,
     scope: SlotId,
+    /// Every `Function` a function value points at, addressed by index so the heap never carries
+    /// the program's lifetime. `definitions` maps a `Function`'s address back to its index, so a
+    /// closure created in a loop reuses one entry instead of adding one per iteration.
+    functions: Vec<&'p Function>,
+    definitions: HashMap<usize, usize>,
+    /// Number of calls currently on the frame stack; bounded by [`CALL_DEPTH_LIMIT`].
+    depth: usize,
 }
 
 impl<'p> Machine<'p> {
     pub(crate) fn new(program: &'p Program) -> Self {
-        let mut frames: Vec<Frame<'p>> = program.statements.iter().map(Frame::Statement).collect();
-        frames.reverse();
         let mut heap = Heap::default();
         let scope = heap.push_scope(None);
-        Self {
+        let mut machine = Self {
             program,
-            frames,
+            frames: Vec::new(),
             values: Vec::new(),
             heap,
             scope,
+            functions: Vec::new(),
+            definitions: HashMap::new(),
+            depth: 0,
+        };
+        machine.open(&program.statements);
+        machine
+    }
+
+    /// Schedule `statements` in the current scope, after hoisting the named functions they
+    /// declare (decision 3: every `fn name` in a block is bound before the block runs, so mutual
+    /// recursion works in any declaration order).
+    fn open(&mut self, statements: &'p [Statement]) {
+        for statement in statements {
+            if let StatementKind::Function { name, function } = &statement.kind {
+                let value = self.make_function(function);
+                self.heap.declare(self.scope, &name.name, value);
+            }
         }
+        self.frames
+            .extend(statements.iter().rev().map(Frame::Statement));
+    }
+
+    /// Enter `block` in a fresh scope nested in the current one, arranging for that scope to be
+    /// reclaimed when the block's statements are done.
+    fn enter(&mut self, block: &'p Block) {
+        let inner = self.heap.push_scope(Some(self.scope));
+        let outer = core::mem::replace(&mut self.scope, inner);
+        self.frames.push(Frame::ExitScope(outer));
+        self.open(&block.statements);
+    }
+
+    /// Reclaim the current scope (unless a closure captured it) and restore `outer`.
+    fn exit(&mut self, outer: SlotId) {
+        self.heap.release_scope(self.scope);
+        self.scope = outer;
+    }
+
+    /// A function value closing over the current scope, which is marked captured so the scope —
+    /// and its ancestors, which lookups walk — outlive the block that created it.
+    fn make_function(&mut self, function: &'p Function) -> RtValue {
+        let key = core::ptr::from_ref(function) as usize;
+        let definition = match self.definitions.get(&key) {
+            Some(index) => *index,
+            None => {
+                let index = self.functions.len();
+                self.functions.push(function);
+                self.definitions.insert(key, index);
+                index
+            }
+        };
+        self.heap.mark_captured(self.scope);
+        self.heap.new_function(definition, self.scope)
     }
 
     /// Run to completion. Consuming `self` is the memory contract: the heap is dropped here, on
@@ -126,15 +258,9 @@ impl<'p> Machine<'p> {
     fn step(&mut self, frame: Frame<'p>) -> Result<Option<Value>, Diagnostic> {
         match frame {
             Frame::Statement(statement) => return self.statement(statement),
-            Frame::ExitScope(outer) => {
-                // Nothing can reference a scope once its block exits: values hold only
-                // collection handles. Story 1.7 changes that — a closure captures its defining
-                // scope — so it must mark a scope captured before any closure references it,
-                // and this reclaim must skip captured scopes (they then live until the
-                // execution ends, like any other heap garbage).
-                self.heap.release(self.scope);
-                self.scope = outer;
-            }
+            // A scope a closure captured is skipped here and lives until the execution ends,
+            // like any other heap garbage; see `environment.rs`.
+            Frame::ExitScope(outer) => self.exit(outer),
             Frame::Eval(id) => self.expression(id)?,
             Frame::Discard => {
                 self.pop();
@@ -145,19 +271,12 @@ impl<'p> Machine<'p> {
             }
             Frame::Return(expression) => {
                 let value = self.pop();
-                return match self.heap.detach(&value) {
-                    Some(result) => Ok(Some(result)),
-                    None => Err(Diagnostic::new(
-                        Category::Type,
-                        Code::CYCLIC_RESULT,
-                        format!(
-                            "cannot return this {}: it contains a value that refers back to \
-                             itself, and a Script result must be a finite tree of values",
-                            value.type_name()
-                        ),
-                        self.program.expression(expression).span,
-                    )),
-                };
+                if self.depth > 0 {
+                    // Inside a call: this returns from the innermost function, not the Script.
+                    self.return_from_call(value);
+                    return Ok(None);
+                }
+                return self.script_result(&value, expression).map(Some);
             }
             Frame::Unary { operator, operand } => {
                 let value = self.pop();
@@ -235,8 +354,332 @@ impl<'p> Machine<'p> {
                 }
             }
             Frame::AssignMember { base, prefix, link } => self.assign_member(base, prefix, link)?,
+            Frame::Branch {
+                branches,
+                index,
+                else_branch,
+            } => {
+                let taken = self.pop();
+                if self.heap.is_truthy(&taken) {
+                    let body = self.program.block(branches[index].body);
+                    self.enter(body);
+                } else {
+                    self.next_branch(branches, index + 1, else_branch);
+                }
+            }
+            Frame::Loop(state) => self.advance(state)?,
+            Frame::LoopTest(state) => {
+                let condition = self.pop();
+                if self.heap.is_truthy(&condition) {
+                    let body = state.kind.body();
+                    self.frames.push(Frame::Loop(state));
+                    self.enter(body);
+                }
+            }
+            Frame::ForStart {
+                keyword,
+                binding,
+                iterable,
+                body,
+            } => self.for_start(keyword, binding, iterable, body)?,
+            Frame::Invoke {
+                base,
+                links,
+                index,
+                in_target,
+                arguments,
+            } => self.invoke(base, links, index, in_target, arguments)?,
+            Frame::CallEnd {
+                outer_scope,
+                values,
+                base,
+                links,
+                index,
+                in_target,
+            } => {
+                // The body ran off its end without `return`, so the call yields null (§6).
+                self.values.truncate(values);
+                self.exit(outer_scope);
+                self.depth -= 1;
+                self.values.push(RtValue::Null);
+                self.frames.push(Frame::Link {
+                    base,
+                    links,
+                    index: index + 1,
+                    in_target,
+                });
+            }
         }
         Ok(None)
+    }
+
+    /// Detach the top-level `return`'s value into the Script result.
+    fn script_result(&self, value: &RtValue, expression: ExprId) -> Result<Value, Diagnostic> {
+        let span = self.program.expression(expression).span;
+        match self.heap.detach(value) {
+            Ok(result) => Ok(result),
+            Err(DetachFailure::Cycle) => Err(Diagnostic::new(
+                Category::Type,
+                Code::CYCLIC_RESULT,
+                format!(
+                    "cannot return this {}: it contains a value that refers back to itself, and \
+                     a Script result must be a finite tree of values",
+                    value.type_name()
+                ),
+                span,
+            )),
+            // Decision 1: a function has no wire representation, so it cannot leave the
+            // execution. Widening this into a callable handle later is not a breaking change.
+            Err(DetachFailure::Function) => Err(Diagnostic::new(
+                Category::Type,
+                Code::FUNCTION_RESULT,
+                if matches!(value, RtValue::Function(_)) {
+                    "cannot return a function: a Script result must be data the Backend can \
+                     receive"
+                        .to_owned()
+                } else {
+                    format!(
+                        "cannot return this {}: it contains a function, and a Script result must \
+                         be data the Backend can receive",
+                        value.type_name()
+                    )
+                },
+                span,
+            )),
+        }
+    }
+
+    /// Test `branches[index]`, or fall through to the `else` body when there is none left.
+    fn next_branch(
+        &mut self,
+        branches: &'p [ConditionalBranch],
+        index: usize,
+        else_branch: &'p Option<ElseBranch>,
+    ) {
+        if let Some(branch) = branches.get(index) {
+            self.frames.push(Frame::Branch {
+                branches,
+                index,
+                else_branch,
+            });
+            self.frames.push(Frame::Eval(branch.condition.expression));
+        } else if let Some(otherwise) = else_branch {
+            let body = self.program.block(otherwise.body);
+            self.enter(body);
+        }
+    }
+
+    /// Open a `for` loop over the iterable on top of the value stack.
+    fn for_start(
+        &mut self,
+        keyword: Span,
+        binding: &'p Identifier,
+        iterable: ExprId,
+        body: BlockId,
+    ) -> Result<(), Diagnostic> {
+        let value = self.pop();
+        let (collection, keys) = match value {
+            RtValue::Array(id) => (id, None),
+            RtValue::Object(id) => (id, Some(self.heap.object_keys(id))),
+            other => {
+                return Err(Diagnostic::new(
+                    Category::Type,
+                    Code::OPERAND_MISMATCH,
+                    format!(
+                        "cannot iterate {}: `for … in` needs an array or an object",
+                        article(&other)
+                    ),
+                    self.program.expression(iterable).span,
+                ));
+            }
+        };
+        self.frames.push(Frame::Loop(Box::new(LoopFrame {
+            outer_scope: self.scope,
+            values: self.values.len(),
+            kind: LoopKind::For {
+                keyword,
+                binding,
+                body: self.program.block(body),
+                collection,
+                version: self.heap.version(collection),
+                index: 0,
+                keys,
+            },
+        })));
+        Ok(())
+    }
+
+    /// Advance a loop by one iteration, or let it end by not re-scheduling itself.
+    fn advance(&mut self, mut state: Box<LoopFrame<'p>>) -> Result<(), Diagnostic> {
+        match &mut state.kind {
+            LoopKind::While { condition, .. } => {
+                let condition = *condition;
+                self.frames.push(Frame::LoopTest(state));
+                self.frames.push(Frame::Eval(condition));
+            }
+            LoopKind::For {
+                keyword,
+                binding,
+                body,
+                collection,
+                version,
+                index,
+                keys,
+            } => {
+                if self.heap.version(*collection) != *version {
+                    return Err(Diagnostic::new(
+                        Category::Reference,
+                        Code::COLLECTION_MUTATED,
+                        "the collection this `for` loop is iterating was modified while it ran"
+                            .to_owned(),
+                        *keyword,
+                    ));
+                }
+                let item = match keys {
+                    Some(keys) => keys.get(*index).map(|key| RtValue::String(Arc::clone(key))),
+                    None => self.heap.array_get(*collection, *index),
+                };
+                let Some(item) = item else {
+                    return Ok(()); // exhausted: the loop frame is not re-scheduled
+                };
+                *index += 1;
+                let (binding, body) = (*binding, *body);
+                // Decision 4: the binding and the body share one scope, fresh per iteration, so
+                // a closure created in iteration i captures that iteration's value.
+                let inner = self.heap.push_scope(Some(state.outer_scope));
+                let outer = core::mem::replace(&mut self.scope, inner);
+                self.heap.declare(inner, &binding.name, item);
+                self.frames.push(Frame::Loop(state));
+                self.frames.push(Frame::ExitScope(outer));
+                self.open(&body.statements);
+            }
+        }
+        Ok(())
+    }
+
+    /// Unwind to the innermost loop boundary. `break` consumes it; `continue` leaves it in
+    /// place, so the next step re-tests the condition or takes the next element.
+    fn unwind_to_loop(&mut self, consume: bool) {
+        while let Some(frame) = self.frames.pop() {
+            match frame {
+                Frame::ExitScope(outer) => self.exit(outer),
+                Frame::Loop(state) => {
+                    self.values.truncate(state.values);
+                    self.scope = state.outer_scope;
+                    if !consume {
+                        self.frames.push(Frame::Loop(state));
+                    }
+                    return;
+                }
+                // The parser rejects loop control that is not inside a loop of its own function
+                // body, so a call boundary can only be reached here from a hand-built tree. The
+                // frames above it are already gone, so the call cannot be resumed correctly;
+                // put the boundary back and stop, which ends the call with `null` instead of
+                // unwinding past it into the caller's loop.
+                Frame::CallEnd { .. } => {
+                    self.frames.push(frame);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Return `value` from the innermost call, resuming the access chain the call sits in.
+    fn return_from_call(&mut self, value: RtValue) {
+        while let Some(frame) = self.frames.pop() {
+            match frame {
+                Frame::ExitScope(outer) => self.exit(outer),
+                Frame::CallEnd {
+                    outer_scope,
+                    values,
+                    base,
+                    links,
+                    index,
+                    in_target,
+                } => {
+                    self.values.truncate(values);
+                    self.exit(outer_scope);
+                    self.depth -= 1;
+                    self.values.push(value);
+                    self.frames.push(Frame::Link {
+                        base,
+                        links,
+                        index: index + 1,
+                        in_target,
+                    });
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Call the function under its arguments on the value stack.
+    fn invoke(
+        &mut self,
+        base: ExprId,
+        links: &'p [AccessLink],
+        index: usize,
+        in_target: bool,
+        arguments: usize,
+    ) -> Result<(), Diagnostic> {
+        let link = &links[index];
+        let values = self.pop_many(arguments);
+        let callee = self.pop();
+        let RtValue::Function(slot) = callee else {
+            return Err(Diagnostic::new(
+                Category::Type,
+                Code::NOT_CALLABLE,
+                format!(
+                    "cannot call {}: only functions can be called",
+                    article(&callee)
+                ),
+                link.span,
+            ));
+        };
+        let Some((definition, captured)) = self.heap.function(slot) else {
+            return Err(internal(link.span));
+        };
+        let function = self.functions[definition];
+        if values.len() != function.parameters.len() {
+            return Err(Diagnostic::new(
+                Category::Arity,
+                Code::ARGUMENT_COUNT,
+                format!(
+                    "this call passes {} argument{}, but the function takes {}",
+                    values.len(),
+                    if values.len() == 1 { "" } else { "s" },
+                    function.parameters.len()
+                ),
+                link.span,
+            ));
+        }
+        if self.depth >= CALL_DEPTH_LIMIT {
+            return Err(Diagnostic::new(
+                Category::Depth,
+                Code::CALL_DEPTH_EXCEEDED,
+                format!("too many nested calls: the limit is {CALL_DEPTH_LIMIT}"),
+                link.span,
+            ));
+        }
+        self.depth += 1;
+        // The call scope's parent is the callee's captured scope, never the caller's (§6).
+        let inner = self.heap.push_scope(Some(captured));
+        let outer = core::mem::replace(&mut self.scope, inner);
+        self.frames.push(Frame::CallEnd {
+            outer_scope: outer,
+            values: self.values.len(),
+            base,
+            links,
+            index,
+            in_target,
+        });
+        for (parameter, value) in function.parameters.iter().zip(values) {
+            self.heap.declare(inner, &parameter.name, value);
+        }
+        self.open(&self.program.block(function.body).statements);
+        Ok(())
     }
 
     fn statement(&mut self, statement: &'p Statement) -> Result<Option<Value>, Diagnostic> {
@@ -256,32 +699,50 @@ impl<'p> Machine<'p> {
                     self.frames.push(Frame::Return(*id));
                     self.frames.push(Frame::Eval(*id));
                 }
+                // A bare `return` yields null (§5) — from the function when inside a call, and
+                // otherwise as the Script result.
+                None if self.depth > 0 => self.return_from_call(RtValue::Null),
                 None => return Ok(Some(Value::Null)),
             },
-            StatementKind::Block(id) => {
-                let block = self.program.block(*id);
-                let inner = self.heap.push_scope(Some(self.scope));
-                let outer = core::mem::replace(&mut self.scope, inner);
-                self.frames.push(Frame::ExitScope(outer));
-                self.frames
-                    .extend(block.statements.iter().rev().map(Frame::Statement));
-            }
+            StatementKind::Block(id) => self.enter(self.program.block(*id)),
             StatementKind::Assignment { target, value, .. } => {
                 self.assignment(*target, *value)?;
             }
-            StatementKind::Function { name, .. } => {
-                return Err(not_yet("named function declarations", name.span));
+            // Already bound by `open` before this block's statements ran (decision 3).
+            StatementKind::Function { .. } => {}
+            StatementKind::If {
+                branches,
+                else_branch,
+            } => self.next_branch(branches, 0, else_branch),
+            StatementKind::While {
+                condition, body, ..
+            } => {
+                self.frames.push(Frame::Loop(Box::new(LoopFrame {
+                    outer_scope: self.scope,
+                    values: self.values.len(),
+                    kind: LoopKind::While {
+                        condition: condition.expression,
+                        body: self.program.block(*body),
+                    },
+                })));
             }
-            StatementKind::If { branches, .. } => {
-                let span = branches.first().map_or(statement.span, |b| b.keyword);
-                return Err(not_yet("`if` statements", span));
+            StatementKind::For {
+                keyword,
+                binding,
+                iterable,
+                body,
+                ..
+            } => {
+                self.frames.push(Frame::ForStart {
+                    keyword: *keyword,
+                    binding,
+                    iterable: *iterable,
+                    body: *body,
+                });
+                self.frames.push(Frame::Eval(*iterable));
             }
-            StatementKind::While { keyword, .. } => {
-                return Err(not_yet("`while` loops", *keyword));
-            }
-            StatementKind::For { keyword, .. } => return Err(not_yet("`for` loops", *keyword)),
-            StatementKind::Break { keyword } => return Err(not_yet("`break`", *keyword)),
-            StatementKind::Continue { keyword } => return Err(not_yet("`continue`", *keyword)),
+            StatementKind::Break { .. } => self.unwind_to_loop(true),
+            StatementKind::Continue { .. } => self.unwind_to_loop(false),
         }
         Ok(None)
     }
@@ -387,7 +848,8 @@ impl<'p> Machine<'p> {
                 self.frames.push(Frame::Eval(*base));
             }
             ExpressionKind::Function(function) => {
-                return Err(not_yet("function expressions", function.keyword));
+                let value = self.make_function(function);
+                self.values.push(value);
             }
         }
         Ok(())
@@ -410,8 +872,19 @@ impl<'p> Machine<'p> {
             // chain's value and no later link (or index expression) is evaluated.
             return Ok(());
         }
-        if let AccessKind::Call { .. } = link.kind {
-            return Err(not_yet("function calls", link.span));
+        if let AccessKind::Call { arguments, .. } = &link.kind {
+            // Calls are handled before the null check: calling `null` is `type.not_callable`,
+            // not a null access, and there is no optional call form to suppress it (§4.4).
+            self.frames.push(Frame::Invoke {
+                base,
+                links,
+                index,
+                in_target,
+                arguments: arguments.len(),
+            });
+            self.frames
+                .extend(arguments.iter().rev().map(|a| Frame::Eval(*a)));
+            return Ok(());
         }
         if receiver_is_null {
             // `?.` is not allowed in an assignment target, so only suggest it for plain reads.
@@ -438,6 +911,7 @@ impl<'p> Machine<'p> {
                 });
                 self.frames.push(Frame::Eval(*expression));
             }
+            // Scheduled above, before the null check.
             AccessKind::Call { .. } => {}
         }
         Ok(())
@@ -811,6 +1285,7 @@ fn article(value: &RtValue) -> &'static str {
         RtValue::String(_) => "a string",
         RtValue::Array(_) => "an array",
         RtValue::Object(_) => "an object",
+        RtValue::Function(_) => "a function",
     }
 }
 
@@ -830,15 +1305,6 @@ const fn binary_symbol(operator: BinaryOperator) -> &'static str {
         BinaryOperator::And => "&&",
         BinaryOperator::Or => "||",
     }
-}
-
-fn not_yet(construct: &str, span: Span) -> Diagnostic {
-    Diagnostic::new(
-        Category::Policy,
-        NOT_YET_IMPLEMENTED,
-        format!("{construct}: not evaluated yet (Story 1.7)"),
-        span,
-    )
 }
 
 /// The parser never produces these shapes; a hand-built AST gets a diagnostic, not a panic.
@@ -956,16 +1422,53 @@ mod tests {
             })
         }
 
-        fn block(&mut self, statements: Vec<Statement>) -> Statement {
+        fn body(&mut self, statements: Vec<Statement>) -> BlockId {
             self.0.blocks.push(Block {
                 span: span(),
                 open: span(),
                 close: span(),
                 statements,
             });
-            statement(StatementKind::Block(hexput_ast::BlockId(
-                self.0.blocks.len() - 1,
-            )))
+            BlockId(self.0.blocks.len() - 1)
+        }
+
+        fn block(&mut self, statements: Vec<Statement>) -> Statement {
+            let id = self.body(statements);
+            statement(StatementKind::Block(id))
+        }
+
+        fn function(&mut self, parameters: &[&str], statements: Vec<Statement>) -> Function {
+            let body = self.body(statements);
+            Function {
+                keyword: span(),
+                open: span(),
+                parameters: parameters.iter().map(|p| identifier(p)).collect(),
+                close: span(),
+                body,
+            }
+        }
+
+        fn call(&mut self, callee: ExprId, arguments: Vec<ExprId>) -> ExprId {
+            self.expression(ExpressionKind::Access {
+                base: callee,
+                links: vec![AccessLink {
+                    span: span(),
+                    operator: span(),
+                    optional: false,
+                    kind: AccessKind::Call {
+                        open: span(),
+                        arguments,
+                        close: span(),
+                    },
+                }],
+            })
+        }
+
+        fn ret(&mut self, value: Option<ExprId>) -> Statement {
+            statement(StatementKind::Return {
+                keyword: span(),
+                value,
+            })
         }
 
         /// `let a = ["marker"]; a[1] = a;` — a self-containing array holding a string.
@@ -1056,6 +1559,148 @@ mod tests {
         assert_eq!(Arc::strong_count(&marker), 2, "held by the result alone");
         drop(result);
         assert_eq!(Arc::strong_count(&marker), 1);
+    }
+
+    /// `{ let hidden = 7; f = fn() { return hidden; }; }` — the block's scope is captured, so
+    /// the reclaim skips it and the closure still reads `hidden` after the block exits.
+    #[test]
+    fn a_captured_scope_survives_its_block_and_keeps_its_bindings() {
+        let mut build = Build::new();
+        let null = build.literal(Literal::Null);
+        let declare_f = build.declare("f", null);
+        let seven = build.literal(Literal::Number(7.0));
+        let declare_hidden = build.declare("hidden", seven);
+        let read_hidden = build.name("hidden");
+        let inner_return = build.ret(Some(read_hidden));
+        let closure = build.function(&[], vec![inner_return]);
+        let closure_expression = build.expression(ExpressionKind::Function(closure));
+        let target = build.name("f");
+        let assign = build.assign(target, closure_expression);
+        let block = build.block(vec![declare_hidden, assign]);
+        let callee = build.name("f");
+        let call = build.call(callee, Vec::new());
+        let result = build.ret(Some(call));
+        build.0.statements = vec![declare_f, block, result];
+        let program = build.0;
+
+        let mut machine = Machine::new(&program);
+        let value = machine.execute().expect("evaluates");
+        assert_eq!(value.as_number(), Some(7.0), "the capture is intact");
+        // Root scope, the retained (captured) block scope, and the function value itself. The
+        // call's own scope captured nothing, so it was reclaimed.
+        assert_eq!(machine.heap.live(), 3);
+    }
+
+    /// The same shape without a closure: the block's scope is reclaimed as before.
+    #[test]
+    fn a_block_that_creates_no_function_is_still_reclaimed() {
+        let mut build = Build::new();
+        let seven = build.literal(Literal::Number(7.0));
+        let declare_hidden = build.declare("hidden", seven);
+        let block = build.block(vec![declare_hidden]);
+        build.0.statements = vec![block];
+        let program = build.0;
+
+        let mut machine = Machine::new(&program);
+        machine.execute().expect("evaluates");
+        assert_eq!(machine.heap.live(), 1, "only the root scope is live");
+    }
+
+    /// A call whose body creates no function value releases its scope on return, so repeated
+    /// calls reuse one slot instead of accumulating.
+    #[test]
+    fn call_scopes_that_capture_nothing_are_reclaimed() {
+        let n = 5_000;
+        let mut build = Build::new();
+        let a = build.name("a");
+        let body_return = build.ret(Some(a));
+        let identity = build.function(&["a"], vec![body_return]);
+        let declaration = statement(StatementKind::Function {
+            name: identifier("id"),
+            function: identity,
+        });
+        let mut statements = vec![declaration];
+        for _ in 0..n {
+            let callee = build.name("id");
+            let one = build.literal(Literal::Number(1.0));
+            let call = build.call(callee, vec![one]);
+            statements.push(statement(StatementKind::Expression(call)));
+        }
+        build.0.statements = statements;
+        let program = build.0;
+
+        let mut machine = Machine::new(&program);
+        machine.execute().expect("evaluates");
+        // Root scope plus the one function value; the single call scope is on the free list.
+        assert_eq!(machine.heap.live(), 2);
+        assert_eq!(
+            machine.heap.capacity(),
+            3,
+            "every call reused the same reclaimed scope slot"
+        );
+    }
+
+    /// Recursion allocates one call scope per active call and gives every one of them back.
+    #[test]
+    fn recursion_unwinds_its_call_scopes() {
+        // `fn down(n) { if (n == 0) { return 0; }; return down(n - 1); }; return down(500);`
+        let depth = 500.0;
+        let mut build = Build::new();
+        let zero_literal = build.literal(Literal::Number(0.0));
+        let base_return = build.ret(Some(zero_literal));
+        let base_body = build.body(vec![base_return]);
+        let n_read = build.name("n");
+        let zero = build.literal(Literal::Number(0.0));
+        let test = build.expression(ExpressionKind::Binary {
+            left: n_read,
+            operator: Spanned {
+                kind: BinaryOperator::Equal,
+                span: span(),
+            },
+            right: zero,
+        });
+        let guard = statement(StatementKind::If {
+            branches: vec![hexput_ast::ConditionalBranch {
+                else_keyword: None,
+                keyword: span(),
+                condition: hexput_ast::Condition {
+                    open: span(),
+                    expression: test,
+                    close: span(),
+                },
+                body: base_body,
+            }],
+            else_branch: None,
+        });
+        let n_again = build.name("n");
+        let one = build.literal(Literal::Number(1.0));
+        let next = build.expression(ExpressionKind::Binary {
+            left: n_again,
+            operator: Spanned {
+                kind: BinaryOperator::Subtract,
+                span: span(),
+            },
+            right: one,
+        });
+        let callee = build.name("down");
+        let recurse = build.call(callee, vec![next]);
+        let tail = build.ret(Some(recurse));
+        let function = build.function(&["n"], vec![guard, tail]);
+        let declaration = statement(StatementKind::Function {
+            name: identifier("down"),
+            function,
+        });
+        let entry = build.name("down");
+        let argument = build.literal(Literal::Number(depth));
+        let call = build.call(entry, vec![argument]);
+        let result = build.ret(Some(call));
+        build.0.statements = vec![declaration, result];
+        let program = build.0;
+
+        let mut machine = Machine::new(&program);
+        let value = machine.execute().expect("evaluates");
+        assert_eq!(value.as_number(), Some(0.0));
+        assert_eq!(machine.heap.live(), 2, "every call scope was reclaimed");
     }
 
     #[test]

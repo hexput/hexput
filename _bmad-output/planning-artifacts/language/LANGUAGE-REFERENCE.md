@@ -172,6 +172,8 @@ continue;                    // innermost loop only
 - **[DECISION, 2026-09-19]** `let`, named functions, and parameters share one block namespace. Duplicate parameters and redeclarations in the function's own body are compile-time errors; nested blocks may shadow them.
 - **[DECISION]** Re-declaring the same name in the same block is a compile-time error. Assignment to an undeclared name is a runtime error — there is no implicit global creation.
 - **[DECISION]** `for (item in array)` binds each element; `for (key in object)` binds each key as a `string`, in insertion order. Mutating the collection being iterated is a runtime error rather than undefined behavior.
+- **[DECISION, 2026-09-22] Each loop iteration gets a fresh scope**, shared by the `for` binding and the body, so a closure created in iteration *i* captures that iteration's value rather than the loop's final one. A `let` in the body therefore never collides with itself across turns.
+- **[DECISION, 2026-09-22] Iterating a non-collection is a `type` error** (`type.operand_mismatch`) spanned on the iterable expression, and mutation of the iterated collection is `reference.collection_mutated` spanned on the `for` keyword. **Any store into the iterated collection counts** — appending, adding a key, and replacing an existing element or value alike — but mutating a collection *nested* inside it is not a mutation of it and is allowed. **The check fires when the loop advances**, immediately before it takes the next element (the turn that discovers the collection is exhausted included), so mutating and then leaving the loop in the same iteration — via `break`, or a `return` out of the enclosing function or Script — is not an error: no advance follows it to observe the change.
 - **[DECISION]** `break` and `continue` outside a loop are compile-time errors. A function body starts its own loop context; loops surrounding its declaration do not authorize loop control inside it.
 - **[DECISION, 2026-09-19]** Top-level `return` is valid, including inside top-level control flow, and represents the Script result. A bare return has no expression only before `;`, `}`, or end of input; whitespace never terminates it.
 
@@ -189,6 +191,9 @@ items.each(fn(item) { ... });          // callback as an argument
 - A function body that reaches its end without `return` yields `null`.
 - **[DECISION]** Closures capture their defining scope **by reference**, so a callback sees later mutations of a captured binding.
 - **[DECISION]** Recursion is permitted and bounded by a call-depth limit; exceeding it is a runtime error (never a host stack overflow — Story 1.7).
+- **[DECISION, 2026-09-22] The call-depth limit is 1024**, a documented constant of the interpreter rather than a parameter. Exceeding it is `depth.call_depth_exceeded`, spanned on the call's argument list. A Backend-configurable limit belongs to the Resource Budget (FR-8), not to the language.
+- **[DECISION, 2026-09-22] Named functions hoist within their block.** Every `fn name` declared in a block is bound before any of that block's statements run, so mutual recursion works in any declaration order. A declaration's captured scope is that same block scope.
+- **[DECISION, 2026-09-22]** A call whose callee is not a function is `type.not_callable`, and a wrong argument count is `arity.argument_count`; both are spanned on the call's argument list.
 - Functions are first-class values: passable, returnable, storable in local bindings, arrays, and objects — but not in Global Variables (§3).
 
 ## 7. Errors
@@ -222,6 +227,8 @@ Every failure carries a category, a stable code, a message, and a source span (E
 
 - **Property access on `null` without `?.`** — `order.customer.name` where `customer` is `null` raises, naming `customer`. Use `order.customer?.name` to opt into `null` instead (§4.4). Without this default, one absent field would silently produce `null` three levels later and the rule would compute a confidently wrong answer while looking like it worked.
 - **Undeclared identifier** — a typo'd variable name is never data. The static check (§11) turns this into a pre-execution error when it is enabled.
+
+**[DECISION, 2026-09-22] A Script result cannot be, or contain, a function.** A Script result leaves the execution as data the Backend can receive, and a function — which closes over an environment that dies with the execution — has no wire representation. Returning one is a `type` error (`type.function_result`) spanned on the returned expression, exactly like `type.cyclic_result`. Functions the Script builds, passes and calls without returning are unaffected. Returning a *re-triggerable callable handle* — a frozen closure the Backend can invoke later over the socket, rebound to its outer context and Global Variables — is the intended long-term direction; widening this error into a value later is not a breaking change.
 
 **[DECISION]** Scripts cannot catch errors in v2 — there is no `try`/`catch`. Any error terminates the execution and is reported to the Backend. Host-side errors from a Registered Function (§8) reach the script the same way and are equally uncatchable.
 

@@ -571,21 +571,542 @@ fn number_to_string_is_javascript_style() {
 }
 
 #[test]
-fn constructs_owned_by_story_1_7_fail_without_panicking() {
+fn only_the_taken_branch_runs_and_each_body_is_its_own_scope() {
+    let chain = |first: &str, second: &str| {
+        format!(
+            "let seen = 0; if ({first}) {{ seen = 1; }} else if ({second}) {{ seen = 2; }} \
+             else {{ seen = 3; }}; return seen;"
+        )
+    };
+    assert_eq!(num(&chain("1", "1")), 1.0);
+    assert_eq!(num(&chain("0", "1")), 2.0);
+    assert_eq!(num(&chain("0", "0")), 3.0);
+    // The untaken branches are never evaluated — neither their bodies nor later conditions.
+    assert_eq!(
+        num("let x = 0; if (1) { x = 1; } else { nope; }; return x;"),
+        1.0
+    );
+    assert_eq!(
+        num("let x = 0; if (1) { x = 1; } else if (nope) { }; return x;"),
+        1.0
+    );
+    // No `else`, condition false: nothing happens at all.
+    assert!(ok("if (0) { nope; };").is_null());
+    // Each body is its own scope: a declaration inside does not leak, and it may shadow.
+    assert_error(
+        "if (1) { let inner = 1; }; return inner;",
+        Category::Reference,
+        Code::UNDECLARED_IDENTIFIER,
+        "inner",
+    );
+    assert_eq!(
+        num("let x = 1; if (1) { let x = 2; } else { }; return x;"),
+        1.0
+    );
+}
+
+#[test]
+fn conditions_follow_truthiness() {
+    for falsy in ["null", "false", "0", r#""""#, "[]", "{}", "-0"] {
+        let source = format!("let t = 0; if ({falsy}) {{ t = 1; }}; return t;");
+        assert_eq!(num(&source), 0.0, "{falsy} should be falsy");
+        let looped = format!("let n = 0; while ({falsy}) {{ n = n + 1; break; }}; return n;");
+        assert_eq!(num(&looped), 0.0, "{falsy} should be falsy");
+    }
+    for truthy in ["true", "1", r#""a""#, r#""0""#, "[0]", "{a: 0}", "-1"] {
+        let source = format!("let t = 0; if ({truthy}) {{ t = 1; }}; return t;");
+        assert_eq!(num(&source), 1.0, "{truthy} should be truthy");
+    }
+}
+
+#[test]
+fn while_accumulates_into_an_outer_binding() {
+    assert_eq!(
+        num("let i = 0; let sum = 0; while (i < 5) { sum = sum + i; i = i + 1; }; return sum;"),
+        10.0
+    );
+    // A condition that is false from the start never runs the body.
+    assert_eq!(num("let n = 0; while (0) { n = 1; }; return n;"), 0.0);
+    // The body's scope is fresh each turn: `let` inside it does not collide with itself.
+    assert_eq!(
+        num(
+            "let i = 0; let last = 0; while (i < 3) { let doubled = i * 2; last = doubled; i = i + 1; }; return last;"
+        ),
+        4.0
+    );
+}
+
+#[test]
+fn break_and_continue_affect_the_innermost_loop_only() {
+    assert_eq!(
+        num("let i = 0; while (1) { i = i + 1; if (i == 3) { break; }; }; return i;"),
+        3.0
+    );
+    // `continue` re-tests the condition, so the counter must advance before it.
+    assert_eq!(
+        num(
+            "let i = 0; let odd = 0; while (i < 6) { i = i + 1; if (i % 2 == 0) { continue; }; odd = odd + 1; }; return odd;"
+        ),
+        3.0
+    );
+    assert_eq!(
+        num("let n = 0; for (x in [1, 2, 3, 4]) { if (x == 3) { break; }; n = n + x; }; return n;"),
+        3.0
+    );
+    assert_eq!(
+        num("let n = 0; for (x in [1, 2, 3]) { if (x == 2) { continue; }; n = n + x; }; return n;"),
+        4.0
+    );
+    // From inside nested blocks, still the innermost loop.
+    assert_eq!(
+        num(
+            "let n = 0; for (x in [1, 2, 3]) { { { if (x == 2) { continue; }; }; }; n = n + x; }; return n;"
+        ),
+        4.0
+    );
+    // Nested loops: the inner `break` leaves only the inner loop running.
+    assert_eq!(
+        num(
+            "let n = 0; for (x in [1, 2]) { for (y in [10, 20]) { break; }; n = n + x; }; return n;"
+        ),
+        3.0
+    );
+    assert_eq!(
+        num(
+            "let n = 0; for (x in [1, 2]) { let i = 0; while (i < 3) { i = i + 1; if (i == 2) { break; }; n = n + 1; }; }; return n;"
+        ),
+        2.0
+    );
+}
+
+#[test]
+fn for_walks_arrays_in_order_and_objects_by_key() {
+    // Elements arrive in order.
+    assert_eq!(
+        text(r#"let out = ""; for (x in [1, 2, 3]) { out = out + x; }; return out;"#),
+        "123"
+    );
+    // Object keys arrive as strings, in insertion order, including one added before the loop.
+    assert_eq!(
+        text(
+            r#"let o = {b: 1, a: 2}; o.c = 3; let out = ""; for (k in o) { out = out + k; }; return out;"#
+        ),
+        "bac"
+    );
+    assert!(boolean(
+        r#"let out = null; for (k in {n: 1}) { out = k; }; return out == "n";"#
+    ));
+    // An empty collection never runs the body.
+    assert_eq!(num("let n = 0; for (x in []) { n = 1; }; return n;"), 0.0);
+    assert_eq!(num("let n = 0; for (x in {}) { n = 1; }; return n;"), 0.0);
+    // The binding is fresh per iteration: assigning it does not disturb the walk.
+    assert_eq!(
+        text(r#"let out = ""; for (x in [1, 2]) { x = 9; out = out + x; }; return out;"#),
+        "99"
+    );
+    // A non-collection iterable is a type error on the iterable expression.
+    for (source, spanned) in [
+        ("for (x in 1) {}", "1"),
+        (r#"for (x in "ab") {}"#, r#""ab""#),
+        ("for (x in null) {}", "null"),
+        ("let f = fn() {}; for (x in f) {}", "f"),
+    ] {
+        assert_error(source, Category::Type, Code::OPERAND_MISMATCH, spanned);
+    }
+}
+
+#[test]
+fn mutating_the_iterated_collection_is_a_reference_error_on_the_loop() {
     for source in [
-        "if (1) {}",
-        "while (0) {}",
-        "for (x in []) {}",
-        "fn f() {}",
-        "let f = fn() {};",
-        "let f = 1; f();",
-        "let o = {}; o.m();",
+        "let a = [1, 2]; for (x in a) { a[0] = 1; };",
+        "let a = [1]; for (x in a) { a[1] = 2; };",
+        "let o = {a: 1}; for (k in o) { o.b = 2; };",
+        "let o = {a: 1}; for (k in o) { o.a = 2; };",
+        // Detected even when the mutation happens on the loop's last turn.
+        "let a = [1]; for (x in a) { a[0] = 7; };",
+    ] {
+        assert_error(source, Category::Reference, Code::COLLECTION_MUTATED, "for");
+    }
+    // The guard fires when the loop advances, so mutating and leaving the loop in the same
+    // iteration never reaches a check. That is the defined behaviour, not an oversight.
+    assert_eq!(
+        num("let a = [1, 2]; for (x in a) { a[0] = 9; break; }; return a[0];"),
+        9.0
+    );
+    assert_eq!(
+        num("let a = [1, 2]; for (x in a) { a[0] = 9; return a[0]; }; return 0;"),
+        9.0
+    );
+    assert_eq!(
+        num("fn f(o) { for (k in o) { o.b = 1; return 5; }; return 0; }; return f({a: 0});"),
+        5.0
+    );
+    // A collection nested inside the iterated one is untouched by the guard.
+    assert_eq!(
+        num("let a = [[0], [0]]; for (x in a) { x[0] = 5; }; return a[1][0];"),
+        5.0
+    );
+    // So is an unrelated collection, and so is rebinding the variable that named it.
+    assert_eq!(
+        num("let a = [1, 2]; let b = []; for (x in a) { b[0] = x; }; return b[0];"),
+        2.0
+    );
+    assert_eq!(
+        num("let a = [1, 2]; let n = 0; for (x in a) { a = [9]; n = n + x; }; return n;"),
+        3.0
+    );
+}
+
+#[test]
+fn calls_bind_parameters_per_invocation() {
+    assert_eq!(
+        num("fn add(a, b) { return a + b; }; return add(1, 2);"),
+        3.0
+    );
+    // A body that reaches its end without `return` yields null.
+    assert!(ok("fn nothing() { }; return nothing();").is_null());
+    assert!(ok("fn bare() { return; }; return bare();").is_null());
+    // Repeated calls do not leak bindings into each other, and parameters shadow outer names.
+    assert_eq!(
+        text(r#"fn tag(x) { let local = "-"; return x + local; }; return tag("a") + tag("b");"#),
+        "a-b-"
+    );
+    assert_eq!(
+        num("let x = 1; fn shadow(x) { return x; }; let got = shadow(9); return got + x;"),
+        10.0
+    );
+    // Parameters do not leak out of the call.
+    assert_error(
+        "fn f(p) { return p; }; f(1); return p;",
+        Category::Reference,
+        Code::UNDECLARED_IDENTIFIER,
+        "p",
+    );
+    // Recursion keeps one set of bindings per invocation.
+    assert_eq!(
+        num("fn fact(n) { if (n <= 1) { return 1; }; return n * fact(n - 1); }; return fact(6);"),
+        720.0
+    );
+    assert_eq!(
+        num(
+            "fn fib(n) { if (n < 2) { return n; }; return fib(n - 1) + fib(n - 2); }; return fib(15);"
+        ),
+        610.0
+    );
+    // Named functions hoist within their block, so declaration order does not matter.
+    assert_eq!(num("return first(3); fn first(n) { return n * 2; }"), 6.0);
+    assert_eq!(
+        num(
+            "fn even(n) { if (n == 0) { return 1; }; return odd(n - 1); }; fn odd(n) { if (n == 0) { return 0; }; return even(n - 1); }; return even(8);"
+        ),
+        1.0
+    );
+    // Arguments are evaluated left to right, after the callee.
+    assert_error(
+        "fn f(a, b) { return a; }; return f(x1, x2);",
+        Category::Reference,
+        Code::UNDECLARED_IDENTIFIER,
+        "x1",
+    );
+    assert_error(
+        "return missingFn(x1);",
+        Category::Reference,
+        Code::UNDECLARED_IDENTIFIER,
+        "missingFn",
+    );
+}
+
+#[test]
+fn functions_are_values_and_callbacks_work() {
+    assert_eq!(
+        num("fn apply(f, v) { return f(v); }; return apply(fn(x) { return x * 2; }, 21);"),
+        42.0
+    );
+    // Held in a binding, an array, and an object, then called from there.
+    assert_eq!(num("let f = fn(x) { return x + 1; }; return f(1);"), 2.0);
+    assert_eq!(num("let a = [fn() { return 7; }]; return a[0]();"), 7.0);
+    assert_eq!(num("let o = {m: fn() { return 8; }}; return o.m();"), 8.0);
+    // A call's result continues the access chain it sits in.
+    assert_eq!(
+        num("fn make() { return {v: [0, 9]}; }; return make().v[1];"),
+        9.0
+    );
+    assert_eq!(
+        num("fn outer() { return fn(x) { return x - 1; }; }; return outer()(4);"),
+        3.0
+    );
+    // A function returned from a call, stored, then invoked later.
+    assert_eq!(
+        num(
+            "fn adder(n) { return fn(x) { return x + n; }; }; let add5 = adder(5); return add5(2);"
+        ),
+        7.0
+    );
+    // Truthiness and identity of function values.
+    assert!(boolean("let f = fn() {}; return !!f;"));
+    assert!(boolean("let f = fn() {}; let g = f; return f == g;"));
+    assert!(!boolean("return fn() {} == fn() {};"));
+    assert_eq!(text("let f = fn() {}; return \"\" + (f == f);"), "true");
+}
+
+#[test]
+fn closures_capture_by_reference() {
+    // The callback sees a mutation made after it was created.
+    assert_eq!(
+        num("let n = 1; let get = fn() { return n; }; n = 42; return get();"),
+        42.0
+    );
+    // And a mutation the callback itself makes is visible outside.
+    assert_eq!(
+        num("let n = 0; let bump = fn() { n = n + 1; }; bump(); bump(); return n;"),
+        2.0
+    );
+    // The captured scope is the defining one, never the caller's.
+    assert_error(
+        "let f = fn() { return caller_local; }; fn run(g) { let caller_local = 1; return g(); }; return run(f);",
+        Category::Reference,
+        Code::UNDECLARED_IDENTIFIER,
+        "caller_local",
+    );
+    // A closure made in a block outlives the block.
+    assert_eq!(
+        num("let get = null; { let hidden = 5; get = fn() { return hidden; }; }; return get();"),
+        5.0
+    );
+    // The binding lives in a strict, non-root *ancestor* of the closure's own scope, and that
+    // ancestor exits while the closure is still callable: the whole parent chain must be
+    // retained, not just the defining scope.
+    assert_eq!(
+        num("let g = null; { let a = 1; { g = fn() { return a; }; }; }; return g();"),
+        1.0
+    );
+    // The same, with sibling blocks afterwards: a wrongly freed ancestor slot would be handed
+    // straight back out to them, and the capture would read their bindings or fail to resolve.
+    assert_eq!(
+        num(
+            "let g = null; { let a = 2; { g = fn() { return a; }; }; }; { let b = 3; { let c = 4; }; }; { let d = 5; }; return g();"
+        ),
+        2.0
+    );
+    // Each loop iteration gets a fresh scope, so each closure captures its own value.
+    assert_eq!(
+        text(
+            r#"let fs = []; for (x in [1, 2, 3]) { fs[x - 1] = fn() { return x; }; }; return "" + fs[0]() + fs[1]() + fs[2]();"#
+        ),
+        "123"
+    );
+    assert_eq!(
+        text(
+            r#"let fs = []; let i = 0; while (i < 3) { let captured = i; fs[i] = fn() { return captured; }; i = i + 1; }; return "" + fs[0]() + fs[1]() + fs[2]();"#
+        ),
+        "012"
+    );
+}
+
+#[test]
+fn a_function_in_an_operand_position_is_a_type_error() {
+    let with = |rest: &str| format!("let f = fn() {{}}; return {rest};");
+    for (rest, code, spanned) in [
+        ("f + 1", Code::OPERAND_MISMATCH, "f"),
+        (r#""x" + f"#, Code::OPERAND_MISMATCH, "f"),
+        ("-f", Code::OPERAND_MISMATCH, "f"),
+        ("f < f", Code::OPERAND_MISMATCH, "f"),
+        ("f * 2", Code::OPERAND_MISMATCH, "f"),
+        ("f.x", Code::INVALID_PROPERTY_ACCESS, ".x"),
+        ("f[0]", Code::INVALID_INDEX, "[0]"),
+        ("[1][f]", Code::INVALID_INDEX, "f"),
+    ] {
+        let e = assert_error(&with(rest), Category::Type, code, spanned);
+        assert!(e.message.contains("function"), "{rest}: {e}");
+    }
+    // Identity comparison is not a conversion, so it still works on function values.
+    assert!(boolean("let f = fn() {}; return f == f;"));
+}
+
+#[test]
+fn wrong_arity_is_an_arity_error_on_the_call() {
+    for (source, spanned) in [
+        ("fn add(a, b) { return a + b; }; return add(1);", "(1)"),
+        (
+            "fn add(a, b) { return a + b; }; return add(1, 2, 3);",
+            "(1, 2, 3)",
+        ),
+        ("fn none() { }; return none(1);", "(1)"),
+        ("let f = fn(a) { }; return f();", "()"),
+    ] {
+        let e = assert_error(source, Category::Arity, Code::ARGUMENT_COUNT, spanned);
+        assert!(e.message.contains("argument"), "{source}: {e}");
+    }
+}
+
+#[test]
+fn calling_a_non_function_is_a_type_error() {
+    for (source, spanned) in [
+        ("let x = 1; x();", "()"),
+        ("let o = {}; o.missing();", "()"),
+        (r#"let s = "a"; s();"#, "()"),
+        ("let a = []; a[0]();", "()"),
+        ("null();", "()"),
+    ] {
+        let e = assert_error(source, Category::Type, Code::NOT_CALLABLE, spanned);
+        assert!(e.message.contains("only functions"), "{source}: {e}");
+    }
+    // `?.` short-circuits the chain before the call is ever reached.
+    assert!(ok("let a = null; return a?.b();").is_null());
+}
+
+#[test]
+fn unbounded_recursion_ends_in_a_depth_error() {
+    for source in [
+        "fn f() { return f(); }; return f();",
+        "fn a() { return b(); }; fn b() { return a(); }; return a();",
+        "let f = null; f = fn() { return f(); }; return f();",
+        // Recursion through a callback argument is bounded the same way.
+        "fn run(g) { return g(g); }; return run(fn(g) { return g(g); });",
     ] {
         let e = err(source);
-        assert_eq!(e.code.as_str(), "temporary.not_yet_implemented", "{source}");
+        assert_eq!(e.category, Category::Depth, "{source}: {e}");
+        assert_eq!(e.code, Code::CALL_DEPTH_EXCEEDED, "{source}: {e}");
+        assert!(
+            e.message
+                .contains(&hexput_interpreter::CALL_DEPTH_LIMIT.to_string()),
+            "{source}: {e}"
+        );
     }
-    // An optional chain that short-circuits never reaches its call.
-    assert!(ok("let a = null; return a?.b();").is_null());
+    // The boundary is exact. `down(n)` holds n + 1 calls open at once — the tail call is made
+    // while the caller's frame is still live — so the deepest argument that fits the limit is
+    // CALL_DEPTH_LIMIT - 1, and one more is the first to fail.
+    assert_eq!(
+        num(&countdown(hexput_interpreter::CALL_DEPTH_LIMIT - 1)),
+        0.0
+    );
+    assert_error(
+        &countdown(hexput_interpreter::CALL_DEPTH_LIMIT),
+        Category::Depth,
+        Code::CALL_DEPTH_EXCEEDED,
+        "(n - 1)",
+    );
+}
+
+/// `return down(n);` over a countdown that recurses exactly `n + 1` times.
+fn countdown(n: usize) -> String {
+    format!("fn down(n) {{ if (n == 0) {{ return 0; }}; return down(n - 1); }}; return down({n});")
+}
+
+#[test]
+fn return_returns_from_the_innermost_function() {
+    // From inside a loop inside a function: the function returns, the Script keeps going.
+    assert_eq!(
+        num(
+            "fn first(items) { for (x in items) { return x; }; return -1; }; let got = first([7, 8]); return got + 1;"
+        ),
+        8.0
+    );
+    assert_eq!(
+        num(
+            "fn count() { let i = 0; while (1) { i = i + 1; if (i == 4) { return i; }; }; }; return count();"
+        ),
+        4.0
+    );
+    // A `return` in a nested block of a function body still returns from the function.
+    assert_eq!(
+        num("fn f() { { { return 2; }; }; return 3; }; return f();"),
+        2.0
+    );
+    // Top-level `return` inside control flow ends the Script.
+    assert_eq!(num("if (1) { return 5; }; return 6;"), 5.0);
+    assert_eq!(num("for (x in [9]) { return x; }; return 0;"), 9.0);
+    assert_eq!(num("while (1) { return 4; }; return 0;"), 4.0);
+    // Statements after a call's `return` never run.
+    assert_eq!(num("fn f() { return 1; nope; }; return f();"), 1.0);
+}
+
+#[test]
+fn returning_a_function_is_a_type_error_on_the_returned_expression() {
+    for (source, spanned) in [
+        ("return fn(x) { return x; };", "fn(x) { return x; }"),
+        ("fn f() { }; return f;", "f"),
+        ("let f = fn() {}; return [f];", "[f]"),
+        ("let f = fn() {}; return {a: {b: f}};", "{a: {b: f}}"),
+        ("fn make() { return fn() {}; }; return make();", "make()"),
+    ] {
+        let e = assert_error(source, Category::Type, Code::FUNCTION_RESULT, spanned);
+        assert!(e.message.contains("function"), "{source}: {e}");
+    }
+    // A function the Script holds but does not return is fine.
+    assert_eq!(num("let f = fn() { return 1; }; return f();"), 1.0);
+    assert_eq!(num("let a = [fn() {}]; return 2;"), 2.0);
+}
+
+#[test]
+fn control_flow_and_calls_are_stack_safe() {
+    let n = 12_000;
+    let nested_if = format!(
+        "let x = 0; {}x = 1;{} return x;",
+        "if (1) { ".repeat(n),
+        "};".repeat(n)
+    );
+    assert_eq!(num(&nested_if), 1.0);
+    let nested_else = format!(
+        "let x = 0; {}x = 1;{} return x;",
+        "if (0) { } else { ".repeat(n),
+        "};".repeat(n)
+    );
+    assert_eq!(num(&nested_else), 1.0);
+    // Every level breaks out of its own loop, so the nesting is depth, not an endless outer turn.
+    let nested_while = format!(
+        "let x = 0; {}x = x + 1;{} return x;",
+        "while (1) { ".repeat(n),
+        "break; };".repeat(n)
+    );
+    assert_eq!(num(&nested_while), 1.0);
+    // Long-running loops: iteration count is not depth.
+    let iterations = 100_000;
+    let counting = format!("let i = 0; while (i < {iterations}) {{ i = i + 1; }}; return i;");
+    assert_eq!(num(&counting), f64::from(iterations));
+    let skipping = format!(
+        "let i = 0; let n = 0; while (i < {iterations}) {{ i = i + 1; if (i % 2) {{ continue; }}; n = n + 1; }}; return n;"
+    );
+    assert_eq!(num(&skipping), f64::from(iterations / 2));
+    // A `for` over a long array, built by appending.
+    let walking = format!(
+        "let a = []; let i = 0; while (i < {iterations}) {{ a[i] = i; i = i + 1; }}; let sum = 0; for (x in a) {{ sum = sum + 1; }}; return sum;"
+    );
+    assert_eq!(num(&walking), f64::from(iterations));
+    // Calls nested as deeply as the limit allows: n + 1 are open at once, so the deepest
+    // argument that fits is CALL_DEPTH_LIMIT - 1.
+    let deepest = hexput_interpreter::CALL_DEPTH_LIMIT - 1;
+    let recursive = format!(
+        "fn down(n) {{ if (n == 0) {{ return 0; }}; return 1 + down(n - 1); }}; return down({deepest});"
+    );
+    assert_eq!(num(&recursive), deepest as f64);
+    // Many sequential calls: depth is restored after each one returns.
+    let sequential = format!(
+        "fn one() {{ return 1; }}; let n = 0; let i = 0; while (i < {iterations}) {{ n = n + one(); i = i + 1; }}; return n;"
+    );
+    assert_eq!(num(&sequential), f64::from(iterations));
+    // Errors from deep inside nested control flow still come back as diagnostics.
+    let failing = format!("{}nope;{} ", "if (1) { ".repeat(n), "};".repeat(n));
+    assert_eq!(err(&failing).code, Code::UNDECLARED_IDENTIFIER);
+}
+
+#[test]
+fn control_flow_tokens_do_not_panic() {
+    let atoms = [
+        "if", "while", "for", "in", "fn", "return", "break", "continue", "(", ")", "{", "}", "x",
+        "1", ";", ",",
+    ];
+    for a in atoms {
+        for b in atoms {
+            for c in atoms {
+                for d in atoms {
+                    if let Ok(program) = parse(&format!("{a} {b} {c} {d}")) {
+                        let _ = evaluate(&program);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

@@ -2,10 +2,11 @@
 //! owned by its `Machine`, and runtime values are plain handles into it.
 //!
 //! Nothing inside the heap is reference counted, so a reference cycle (`let a = []; a[0] = a;`,
-//! or a Story 1.7 closure capturing its own scope) costs nothing extra: when the execution
-//! ends — by result or by error — the `Machine` drops and the whole heap goes with it. There is
-//! no collection within an execution: garbage stays until the execution ends (Story 3.5's
-//! memory budget bounds it). The one exception is scopes, reclaimed eagerly on block exit.
+//! or a closure capturing its own scope) costs nothing extra: when the execution ends — by
+//! result or by error — the `Machine` drops and the whole heap goes with it. There is no
+//! collection within an execution: garbage stays until the execution ends (Story 3.5's memory
+//! budget bounds it). The one exception is scopes, reclaimed eagerly on block exit — and only
+//! those no function value has captured (see `environment.rs`).
 //!
 //! Dropping the heap is flat by construction: slots hold handles, never owned children.
 
@@ -34,6 +35,9 @@ pub(crate) enum RtValue {
     String(Arc<str>),
     Array(SlotId),
     Object(SlotId),
+    /// A function value: the defining scope plus which `Function` in the program it is. Like a
+    /// collection, cloning one aliases it and `==` is handle identity.
+    Function(SlotId),
 }
 
 impl RtValue {
@@ -46,6 +50,7 @@ impl RtValue {
             Self::String(_) => "string",
             Self::Array(_) => "array",
             Self::Object(_) => "object",
+            Self::Function(_) => "function",
         }
     }
 
@@ -62,7 +67,9 @@ impl RtValue {
             (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::Number(a), Self::Number(b)) => a == b,
             (Self::String(a), Self::String(b)) => a == b,
-            (Self::Array(a), Self::Array(b)) | (Self::Object(a), Self::Object(b)) => a == b,
+            (Self::Array(a), Self::Array(b))
+            | (Self::Object(a), Self::Object(b))
+            | (Self::Function(a), Self::Function(b)) => a == b,
             (Self::Number(n), Self::String(s)) | (Self::String(s), Self::Number(n)) => {
                 crate::convert::parse_number(s) == Some(*n)
             }
@@ -71,12 +78,39 @@ impl RtValue {
     }
 }
 
+/// What a function value points at: which `Function` of the program (an index into the
+/// machine's table, so the heap stays free of the program's lifetime) and the scope it closes
+/// over. The scope is held by handle, so the closure sees later mutations of its bindings (§6).
+pub(crate) struct FunctionRecord {
+    pub(crate) definition: usize,
+    pub(crate) scope: SlotId,
+}
+
+/// Why a value has no detached form (see [`Heap::detach`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachFailure {
+    /// The reachable graph refers back to itself, so it is not a finite tree.
+    Cycle,
+    /// The value is, or contains, a function.
+    Function,
+}
+
 pub(crate) enum Slot {
     /// Reclaimed; its id is on the free list.
     Free,
-    Array(Vec<RtValue>),
-    Object(IndexMap<Arc<str>, RtValue>),
+    /// `version` counts mutations of this collection itself, so a `for` loop can tell that the
+    /// collection it is iterating changed under it. Mutating a *nested* collection bumps that
+    /// one's counter, never this one.
+    Array {
+        items: Vec<RtValue>,
+        version: u64,
+    },
+    Object {
+        entries: IndexMap<Arc<str>, RtValue>,
+        version: u64,
+    },
     Scope(ScopeRecord),
+    Function(FunctionRecord),
 }
 
 #[derive(Default)]
@@ -117,25 +151,56 @@ impl Heap {
     }
 
     pub(crate) fn new_array(&mut self, items: Vec<RtValue>) -> RtValue {
-        RtValue::Array(self.alloc(Slot::Array(items)))
+        RtValue::Array(self.alloc(Slot::Array { items, version: 0 }))
     }
 
     pub(crate) fn new_object(&mut self, entries: IndexMap<Arc<str>, RtValue>) -> RtValue {
-        RtValue::Object(self.alloc(Slot::Object(entries)))
+        RtValue::Object(self.alloc(Slot::Object {
+            entries,
+            version: 0,
+        }))
+    }
+
+    /// Allocate a function value closing over `scope`.
+    pub(crate) fn new_function(&mut self, definition: usize, scope: SlotId) -> RtValue {
+        RtValue::Function(self.alloc(Slot::Function(FunctionRecord { definition, scope })))
+    }
+
+    /// The definition index and captured scope of the function at `id`.
+    pub(crate) fn function(&self, id: SlotId) -> Option<(usize, SlotId)> {
+        match self.slot(id) {
+            Some(Slot::Function(record)) => Some((record.definition, record.scope)),
+            _ => None,
+        }
+    }
+
+    /// How many times the collection at `id` has been mutated; `0` for anything else.
+    pub(crate) fn version(&self, id: SlotId) -> u64 {
+        match self.slot(id) {
+            Some(Slot::Array { version, .. } | Slot::Object { version, .. }) => *version,
+            _ => 0,
+        }
+    }
+
+    /// The object's keys in insertion order — the sequence `for (key in object)` walks.
+    pub(crate) fn object_keys(&self, id: SlotId) -> Vec<Arc<str>> {
+        self.entries(id)
+            .map(|entries| entries.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// The elements of the array at `id`; empty for a handle that is not an array (which the
     /// machine never produces).
     fn elements(&self, id: SlotId) -> &[RtValue] {
         match self.slot(id) {
-            Some(Slot::Array(items)) => items,
+            Some(Slot::Array { items, .. }) => items,
             _ => &[],
         }
     }
 
     fn entries(&self, id: SlotId) -> Option<&IndexMap<Arc<str>, RtValue>> {
         match self.slot(id) {
-            Some(Slot::Object(entries)) => Some(entries),
+            Some(Slot::Object { entries, .. }) => Some(entries),
             _ => None,
         }
     }
@@ -150,18 +215,18 @@ impl Heap {
 
     /// Set `index`, or append when `index` is exactly the length. Returns `false` otherwise.
     pub(crate) fn array_store(&mut self, id: SlotId, index: usize, value: RtValue) -> bool {
-        let Some(Slot::Array(items)) = self.slot_mut(id) else {
+        let Some(Slot::Array { items, version }) = self.slot_mut(id) else {
             return false;
         };
         if let Some(slot) = items.get_mut(index) {
             *slot = value;
-            true
         } else if index == items.len() {
             items.push(value);
-            true
         } else {
-            false
+            return false;
         }
+        *version = version.wrapping_add(1);
+        true
     }
 
     pub(crate) fn object_get(&self, id: SlotId, key: &str) -> Option<RtValue> {
@@ -170,12 +235,13 @@ impl Heap {
 
     /// Replace an existing key in place, or append a new one at the end.
     pub(crate) fn object_store(&mut self, id: SlotId, key: &str, value: RtValue) {
-        if let Some(Slot::Object(entries)) = self.slot_mut(id) {
+        if let Some(Slot::Object { entries, version }) = self.slot_mut(id) {
             if let Some(slot) = entries.get_mut(key) {
                 *slot = value;
             } else {
                 entries.insert(Arc::from(key), value);
             }
+            *version = version.wrapping_add(1);
         }
     }
 
@@ -188,17 +254,20 @@ impl Heap {
             RtValue::String(s) => !s.is_empty(),
             RtValue::Array(id) => !self.elements(*id).is_empty(),
             RtValue::Object(id) => self.entries(*id).is_some_and(|e| !e.is_empty()),
+            // A function is a thing, never an empty collection, so it is always truthy.
+            RtValue::Function(_) => true,
         }
     }
 
     /// Copy `root` and everything reachable from it out of the heap into an owned [`Value`].
-    /// `None` when the reachable graph contains a cycle.
+    /// Fails when the reachable graph contains a cycle, or reaches a function — neither has a
+    /// finite detached form the Backend can receive (§7, and Story 1.7 decision 1).
     ///
     /// Walks with an explicit stack, so nesting depth never grows the host stack. A collection
     /// is "on the path" from when it is entered until its children are done; meeting one again
     /// in that window is a cycle. Meeting one again after it is done is sharing (`[x, x]`), not
     /// a cycle, and reuses the memoized detached form, so shared structure is detached once.
-    pub(crate) fn detach(&self, root: &RtValue) -> Option<Value> {
+    pub(crate) fn detach(&self, root: &RtValue) -> Result<Value, DetachFailure> {
         enum Visit {
             Enter(RtValue),
             Finish(SlotId),
@@ -230,6 +299,7 @@ impl Heap {
                             out.push(Value::String(s));
                             continue;
                         }
+                        RtValue::Function(_) => return Err(DetachFailure::Function),
                         RtValue::Array(id) | RtValue::Object(id) => id,
                     };
                     match marks.get(&id) {
@@ -237,17 +307,17 @@ impl Heap {
                             out.push(done.clone());
                             continue;
                         }
-                        Some(Mark::OnPath) => return None,
+                        Some(Mark::OnPath) => return Err(DetachFailure::Cycle),
                         None => {}
                     }
                     marks.insert(id, Mark::OnPath);
                     work.push(Visit::Finish(id));
                     // Reversed so children are entered, and land on `out`, in order.
                     match self.slot(id) {
-                        Some(Slot::Array(items)) => {
+                        Some(Slot::Array { items, .. }) => {
                             work.extend(items.iter().rev().cloned().map(Visit::Enter));
                         }
-                        Some(Slot::Object(entries)) => {
+                        Some(Slot::Object { entries, .. }) => {
                             work.extend(entries.values().rev().cloned().map(Visit::Enter));
                         }
                         _ => {}
@@ -255,11 +325,11 @@ impl Heap {
                 }
                 Visit::Finish(id) => {
                     let detached = match self.slot(id) {
-                        Some(Slot::Array(items)) => {
+                        Some(Slot::Array { items, .. }) => {
                             let at = out.len().saturating_sub(items.len());
                             Value::Array(Array::new(out.split_off(at)))
                         }
-                        Some(Slot::Object(entries)) => {
+                        Some(Slot::Object { entries, .. }) => {
                             let at = out.len().saturating_sub(entries.len());
                             let values = out.split_off(at);
                             Value::Object(Object::new(
@@ -273,7 +343,7 @@ impl Heap {
                 }
             }
         }
-        out.pop()
+        out.pop().ok_or(DetachFailure::Cycle)
     }
 
     /// Number of slots ever allocated (live or free).
@@ -298,8 +368,8 @@ impl Heap {
         let mut found = Vec::new();
         for slot in &self.slots {
             let values: Vec<&RtValue> = match slot {
-                Slot::Array(items) => items.iter().collect(),
-                Slot::Object(entries) => entries.values().collect(),
+                Slot::Array { items, .. } => items.iter().collect(),
+                Slot::Object { entries, .. } => entries.values().collect(),
                 _ => Vec::new(),
             };
             for value in values {
@@ -315,7 +385,7 @@ impl Heap {
     #[cfg(test)]
     pub(crate) fn has_self_containing_array(&self) -> bool {
         self.slots.iter().enumerate().any(|(i, slot)| {
-            matches!(slot, Slot::Array(items)
+            matches!(slot, Slot::Array { items, .. }
                 if items.iter().any(|v| matches!(v, RtValue::Array(id) if id.0 == i)))
         })
     }

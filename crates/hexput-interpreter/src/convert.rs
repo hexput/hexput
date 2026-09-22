@@ -5,25 +5,26 @@ use std::sync::Arc;
 
 use crate::heap::RtValue;
 
-/// To-number (§4.3): `null` → 0, bools → 1/0, numeric strings parse, collections fail.
+/// To-number (§4.3): `null` → 0, bools → 1/0, numeric strings parse, collections and functions
+/// fail.
 pub(crate) fn to_number(value: &RtValue) -> Option<f64> {
     match value {
         RtValue::Null => Some(0.0),
         RtValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
         RtValue::Number(n) => Some(*n),
         RtValue::String(s) => parse_number(s),
-        RtValue::Array(_) | RtValue::Object(_) => None,
+        RtValue::Array(_) | RtValue::Object(_) | RtValue::Function(_) => None,
     }
 }
 
-/// To-string (§4.3): collections have no string form.
+/// To-string (§4.3): collections and functions have no string form.
 pub(crate) fn to_string(value: &RtValue) -> Option<Arc<str>> {
     match value {
         RtValue::Null => Some(Arc::from("null")),
         RtValue::Bool(b) => Some(Arc::from(if *b { "true" } else { "false" })),
         RtValue::Number(n) => Some(Arc::from(number_to_string(*n))),
         RtValue::String(s) => Some(Arc::clone(s)),
-        RtValue::Array(_) | RtValue::Object(_) => None,
+        RtValue::Array(_) | RtValue::Object(_) | RtValue::Function(_) => None,
     }
 }
 

@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-18-2026 11:43
-last_updated: 09-19-2026 16:30
+last_updated: 09-22-2026 09:11
 project: hexput
 project_key: NOKEY
 tracking_system: file-system
@@ -42,7 +42,7 @@ development_status:
   1-4-parse-conditionals-and-loops: review
   1-5-parse-functions-callbacks-objects-and-arrays: review
   1-6-evaluate-expressions-and-variable-scope: review
-  1-7-execute-control-flow-functions-and-callbacks: backlog
+  1-7-execute-control-flow-functions-and-callbacks: review
   1-8-report-errors-with-precise-source-locations: backlog
   1-9-evaluate-a-script-from-the-command-line: backlog
   1-10-check-a-script-without-running-it: backlog

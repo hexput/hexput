@@ -12,10 +12,12 @@ Append-only. Each entry is work identified during a build but deliberately not d
   evidence: AD-1 requires a Named Pipe adapter alongside UDS/TCP+TLS/WebSocket, and AD-7 implies per-OS System Config default paths. Neither is exercised by a Linux-only job. `hexput-transport` is an empty stub today so there is nothing to cross-compile yet; add a `strategy.matrix.os` when Epic 2 lands the adapters.
 
 - source_spec: `spec-1-1-project-scaffold-and-pinned-toolchain.md`
+  status: PARTIALLY RESOLVED 2026-09-23 by `spec-2-1-start-the-daemon-from-a-system-config-file.md` — feature sets are now hoisted into `[workspace.dependencies]` alongside versions (`tokio` gains `rt-multi-thread` + `signal`, `serde` gains `derive`), `tracing-subscriber 0.3.23` (`fmt`, `std`) and `toml 1.1.6` are pinned there and in the Spine's Stack table, and members write `workspace = true` only. Still open: `rustls`'s crypto provider and `tokio`'s `net`/`sync`/`time` features — add them to the same pins when Stories 2.3+ first consume them.
   summary: `[workspace.dependencies]` pins bare versions with no feature sets, and omits `tracing-subscriber` which FR-12's structured logging will need.
   evidence: `tokio = "1.53.1"` with default features has no `rt-multi-thread`/`net`/`sync`/`macros`/`time`; `serde` lacks `derive`; `rustls` lacks a crypto provider. Hoisting versions only pays off if features are hoisted too, otherwise members re-add them locally and diverge. Deliberately not decided in Story 1.1: no crate consumes any of the nine yet, so the correct feature set per crate is not yet knowable. Decide when the first consumer lands (Epic 2).
 
 - source_spec: `spec-1-1-project-scaffold-and-pinned-toolchain.md`
+  status: RESOLVED 2026-09-23 by `spec-2-1-start-the-daemon-from-a-system-config-file.md` — the stub is gone. The resolver is the free function `hexput_config::resolve(flag: Option<&Path>, env: Option<&OsStr>, default_path: &Path) -> Result<Loaded, ConfigError>`; `hexput-daemon` feeds it the `clap`-parsed `--config`, the process's `HEXPUT_CONFIG` and `hexput_config::default_path()`.
   summary: `SystemConfig::resolve()` takes no arguments, so AD-7's "CLI flag > env var > default path" precedence has no channel for the CLI flag.
   evidence: The stub exists only so the `hexput-daemon` binary's call chain type-checks. Implementing AD-7 requires `resolve()` to accept the parsed `--config` flag and to report parse failure, e.g. `resolve(cli_flag: Option<&Path>) -> Result<Self, ConfigError>`. Settle the signature in the story that implements System Config discovery.
 
@@ -109,3 +111,23 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-1-10-check-a-script-without-running-it.md`
   summary: `hexput-check`'s `operands.rs` and `hexput-interpreter`'s `convert.rs` hold two byte-for-byte copies of the §4.3 string-to-number rule, and AD-8 forbids the edge that would let them share one.
   evidence: Deliberate and accepted for Epic 1: the cross-check sweep in `tests/check.rs` now compares all 2,700+ operator/operand combinations — including the strings that reach the trailing-garbage guard, and a function literal — against `hexput_interpreter::evaluate`, so a divergence fails a test rather than shipping. The structural fix, if the duplication grows past this one rule, is to move the pure conversion predicates into `hexput-ast` (which both crates already depend on) rather than to weaken AD-8. Revisit when Epic 6 extends the language, since every new conversion rule has to be written twice until then.
+
+- source_spec: `spec-2-1-start-the-daemon-from-a-system-config-file.md`
+  summary: System Config has no Named Pipe transport section, although AD-1 lists a Named Pipe adapter.
+  evidence: Story 2.1's spec enumerates exactly three sections (`uds`, `tcp`, `websocket`), so `[transport.pipe]` is rejected today as an unknown key. When Epic 5 adds the Named Pipe adapter it needs a `[transport.named_pipe]` (or similar) section with its pipe name, and a decision on whether a Windows-only section is an error or ignored on Unix.
+
+- source_spec: `spec-2-1-start-the-daemon-from-a-system-config-file.md`
+  summary: A missing field inside a transport section is located at the section header, not at a line of its own, and the message names the field but not the section.
+  evidence: The TOML deserializer reports `missing field `tls_cert`` with the span of the enclosing table, so the error reads `config.toml:4:1: missing field `tls_cert`` where line 4 is `[transport.tcp]`. The file, line and field are all named, which meets the story, but with two transports missing the same field the section is only implied by the line. If operators find this ambiguous, qualify the message with the dotted table path (the second validation layer in `crates/hexput-config/src/file.rs` already does this for invalid values).
+
+- source_spec: `spec-2-1-start-the-daemon-from-a-system-config-file.md`
+  summary: A signal arriving between process start and the first poll of the shutdown future meets the default disposition and kills the Daemon without a clean exit.
+  evidence: `hexput-daemon` installs its SIGINT/SIGTERM handlers on the shutdown future's first poll, which happens before "waiting for a shutdown signal" is logged, so any signal sent after that line is caught. A signal sent in the few milliseconds before it still ends the process with the signal's status instead of `0`. Harmless while there is nothing to clean up; once Story 2.3 creates a socket file, an early signal leaves it behind — which the UDS adapter's stale-socket removal already has to handle.
+
+- source_spec: `spec-2-1-start-the-daemon-from-a-system-config-file.md`
+  summary: The Windows System Config default path (`%ProgramData%\hexput\config.toml`) and the Ctrl-C shutdown path are never compiled or run in CI, and Windows console close/logoff/shutdown events are not listened for.
+  evidence: `default_path()`'s `#[cfg(windows)]` branch and `shutdown_signal`'s `#[cfg(not(unix))]` branch are unexercised by the Linux-only CI; only `tokio::signal::ctrl_c()` is awaited, so `ctrl_close`/`ctrl_logoff`/`ctrl_shutdown` end the process without the clean path. Add a `#[cfg(windows)]` default-path assertion and the extra handlers when the CI OS matrix lands with the Named Pipe adapter.
+
+- source_spec: `spec-2-1-start-the-daemon-from-a-system-config-file.md`
+  summary: `hexput-config`'s `locate` slices `&text[..offset]` on a toml error span offset, which would panic if a span ever landed inside a multi-byte character (unverified, would be medium).
+  evidence: Six malformed non-ASCII inputs probed through the binary produced correct char-based locations and no panic, so spans appear char-aligned. Settle by confirming toml's error spans are always char boundaries, or harden with `str::floor_char_boundary`.

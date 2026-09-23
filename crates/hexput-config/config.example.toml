@@ -1,0 +1,40 @@
+# Hexput System Config — the Daemon's own operational settings.
+#
+# This file configures the Daemon, never a Backend: a Backend's per-backend Config arrives
+# inline over the socket and is never read from disk.
+#
+# Where the Daemon looks for this file, first match wins and there is no fallthrough:
+#   1. hexput-daemon --config <path>
+#   2. the HEXPUT_CONFIG environment variable
+#   3. /etc/hexput/config.toml on Unix, %ProgramData%\hexput\config.toml on Windows
+#
+# The file is read once, at startup; restart the Daemon to apply a change. Unknown keys are an
+# error, so a misspelled key is reported rather than silently ignored. Relative paths are
+# relative to the Daemon's working directory.
+
+# The least severe log event emitted: "error", "warn", "info", "debug" or "trace".
+# Optional; defaults to "info".
+log_level = "info"
+
+# How long a Session outlives its last Connection, in whole seconds, at least 1.
+# Optional; defaults to 300.
+session_ttl_secs = 300
+
+# Transports. At least one [transport.*] section is required, and every field inside a
+# section that is present is required unless marked optional.
+
+# A Unix Domain Socket.
+[transport.uds]
+path = "/run/hexput/hexput.sock"
+
+# TCP. Always TLS: both the certificate and the key are required.
+[transport.tcp]
+bind = "0.0.0.0:7400"
+tls_cert = "/etc/hexput/tls/cert.pem"
+tls_key = "/etc/hexput/tls/key.pem"
+
+# WebSocket. TLS is optional here, but tls_cert and tls_key are given together or not at all.
+[transport.websocket]
+bind = "0.0.0.0:7401"
+tls_cert = "/etc/hexput/tls/cert.pem"
+tls_key = "/etc/hexput/tls/key.pem"

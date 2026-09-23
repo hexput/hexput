@@ -15,6 +15,10 @@ hexput-script = { path = "../hexput-script" }
 hexput-plugin = { path = "../hexput-plugin" }
 hexput-config = { path = "../hexput-config" }
 hexput-exec = { path = "../hexput-exec" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

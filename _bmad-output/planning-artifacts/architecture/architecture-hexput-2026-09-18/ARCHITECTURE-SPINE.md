@@ -131,8 +131,12 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 | criterion | 0.8.2 |
 | tracing | 0.1.44 |
 | clap (`derive`) | 4.6.7 |
+| toml (`std`, `parse`, `serde`; no default features) | 1.1.6 |
+| tracing-subscriber (`fmt`, `std`; no default features) | 0.3.23 |
 
 **[Amended 2026-09-22, Epic 1 Story 1.9 decision 1]** `clap` is added: `hexput-cli-core` needs an argument parser for the eval command, and Story 1.10's check command and the daemon's own `--config` flag (AD-7) then inherit the same one rather than each hand-rolling a parser. It is pinned here and in `[workspace.dependencies]` like every other row. Adding it to this table is deliberate: "nothing not listed is permitted" governs *crate edges* in the dependency graph below, while the Stack table is the one place a third-party version lives.
+
+**[Amended 2026-09-23, Epic 2 Story 2.1 decision 1]** `toml` and `tracing-subscriber` are added. `hexput-config` parses the System Config file as TOML through `serde`, with the parser's serializer (`display`) left out because System Config has no write API. `hexput-daemon` emits its startup log — the resolved System Config path and the AD-7 source that supplied it — through a plain `tracing-subscriber` `fmt` subscriber filtered at the file's `log_level`; structured JSON output joins as a feature of the same pin with Story 2.8. From this story on, `[workspace.dependencies]` pins each crate's **feature set** alongside its version (`tokio`'s `rt-multi-thread` + `signal`, `serde`'s `derive`), so a member writes `workspace = true` and nothing else and two crates cannot diverge on what a dependency provides.
 
 ## Structural Seed
 

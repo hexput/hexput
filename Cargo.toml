@@ -22,14 +22,25 @@ undocumented_unsafe_blocks = "deny"
 # Pinned once here and inherited; no member ever re-pins a version. `clap` parses every CLI's
 # arguments — the `hexput` eval/check commands and the daemon's own `--config` (AD-7) — so one
 # parser and one usage style serve all of them. The Spine's Stack table records it too.
+#
+# Feature sets are hoisted here with the version (Story 2.1): a member writes `workspace = true`
+# and nothing else, so two crates can never diverge on what a dependency provides. A feature is
+# added here, in the one place, when its first consumer needs it.
 clap = { version = "4.6.7", features = ["derive"] }
-tokio = "1.53.1"
+# `rt-multi-thread` for the daemon's runtime, `signal` for its SIGINT/SIGTERM (Ctrl-C) shutdown.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "signal"] }
 tokio-tungstenite = "0.30.0"
 rustls = "0.23.45"
-serde = "1.0.229"
+serde = { version = "1.0.229", features = ["derive"] }
+# System Config's file format (Story 2.1). Parsing only: `display` (the serializer) is left out
+# because `hexput-config` exposes no write API.
+toml = { version = "1.1.6", default-features = false, features = ["std", "parse", "serde"] }
 rmp-serde = "1.3.1"
 dashmap = "6.2.1"
 moka = "0.12.16"
 criterion = "0.8.2"
 tracing = "0.1.44"
+# The daemon's log output (Story 2.1): plain `fmt` lines filtered at System Config's `log_level`.
+# JSON output is Story 2.8's, and adds its feature here when it lands.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 indexmap = "2.14.2"

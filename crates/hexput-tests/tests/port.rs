@@ -466,6 +466,9 @@ fn protocol_codes_are_stable_and_in_the_protocol_category() {
         "protocol.invalid_envelope",
         "protocol.unknown_message_type",
         "protocol.frame_too_large",
+        "protocol.init_not_completed",
+        "protocol.unexpected_message",
+        "protocol.not_implemented",
     ];
     let actual: Vec<_> = ProtocolCode::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);

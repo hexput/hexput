@@ -7,8 +7,12 @@ rust-version.workspace = true
 
 [lib]
 
+# `hexput-port` is the only workspace crate this may reach (asserted by
+# `scripts/check-crate-graph.py`): an adapter turns bytes into the Port's envelopes and knows
+# nothing of Sessions or execution (AD-1).
 [dependencies]
 hexput-port = { path = "../hexput-port" }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

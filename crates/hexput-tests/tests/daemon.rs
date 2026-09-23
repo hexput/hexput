@@ -108,7 +108,20 @@ fn daemon(args: &[&str], discovery: &Discovery) -> Run {
     }
 }
 
-const VALID: &str = "[transport.uds]\npath = \"/run/hexput.sock\"\n";
+impl Sandbox {
+    /// Where this sandbox's Daemon puts its socket. Short: a socket path has a platform limit.
+    fn socket(&self) -> PathBuf {
+        self.dir.join("d.sock")
+    }
+
+    /// A minimal valid System Config whose socket lives inside this sandbox.
+    fn valid(&self) -> String {
+        format!(
+            "[transport.uds]\npath = {:?}\n",
+            self.socket().to_str().unwrap()
+        )
+    }
+}
 
 fn nothing(sandbox: &Sandbox) -> Discovery {
     Discovery::new(None, sandbox.dir.join("no-default.toml"))
@@ -119,7 +132,7 @@ fn nothing(sandbox: &Sandbox) -> Discovery {
 #[test]
 fn a_valid_file_via_the_flag_starts_and_logs_the_path_and_source() {
     let sandbox = Sandbox::new();
-    let config = sandbox.file("config.toml", VALID);
+    let config = sandbox.file("config.toml", &sandbox.valid());
     let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
     run.exit(0);
     assert_eq!(run.stdout, "");
@@ -143,7 +156,7 @@ fn a_valid_file_via_the_flag_starts_and_logs_the_path_and_source() {
 #[test]
 fn the_startup_log_names_the_env_var_and_default_sources() {
     let sandbox = Sandbox::new();
-    let from_env = sandbox.file("env.toml", VALID);
+    let from_env = sandbox.file("env.toml", &sandbox.valid());
     let run = daemon(
         &[],
         &Discovery::new(
@@ -159,7 +172,7 @@ fn the_startup_log_names_the_env_var_and_default_sources() {
         run.log
     );
 
-    let default = sandbox.file("default.toml", VALID);
+    let default = sandbox.file("default.toml", &sandbox.valid());
     let run = daemon(&[], &Discovery::new(None, &default));
     run.exit(0);
     assert!(
@@ -175,7 +188,7 @@ fn the_startup_log_names_the_env_var_and_default_sources() {
 fn a_relative_path_is_logged_as_given() {
     // The path is not canonicalised: "absolute-or-as-given", so an operator sees what they typed.
     let sandbox = Sandbox::new();
-    sandbox.file("config.toml", VALID);
+    sandbox.file("config.toml", &sandbox.valid());
     let relative = pathdiff(&sandbox.dir.join("config.toml"));
     let run = daemon(&["--config", &relative], &nothing(&sandbox));
     run.exit(0);
@@ -205,7 +218,10 @@ fn pathdiff(target: &Path) -> String {
 #[test]
 fn the_log_honours_the_configured_level() {
     let sandbox = Sandbox::new();
-    let config = sandbox.file("quiet.toml", &format!("log_level = \"warn\"\n{VALID}"));
+    let config = sandbox.file(
+        "quiet.toml",
+        &format!("log_level = \"warn\"\n{}", sandbox.valid()),
+    );
     let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
     run.exit(0);
     assert_eq!(run.log, "", "info events are filtered out at warn");
@@ -216,8 +232,8 @@ fn the_log_honours_the_configured_level() {
 #[test]
 fn a_flag_naming_a_missing_file_fails_without_falling_through() {
     let sandbox = Sandbox::new();
-    let env_file = sandbox.file("env.toml", VALID);
-    let default = sandbox.file("default.toml", VALID);
+    let env_file = sandbox.file("env.toml", &sandbox.valid());
+    let default = sandbox.file("default.toml", &sandbox.valid());
     let run = daemon(
         &["--config", "/nope.toml"],
         &Discovery::new(Some(env_file.into_os_string()), default),
@@ -392,7 +408,7 @@ fn the_binary_logs_its_config_and_stops_cleanly_on_a_signal() {
 
     const DEADLINE: Duration = Duration::from_secs(10);
     let sandbox = Sandbox::new();
-    let config = sandbox.file("config.toml", VALID);
+    let config = sandbox.file("config.toml", &sandbox.valid());
     for signal in ["-TERM", "-INT"] {
         let mut child = Reaped(
             Command::new(daemon_binary())
@@ -445,5 +461,340 @@ fn the_binary_logs_its_config_and_stops_cleanly_on_a_signal() {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(exit.code(), Some(0), "{signal}");
+        assert!(
+            !sandbox.socket().exists(),
+            "{signal}: the socket is removed on a signalled shutdown"
+        );
     }
+}
+
+// --- Story 2.3: serving a Unix Domain Socket ---
+
+/// A Daemon running on its own thread until [`Serving::stop`], with a real socket.
+#[cfg(unix)]
+struct Serving {
+    stop: tokio::sync::oneshot::Sender<()>,
+    thread: std::thread::JoinHandle<Run>,
+    socket: PathBuf,
+}
+
+#[cfg(unix)]
+impl Serving {
+    fn start(sandbox: &Sandbox, config_text: &str) -> Self {
+        let config = sandbox.file("config.toml", config_text);
+        let discovery = nothing(sandbox);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let argv: Vec<OsString> =
+                vec!["hexput-daemon".into(), "--config".into(), config.into()];
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let log = SharedLog::default();
+            let code = run_with(argv, &discovery, &mut out, &mut err, log.clone(), async {
+                let _ = stopped.await;
+            });
+            Run {
+                code: format!("{code:?}"),
+                stdout: String::from_utf8(out).unwrap(),
+                stderr: String::from_utf8(err).unwrap(),
+                log: log.text(),
+            }
+        });
+        Self {
+            stop,
+            thread,
+            socket: sandbox.socket(),
+        }
+    }
+
+    /// A client connection, waiting until the Daemon is listening.
+    fn connect(&self) -> std::os::unix::net::UnixStream {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        loop {
+            match std::os::unix::net::UnixStream::connect(&self.socket) {
+                Ok(stream) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10) && !self.thread.is_finished(),
+                        "the Daemon never listened: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    fn stop(self) -> Run {
+        let _ = self.stop.send(());
+        self.thread.join().expect("the Daemon thread")
+    }
+}
+
+#[cfg(unix)]
+mod wire {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value, decode, encode, encode_frame};
+
+    pub fn request(id: u64) -> Envelope<Value> {
+        Envelope::new(CorrelationId(id), MessageType::ExecutionStart, Value::Nil)
+    }
+
+    pub fn send(stream: &mut UnixStream, envelope: &Envelope<Value>) {
+        send_raw(stream, &encode_frame(&encode(envelope).unwrap()).unwrap());
+    }
+
+    pub fn send_raw(stream: &mut UnixStream, bytes: &[u8]) {
+        stream.write_all(bytes).unwrap();
+    }
+
+    /// The next reply, or `None` at end of stream.
+    pub fn reply(stream: &mut UnixStream) -> Option<Envelope<Value>> {
+        let mut prefix = [0; 4];
+        match stream.read_exact(&mut prefix) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+            Err(error) => panic!("no reply: {error}"),
+        }
+        let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+        stream.read_exact(&mut body).unwrap();
+        Some(decode(&body).unwrap())
+    }
+
+    /// The `(id, code)` of the next reply, which must be an `Error`.
+    pub fn refusal(stream: &mut UnixStream) -> (Option<u64>, String) {
+        let reply = reply(stream).expect("a reply");
+        assert_eq!(reply.message_type, MessageType::Error);
+        let Value::Map(fields) = reply.payload else {
+            panic!("an error payload is a map");
+        };
+        let code = fields
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("code"))
+            .and_then(|(_, value)| value.as_str())
+            .expect("a code")
+            .to_owned();
+        (reply.id.map(CorrelationId::get), code)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_daemon_answers_over_its_socket_and_removes_it_on_shutdown() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let mut client = serving.connect();
+    wire::send(&mut client, &wire::request(41));
+    assert_eq!(
+        wire::refusal(&mut client),
+        (Some(41), "protocol.init_not_completed".to_owned())
+    );
+    let socket = serving.socket.clone();
+    let run = serving.stop();
+    run.exit(0);
+    assert!(
+        run.log.contains(&format!(
+            "listening on a Unix Domain Socket path={}",
+            socket.display()
+        )),
+        "{}",
+        run.log
+    );
+    assert!(run.log.contains("daemon stopping"), "{}", run.log);
+    assert!(!socket.exists(), "the socket is removed on shutdown");
+}
+
+#[cfg(unix)]
+#[test]
+fn one_client_leaving_abruptly_disturbs_no_other() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let mut first = serving.connect();
+    let mut leaving = serving.connect();
+    let mut third = serving.connect();
+
+    // Half a frame, then gone.
+    let frame =
+        hexput_port::encode_frame(&hexput_port::encode(&wire::request(2)).unwrap()).unwrap();
+    wire::send_raw(&mut leaving, &frame[..frame.len() / 2]);
+    drop(leaving);
+
+    for (client, id) in [(&mut first, 1), (&mut third, 3)] {
+        wire::send(client, &wire::request(id));
+        assert_eq!(
+            wire::refusal(client),
+            (Some(id), "protocol.init_not_completed".to_owned())
+        );
+    }
+    let mut later = serving.connect();
+    wire::send(&mut later, &wire::request(4));
+    assert_eq!(wire::refusal(&mut later).0, Some(4));
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_malformed_frame_is_answered_and_the_connection_keeps_serving() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let mut client = serving.connect();
+    wire::send_raw(&mut client, &hexput_port::encode_frame(&[0xc1]).unwrap());
+    wire::send(&mut client, &wire::request(6));
+    assert_eq!(
+        wire::refusal(&mut client),
+        (None, "protocol.malformed_frame".to_owned())
+    );
+    assert_eq!(
+        wire::refusal(&mut client),
+        (Some(6), "protocol.init_not_completed".to_owned())
+    );
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_oversized_frame_is_answered_then_the_connection_is_closed() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let mut client = serving.connect();
+    let too_long = u32::try_from(hexput_port::MAX_FRAME_LEN + 1).unwrap();
+    wire::send_raw(&mut client, &too_long.to_be_bytes());
+    assert_eq!(
+        wire::refusal(&mut client),
+        (None, "protocol.frame_too_large".to_owned())
+    );
+    assert!(wire::reply(&mut client).is_none(), "the Daemon closed it");
+    // The Daemon itself carries on.
+    let mut next = serving.connect();
+    wire::send(&mut next, &wire::request(1));
+    assert_eq!(wire::refusal(&mut next).0, Some(1));
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_socket_mode_is_in_force_while_serving() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &format!("{}mode = \"0600\"\n", sandbox.valid()));
+    let _client = serving.connect();
+    let bits = std::fs::metadata(&serving.socket)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(bits, 0o600);
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stale_socket_is_replaced_and_the_removal_logged() {
+    let sandbox = Sandbox::new();
+    drop(std::os::unix::net::UnixListener::bind(sandbox.socket()).unwrap());
+    let config = sandbox.file("config.toml", &sandbox.valid());
+    let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+    run.exit(0);
+    assert!(
+        run.log.contains("removed a stale socket file"),
+        "{}",
+        run.log
+    );
+    assert!(!sandbox.socket().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn every_startup_failure_exits_one_naming_the_cause_and_touches_nothing() {
+    let sandbox = Sandbox::new();
+    let socket = sandbox.socket();
+    let socket_path = socket.display().to_string();
+
+    // A live socket: another process is listening.
+    let live = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let config = sandbox.file("config.toml", &sandbox.valid());
+    let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+    run.exit(1);
+    assert_eq!(
+        run.stderr,
+        format!(
+            "error: {socket_path}: socket already in use: another process is listening on it\n"
+        )
+    );
+    assert!(!run.log.contains("daemon started"), "{}", run.log);
+    std::os::unix::net::UnixStream::connect(&socket).expect("the live socket survives");
+    drop(live);
+    std::fs::remove_file(&socket).unwrap();
+
+    // A regular file where the socket goes.
+    std::fs::write(&socket, "precious").unwrap();
+    let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+    run.exit(1);
+    assert!(
+        run.stderr.starts_with(&format!("error: {socket_path}: ")),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("is not a socket"), "{}", run.stderr);
+    assert_eq!(std::fs::read_to_string(&socket).unwrap(), "precious");
+    std::fs::remove_file(&socket).unwrap();
+
+    // A missing parent directory.
+    let orphan = sandbox.dir.join("absent").join("d.sock");
+    let config = sandbox.file(
+        "orphan.toml",
+        &format!("[transport.uds]\npath = {:?}\n", orphan.to_str().unwrap()),
+    );
+    let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+    run.exit(1);
+    assert!(
+        run.stderr
+            .starts_with(&format!("error: {}: cannot bind", orphan.display())),
+        "{}",
+        run.stderr
+    );
+
+    // Transports no adapter serves yet, alone or beside UDS.
+    for (name, extra, expected) in [
+        (
+            "tcp.toml",
+            "[transport.tcp]\nbind = \"127.0.0.1:7400\"\ntls_cert = \"c\"\ntls_key = \"k\"\n",
+            "[transport.tcp] not supported yet",
+        ),
+        (
+            "ws.toml",
+            "[transport.websocket]\nbind = \"127.0.0.1:7401\"\n",
+            "[transport.websocket] not supported yet",
+        ),
+    ] {
+        for text in [extra.to_owned(), format!("{}{extra}", sandbox.valid())] {
+            let config = sandbox.file(name, &text);
+            let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+            run.exit(1);
+            assert!(
+                run.stderr
+                    .starts_with(&format!("error: {}: {expected}", config.display())),
+                "{}",
+                run.stderr
+            );
+            assert!(!socket.exists(), "nothing is bound: {text}");
+        }
+    }
+
+    // An invalid mode is a System Config error, before anything is bound.
+    let config = sandbox.file("mode.toml", &format!("{}mode = \"rw\"\n", sandbox.valid()));
+    let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+    run.exit(1);
+    assert!(
+        run.stderr.contains("`transport.uds.mode`"),
+        "{}",
+        run.stderr
+    );
+    assert!(!socket.exists());
 }

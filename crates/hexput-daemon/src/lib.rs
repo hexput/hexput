@@ -18,10 +18,20 @@
 //!   supplied it, and later shut down cleanly on SIGINT/SIGTERM (Ctrl-C on Windows); or help or
 //!   the version was explicitly requested (printed to stdout).
 //! * `2` — the invocation was wrong (an unknown flag, `--config` without a value).
-//! * `1` — the System Config could not be loaded (missing, unreadable, malformed, invalid), or
-//!   the runtime could not start. The reason is one line on stderr naming the file.
+//! * `1` — the System Config could not be loaded (missing, unreadable, malformed, invalid), it
+//!   names a transport no adapter serves yet, the socket could not be bound, or the runtime
+//!   could not start. The reason is one line on stderr naming the file or the socket path.
 //!
-//! No transport is started yet: listeners arrive with Story 2.3.
+//! # Serving
+//!
+//! The Daemon listens on the configured Unix Domain Socket (`hexput-transport`), binding it
+//! before it announces that it started. Each accepted connection is its own Tokio task running
+//! `hexput_connection::serve`, which is generic over the Port and never learns the transport
+//! (AD-1); a connection that fails, disconnects abruptly or panics ends only its own task. On
+//! shutdown the Daemon stops accepting and removes the socket file it created.
+//!
+//! TCP+TLS and WebSocket have no adapter until Epic 5: a System Config naming either is refused
+//! at startup, so the Daemon never appears to listen where it does not.
 
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
@@ -30,6 +40,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::task::Poll;
+#[cfg(unix)]
+use std::time::Duration;
 
 use clap::Parser;
 use hexput_config::{Loaded, LogLevel};
@@ -176,19 +188,34 @@ where
     };
 
     // Scoped, not global: a test runs several Daemons in one process, each with its own log.
-    tracing::dispatcher::with_default(&dispatch, || {
-        runtime.block_on(serve(&loaded, shutdown));
-    });
-    ExitCode::SUCCESS
+    let served =
+        tracing::dispatcher::with_default(&dispatch, || runtime.block_on(serve(&loaded, shutdown)));
+    match served {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            ExitCode::from(FAILURE)
+        }
+    }
 }
 
-/// The Daemon proper. Today: announce the resolved System Config, then wait for shutdown.
-async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) {
+/// How long the accept loop pauses after a failed accept, so a persistent failure (out of file
+/// descriptors) cannot spin a core.
+#[cfg(unix)]
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The Daemon proper: announce the System Config, bind the socket, serve connections until
+/// `shutdown` completes, then remove the socket. `Err` is the one-line startup failure.
+#[cfg(unix)]
+async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(), String> {
     tracing::info!(
         path = %loaded.path.display(),
         source = %loaded.source.as_str(),
         "System Config loaded",
     );
+    let listener = listen(loaded)?;
+    tracing::info!(path = %listener.path().display(), "listening on a Unix Domain Socket");
+
     // Poll once before announcing readiness: a signal future installs its handlers on first
     // poll, so once "waiting" is logged a signal is certain to be caught rather than meeting the
     // default disposition.
@@ -196,9 +223,84 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) {
     let armed = std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx))).await;
     if armed.is_pending() {
         tracing::info!("daemon started; waiting for a shutdown signal");
-        shutdown.await;
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.as_mut() => break,
+                Some(joined) = connections.join_next() => {
+                    if let Err(error) = joined
+                        && error.is_panic()
+                    {
+                        tracing::error!("a connection task panicked; other connections are unaffected");
+                    }
+                }
+                accepted = listener.accept() => match accepted {
+                    Ok(port) => {
+                        tracing::debug!("connection accepted");
+                        connections.spawn(hexput_connection::serve(port));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot accept a connection");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    }
+                },
+            }
+        }
+        // Connections end with the runtime; nothing they hold outlives them yet.
+        connections.abort_all();
     }
     tracing::info!("shutdown requested; daemon stopping");
+    let path = listener.path().to_path_buf();
+    if let Err(error) = listener.close() {
+        tracing::warn!(path = %path.display(), %error, "cannot remove the socket file");
+    }
+    Ok(())
+}
+
+/// No adapter serves a non-Unix platform until the Named Pipe arrives (Epic 5), so the Daemon
+/// refuses to start rather than listen nowhere.
+#[cfg(not(unix))]
+async fn serve<S: Future<Output = ()>>(loaded: &Loaded, _shutdown: S) -> Result<(), String> {
+    Err(format!(
+        "{}: no transport is served on this platform yet; the Named Pipe adapter arrives with \
+         a later release",
+        loaded.path.display()
+    ))
+}
+
+/// Bind the configured Unix Domain Socket, refusing a System Config that names a transport no
+/// adapter serves yet.
+#[cfg(unix)]
+fn listen(loaded: &Loaded) -> Result<hexput_transport::uds::UdsListener, String> {
+    let transports = &loaded.config.transports;
+    let unserved: Vec<&str> = [
+        (transports.tcp.is_some(), "[transport.tcp]"),
+        (transports.websocket.is_some(), "[transport.websocket]"),
+    ]
+    .into_iter()
+    .filter_map(|(present, name)| present.then_some(name))
+    .collect();
+    if !unserved.is_empty() {
+        return Err(format!(
+            "{}: {} not supported yet; only [transport.uds] is served in this version",
+            loaded.path.display(),
+            unserved.join(" and "),
+        ));
+    }
+    // A parsed System Config has at least one transport, and only UDS remains.
+    let Some(uds) = transports.uds.as_ref() else {
+        return Err(format!("{}: no transport to serve", loaded.path.display()));
+    };
+    let listener =
+        hexput_transport::uds::UdsListener::bind(&uds.path, uds.mode).map_err(|e| e.to_string())?;
+    if listener.replaced_stale() {
+        tracing::info!(
+            path = %uds.path.display(),
+            "removed a stale socket file left by an unclean shutdown",
+        );
+    }
+    Ok(listener)
 }
 
 /// A plain-text `fmt` subscriber writing to `log`, filtered at the System Config's `log_level`.

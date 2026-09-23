@@ -24,9 +24,23 @@ session_ttl_secs = 300
 # section that is present is required unless marked optional.
 
 # A Unix Domain Socket.
+#
+# The Daemon creates the socket file at startup and removes it on a clean shutdown. A socket file
+# left behind by an unclean shutdown (nothing listening on it) is removed and replaced. Anything
+# else at the path — a socket another process is listening on, a regular file, a directory — is
+# never deleted: the Daemon refuses to start and names the path. The parent directory must
+# already exist.
 [transport.uds]
 path = "/run/hexput/hexput.sock"
+# The socket file's permission bits, as a string of three or four octal digits, at most "0777".
+# Connecting needs write permission on the socket, so "0660" admits the Daemon's user and group.
+# The mode is in place before any Backend can connect. Optional; without it the Daemon's umask
+# decides.
+mode = "0660"
 
+# TCP and WebSocket are not served yet: their adapters arrive with Epic 5, and until then the
+# Daemon refuses to start when either section is present rather than silently not listening.
+#
 # TCP. Always TLS: both the certificate and the key are required.
 [transport.tcp]
 bind = "0.0.0.0:7400"

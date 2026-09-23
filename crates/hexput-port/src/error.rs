@@ -7,7 +7,8 @@ use hexput_shared::wire::{CorrelationId, Envelope, MessageType};
 use rmpv::Value;
 use serde::{Deserialize, Serialize};
 
-/// Which way a frame was broken. Each maps to one stable `protocol.*` code a Backend may match on.
+/// Which way a frame was broken, or why a well-formed message was refused. Each maps to one
+/// stable `protocol.*` code a Backend may match on.
 ///
 /// `protocol` is a **wire-only** category: a protocol failure is never a language failure, so it
 /// is deliberately not a [`Category`](hexput_shared::diagnostics::Category) and LANGUAGE-REFERENCE
@@ -28,6 +29,14 @@ pub enum ProtocolCode {
     /// A length prefix above [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN). The stream cannot be
     /// resynchronised after this, so the adapter closes the connection after responding.
     FrameTooLarge,
+    /// A request that needs a Session arrived before the connection completed init (FR-1).
+    InitNotCompleted,
+    /// A well-formed message the Daemon never accepts from a Backend on its own initiative, such
+    /// as a `Result` or `Error` answering nothing the Daemon asked.
+    UnexpectedMessage,
+    /// A message type the Daemon knows but does not serve yet. Temporary: Story 2.4 serves
+    /// `Init`, its only use, and removes this code.
+    NotImplemented,
 }
 
 impl ProtocolCode {
@@ -41,6 +50,9 @@ impl ProtocolCode {
         Self::InvalidEnvelope,
         Self::UnknownMessageType,
         Self::FrameTooLarge,
+        Self::InitNotCompleted,
+        Self::UnexpectedMessage,
+        Self::NotImplemented,
     ];
 
     /// The code's stable string form.
@@ -52,6 +64,9 @@ impl ProtocolCode {
             Self::InvalidEnvelope => "protocol.invalid_envelope",
             Self::UnknownMessageType => "protocol.unknown_message_type",
             Self::FrameTooLarge => "protocol.frame_too_large",
+            Self::InitNotCompleted => "protocol.init_not_completed",
+            Self::UnexpectedMessage => "protocol.unexpected_message",
+            Self::NotImplemented => "protocol.not_implemented",
         }
     }
 }

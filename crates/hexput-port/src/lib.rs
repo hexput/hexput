@@ -1,8 +1,8 @@
 //! The wire codec every Transport adapter wraps (AD-1): stream framing, envelope encoding and
 //! decoding, and the one error shape a Backend ever receives.
 //!
-//! Sans-IO by construction — no sockets, no tasks, no async. An adapter owns the bytes; this
-//! crate turns them into [`Envelope`]s and back:
+//! Sans-IO by construction — no sockets, no tasks, no async runtime. An adapter owns the bytes;
+//! this crate turns them into [`Envelope`]s and back:
 //!
 //! * [`FrameDecoder`] splits a byte stream into frames (a 4-byte big-endian length, then that
 //!   many bytes), however the stream arrives — byte by byte or several frames per chunk.
@@ -15,19 +15,23 @@
 //!   [`Diagnostic`](hexput_shared::diagnostics::Diagnostic) or a [`ProtocolError`];
 //!   [`error_response`] wraps one in an `Error` envelope.
 //!
-//! The async `Port` trait a connection adapter implements arrives with the first adapter
-//! (Story 2.3), wrapping this codec. Health/metrics (FR-11) will ride the same Port, exempted
-//! from the init-handshake gate rather than given a separate listener.
+//! * [`Port`] is what a Transport adapter implements around this codec: one connection, split
+//!   into an [`Inbound`] half yielding [`Received`] items and an [`Outbound`] half taking
+//!   envelopes. The core is generic over it and never names a transport. Health/metrics (FR-11)
+//!   will ride the same Port, exempted from the init-handshake gate rather than given a separate
+//!   listener.
 //!
 //! Binds: AD-1.
 
 mod codec;
 mod error;
 mod frame;
+mod port;
 
 pub use codec::{EncodeError, MAX_NESTING_DEPTH, ProtocolFailure, decode, encode};
 pub use error::{ErrorBody, ProtocolCode, ProtocolError, WireSpan, error_response};
 pub use frame::{FrameDecoder, LENGTH_PREFIX_LEN, MAX_FRAME_LEN, encode_frame};
+pub use port::{Inbound, Outbound, Port, Received};
 
 pub use hexput_shared::wire::{CorrelationId, Envelope, MessageType};
 /// The untyped MessagePack value the Port uses as its payload type. Re-exported so consumers

@@ -12,7 +12,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
   evidence: AD-1 requires a Named Pipe adapter alongside UDS/TCP+TLS/WebSocket, and AD-7 implies per-OS System Config default paths. Neither is exercised by a Linux-only job. `hexput-transport` is an empty stub today so there is nothing to cross-compile yet; add a `strategy.matrix.os` when Epic 2 lands the adapters.
 
 - source_spec: `spec-1-1-project-scaffold-and-pinned-toolchain.md`
-  status: PARTIALLY RESOLVED 2026-09-23 by `spec-2-1-start-the-daemon-from-a-system-config-file.md` — feature sets are now hoisted into `[workspace.dependencies]` alongside versions (`tokio` gains `rt-multi-thread` + `signal`, `serde` gains `derive`), `tracing-subscriber 0.3.23` (`fmt`, `std`) and `toml 1.1.6` are pinned there and in the Spine's Stack table, and members write `workspace = true` only. Still open: `rustls`'s crypto provider and `tokio`'s `net`/`sync`/`time` features — add them to the same pins when Stories 2.3+ first consume them.
+  status: PARTIALLY RESOLVED 2026-09-23 by `spec-2-1-start-the-daemon-from-a-system-config-file.md` — feature sets are now hoisted into `[workspace.dependencies]` alongside versions (`tokio` gains `rt-multi-thread` + `signal`, `serde` gains `derive`), `tracing-subscriber 0.3.23` (`fmt`, `std`) and `toml 1.1.6` are pinned there and in the Spine's Stack table, and members write `workspace = true` only. `tokio`'s `net`, `io-util`, `macros`, `time` and `sync` features joined the pin with `spec-2-3-accept-connections-over-a-unix-domain-socket.md`. Still open: `rustls`'s crypto provider — add it to the same pin when Epic 5's TCP+TLS first consumes it.
   summary: `[workspace.dependencies]` pins bare versions with no feature sets, and omits `tracing-subscriber` which FR-12's structured logging will need.
   evidence: `tokio = "1.53.1"` with default features has no `rt-multi-thread`/`net`/`sync`/`macros`/`time`; `serde` lacks `derive`; `rustls` lacks a crypto provider. Hoisting versions only pays off if features are hoisted too, otherwise members re-add them locally and diverge. Deliberately not decided in Story 1.1: no crate consumes any of the nine yet, so the correct feature set per crate is not yet knowable. Decide when the first consumer lands (Epic 2).
 
@@ -122,6 +122,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
   evidence: The TOML deserializer reports `missing field `tls_cert`` with the span of the enclosing table, so the error reads `config.toml:4:1: missing field `tls_cert`` where line 4 is `[transport.tcp]`. The file, line and field are all named, which meets the story, but with two transports missing the same field the section is only implied by the line. If operators find this ambiguous, qualify the message with the dotted table path (the second validation layer in `crates/hexput-config/src/file.rs` already does this for invalid values).
 
 - source_spec: `spec-2-1-start-the-daemon-from-a-system-config-file.md`
+  status: MITIGATED 2026-09-23 by `spec-2-3-accept-connections-over-a-unix-domain-socket.md` — the socket such an early signal leaves behind is exactly the stale socket the UDS adapter now removes on the next start, so the only remaining effect is a non-zero exit status for a Daemon killed during its first milliseconds.
   summary: A signal arriving between process start and the first poll of the shutdown future meets the default disposition and kills the Daemon without a clean exit.
   evidence: `hexput-daemon` installs its SIGINT/SIGTERM handlers on the shutdown future's first poll, which happens before "waiting for a shutdown signal" is logged, so any signal sent after that line is caught. A signal sent in the few milliseconds before it still ends the process with the signal's status instead of `0`. Harmless while there is nothing to clean up; once Story 2.3 creates a socket file, an early signal leaves it behind — which the UDS adapter's stale-socket removal already has to handle.
 
@@ -144,3 +145,20 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-2-2-frame-requests-and-responses-on-the-wire.md`
   summary: `hexput_port::encode` recurses once per nesting level with no depth bound, and the interpreter builds arbitrarily deep values without host recursion — a Script returning a deeply nested array can overflow the daemon's stack when its result is converted and serialized.
   evidence: e.g. repeatedly wrapping `a = [a]` in a loop then returning `a`. Story 2.6's value-to-`rmpv::Value` conversion and `encode` are the first recursive consumers of a Script result. 2.6 must reject a result nested deeper than `MAX_NESTING_DEPTH - 1` (the depth the daemon's own decoder accepts) with a defined error before converting it, using an iterative walk.
+
+- source_spec: `spec-2-3-accept-connections-over-a-unix-domain-socket.md`
+  summary: `protocol.not_implemented` exists only so `Init` has a defined answer before Story 2.4 serves it; 2.4 must remove the code from `ProtocolCode` (and `ALL`, and the stability test) when it lands.
+  evidence: Decision 1 of Story 2.3 pulls the init gate forward but nothing can complete init yet; the code is temporary by that decision.
+
+- source_spec: `spec-2-3-accept-connections-over-a-unix-domain-socket.md`
+  summary: The Daemon has no bound on concurrently open connections; each accepted connection is a task holding up to one frame (16 MiB) of buffered input.
+  evidence: NFR4 is met (one connection cannot disturb another's correctness), but a local client opening thousands of connections grows memory without limit. UDS access is gated by the socket's mode, so this is an operator-trust issue today; it becomes real with Epic 5's network transports and belongs with Resource Budget work (Epic 3) or a System Config `max_connections`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-accept-connections-over-a-unix-domain-socket.md`
+  summary: A peer that keeps its connection open but stops reading blocks that connection's `write_all` forever; nothing times the write out.
+  evidence: `UdsOutbound::send` awaits `write_all` with no deadline, so the task and its buffers live until shutdown. Isolation holds (only that connection stalls), but together with the uncapped connection count it lets a local peer pin memory and file descriptors. Settle with a write timeout or per-connection budget alongside the connection cap (Epic 3 / before Epic 5's network transports).
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-accept-connections-over-a-unix-domain-socket.md`
+  summary: The cleanup of the temporary socket and private directory when `chmod` or the link fails is never exercised by a test.
+  evidence: Placement can only fail after `clear_stale` passed through a race or an OS fault; covering it needs a fault-injection seam in `hexput-transport::uds::bind_with_mode`.
+

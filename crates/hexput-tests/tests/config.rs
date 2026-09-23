@@ -80,6 +80,7 @@ session_ttl_secs = 42
 
 [transport.uds]
 path = "/run/hexput/hexput.sock"
+mode = "0660"
 
 [transport.tcp]
 bind = "0.0.0.0:7400"
@@ -98,6 +99,7 @@ tls_key = "/tls/ws-key.pem"
     assert_eq!(config.session_ttl, Duration::from_secs(42));
     let uds = config.transports.uds.expect("a UDS transport");
     assert_eq!(uds.path, Path::new("/run/hexput/hexput.sock"));
+    assert_eq!(uds.mode, Some(0o660));
     let tcp = config.transports.tcp.expect("a TCP transport");
     assert_eq!(tcp.bind, "0.0.0.0:7400".parse::<SocketAddr>().unwrap());
     assert_eq!(tcp.tls.cert, Path::new("/tls/tcp-cert.pem"));
@@ -117,6 +119,8 @@ fn log_level_and_session_ttl_have_documented_defaults() {
     assert_eq!(DEFAULT_SESSION_TTL, Duration::from_secs(300));
     assert!(config.transports.tcp.is_none());
     assert!(config.transports.websocket.is_none());
+    let uds = config.transports.uds.expect("a UDS transport");
+    assert_eq!(uds.mode, None, "no mode means the umask decides");
 }
 
 #[test]
@@ -142,7 +146,8 @@ fn the_example_file_parses_and_documents_every_field() {
     let text = std::fs::read_to_string(&path).expect("the example file");
     let config = parse(&text).expect("the example file parses");
 
-    assert!(config.transports.uds.is_some());
+    let uds = config.transports.uds.expect("the example sets UDS");
+    assert!(uds.mode.is_some(), "the example documents the socket mode");
     assert!(config.transports.tcp.is_some());
     let websocket = config
         .transports
@@ -486,6 +491,57 @@ fn an_empty_path_is_rejected() {
     }
 }
 
+#[test]
+fn a_socket_mode_is_three_or_four_octal_digits() {
+    for (text, bits) in [("660", 0o660), ("0660", 0o660), ("0777", 0o777), ("000", 0)] {
+        let config = parse(&format!(
+            "[transport.uds]\npath = \"x\"\nmode = \"{text}\"\n"
+        ))
+        .expect("a valid mode");
+        assert_eq!(config.transports.uds.unwrap().mode, Some(bits), "{text}");
+    }
+}
+
+#[test]
+fn an_invalid_socket_mode_names_the_field_and_the_value() {
+    for text in [
+        "",
+        "66",
+        "06600",
+        "0668",
+        "1777",
+        "rw-rw----",
+        "+660",
+        " 660",
+    ] {
+        let file = format!("[transport.uds]\npath = \"x\"\nmode = \"{text}\"\n");
+        match parse_err(&file) {
+            Problem::InvalidValue {
+                field,
+                location,
+                message,
+            } => {
+                assert_eq!(field, "transport.uds.mode", "{text:?}");
+                assert_eq!(location.map(|l| l.line), Some(3), "{text:?}");
+                assert!(
+                    message.contains(&format!("{text:?}")),
+                    "{text:?}: {message}"
+                );
+            }
+            other => panic!("{text:?}: expected an invalid mode, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_socket_mode_must_be_a_string() {
+    // A bare `660` would be decimal 660 (0o1224), not the octal an operator means.
+    match parse_err("[transport.uds]\npath = \"x\"\nmode = 660\n") {
+        Problem::Parse { message, .. } => assert!(message.contains("string"), "{message}"),
+        other => panic!("expected a type error, got {other:?}"),
+    }
+}
+
 // --- unknown keys ---
 
 #[test]
@@ -501,7 +557,10 @@ fn an_unknown_top_level_key_is_named() {
 #[test]
 fn unknown_keys_are_rejected_at_every_level() {
     for (text, key) in [
-        ("[transport.uds]\npath = \"x\"\nmode = 1\n", "mode"),
+        (
+            "[transport.uds]\npath = \"x\"\nowner = \"hexput\"\n",
+            "owner",
+        ),
         ("[transport.pipe]\nname = \"x\"\n", "pipe"),
         (
             "[transport.websocket]\nbind = \"127.0.0.1:1\"\ntls = true\n",

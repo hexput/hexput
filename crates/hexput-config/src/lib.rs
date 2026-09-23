@@ -28,6 +28,7 @@
 //!
 //! [transport.uds]             # at least one [transport.*] section is required
 //! path = "/run/hexput/hexput.sock"
+//! mode = "0660"               # optional: the socket's permission bits — default: the umask
 //!
 //! [transport.tcp]             # TCP always uses TLS: both paths are required
 //! bind = "0.0.0.0:7400"
@@ -129,6 +130,9 @@ pub struct Transports {
 pub struct UdsTransport {
     /// The socket file's path.
     pub path: PathBuf,
+    /// `mode`: the socket file's permission bits (at most `0o777`). `None` leaves them to the
+    /// Daemon's umask.
+    pub mode: Option<u32>,
 }
 
 /// `[transport.tcp]`.

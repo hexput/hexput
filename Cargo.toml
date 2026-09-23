@@ -28,7 +28,18 @@ undocumented_unsafe_blocks = "deny"
 # added here, in the one place, when its first consumer needs it.
 clap = { version = "4.6.7", features = ["derive"] }
 # `rt-multi-thread` for the daemon's runtime, `signal` for its SIGINT/SIGTERM (Ctrl-C) shutdown.
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "signal"] }
+# Story 2.3: `net` + `io-util` for the Unix Domain Socket adapter, `macros` for the accept loop's
+# `select!`, `time` for its back-off after a failed accept, and `sync` for a test's shutdown
+# channel — one feature set, so the tests exercise the same tokio the daemon runs on.
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "signal",
+    "net",
+    "io-util",
+    "macros",
+    "time",
+    "sync",
+] }
 tokio-tungstenite = "0.30.0"
 rustls = "0.23.45"
 serde = { version = "1.0.229", features = ["derive"] }

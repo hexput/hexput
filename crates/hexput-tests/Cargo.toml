@@ -25,10 +25,14 @@ hexput-cli-core = { path = "../hexput-cli-core" }
 hexput-config = { path = "../hexput-config" }
 hexput-daemon = { path = "../hexput-daemon" }
 hexput-port = { path = "../hexput-port" }
+hexput-transport = { path = "../hexput-transport" }
+hexput-connection = { path = "../hexput-connection" }
 # Third-party, for building and inspecting raw MessagePack in the wire tests.
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 serde = { workspace = true }
+# Story 2.3: the Port's halves are async; the adapter and connection tests run them on tokio.
+tokio = { workspace = true }
 
 [lints]
 workspace = true

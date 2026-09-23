@@ -38,6 +38,7 @@ struct RawTransports {
 #[serde(deny_unknown_fields)]
 struct RawUds {
     path: Spanned<String>,
+    mode: Option<Spanned<String>>,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +133,10 @@ impl Validator<'_> {
             None => None,
             Some(uds) => Some(UdsTransport {
                 path: self.path("transport.uds.path", &uds.path)?,
+                mode: match uds.mode {
+                    None => None,
+                    Some(mode) => Some(self.mode("transport.uds.mode", &mode)?),
+                },
             }),
         };
         let tcp = match raw.tcp {
@@ -193,6 +198,28 @@ impl Validator<'_> {
                     "expected an IP address and port such as \"127.0.0.1:7400\" or \
                      \"[::1]:7400\", got {:?}",
                     bind.get_ref()
+                ),
+            )
+        })
+    }
+
+    /// A permission mode written as a string of three or four octal digits — `"660"` or
+    /// `"0660"` — never above `0777`. A string, not a TOML integer, because TOML has no octal
+    /// literal an operator would recognise (`0o660`) and a bare `660` would silently be decimal.
+    fn mode(&self, field: &str, mode: &Spanned<String>) -> Result<u32, Problem> {
+        let text = mode.get_ref();
+        let octal = (3..=4).contains(&text.len()) && text.bytes().all(|b| matches!(b, b'0'..=b'7'));
+        let parsed = octal
+            .then(|| u32::from_str_radix(text, 8).ok())
+            .flatten()
+            .filter(|bits| *bits <= 0o777);
+        parsed.ok_or_else(|| {
+            self.invalid(
+                field,
+                mode,
+                format!(
+                    "expected three or four octal digits no greater than \"0777\", \
+                     such as \"0660\", got {text:?}"
                 ),
             )
         })

@@ -216,6 +216,7 @@ graph TD
   session[hexput-session] --> port
   session --> shared
   conn[hexput-connection] --> session
+  conn --> port
   session --> globalvar
   script[hexput-script] --> parser
   script --> interp
@@ -261,6 +262,8 @@ What this graph makes a compile error rather than a review comment:
 - **AD-8:** `hexput-check` depends on `hexput-ast` alone — not `hexput-interpreter`, not `hexput-rpc`, not `hexput-enforce`. It cannot execute a script or touch the host even by mistake; the capability to do so was never compiled in.
 
 **[Amended 2026-09-22, Epic 1 Story 1.10 decision 2]** AD-8's entry point takes one more thing the environment provides: the Script's **starting-variable names**. A Script written for a Backend reads inputs its own source never declares, so a pass that does not know them reports every such read as undeclared and is useless on exactly the Scripts it exists for. Only names are taken — a static check needs to know a name exists, never what it holds, and taking a value would put an evaluation on a path whose whole promise is that nothing runs. The `hexput-ast`-alone edge is unchanged and is now asserted by `scripts/check-crate-graph.py` rather than only stated here; the `hexput-shared` edge the crate was scaffolded with in Story 1.1 is gone, since `hexput-ast` re-exports the diagnostics shape and the graph above lists `check --> ast` only.
+
+**[Amended 2026-09-23, Epic 2 Story 2.3]** The edge `hexput-connection --> hexput-port` is added. The connection actor is what drives a `Port` — it reads envelopes from an accepted connection and writes responses back — so it needs the `Port` trait and the envelope types, which live in `hexput-port`. Routing them through a `hexput-session` re-export would hide the real dependency behind a crate that has no reason to carry it. The edge grants no reach AD-1 forbids: `hexput-port` holds no transport, and `hexput-connection` still cannot name one, because only `hexput-daemon` depends on `hexput-transport`. `scripts/check-crate-graph.py` now pins the exact sets of `hexput-transport` (`hexput-port` alone), `hexput-connection` and `hexput-daemon`. The same story adds `tokio`'s `net`, `io-util`, `macros`, `time` and `sync` features to the pinned feature set.
 
 `[workspace.dependencies]` in the root `Cargo.toml` pins every version from the Stack table above exactly once; member crates inherit with `workspace = true` rather than re-pinning.
 

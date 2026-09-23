@@ -20,6 +20,7 @@ hexput-lexer = { path = "../hexput-lexer" }
 hexput-ast = { path = "../hexput-ast" }
 hexput-parser = { path = "../hexput-parser" }
 hexput-interpreter = { path = "../hexput-interpreter" }
+hexput-check = { path = "../hexput-check" }
 hexput-cli-core = { path = "../hexput-cli-core" }
 
 [lints]

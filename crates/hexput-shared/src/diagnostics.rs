@@ -221,6 +221,61 @@ impl Code {
     /// The collection a `for … in` loop is iterating was mutated by its own body (§5). Mutating
     /// a collection *nested* inside it is fine. Category `reference`.
     pub const COLLECTION_MUTATED: Self = Self::new("reference.collection_mutated");
+
+    // --- static-check findings (Story 1.10) ---
+
+    /// Code after a `return`, `break` or `continue` in the same block can never run. A
+    /// [`Severity::Warning`]: unreachable code cannot fail, so it must never reject a script.
+    /// Category `syntax`.
+    pub const UNREACHABLE_CODE: Self = Self::new("syntax.unreachable_code");
+    /// A `let` binding no expression ever reads. A [`Severity::Warning`], for the same reason.
+    /// Category `reference`.
+    pub const UNUSED_VARIABLE: Self = Self::new("reference.unused_variable");
+    /// A call to a name that is neither declared in the Script nor among the callable names the
+    /// caller supplied — a typo'd host call, caught before it becomes a runtime `capability`
+    /// failure. Raised only when a callable-name list was supplied at all. Category
+    /// `capability`.
+    pub const UNKNOWN_FUNCTION: Self = Self::new("capability.unknown_function");
+    /// A language construct the active policy disables (FR-3), named by its toggle. Category
+    /// `policy`.
+    pub const CONSTRUCT_DISABLED: Self = Self::new("policy.construct_disabled");
+
+    /// Every code the workspace defines, so a test can assert that each one is covered rather
+    /// than trusting a hand-maintained list to have kept up. Add a new code here in the same
+    /// change that declares it.
+    pub const ALL: &'static [Self] = &[
+        Self::EXPECTED_SYNTAX,
+        Self::INVALID_ASSIGNMENT_TARGET,
+        Self::DUPLICATE_DECLARATION,
+        Self::LOOP_CONTROL_OUTSIDE_LOOP,
+        Self::DUPLICATE_OBJECT_KEY,
+        Self::UNTERMINATED_STRING,
+        Self::UNTERMINATED_COMMENT,
+        Self::UNKNOWN_CHARACTER,
+        Self::NON_ASCII_IDENTIFIER,
+        Self::INVALID_ESCAPE,
+        Self::INVALID_UNICODE_ESCAPE,
+        Self::INVALID_NUMBER,
+        Self::OPERAND_MISMATCH,
+        Self::INVALID_INDEX,
+        Self::INVALID_PROPERTY_ACCESS,
+        Self::CYCLIC_RESULT,
+        Self::UNDECLARED_IDENTIFIER,
+        Self::UNDECLARED_ASSIGNMENT,
+        Self::NULL_ACCESS,
+        Self::INDEX_OUT_OF_RANGE,
+        Self::DIVISION_BY_ZERO,
+        Self::NON_FINITE,
+        Self::NOT_CALLABLE,
+        Self::FUNCTION_RESULT,
+        Self::ARGUMENT_COUNT,
+        Self::CALL_DEPTH_EXCEEDED,
+        Self::COLLECTION_MUTATED,
+        Self::UNREACHABLE_CODE,
+        Self::UNUSED_VARIABLE,
+        Self::UNKNOWN_FUNCTION,
+        Self::CONSTRUCT_DISABLED,
+    ];
 }
 
 impl fmt::Display for Code {

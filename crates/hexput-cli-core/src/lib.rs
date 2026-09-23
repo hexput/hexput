@@ -13,12 +13,15 @@
 //!
 //! # Contract (Story 1.9 decision 5)
 //!
-//! * `0` — the Script evaluated; its result is on stdout in Hexput literal form, one line.
+//! * `0` — the Script evaluated; its result is on stdout in Hexput literal form, one line. For
+//!   `check`, the Script carried no error-severity finding; stdout says which of clean and
+//!   warnings-only it was, and any findings are on stderr.
 //! * `2` — the invocation was wrong: an unknown flag, a missing operand, a malformed, repeated or
 //!   non-evaluating `--var`. Nothing is read or evaluated.
 //! * `1` — the Hexput was wrong, or its file could not be read: a lexical, syntax or runtime
-//!   diagnostic (rendered by Story 1.8's renderer with the script path as origin), a file that
-//!   does not exist or is not a file, or bytes that are not UTF-8.
+//!   diagnostic (rendered by Story 1.8's renderer with the script path as origin), an
+//!   error-severity check finding, a file that does not exist or is not a file, or bytes that
+//!   are not UTF-8.
 //!
 //! Every failure writes to stderr, so the result can be piped; stdout carries a successful
 //! evaluation's result, and the help or version text when the user explicitly asks for it (exit
@@ -34,11 +37,12 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser as _;
+use hexput_check::{Environment, Outcome, Policy};
 use hexput_interpreter::{Value, evaluate, evaluate_with_variables};
 use hexput_lexer::{TokenKind, tokenize};
-use hexput_parser::{Diagnostic, RenderOptions, StatementKind, parse, render_diagnostic};
+use hexput_parser::{Diagnostic, Program, RenderOptions, StatementKind, parse, render_diagnostic};
 
-use args::{Cli, Command, EvalArgs};
+use args::{CheckArgs, Cli, Command, EvalArgs};
 
 /// The invocation was wrong (a bad flag, a missing operand, a malformed `--var`), as distinct
 /// from the Hexput being wrong — so a calling script can tell the two apart.
@@ -87,7 +91,123 @@ where
     };
     match &cli.command {
         Command::Eval(arguments) => eval(arguments, out, err),
+        Command::Check(arguments) => check(arguments, out, err),
     }
+}
+
+/// The check command: read the file, parse, check, report. Nothing is executed at any point —
+/// not the Script, and not a `--var` value, which is why this command's `--var` takes a name
+/// alone.
+fn check(arguments: &CheckArgs, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let variables = match names(&arguments.variables, "--var") {
+        Ok(names) => names,
+        Err(report) => {
+            let _ = writeln!(err, "{report}");
+            return ExitCode::from(USAGE);
+        }
+    };
+    let callables = match names(&arguments.callables, "--callable") {
+        Ok(names) => names,
+        Err(report) => {
+            let _ = writeln!(err, "{report}");
+            return ExitCode::from(USAGE);
+        }
+    };
+
+    let path = arguments.script.display().to_string();
+    let (source, program) = match read_program(&arguments.script, err) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+
+    // A supplied `--callable` list — even an empty one — is what turns on reporting an unknown
+    // call. No flag means no list, which suppresses that finding entirely.
+    let mut environment = Environment::new().with_variables(variables);
+    if !callables.is_empty() {
+        environment = environment.with_callables(callables);
+    }
+    let findings = hexput_check::check(&program, &environment, &Policy::new());
+
+    for finding in findings.diagnostics() {
+        let _ = writeln!(
+            err,
+            "{}",
+            render_diagnostic(finding, &source, RenderOptions::new().with_origin(&path))
+        );
+    }
+    let _ = writeln!(out, "{path}: {}", summary(&findings));
+    if findings.has_errors() {
+        ExitCode::from(FAILURE)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// The one line the check command writes to stdout, so a person reading it gets an answer
+/// whether or not anything was found, and clean is visibly not the same as warnings-only.
+fn summary(findings: &hexput_check::Findings) -> String {
+    match findings.outcome() {
+        Outcome::Clean => "no findings".to_owned(),
+        _ => format!(
+            "{} finding{}, {} error{}",
+            findings.len(),
+            if findings.len() == 1 { "" } else { "s" },
+            findings.error_count(),
+            if findings.error_count() == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+/// Read and parse a script, reporting an unreadable file or a lexical/syntax diagnostic exactly
+/// as the eval command does — the two commands share one surface, so they must fail alike.
+fn read_program(path: &Path, err: &mut dyn Write) -> Result<(String, Program), ExitCode> {
+    let label = path.display().to_string();
+    let source = match read_script(path) {
+        Ok(source) => source,
+        Err(report) => {
+            let _ = writeln!(err, "{report}");
+            return Err(ExitCode::from(FAILURE));
+        }
+    };
+    match parse(&source) {
+        Ok(program) => Ok((source, program)),
+        Err(diagnostic) => {
+            let _ = writeln!(
+                err,
+                "{}",
+                render_diagnostic(
+                    &diagnostic,
+                    &source,
+                    RenderOptions::new().with_origin(&label)
+                )
+            );
+            Err(ExitCode::from(FAILURE))
+        }
+    }
+}
+
+/// Validate a repeatable name-only flag: each value must be a §2 identifier, and a name may be
+/// given once. Both rules match `--var`'s under eval — a repeat is a usage error there because
+/// silently dropping one of two supplied values is the kind of thing a person debugs for an
+/// hour, and a repeat here is the same mistake with the same cause.
+fn names(arguments: &[String], flag: &str) -> Result<Vec<String>, String> {
+    let mut given: Vec<String> = Vec::new();
+    for argument in arguments {
+        if !is_identifier(argument) {
+            return Err(format!(
+                "hexput: {flag} `{argument}`: not a name — a name is ASCII letters, digits and \
+                 `_`, does not begin with a digit, and is not a reserved word"
+            ));
+        }
+        if given.iter().any(|existing| existing == argument) {
+            return Err(format!(
+                "hexput: {flag} `{argument}` was supplied more than once; give each name exactly \
+                 once"
+            ));
+        }
+        given.push(argument.clone());
+    }
+    Ok(given)
 }
 
 /// The eval command: bind the starting variables, read the file, parse, evaluate, print.
@@ -104,31 +224,25 @@ fn eval(arguments: &EvalArgs, out: &mut dyn Write, err: &mut dyn Write) -> ExitC
     };
 
     let path = arguments.script.display().to_string();
-    let source = match read_script(&arguments.script) {
-        Ok(source) => source,
-        Err(report) => {
-            let _ = writeln!(err, "{report}");
-            return ExitCode::from(FAILURE);
-        }
+    let (source, program) = match read_program(&arguments.script, err) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
     };
 
-    // One rendering for every lexical, syntax and runtime failure, with the script path as the
-    // origin label. Story 1.8's output is used exactly as produced — never post-processed.
-    let render = |diagnostic: &Diagnostic| {
-        render_diagnostic(diagnostic, &source, RenderOptions::new().with_origin(&path))
-    };
-
-    let program = match parse(&source) {
-        Ok(program) => program,
-        Err(diagnostic) => {
-            let _ = writeln!(err, "{}", render(&diagnostic));
-            return ExitCode::from(FAILURE);
-        }
-    };
+    // Story 1.8's output is used exactly as produced — never post-processed — with the script
+    // path as the origin label, the same way `read_program` renders a lexical or syntax failure.
     let result = match evaluate_with_variables(&program, variables) {
         Ok(result) => result,
         Err(diagnostic) => {
-            let _ = writeln!(err, "{}", render(&diagnostic));
+            let _ = writeln!(
+                err,
+                "{}",
+                render_diagnostic(
+                    &diagnostic,
+                    &source,
+                    RenderOptions::new().with_origin(&path)
+                )
+            );
             return ExitCode::from(FAILURE);
         }
     };

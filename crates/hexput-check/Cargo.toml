@@ -8,8 +8,9 @@ rust-version.workspace = true
 [lib]
 
 [dependencies]
+# AD-8 and the Spine's crate graph both say `hexput-ast` alone. The diagnostics shape reaches
+# this crate through that crate's re-export; a direct `hexput-shared` edge is not in the graph.
 hexput-ast = { path = "../hexput-ast" }
-hexput-shared = { path = "../hexput-shared" }
 
 [lints]
 workspace = true

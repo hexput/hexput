@@ -54,6 +54,10 @@ EXACT_DEPENDENCIES = {
     "hexput-ast": {"hexput-shared"},
     "hexput-lexer": {"hexput-shared"},
     "hexput-parser": {"hexput-lexer", "hexput-ast"},
+    # Story 1.10: AD-8 says `hexput-ast` alone, and `hexput-ast` re-exports the diagnostics
+    # shape, so the `hexput-shared` edge the crate was scaffolded with is gone. When Epic 3
+    # needs `hexput-shared::budget` here, adding it back is a deliberate amendment.
+    "hexput-check": {"hexput-ast"},
     # Story 1.9: the CLI reaches diagnostics through a re-export from the parser and the
     # interpreter. A direct `hexput-shared` or `hexput-ast` edge is not in the Spine's graph and
     # would otherwise only be caught by a reviewer's eye. `hexput-check` is listed because

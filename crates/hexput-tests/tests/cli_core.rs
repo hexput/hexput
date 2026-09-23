@@ -573,3 +573,225 @@ fn a_sink_that_fails_mid_write_changes_nothing_but_the_output() {
         format!("{:?}", ExitCode::from(1))
     );
 }
+
+// --- Story 1.10: the `hexput check` command ---
+
+fn check_at(path: &Path, flags: &[&str]) -> Run {
+    let path = path.to_str().expect("a UTF-8 temporary path");
+    let mut arguments = vec!["check", path];
+    arguments.extend_from_slice(flags);
+    cli(&arguments)
+}
+
+/// Check `source` from a file, and report what the command wrote where.
+fn check_with(source: &str, flags: &[&str]) -> (Run, String) {
+    let sandbox = Sandbox::new();
+    let path = sandbox.file("script.hxp", source);
+    let run = check_at(&path, flags);
+    let label = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    (run, label)
+}
+
+fn check(source: &str) -> (Run, String) {
+    check_with(source, &[])
+}
+
+/// The summary line the command writes to stdout, whatever else it reported.
+#[track_caller]
+fn summarized(run: &Run, label: &str, expected: &str) {
+    assert_eq!(run.stdout, format!("{label}: {expected}\n"));
+}
+
+#[test]
+fn a_clean_script_checks_clean_and_exits_zero() {
+    let (run, label) = check("let x = 1; return x;");
+    run.exit(0);
+    summarized(&run, &label, "no findings");
+    assert_eq!(run.stderr, "", "a clean script reports nothing");
+}
+
+#[test]
+fn an_undeclared_read_is_reported_and_exits_one() {
+    let (run, label) = check("return x;");
+    run.exit(1);
+    summarized(&run, &label, "1 finding, 1 error");
+    assert!(run.stderr.contains("reference.undeclared_identifier"));
+    assert!(run.stderr.contains(&format!("{label}:1:8:")));
+}
+
+#[test]
+fn an_undeclared_assignment_is_reported_and_exits_one() {
+    let (run, _) = check("x = 1;");
+    run.exit(1);
+    assert!(run.stderr.contains("reference.undeclared_assignment"));
+}
+
+#[test]
+fn a_binding_used_before_its_let_is_reported() {
+    let (run, _) = check("return x; let x = 1;");
+    run.exit(1);
+    assert!(run.stderr.contains("reference.undeclared_identifier"));
+}
+
+#[test]
+fn a_wrong_argument_count_is_reported_and_exits_one() {
+    let (run, _) = check("fn f(a) { return a; }; return f(1, 2);");
+    run.exit(1);
+    assert!(run.stderr.contains("arity.argument_count"));
+}
+
+#[test]
+fn a_reassigned_function_name_is_not_reported_for_arity() {
+    let (run, label) = check("fn f(a) { return a; }; f = 1; return f(1, 2);");
+    run.exit(0);
+    summarized(&run, &label, "no findings");
+}
+
+#[test]
+fn a_literal_operand_error_is_reported_and_exits_one() {
+    let (run, _) = check("return \"abc\" * 2;");
+    run.exit(1);
+    assert!(run.stderr.contains("type.operand_mismatch"));
+
+    let (run, _) = check("return [1] + \"x\";");
+    run.exit(1);
+    assert!(run.stderr.contains("type.operand_mismatch"));
+}
+
+#[test]
+fn an_operand_reached_through_a_binding_is_not_reported() {
+    let (run, label) = check("let s = \"abc\"; return s * 2;");
+    run.exit(0);
+    summarized(&run, &label, "no findings");
+}
+
+#[test]
+fn warnings_alone_never_reject_a_script() {
+    let (run, label) = check("let x = 1; return 2;");
+    run.exit(0);
+    summarized(&run, &label, "1 finding, 0 errors");
+    assert!(run.stderr.contains("reference.unused_variable"));
+    assert!(run.stderr.contains("warning"));
+
+    // One warning, not two: the dead statement is not walked at all, so `dead` is never even
+    // declared — saying it is also unused would be a second claim about code that cannot run.
+    let (run, label) = check("return 1; let dead = 2;");
+    run.exit(0);
+    summarized(&run, &label, "1 finding, 0 errors");
+    assert!(run.stderr.contains("syntax.unreachable_code"));
+}
+
+#[test]
+fn an_unknown_call_needs_the_callable_flag_to_be_reported() {
+    let (run, label) = check("log(\"hi\"); return 1;");
+    run.exit(0);
+    summarized(&run, &label, "no findings");
+
+    let (run, _) = check_with("log(\"hi\"); return 1;", &["--callable", "warn"]);
+    run.exit(1);
+    assert!(run.stderr.contains("capability.unknown_function"));
+
+    let (run, label) = check_with("log(\"hi\"); return 1;", &["--callable", "log"]);
+    run.exit(0);
+    summarized(&run, &label, "no findings");
+}
+
+#[test]
+fn a_starting_variable_is_declared_by_name_alone() {
+    let (run, label) = check_with("return n * 2;", &["--var", "n"]);
+    run.exit(0);
+    summarized(&run, &label, "no findings");
+
+    let (run, _) = check("return n * 2;");
+    run.exit(1);
+    assert!(run.stderr.contains("reference.undeclared_identifier"));
+}
+
+#[test]
+fn a_check_var_carrying_a_value_is_a_usage_error() {
+    // The eval command's `name=<expression>` spelling is not accepted here: a static check needs
+    // the name and never the value, and evaluating one would be execution.
+    let (run, _) = check_with("return n;", &["--var", "n=5"]);
+    run.exit(2).reported("--var `n=5`");
+
+    let (run, _) = check_with("return n;", &["--var", "1n"]);
+    run.exit(2).reported("--var `1n`");
+
+    let (run, _) = check_with("return n;", &["--var", "let"]);
+    run.exit(2).reported("--var `let`");
+}
+
+#[test]
+fn a_repeated_name_is_a_usage_error_on_either_flag() {
+    let (run, _) = check_with("return n;", &["--var", "n", "--var", "n"]);
+    run.exit(2).reported("supplied more than once");
+
+    let (run, _) = check_with(
+        "log(1); return 1;",
+        &["--callable", "log", "--callable", "log"],
+    );
+    run.exit(2).reported("supplied more than once");
+
+    let (run, _) = check_with("log(1); return 1;", &["--callable", "1log"]);
+    run.exit(2).reported("--callable `1log`");
+}
+
+#[test]
+fn an_unparseable_script_is_reported_and_never_checked() {
+    let (run, label) = check("let x = 1 +;");
+    run.exit(1);
+    assert_eq!(
+        run.stdout, "",
+        "nothing was checked, so there is no summary"
+    );
+    assert!(run.stderr.contains("syntax.expected_syntax"));
+    assert!(run.stderr.contains(&label));
+}
+
+#[test]
+fn the_check_command_shares_evals_failures_for_the_file_itself() {
+    let sandbox = Sandbox::new();
+    let missing = sandbox.dir.join("nope.hxp");
+    check_at(&missing, &[]).exit(1).reported("cannot read");
+    check_at(&sandbox.dir, &[]).exit(1).reported("cannot read");
+
+    let invalid = sandbox.file("bad.hxp", [0x66, 0x6e, 0xff, 0x28]);
+    check_at(&invalid, &[])
+        .exit(1)
+        .reported("is not valid UTF-8");
+}
+
+#[test]
+fn an_unknown_flag_on_check_is_a_usage_error() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.file("script.hxp", "return 1;");
+    check_at(&path, &["--nope"]).exit(2);
+    cli(&["check"]).exit(2);
+}
+
+#[test]
+fn an_adversarially_nested_script_is_checked_without_overflowing() {
+    let depth = 20_000;
+    let source = format!("return {}1{};", "[".repeat(depth), "]".repeat(depth));
+    let (run, label) = check(&source);
+    run.exit(0);
+    summarized(&run, &label, "no findings");
+}
+
+#[test]
+fn checking_a_script_never_runs_any_of_it() {
+    // A script whose *result* would fail at run time checks clean: nothing about it is executed,
+    // so nothing about it can fail here.
+    let (run, label) = check("let a = []; a[0] = a; return a;");
+    run.exit(0);
+    summarized(&run, &label, "no findings");
+    // And the same source really does fail under eval, so the silence above is about not running
+    // it rather than about the mistake not existing.
+    let sandbox = Sandbox::new();
+    eval_at(
+        &sandbox.file("script.hxp", "let a = []; a[0] = a; return a;"),
+        &[],
+    )
+    .exit(1)
+    .reported("type.cyclic_result");
+}

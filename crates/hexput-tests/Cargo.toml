@@ -24,6 +24,11 @@ hexput-check = { path = "../hexput-check" }
 hexput-cli-core = { path = "../hexput-cli-core" }
 hexput-config = { path = "../hexput-config" }
 hexput-daemon = { path = "../hexput-daemon" }
+hexput-port = { path = "../hexput-port" }
+# Third-party, for building and inspecting raw MessagePack in the wire tests.
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+serde = { workspace = true }
 
 [lints]
 workspace = true

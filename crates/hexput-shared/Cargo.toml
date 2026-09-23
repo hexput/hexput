@@ -7,5 +7,10 @@ rust-version.workspace = true
 
 [lib]
 
+[dependencies]
+# Story 2.2: the wire envelope and the Client ID serialize through serde. `diagnostics` stays
+# serde-free — the wire error shape is `hexput-port`'s `ErrorBody`, built from a `Diagnostic`.
+serde = { workspace = true }
+
 [lints]
 workspace = true

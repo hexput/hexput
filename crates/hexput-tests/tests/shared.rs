@@ -162,3 +162,96 @@ fn every_code_is_enumerated_exactly_once() {
         assert!(!rest.is_empty(), "`{code}` has an empty name");
     }
 }
+
+// --- Story 2.2: Client ID and the wire envelope ---
+
+#[test]
+fn client_id_text_form_is_32_lowercase_hex_and_round_trips() {
+    use hexput_shared::ids::ClientId;
+    let bytes = [
+        0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba,
+        0xfe,
+    ];
+    let id = ClientId::from_bytes(bytes);
+    let text = id.to_string();
+    assert_eq!(text, "000123456789abcdef1032547698bafe");
+    assert_eq!(text.len(), ClientId::TEXT_LEN);
+    assert_eq!(text.parse::<ClientId>().unwrap(), id);
+    assert_eq!(id.as_bytes(), &bytes);
+}
+
+#[test]
+fn client_id_rejects_malformed_text() {
+    use hexput_shared::ids::ClientId;
+    let good = "000123456789abcdef1032547698bafe";
+    let cases = [
+        String::new(),
+        good[..31].to_owned(),
+        format!("{good}0"),
+        good.to_uppercase(),
+        format!("{}g", &good[..31]),
+        format!("-{}", &good[..31]),
+        format!("{}é", &good[..30]),
+        format!(" {}", &good[..31]),
+    ];
+    for case in cases {
+        let err = case.parse::<ClientId>().unwrap_err();
+        assert!(err.to_string().contains("32 lowercase hex"), "{case:?}");
+    }
+}
+
+#[test]
+fn client_id_serializes_as_a_string() {
+    use hexput_shared::ids::ClientId;
+    let id = ClientId::from_bytes([0xab; 16]);
+    let bytes = rmp_serde::to_vec(&id).unwrap();
+    let value = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+    assert_eq!(value.as_str(), Some("abababababababababababababababab"));
+    assert_eq!(rmp_serde::from_slice::<ClientId>(&bytes).unwrap(), id);
+
+    let malformed = rmp_serde::to_vec("not-a-client-id").unwrap();
+    assert!(rmp_serde::from_slice::<ClientId>(&malformed).is_err());
+    let integer = rmp_serde::to_vec(&7_u64).unwrap();
+    assert!(rmp_serde::from_slice::<ClientId>(&integer).is_err());
+}
+
+#[test]
+fn message_types_spell_pascal_case_and_parse_exactly() {
+    use hexput_shared::wire::MessageType;
+    let spellings: Vec<_> = MessageType::ALL.iter().map(|t| t.as_str()).collect();
+    assert_eq!(spellings, ["Init", "ExecutionStart", "Result", "Error"]);
+    for t in MessageType::ALL {
+        assert_eq!(t.as_str().parse::<MessageType>().unwrap(), *t);
+        assert_eq!(t.to_string(), t.as_str());
+    }
+    let err = "Frobnicate".parse::<MessageType>().unwrap_err();
+    assert_eq!(err.0, "Frobnicate");
+    assert!("executionstart".parse::<MessageType>().is_err());
+}
+
+#[test]
+fn typed_envelope_encodes_as_a_named_map() {
+    use hexput_shared::wire::{CorrelationId, Envelope, MessageType};
+
+    #[derive(serde::Serialize)]
+    struct Payload {
+        script: &'static str,
+    }
+
+    let envelope = Envelope::new(
+        CorrelationId(9),
+        MessageType::ExecutionStart,
+        Payload { script: "1" },
+    );
+    let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+    let value = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+    let s = rmpv::Value::from;
+    assert_eq!(
+        value,
+        rmpv::Value::Map(vec![
+            (s("id"), rmpv::Value::from(9)),
+            (s("type"), s("ExecutionStart")),
+            (s("payload"), rmpv::Value::Map(vec![(s("script"), s("1"))])),
+        ])
+    );
+}

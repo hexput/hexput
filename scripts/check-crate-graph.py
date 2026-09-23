@@ -71,6 +71,9 @@ EXACT_DEPENDENCIES = {
     # Story 2.1: System Config reaches `hexput-shared` alone — never `hexput-session` (AD-5,
     # asserted above too) nor anything that could let it reload, watch or write itself.
     "hexput-config": {"hexput-shared"},
+    # Story 2.2: the wire codec is transport-agnostic and sans-IO (AD-1). It reaches the shared
+    # envelope and diagnostics and nothing else — no transport, no session, no executor.
+    "hexput-port": {"hexput-shared"},
     # Story 2.1: the binaries are thin hand-offs. `hexput-daemon` re-exports what its `main` needs,
     # so `hexput-bin` never reaches `hexput-config` (or anything else) directly.
     "hexput-bin": {"hexput-daemon", "hexput-cli-core", "hexput-lsp-core"},

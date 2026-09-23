@@ -30,6 +30,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
   evidence: Chosen so arbitrary lookahead is total, but actual lookahead is bounded at 3 (`peek_at(1 + sign_width)` in `lex_number`). A `Peekable<CharIndices>` with a small buffer, or byte indexing since every lookahead target is ASCII, gets the same result. Deferred because rewriting the cursor touches every scanner and the story was already patched substantially; revisit when Epic 3 lands Resource Budget enforcement, which is also what should bound submitted script size (AD-3 puts that in `hexput-enforce`, not here).
 
 - source_spec: `spec-1-2-tokenize-hexput-source.md`
+  status: RESOLVED 2026-09-23 by `spec-2-2-frame-requests-and-responses-on-the-wire.md` decision 4 — no serde was added to the diagnostics types. The wire error shape is `hexput_port::ErrorBody`, with owned strings for severity, category, code and message plus an optional span map, built from a `Diagnostic` via `From<&Diagnostic>` and deserializable, so a round-tripped or Backend-side code is a plain string. `Code` stays a `&'static str` newtype for the language side.
   summary: `Code` wraps `&'static str` and no diagnostics type derives serde, but the module declares these as `hexput-port`'s error-response types over MessagePack.
   evidence: A `&'static str` newtype has no inbound representation, so a round-tripped or Backend-supplied code cannot be deserialized, and `hexput-shared` has no serde dependency at all. Settling this before `hexput-port` exists (it is still a stub) avoids forking a parallel wire type there. Likely shape: `Cow<'static, str>` or an interned form, plus feature-gated `Serialize`/`Deserialize`.
 
@@ -131,3 +132,15 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-2-1-start-the-daemon-from-a-system-config-file.md`
   summary: `hexput-config`'s `locate` slices `&text[..offset]` on a toml error span offset, which would panic if a span ever landed inside a multi-byte character (unverified, would be medium).
   evidence: Six malformed non-ASCII inputs probed through the binary produced correct char-based locations and no panic, so spans appear char-aligned. Settle by confirming toml's error spans are always char boundaries, or harden with `str::floor_char_boundary`.
+
+- source_spec: `spec-2-2-frame-requests-and-responses-on-the-wire.md`
+  summary: `hexput_port::encode` has no size check, so a Script result whose envelope encodes past `MAX_FRAME_LEN` has no defined response — only `encode_frame` refuses it.
+  evidence: No result producer exists until Story 2.6. That story must turn an `EncodeError::FrameTooLarge` on a result into an `Error` response carrying the request's id (a new non-fatal code), never a dropped response that leaves the Backend's request pending forever.
+
+- source_spec: `spec-2-2-frame-requests-and-responses-on-the-wire.md`
+  summary: A decoded frame's `rmpv::Value` tree amplifies memory roughly 30x — a 16 MiB frame of 1-byte values (nils, empty arrays) becomes about 0.5 GiB of `Value`s, per frame and per connection, reachable pre-init.
+  evidence: Each `rmpv::Value` is about 32 bytes. The codec never allocates for a length a header merely claims, but the actual decoded size is unbounded. Fix candidates: a total decoded-element budget in phase 1, a lower `MAX_FRAME_LEN`, or a per-connection memory bound. Belongs with Resource Budget work (Epic 3) and must be settled before TCP+TLS (Epic 5) exposes the daemon beyond UDS permissions.
+
+- source_spec: `spec-2-2-frame-requests-and-responses-on-the-wire.md`
+  summary: `hexput_port::encode` recurses once per nesting level with no depth bound, and the interpreter builds arbitrarily deep values without host recursion — a Script returning a deeply nested array can overflow the daemon's stack when its result is converted and serialized.
+  evidence: e.g. repeatedly wrapping `a = [a]` in a loop then returning `a`. Story 2.6's value-to-`rmpv::Value` conversion and `encode` are the first recursive consumers of a Script result. 2.6 must reject a result nested deeper than `MAX_NESTING_DEPTH - 1` (the depth the daemon's own decoder accepts) with a defined error before converting it, using an iterative walk.

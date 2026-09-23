@@ -7,8 +7,13 @@ rust-version.workspace = true
 
 [lib]
 
+# `hexput-shared` is the only workspace crate this may reach (asserted by
+# `scripts/check-crate-graph.py`): the codec is transport-agnostic and performs no I/O (AD-1).
 [dependencies]
 hexput-shared = { path = "../hexput-shared" }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
 
 [lints]
 workspace = true

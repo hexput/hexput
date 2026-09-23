@@ -126,6 +126,7 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 | rustls | 0.23.45 |
 | serde | 1.0.229 |
 | rmp-serde | 1.3.1 |
+| rmpv (`with-serde`) | 1.3.1 |
 | dashmap | 6.2.1 |
 | moka | 0.12.16 |
 | criterion | 0.8.2 |
@@ -137,6 +138,8 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 **[Amended 2026-09-22, Epic 1 Story 1.9 decision 1]** `clap` is added: `hexput-cli-core` needs an argument parser for the eval command, and Story 1.10's check command and the daemon's own `--config` flag (AD-7) then inherit the same one rather than each hand-rolling a parser. It is pinned here and in `[workspace.dependencies]` like every other row. Adding it to this table is deliberate: "nothing not listed is permitted" governs *crate edges* in the dependency graph below, while the Stack table is the one place a third-party version lives.
 
 **[Amended 2026-09-23, Epic 2 Story 2.1 decision 1]** `toml` and `tracing-subscriber` are added. `hexput-config` parses the System Config file as TOML through `serde`, with the parser's serializer (`display`) left out because System Config has no write API. `hexput-daemon` emits its startup log — the resolved System Config path and the AD-7 source that supplied it — through a plain `tracing-subscriber` `fmt` subscriber filtered at the file's `log_level`; structured JSON output joins as a feature of the same pin with Story 2.8. From this story on, `[workspace.dependencies]` pins each crate's **feature set** alongside its version (`tokio`'s `rt-multi-thread` + `signal`, `serde`'s `derive`), so a member writes `workspace = true` and nothing else and two crates cannot diverge on what a dependency provides.
+
+**[Amended 2026-09-23, Epic 2 Story 2.2 decision 5]** `rmpv` is added, with `with-serde`. `hexput-port` decodes a frame in two phases — bytes to an untyped MessagePack value through `rmp-serde` (whose nesting-depth limit bounds recursion), then the envelope map validated by hand so every failure gets its exact `protocol.*` code and the correlation id is recovered whenever it is readable. `rmpv::Value` is that untyped value and the Port's payload type; later stories convert a payload to its typed struct with `rmpv::ext::from_value`. It is the same project and release line as the already-pinned `rmp-serde`.
 
 ## Structural Seed
 

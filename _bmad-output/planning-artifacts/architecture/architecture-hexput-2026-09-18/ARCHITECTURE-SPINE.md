@@ -128,6 +128,7 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 | rmp-serde | 1.3.1 |
 | rmpv (`with-serde`) | 1.3.1 |
 | dashmap | 6.2.1 |
+| getrandom | 0.4.3 |
 | moka | 0.12.16 |
 | criterion | 0.8.2 |
 | tracing | 0.1.44 |
@@ -140,6 +141,8 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 **[Amended 2026-09-23, Epic 2 Story 2.1 decision 1]** `toml` and `tracing-subscriber` are added. `hexput-config` parses the System Config file as TOML through `serde`, with the parser's serializer (`display`) left out because System Config has no write API. `hexput-daemon` emits its startup log — the resolved System Config path and the AD-7 source that supplied it — through a plain `tracing-subscriber` `fmt` subscriber filtered at the file's `log_level`; structured JSON output joins as a feature of the same pin with Story 2.8. From this story on, `[workspace.dependencies]` pins each crate's **feature set** alongside its version (`tokio`'s `rt-multi-thread` + `signal`, `serde`'s `derive`), so a member writes `workspace = true` and nothing else and two crates cannot diverge on what a dependency provides.
 
 **[Amended 2026-09-23, Epic 2 Story 2.2 decision 5]** `rmpv` is added, with `with-serde`. `hexput-port` decodes a frame in two phases — bytes to an untyped MessagePack value through `rmp-serde` (whose nesting-depth limit bounds recursion), then the envelope map validated by hand so every failure gets its exact `protocol.*` code and the correlation id is recovered whenever it is readable. `rmpv::Value` is that untyped value and the Port's payload type; later stories convert a payload to its typed struct with `rmpv::ext::from_value`. It is the same project and release line as the already-pinned `rmp-serde`.
+
+**[Amended 2026-09-23, Epic 2 Stories 2.4 + 2.5]** `getrandom` is added, with no features. `hexput-session` draws each Client ID's 128 bits from the OS CSPRNG through `getrandom::fill`, so a Client ID is unguessable rather than merely unique; OQ-2's reconnect secret (Epic 5) will draw from the same source rather than add a second one. A Daemon that cannot read the CSPRNG issues no Client ID at all. The same stories put the already-pinned `dashmap` to its first use: the Session registry, keyed by Client ID.
 
 ## Structural Seed
 

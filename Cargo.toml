@@ -52,6 +52,9 @@ rmp-serde = "1.3.1"
 # `rmpv::ext::from_value` — which is what `with-serde` provides.
 rmpv = { version = "1.3.1", features = ["with-serde"] }
 dashmap = "6.2.1"
+# The OS CSPRNG (Story 2.4): Client IDs are 128 unguessable bits. OQ-2's reconnect secret will
+# draw from the same source. `fill` needs no feature.
+getrandom = "0.4.3"
 moka = "0.12.16"
 criterion = "0.8.2"
 tracing = "0.1.44"

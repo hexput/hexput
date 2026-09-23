@@ -77,6 +77,10 @@ EXACT_DEPENDENCIES = {
     # Story 2.3: an adapter turns bytes into the Port's envelopes and reaches nothing else — no
     # Session, no executor — so no transport can make a decision the core should make (AD-1).
     "hexput-transport": {"hexput-port"},
+    # Story 2.4: the Session registry reaches the wire value it decodes `Init` from, the shared
+    # ids, and the Global Variable store it alone tears down (AD-4) — never System Config (AD-5)
+    # or anything that executes.
+    "hexput-session": {"hexput-port", "hexput-shared", "hexput-globalvar"},
     # Story 2.3: the connection actor drives a Port (the `conn --> port` edge is the Spine's
     # 2026-09-23 amendment) and attaches to a Session; it never reaches a transport (AD-1).
     "hexput-connection": {"hexput-session", "hexput-port"},

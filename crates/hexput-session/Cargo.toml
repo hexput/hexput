@@ -7,11 +7,17 @@ rust-version.workspace = true
 
 [lib]
 
+# `scripts/check-crate-graph.py` pins the workspace edges of this set.
 [dependencies]
 hexput-port = { path = "../hexput-port" }
 hexput-shared = { path = "../hexput-shared" }
 # AD-4: session is the sole caller of hexput_globalvar::teardown(plugin_id).
 hexput-globalvar = { path = "../hexput-globalvar" }
+# The registry: Client ID -> Session, with per-shard synchronous locks never held across an
+# `.await` (nothing in this crate is async).
+dashmap = { workspace = true }
+# Client IDs come from the OS CSPRNG.
+getrandom = { workspace = true }
 
 [lints]
 workspace = true

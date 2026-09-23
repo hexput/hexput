@@ -11,8 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///
 /// 128 bits. Its text form — `Display`, `FromStr` and serde — is exactly 32 **lowercase** hex
 /// characters: a string rather than an integer because JavaScript numbers cannot hold 128 bits,
-/// and one spelling only, so two SDKs can compare ids as strings. Generation is Story 2.4's;
-/// this type only carries and spells one.
+/// and one spelling only, so two SDKs can compare ids as strings. `hexput-session` generates
+/// one from the OS CSPRNG when it creates a Session; this type only carries and spells one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId([u8; 16]);
 

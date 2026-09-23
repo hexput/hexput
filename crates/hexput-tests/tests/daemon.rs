@@ -610,6 +610,64 @@ fn the_daemon_answers_over_its_socket_and_removes_it_on_shutdown() {
     assert!(!socket.exists(), "the socket is removed on shutdown");
 }
 
+/// Story 2.4: an `Init` over the real socket is answered with a Client ID, and each connection
+/// gets its own.
+#[cfg(unix)]
+#[test]
+fn init_over_the_socket_answers_a_client_id() {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let init = |id| {
+        let registrations = Value::Array(vec![Value::Map(vec![(
+            Value::from("name"),
+            Value::from("getUser"),
+        )])]);
+        Envelope::new(
+            CorrelationId(id),
+            MessageType::Init,
+            Value::Map(vec![
+                (Value::from("config"), Value::Map(vec![])),
+                (Value::from("registrations"), registrations),
+            ]),
+        )
+    };
+    let mut issued = Vec::new();
+    for id in [11, 12] {
+        let mut client = serving.connect();
+        wire::send(&mut client, &init(id));
+        let reply = wire::reply(&mut client).expect("a reply");
+        assert_eq!(reply.id, Some(CorrelationId(id)));
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        let fields = reply.payload.as_map().expect("a map payload");
+        assert_eq!(fields.len(), 1, "exactly `client_id`: {fields:?}");
+        assert_eq!(fields[0].0.as_str(), Some("client_id"));
+        let client_id = fields[0].1.as_str().expect("a string Client ID").to_owned();
+        assert_eq!(client_id.len(), 32);
+        assert!(
+            client_id
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{client_id}"
+        );
+        // Initialized: execution is now past the gate, and refused only until Story 2.6.
+        wire::send(&mut client, &wire::request(id + 10));
+        assert_eq!(
+            wire::refusal(&mut client),
+            (Some(id + 10), "protocol.not_implemented".to_owned())
+        );
+        issued.push(client_id);
+    }
+    assert_ne!(issued[0], issued[1]);
+    serving.stop().exit(0);
+}
+
 #[cfg(unix)]
 #[test]
 fn one_client_leaving_abruptly_disturbs_no_other() {

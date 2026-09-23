@@ -147,8 +147,8 @@ Append-only. Each entry is work identified during a build but deliberately not d
   evidence: e.g. repeatedly wrapping `a = [a]` in a loop then returning `a`. Story 2.6's value-to-`rmpv::Value` conversion and `encode` are the first recursive consumers of a Script result. 2.6 must reject a result nested deeper than `MAX_NESTING_DEPTH - 1` (the depth the daemon's own decoder accepts) with a defined error before converting it, using an iterative walk.
 
 - source_spec: `spec-2-3-accept-connections-over-a-unix-domain-socket.md`
-  summary: `protocol.not_implemented` exists only so `Init` has a defined answer before Story 2.4 serves it; 2.4 must remove the code from `ProtocolCode` (and `ALL`, and the stability test) when it lands.
-  evidence: Decision 1 of Story 2.3 pulls the init gate forward but nothing can complete init yet; the code is temporary by that decision.
+  summary: `protocol.not_implemented` is temporary. Story 2.4 serves `Init`, so its only remaining use is `ExecutionStart` on an initialized connection; Story 2.6 must remove the code from `ProtocolCode` (and `ALL`, and the stability test) when it serves execution.
+  evidence: Decision 1 of Story 2.3 pulled the init gate forward before init existed; Decision 3 of Stories 2.4 + 2.5 (`spec-2-4-complete-the-init-handshake-with-inline-config-and-registrations.md`) moved the removal from 2.4 to 2.6.
 
 - source_spec: `spec-2-3-accept-connections-over-a-unix-domain-socket.md`
   summary: The Daemon has no bound on concurrently open connections; each accepted connection is a task holding up to one frame (16 MiB) of buffered input.
@@ -162,3 +162,14 @@ Append-only. Each entry is work identified during a build but deliberately not d
   summary: The cleanup of the temporary socket and private directory when `chmod` or the link fails is never exercised by a test.
   evidence: Placement can only fail after `clear_stale` passed through a race or an OS fault; covering it needs a fault-injection seam in `hexput-transport::uds::bind_with_mode`.
 
+- source_spec: `spec-2-4-complete-the-init-handshake-with-inline-config-and-registrations.md`
+  summary: A panic inside `hexput_connection::serve` (or the CSPRNG `expect` in `Sessions::create`, after which nothing is attached) skips the explicit detach, so a panicking attached connection leaks its Session until the Daemon stops.
+  evidence: Detach is an explicit call on `serve`'s one exit path rather than a `Drop` guard, by design (AD-4: teardown never implied by `Drop`). Nothing in `serve` is known to panic on peer input. Settle when Story 5.8's TTL lands: a Session with no attached Connection whose TTL has expired is torn down anyway, or a supervisor that detaches on a joined panic.
+
+- source_spec: `spec-2-4-complete-the-init-handshake-with-inline-config-and-registrations.md`
+  summary: The Session registry is unbounded — every accepted connection may create one Session holding its registrations (up to one 16 MiB frame's worth) for as long as it stays connected.
+  evidence: Same exposure as the uncapped connection count noted for Story 2.3, now with per-Session state; settle together with that cap (Epic 3 / before Epic 5's network transports).
+
+- source_spec: `spec-2-4-complete-the-init-handshake-with-inline-config-and-registrations.md`
+  summary: `Sessions::create`'s Client ID collision retry (and its CSPRNG-failure panic) has no test, because the id source cannot be injected.
+  evidence: Review finding (verification-gap layer): replacing the vacant-entry loop with an overwriting `insert` passes every test, since 128-bit random draws never collide in a test; closing it needs a test seam such as `create_with(init, id_source)`, best added with Epic 5's reconnect when Client IDs carry authority.

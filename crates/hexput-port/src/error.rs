@@ -34,9 +34,14 @@ pub enum ProtocolCode {
     /// A well-formed message the Daemon never accepts from a Backend on its own initiative, such
     /// as a `Result` or `Error` answering nothing the Daemon asked.
     UnexpectedMessage,
-    /// A message type the Daemon knows but does not serve yet. Temporary: Story 2.4 serves
-    /// `Init`, its only use, and removes this code.
+    /// A message type the Daemon knows but does not serve yet. Temporary: its only use is
+    /// `ExecutionStart` on an initialized connection, which Story 2.6 serves, removing this code.
     NotImplemented,
+    /// An `Init` payload that is not a valid init: a missing, mistyped or unknown key, a
+    /// malformed or duplicate registration. The message names the offending key or index.
+    InvalidPayload,
+    /// An `Init` on a connection already attached to a Session; that Session is untouched.
+    AlreadyInitialized,
 }
 
 impl ProtocolCode {
@@ -53,6 +58,8 @@ impl ProtocolCode {
         Self::InitNotCompleted,
         Self::UnexpectedMessage,
         Self::NotImplemented,
+        Self::InvalidPayload,
+        Self::AlreadyInitialized,
     ];
 
     /// The code's stable string form.
@@ -67,6 +74,8 @@ impl ProtocolCode {
             Self::InitNotCompleted => "protocol.init_not_completed",
             Self::UnexpectedMessage => "protocol.unexpected_message",
             Self::NotImplemented => "protocol.not_implemented",
+            Self::InvalidPayload => "protocol.invalid_payload",
+            Self::AlreadyInitialized => "protocol.already_initialized",
         }
     }
 }

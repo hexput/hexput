@@ -27,8 +27,10 @@
 //! The Daemon listens on the configured Unix Domain Socket (`hexput-transport`), binding it
 //! before it announces that it started. Each accepted connection is its own Tokio task running
 //! `hexput_connection::serve`, which is generic over the Port and never learns the transport
-//! (AD-1); a connection that fails, disconnects abruptly or panics ends only its own task. On
-//! shutdown the Daemon stops accepting and removes the socket file it created.
+//! (AD-1); a connection that fails, disconnects abruptly or panics ends only its own task. Every
+//! connection shares the run's one Session registry (`hexput-session`), which is where an `Init`
+//! creates a Session. On shutdown the Daemon stops accepting and removes the socket file it
+//! created.
 //!
 //! TCP+TLS and WebSocket have no adapter until Epic 5: a System Config naming either is refused
 //! at startup, so the Daemon never appears to listen where it does not.
@@ -38,6 +40,8 @@ use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(unix)]
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Poll;
 #[cfg(unix)]
@@ -45,6 +49,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use hexput_config::{Loaded, LogLevel};
+#[cfg(unix)]
+use hexput_session::Sessions;
 use tracing_subscriber::filter::LevelFilter;
 
 // Re-exported so a caller of `run_with` (and `hexput-bin`) can name these without a direct
@@ -223,6 +229,8 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
     let armed = std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx))).await;
     if armed.is_pending() {
         tracing::info!("daemon started; waiting for a shutdown signal");
+        // One Session registry per Daemon run, shared by every connection.
+        let sessions = Arc::new(Sessions::new());
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -238,7 +246,7 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                 accepted = listener.accept() => match accepted {
                     Ok(port) => {
                         tracing::debug!("connection accepted");
-                        connections.spawn(hexput_connection::serve(port));
+                        connections.spawn(hexput_connection::serve(port, Arc::clone(&sessions)));
                     }
                     Err(error) => {
                         tracing::warn!(%error, "cannot accept a connection");
@@ -247,7 +255,9 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                 },
             }
         }
-        // Connections end with the runtime; nothing they hold outlives them yet.
+        // Aborted connection tasks never reach their detach, so no Session is torn down one by
+        // one here: the registry, and every Session in it, is dropped with this run. Nothing a
+        // Session holds is on disk or outlives the process, so there is nothing to release.
         connections.abort_all();
     }
     tracing::info!("shutdown requested; daemon stopping");

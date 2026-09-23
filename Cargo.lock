@@ -217,7 +217,6 @@ dependencies = [
  "clap",
  "hexput-check",
  "hexput-interpreter",
- "hexput-lexer",
  "hexput-parser",
 ]
 
@@ -235,6 +234,7 @@ name = "hexput-connection"
 version = "0.1.0"
 dependencies = [
  "hexput-port",
+ "hexput-script",
  "hexput-session",
  "tracing",
 ]
@@ -351,6 +351,7 @@ dependencies = [
  "hexput-exec",
  "hexput-interpreter",
  "hexput-parser",
+ "hexput-port",
 ]
 
 [[package]]
@@ -381,10 +382,12 @@ dependencies = [
  "hexput-config",
  "hexput-connection",
  "hexput-daemon",
+ "hexput-exec",
  "hexput-interpreter",
  "hexput-lexer",
  "hexput-parser",
  "hexput-port",
+ "hexput-script",
  "hexput-session",
  "hexput-shared",
  "hexput-transport",

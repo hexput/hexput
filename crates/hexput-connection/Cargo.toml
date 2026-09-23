@@ -9,10 +9,13 @@ rust-version.workspace = true
 
 # The connection actor drives a `Port`, so it reaches `hexput-port` directly (Spine amendment
 # 2026-09-23, Story 2.3) — and never `hexput-transport`: it is generic over the adapter (AD-1).
-# `scripts/check-crate-graph.py` pins this set.
+# It routes an initialized `ExecutionStart` to `hexput-script` (Spine amendment 2026-09-23,
+# Story 2.6), which owns everything about executing it. `scripts/check-crate-graph.py` pins this
+# set.
 [dependencies]
 hexput-session = { path = "../hexput-session" }
 hexput-port = { path = "../hexput-port" }
+hexput-script = { path = "../hexput-script" }
 tracing = { workspace = true }
 
 [lints]

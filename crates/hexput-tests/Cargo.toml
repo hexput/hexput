@@ -28,6 +28,8 @@ hexput-port = { path = "../hexput-port" }
 hexput-transport = { path = "../hexput-transport" }
 hexput-connection = { path = "../hexput-connection" }
 hexput-session = { path = "../hexput-session" }
+hexput-exec = { path = "../hexput-exec" }
+hexput-script = { path = "../hexput-script" }
 # Third-party, for building and inspecting raw MessagePack in the wire tests.
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }

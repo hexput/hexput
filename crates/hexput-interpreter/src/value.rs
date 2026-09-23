@@ -170,6 +170,11 @@ impl Array {
     pub fn to_vec(&self) -> Vec<Value> {
         self.0.0.clone()
     }
+
+    /// The elements, in order, borrowed — for a caller that walks a result without copying it.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Value> {
+        self.0.0.iter()
+    }
 }
 
 impl Object {
@@ -205,6 +210,12 @@ impl Object {
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.0.0.get(key)
+    }
+
+    /// The entries in insertion order, borrowed — for a caller that walks a result without
+    /// copying it.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Value)> {
+        self.0.0.iter().map(|(k, v)| (&**k, v))
     }
 
     /// The entries in insertion order.

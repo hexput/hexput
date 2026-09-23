@@ -656,15 +656,90 @@ fn init_over_the_socket_answers_a_client_id() {
                 .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
             "{client_id}"
         );
-        // Initialized: execution is now past the gate, and refused only until Story 2.6.
+        // Initialized: execution is now past the gate, and its payload is what is judged.
         wire::send(&mut client, &wire::request(id + 10));
         assert_eq!(
             wire::refusal(&mut client),
-            (Some(id + 10), "protocol.not_implemented".to_owned())
+            (Some(id + 10), "protocol.invalid_payload".to_owned())
         );
         issued.push(client_id);
     }
     assert_ne!(issued[0], issued[1]);
+    serving.stop().exit(0);
+}
+
+/// Story 2.6: an initialized connection runs a Script over the real socket and gets its result
+/// back; a failing Script on one connection disturbs neither that connection nor another.
+#[cfg(unix)]
+#[test]
+fn a_script_runs_over_the_socket_and_a_failure_disturbs_no_one() {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let text = |t: &str| Value::from(t);
+    let initialized = |serving: &Serving| {
+        let mut client = serving.connect();
+        let init = Envelope::new(
+            CorrelationId(1),
+            MessageType::Init,
+            Value::Map(vec![
+                (text("config"), Value::Map(vec![])),
+                (text("registrations"), Value::Array(vec![])),
+            ]),
+        );
+        wire::send(&mut client, &init);
+        assert_eq!(
+            wire::reply(&mut client).expect("a reply").message_type,
+            MessageType::Result
+        );
+        client
+    };
+    let execution = |id, source: &str, variables: Vec<(Value, Value)>| {
+        Envelope::new(
+            CorrelationId(id),
+            MessageType::ExecutionStart,
+            Value::Map(vec![
+                (text("source"), text(source)),
+                (text("variables"), Value::Map(variables)),
+            ]),
+        )
+    };
+
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let mut a = initialized(&serving);
+    let mut b = initialized(&serving);
+
+    // A's Script fails; A's reply is the diagnostic, with A's id.
+    wire::send(&mut a, &execution(20, "return 1 / 0;", vec![]));
+    // B's is sent before A's reply is read. (Both finish at once: a slow Script's independence is
+    // Story 2.7's to show.)
+    wire::send(
+        &mut b,
+        &execution(30, "return a + 1;", vec![(text("a"), Value::from(2))]),
+    );
+    assert_eq!(
+        wire::refusal(&mut a),
+        (Some(20), "arithmetic.division_by_zero".to_owned())
+    );
+    let reply = wire::reply(&mut b).expect("B's reply");
+    assert_eq!(reply.id, Some(CorrelationId(30)));
+    assert_eq!(reply.message_type, MessageType::Result);
+    assert_eq!(
+        reply.payload,
+        Value::Map(vec![(text("value"), Value::from(3))])
+    );
+
+    // A keeps serving after its failure.
+    wire::send(&mut a, &execution(21, "return [1, \"x\", null];", vec![]));
+    let reply = wire::reply(&mut a).expect("A's second reply");
+    assert_eq!(reply.id, Some(CorrelationId(21)));
+    assert_eq!(
+        reply.payload,
+        Value::Map(vec![(
+            text("value"),
+            Value::Array(vec![Value::from(1), text("x"), Value::Nil])
+        )])
+    );
     serving.stop().exit(0);
 }
 

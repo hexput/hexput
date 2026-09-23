@@ -15,12 +15,20 @@
 //!   `protocol.invalid_payload` naming what was wrong, and no Session is created.
 //! * `Init` on an attached connection — `protocol.already_initialized`; its Session is untouched.
 //! * `ExecutionStart` — `protocol.init_not_completed` before init: nothing runs (FR-1). After
-//!   init, `protocol.not_implemented` until Story 2.6 serves it.
+//!   init, a Direct Execution (FR-4): [`hexput_script::direct_execution`] decodes the payload,
+//!   runs the Script through the one Executor, and the connection answers `Result { value }` or
+//!   the `Error` it returns — a parse or runtime diagnostic, or a `protocol.*` refusal. A failing
+//!   Script ends nothing but itself. For now it runs inline in this loop, so this connection reads
+//!   nothing else until it finishes; Story 2.7 moves it to an independent task.
 //! * `Result` or `Error` from the Backend — `protocol.unexpected_message`: the Daemon asked
 //!   nothing it could answer.
 //!
 //! A frame the codec rejects gets its `protocol.*` error response; the connection keeps
 //! reading unless the error is fatal (an oversized frame), after which it closes.
+//!
+//! A reply the adapter cannot frame (too large) is replaced by `protocol.response_too_large`
+//! carrying the same id, so a request is never left unanswered for its reply's size; the
+//! connection stays open.
 //!
 //! However the connection ends — the peer closing, a lost stream, a failed write, a fatal frame —
 //! [`serve`] detaches it from its Session, and detaching the last Connection tears the Session
@@ -76,20 +84,45 @@ async fn exchange<P: Port>(port: P, sessions: &Sessions, attached: &mut Option<A
         };
         // Every registry lock `answer` took is released by now: nothing is held across this
         // `.await`.
-        match outbound.send(reply).await {
-            Ok(()) => {}
-            // Nothing was written: the reply could not be framed, and the connection is intact.
-            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
-                tracing::warn!(%error, "a reply could not be sent; the connection stays open");
-            }
-            Err(error) => {
-                tracing::debug!(%error, "cannot write to the connection; closing it");
-                return;
-            }
+        if !deliver(&mut outbound, reply).await {
+            return;
         }
         if close {
             tracing::debug!("closing the connection after a fatal protocol error");
             return;
+        }
+    }
+}
+
+/// Write `reply`, or — when it cannot be framed — `protocol.response_too_large` with its id in
+/// its place. Returns whether the connection is still usable.
+async fn deliver<O: Outbound>(outbound: &mut O, reply: Envelope<Value>) -> bool {
+    let id = reply.id;
+    let error = match outbound.send(reply).await {
+        Ok(()) => return true,
+        Err(error) => error,
+    };
+    if error.kind() != io::ErrorKind::InvalidInput {
+        tracing::debug!(%error, "cannot write to the connection; closing it");
+        return false;
+    }
+    // Nothing was written: the reply could not be framed, and the connection is intact.
+    tracing::debug!(%error, "a reply was too large to send; answering that instead");
+    let refusal = refuse(
+        id,
+        ProtocolCode::ResponseTooLarge,
+        format!("the response could not be sent: {error}"),
+    );
+    match outbound.send(refusal).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            // A refusal is a few hundred bytes; only a broken adapter lands here.
+            tracing::warn!(%error, "not even the refusal could be sent; the connection stays open");
+            true
+        }
+        Err(error) => {
+            tracing::debug!(%error, "cannot write to the connection; closing it");
+            false
         }
     }
 }
@@ -126,11 +159,18 @@ fn answer(
         );
     }
 
-    refuse(
-        request.id,
-        ProtocolCode::NotImplemented,
-        format!("`{}` is not served yet", request.message_type),
-    )
+    // Past the gate, `ExecutionStart` is the only message left: a Direct Execution.
+    match hexput_script::direct_execution(&request.payload) {
+        Ok(payload) => Envelope {
+            id: request.id,
+            message_type: MessageType::Result,
+            payload,
+        },
+        Err(body) => {
+            tracing::debug!(code = %body.code, "a Direct Execution failed");
+            error_response(request.id, &body)
+        }
+    }
 }
 
 /// Serve `Init`: decode the payload, create the Session with this connection attached, and

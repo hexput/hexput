@@ -7,7 +7,10 @@ rust-version.workspace = true
 
 [lib]
 
+# `hexput-port` for the `ExecutionStart` payload, the wire value and the `ErrorBody` this crate
+# owns (Spine amendment 2026-09-23, Story 2.6). `scripts/check-crate-graph.py` pins this set.
 [dependencies]
+hexput-port = { path = "../hexput-port" }
 hexput-parser = { path = "../hexput-parser" }
 hexput-interpreter = { path = "../hexput-interpreter" }
 hexput-check = { path = "../hexput-check" }

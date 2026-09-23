@@ -48,7 +48,7 @@ mod heap;
 mod machine;
 mod value;
 
-use hexput_ast::{Program, StatementKind};
+use hexput_ast::StatementKind;
 
 pub use value::{Array, Object, Value};
 
@@ -58,6 +58,10 @@ pub use value::{Array, Object, Value};
 pub use hexput_ast::{
     Category, Code, Diagnostic, RenderOptions, Severity, Span, render_diagnostic,
 };
+
+/// The parsed Script [`evaluate`] takes, re-exported so `hexput-exec` — the one Executor, which
+/// the Spine gives no `hexput-ast` edge — can name what it runs.
+pub use hexput_ast::Program;
 
 /// How many calls may be active at once before a call raises `depth.call_depth_exceeded`.
 ///

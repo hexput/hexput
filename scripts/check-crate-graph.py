@@ -61,9 +61,9 @@ EXACT_DEPENDENCIES = {
     # Story 1.9: the CLI reaches diagnostics through a re-export from the parser and the
     # interpreter. A direct `hexput-shared` or `hexput-ast` edge is not in the Spine's graph and
     # would otherwise only be caught by a reviewer's eye. `hexput-check` is listed because
-    # Story 1.10's check command needs it; it is unused until then.
+    # Story 1.10's check command needs it. Story 2.6 moved `is_identifier` into the parser, which
+    # took the last use of `hexput-lexer` with it, so that edge is gone.
     "hexput-cli-core": {
-        "hexput-lexer",
         "hexput-parser",
         "hexput-interpreter",
         "hexput-check",
@@ -83,7 +83,28 @@ EXACT_DEPENDENCIES = {
     "hexput-session": {"hexput-port", "hexput-shared", "hexput-globalvar"},
     # Story 2.3: the connection actor drives a Port (the `conn --> port` edge is the Spine's
     # 2026-09-23 amendment) and attaches to a Session; it never reaches a transport (AD-1).
-    "hexput-connection": {"hexput-session", "hexput-port"},
+    # Story 2.6: it routes `ExecutionStart` to `hexput-script` (`conn --> script`, amended
+    # 2026-09-23) and executes nothing itself.
+    "hexput-connection": {"hexput-session", "hexput-port", "hexput-script"},
+    # Story 2.6: Direct Execution reaches the parser, the interpreter's value types, the static
+    # check (unused until Epic 3's check mode), the one Executor, and the wire value and error
+    # shape (`script --> port`, amended 2026-09-23) — never a transport, never `hexput-enforce`
+    # except through `hexput-exec` (AD-3).
+    "hexput-script": {
+        "hexput-parser",
+        "hexput-interpreter",
+        "hexput-check",
+        "hexput-exec",
+        "hexput-port",
+    },
+    # Story 2.6: the one Executor (AD-3). It alone reaches enforcement; `hexput-rpc` and
+    # `hexput-globalvar` join it for Epic 3's Registered Functions and Epic 6's Global Variables.
+    "hexput-exec": {
+        "hexput-enforce",
+        "hexput-interpreter",
+        "hexput-rpc",
+        "hexput-globalvar",
+    },
     # Story 2.3: the wiring root composes every daemon crate, and it alone reaches a transport.
     "hexput-daemon": {
         "hexput-transport",

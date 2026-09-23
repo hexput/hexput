@@ -34,14 +34,19 @@ pub enum ProtocolCode {
     /// A well-formed message the Daemon never accepts from a Backend on its own initiative, such
     /// as a `Result` or `Error` answering nothing the Daemon asked.
     UnexpectedMessage,
-    /// A message type the Daemon knows but does not serve yet. Temporary: its only use is
-    /// `ExecutionStart` on an initialized connection, which Story 2.6 serves, removing this code.
-    NotImplemented,
-    /// An `Init` payload that is not a valid init: a missing, mistyped or unknown key, a
-    /// malformed or duplicate registration. The message names the offending key or index.
+    /// A request payload the Daemon cannot accept: an `Init` or `ExecutionStart` with a missing,
+    /// mistyped, unknown or repeated key, a malformed or duplicate registration, a starting
+    /// variable that is not a §2 identifier, or a value with no lossless Hexput representation.
+    /// The message names the offending key, index or path. Nothing runs.
     InvalidPayload,
     /// An `Init` on a connection already attached to a Session; that Session is untouched.
     AlreadyInitialized,
+    /// A Script result nested deeper than the Daemon's own decoder accepts in a frame, so a
+    /// Backend could never read it back. The Script ran; its result is not sent.
+    ResultTooDeep,
+    /// A response whose frame would exceed [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN). Sent in its
+    /// place, with the request's id, so no request is left unanswered; the connection stays open.
+    ResponseTooLarge,
 }
 
 impl ProtocolCode {
@@ -57,9 +62,10 @@ impl ProtocolCode {
         Self::FrameTooLarge,
         Self::InitNotCompleted,
         Self::UnexpectedMessage,
-        Self::NotImplemented,
         Self::InvalidPayload,
         Self::AlreadyInitialized,
+        Self::ResultTooDeep,
+        Self::ResponseTooLarge,
     ];
 
     /// The code's stable string form.
@@ -73,9 +79,10 @@ impl ProtocolCode {
             Self::FrameTooLarge => "protocol.frame_too_large",
             Self::InitNotCompleted => "protocol.init_not_completed",
             Self::UnexpectedMessage => "protocol.unexpected_message",
-            Self::NotImplemented => "protocol.not_implemented",
             Self::InvalidPayload => "protocol.invalid_payload",
             Self::AlreadyInitialized => "protocol.already_initialized",
+            Self::ResultTooDeep => "protocol.result_too_deep",
+            Self::ResponseTooLarge => "protocol.response_too_large",
         }
     }
 }

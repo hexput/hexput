@@ -41,6 +41,25 @@ pub fn parse(source: &str) -> Result<Program, Diagnostic> {
     .run()
 }
 
+/// Whether `text` is a §2 identifier: the lexer's own judgement, so the reserved-word list lives
+/// in exactly one place. `text` must lex to a single `Ident` covering all of it — which rejects
+/// the empty string, a reserved word, anything with a space, and `a//b`, whose comment would
+/// otherwise leave one `Ident` behind.
+///
+/// The judgement every layer that receives a name from outside the source uses — the CLI's
+/// `--var`, a Backend's starting variables — before binding it.
+#[must_use]
+pub fn is_identifier(text: &str) -> bool {
+    match tokenize(text).as_deref() {
+        Ok([token]) => {
+            matches!(token.kind, TokenKind::Ident(_))
+                && token.span.offset == 0
+                && token.span.len == text.len()
+        }
+        _ => false,
+    }
+}
+
 struct Parser<'a> {
     source: &'a str,
     tokens: Vec<Token>,

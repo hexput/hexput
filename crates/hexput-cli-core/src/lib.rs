@@ -1,8 +1,8 @@
 //! Eval + check command logic (Stories 1.9-1.10) for the `hexput` CLI binary.
-//! Depends on hexput-lexer, hexput-parser, hexput-interpreter, hexput-check — and, of
+//! Depends on hexput-parser, hexput-interpreter, hexput-check — and, of
 //! non-workspace crates, `clap` alone. Diagnostics are reached through `hexput-parser`'s and
 //! `hexput-interpreter`'s re-exports; a direct `hexput-shared` or `hexput-ast` edge is not in the
-//! Spine's crate graph and `scripts/check-crate-graph.py` asserts the four edges exactly.
+//! Spine's crate graph and `scripts/check-crate-graph.py` asserts the three edges exactly.
 //! Binds no Architecture Decision directly.
 //!
 //! # Shape
@@ -39,7 +39,8 @@ use std::process::ExitCode;
 use clap::Parser as _;
 use hexput_check::{Environment, Outcome, Policy};
 use hexput_interpreter::{Value, evaluate, evaluate_with_variables};
-use hexput_lexer::{TokenKind, tokenize};
+// The parser's identifier judgement, shared with the Daemon's starting-variable names.
+pub(crate) use hexput_parser::is_identifier;
 use hexput_parser::{Diagnostic, Program, RenderOptions, StatementKind, parse, render_diagnostic};
 
 use args::{CheckArgs, Cli, Command, EvalArgs};
@@ -338,19 +339,4 @@ fn evaluate_expression(expression: &str) -> Result<Value, String> {
         });
     }
     evaluate(&program).map_err(|diagnostic| render(&diagnostic))
-}
-
-/// Whether `text` is a §2 identifier: the lexer's own judgement, so the reserved-word list lives
-/// in exactly one place. `text` must lex to a single `Ident` covering all of it — which rejects
-/// the empty string, a reserved word, anything with a space, and `a//b`, whose comment would
-/// otherwise leave one `Ident` behind.
-pub(crate) fn is_identifier(text: &str) -> bool {
-    match tokenize(text).as_deref() {
-        Ok([token]) => {
-            matches!(token.kind, TokenKind::Ident(_))
-                && token.span.offset == 0
-                && token.span.len == text.len()
-        }
-        _ => false,
-    }
 }

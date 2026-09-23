@@ -220,11 +220,13 @@ graph TD
   session --> shared
   conn[hexput-connection] --> session
   conn --> port
+  conn --> script
   session --> globalvar
   script[hexput-script] --> parser
   script --> interp
   script --> check
   script --> exec[hexput-exec]
+  script --> port
   plugin[hexput-plugin] --> parser
   plugin --> globalvar[hexput-globalvar]
   plugin --> exec
@@ -267,6 +269,8 @@ What this graph makes a compile error rather than a review comment:
 **[Amended 2026-09-22, Epic 1 Story 1.10 decision 2]** AD-8's entry point takes one more thing the environment provides: the Script's **starting-variable names**. A Script written for a Backend reads inputs its own source never declares, so a pass that does not know them reports every such read as undeclared and is useless on exactly the Scripts it exists for. Only names are taken — a static check needs to know a name exists, never what it holds, and taking a value would put an evaluation on a path whose whole promise is that nothing runs. The `hexput-ast`-alone edge is unchanged and is now asserted by `scripts/check-crate-graph.py` rather than only stated here; the `hexput-shared` edge the crate was scaffolded with in Story 1.1 is gone, since `hexput-ast` re-exports the diagnostics shape and the graph above lists `check --> ast` only.
 
 **[Amended 2026-09-23, Epic 2 Story 2.3]** The edge `hexput-connection --> hexput-port` is added. The connection actor is what drives a `Port` — it reads envelopes from an accepted connection and writes responses back — so it needs the `Port` trait and the envelope types, which live in `hexput-port`. Routing them through a `hexput-session` re-export would hide the real dependency behind a crate that has no reason to carry it. The edge grants no reach AD-1 forbids: `hexput-port` holds no transport, and `hexput-connection` still cannot name one, because only `hexput-daemon` depends on `hexput-transport`. `scripts/check-crate-graph.py` now pins the exact sets of `hexput-transport` (`hexput-port` alone), `hexput-connection` and `hexput-daemon`. The same story adds `tokio`'s `net`, `io-util`, `macros`, `time` and `sync` features to the pinned feature set.
+
+**[Amended 2026-09-23, Epic 2 Story 2.6]** Two edges are added: `hexput-script --> hexput-port` and `hexput-connection --> hexput-script`. Direct Execution is served in `hexput-script`, which owns the `ExecutionStart` payload, the conversion between wire values and Hexput values, and the `ErrorBody` a failure becomes — all of which are `hexput-port` types, so the script crate reaches the codec directly instead of inventing a second error or value shape. `hexput-connection` only routes an initialized `ExecutionStart` to `hexput_script::direct_execution` and writes the reply on the same connection. Neither edge grants a reach an AD forbids: `hexput-port` holds no transport (AD-1), and `hexput-script` still reaches evaluation only through `hexput_exec::execute`, the one Executor (AD-3) — `hexput-enforce` keeps `hexput-exec` as its sole dependent. `scripts/check-crate-graph.py` now pins the exact sets of `hexput-script` and `hexput-exec`, and `hexput-connection`'s set gains `hexput-script`.
 
 `[workspace.dependencies]` in the root `Cargo.toml` pins every version from the Stack table above exactly once; member crates inherit with `workspace = true` rather than re-pinning.
 

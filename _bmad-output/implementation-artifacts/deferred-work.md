@@ -135,6 +135,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
   evidence: Six malformed non-ASCII inputs probed through the binary produced correct char-based locations and no panic, so spans appear char-aligned. Settle by confirming toml's error spans are always char boundaries, or harden with `str::floor_char_boundary`.
 
 - source_spec: `spec-2-2-frame-requests-and-responses-on-the-wire.md`
+  status: RESOLVED 2026-09-23 by `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md` — a reply the adapter cannot frame (`InvalidInput` from `send`) is replaced by `protocol.response_too_large` carrying the request id, and a result certain to exceed the frame is refused as that code before it is converted.
   summary: `hexput_port::encode` has no size check, so a Script result whose envelope encodes past `MAX_FRAME_LEN` has no defined response — only `encode_frame` refuses it.
   evidence: No result producer exists until Story 2.6. That story must turn an `EncodeError::FrameTooLarge` on a result into an `Error` response carrying the request's id (a new non-fatal code), never a dropped response that leaves the Backend's request pending forever.
 
@@ -143,10 +144,12 @@ Append-only. Each entry is work identified during a build but deliberately not d
   evidence: Each `rmpv::Value` is about 32 bytes. The codec never allocates for a length a header merely claims, but the actual decoded size is unbounded. Fix candidates: a total decoded-element budget in phase 1, a lower `MAX_FRAME_LEN`, or a per-connection memory bound. Belongs with Resource Budget work (Epic 3) and must be settled before TCP+TLS (Epic 5) exposes the daemon beyond UDS permissions.
 
 - source_spec: `spec-2-2-frame-requests-and-responses-on-the-wire.md`
+  status: RESOLVED 2026-09-23 by `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md` — `hexput-script` walks a result iteratively and refuses one nested past `MAX_RESULT_DEPTH` (`MAX_NESTING_DEPTH - 2`, for the envelope and `{value}` maps) as `protocol.result_too_deep` before any recursive conversion or encoding.
   summary: `hexput_port::encode` recurses once per nesting level with no depth bound, and the interpreter builds arbitrarily deep values without host recursion — a Script returning a deeply nested array can overflow the daemon's stack when its result is converted and serialized.
   evidence: e.g. repeatedly wrapping `a = [a]` in a loop then returning `a`. Story 2.6's value-to-`rmpv::Value` conversion and `encode` are the first recursive consumers of a Script result. 2.6 must reject a result nested deeper than `MAX_NESTING_DEPTH - 1` (the depth the daemon's own decoder accepts) with a defined error before converting it, using an iterative walk.
 
 - source_spec: `spec-2-3-accept-connections-over-a-unix-domain-socket.md`
+  status: RESOLVED 2026-09-23 by `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md` — `ProtocolCode::NotImplemented` is gone from the enum, `ALL` and the stability test.
   summary: `protocol.not_implemented` is temporary. Story 2.4 serves `Init`, so its only remaining use is `ExecutionStart` on an initialized connection; Story 2.6 must remove the code from `ProtocolCode` (and `ALL`, and the stability test) when it serves execution.
   evidence: Decision 1 of Story 2.3 pulled the init gate forward before init existed; Decision 3 of Stories 2.4 + 2.5 (`spec-2-4-complete-the-init-handshake-with-inline-config-and-registrations.md`) moved the removal from 2.4 to 2.6.
 
@@ -173,3 +176,15 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-2-4-complete-the-init-handshake-with-inline-config-and-registrations.md`
   summary: `Sessions::create`'s Client ID collision retry (and its CSPRNG-failure panic) has no test, because the id source cannot be injected.
   evidence: Review finding (verification-gap layer): replacing the vacant-entry loop with an overwriting `insert` passes every test, since 128-bit random draws never collide in a test; closing it needs a test seam such as `create_with(init, id_source)`, best added with Epic 5's reconnect when Client IDs carry authority.
+
+- source_spec: `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md`
+  summary: A Script that never ends (`while (true) {}`) pins a runtime worker forever and hangs Daemon shutdown, since `abort_all` only takes effect at an `.await` the task never reaches.
+  evidence: Direct Execution runs inline and synchronously in the connection task (by the spec's decision, until Story 2.7), and no Resource Budget exists yet; after `abort_all` the runtime's drop waits on the spinning worker. Moving the call to a task (2.7) or `spawn_blocking` does not make it cancellable. Settle with a step/time budget checked inside the evaluator loop (Epic 3, Story 3.5) so a runaway Script ends with a defined error.
+
+- source_spec: `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md`
+  summary: A Script result is bounded in wire bytes, not memory — about 16M one-byte scalars pass `check_result` and become an `rmpv::Value` tree of 512 MiB or more before encoding.
+  evidence: `check_result` counts one byte per scalar against `MAX_FRAME_LEN`; each `rmpv::Value` is about 32 bytes, so `to_wire` amplifies ~30x on the connection task. The outbound twin of the 2.2 decoded-size entry; belongs with Resource Budget work (Epic 3), e.g. an element-count bound in the same walk or a streaming encoder.
+
+- source_spec: `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md`
+  summary: AD-3's "every Daemon evaluation goes through `hexput_exec::execute`" is a convention in `hexput-script`, not a graph rule — the Spine's `script --> interp` edge lets it call `evaluate*` directly.
+  evidence: Nothing but review stops Epic 4's Cached Execution from calling `hexput_interpreter::evaluate_with_variables` and skipping Epic 3's enforcement. Closing it means `hexput-exec` re-exporting the value and diagnostic types `hexput-script` needs, dropping the `script --> interp` edge in a dated Spine amendment, and pinning it in `check-crate-graph.py` — best done when Epic 3 puts real enforcement behind the Executor.

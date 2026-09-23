@@ -339,7 +339,7 @@ fn a_failed_write_ends_the_connection() {
 }
 
 #[test]
-fn a_reply_too_large_to_frame_leaves_the_connection_open() {
+fn a_reply_too_large_to_frame_is_answered_as_too_large_and_the_connection_stays_open() {
     let (sent, left) = serve(
         vec![
             message(1, MessageType::ExecutionStart),
@@ -347,11 +347,20 @@ fn a_reply_too_large_to_frame_leaves_the_connection_open() {
         ],
         Some((0, io::ErrorKind::InvalidInput)),
     );
-    let ids: Vec<_> = sent.iter().map(|r| r.id).collect();
+    let answers: Vec<_> = sent.iter().map(|r| (r.id, code_of(r))).collect();
     assert_eq!(
-        ids,
-        [Some(CorrelationId(2))],
-        "the second request is still answered"
+        answers,
+        [
+            (
+                Some(CorrelationId(1)),
+                "protocol.response_too_large".to_owned()
+            ),
+            (
+                Some(CorrelationId(2)),
+                "protocol.init_not_completed".to_owned()
+            ),
+        ],
+        "the unsendable reply is replaced, with its id, and the next request is still answered"
     );
     assert_eq!(left, 0);
 }
@@ -440,14 +449,14 @@ fn an_invalid_init_creates_no_session_and_names_what_is_wrong() {
 }
 
 #[test]
-fn after_init_execution_is_refused_as_not_implemented_and_a_second_init_is_refused() {
+fn after_init_execution_runs_and_a_second_init_is_refused() {
     let sessions = Arc::new(Sessions::new());
     let (sent, seen) = serve_and_look(
         &sessions,
         vec![
             message(1, MessageType::ExecutionStart),
             init(2, init_payload(&["getUser"])),
-            message(3, MessageType::ExecutionStart),
+            execution(3, "return 1;"),
             init(4, init_payload(&["other"])),
             message(5, MessageType::Result),
         ],
@@ -472,10 +481,7 @@ fn after_init_execution_is_refused_as_not_implemented_and_a_second_init_is_refus
                 "protocol.init_not_completed".to_owned()
             ),
             (Some(CorrelationId(2)), "Result".to_owned()),
-            (
-                Some(CorrelationId(3)),
-                "protocol.not_implemented".to_owned()
-            ),
+            (Some(CorrelationId(3)), "Result".to_owned()),
             (
                 Some(CorrelationId(4)),
                 "protocol.already_initialized".to_owned()
@@ -551,4 +557,91 @@ fn every_way_a_connection_ends_detaches_and_tears_down_its_session() {
         assert!(!sessions.contains(client_id));
         assert!(sessions.is_empty());
     }
+}
+
+// --- Story 2.6: Direct Execution ---
+
+fn execution_payload(source: &str, variables: Vec<(&str, Value)>) -> Value {
+    Value::Map(vec![
+        (string("source"), string(source)),
+        (
+            string("variables"),
+            Value::Map(variables.into_iter().map(|(k, v)| (string(k), v)).collect()),
+        ),
+    ])
+}
+
+fn execution(id: u64, source: &str) -> Received {
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::ExecutionStart,
+        execution_payload(source, vec![]),
+    ))
+}
+
+#[test]
+fn an_initialized_execution_is_answered_on_this_connection_with_its_id() {
+    let (sent, _) = serve(
+        vec![
+            init(1, init_payload(&[])),
+            Received::Message(Envelope::new(
+                CorrelationId(7),
+                MessageType::ExecutionStart,
+                execution_payload("return a + 1;", vec![("a", Value::from(2))]),
+            )),
+        ],
+        None,
+    );
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].id, Some(CorrelationId(7)));
+    assert_eq!(sent[1].message_type, MessageType::Result);
+    assert_eq!(
+        sent[1].payload,
+        Value::Map(vec![(string("value"), Value::from(3))])
+    );
+}
+
+#[test]
+fn a_failing_script_is_answered_and_the_connection_keeps_serving() {
+    let (sent, left) = serve(
+        vec![
+            init(1, init_payload(&[])),
+            execution(2, "let = ;"),
+            execution(3, "return 1 / 0;"),
+            Received::Message(Envelope::new(
+                CorrelationId(4),
+                MessageType::ExecutionStart,
+                Value::Nil,
+            )),
+            execution(5, "return \"still here\";"),
+        ],
+        None,
+    );
+    assert_eq!(left, 0);
+    let answers: Vec<_> = sent[1..]
+        .iter()
+        .map(|r| {
+            let code = if r.message_type == MessageType::Result {
+                "Result".to_owned()
+            } else {
+                code_of(r)
+            };
+            (r.id, code)
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        [
+            (Some(CorrelationId(2)), "syntax.expected_syntax".to_owned()),
+            (
+                Some(CorrelationId(3)),
+                "arithmetic.division_by_zero".to_owned()
+            ),
+            (
+                Some(CorrelationId(4)),
+                "protocol.invalid_payload".to_owned()
+            ),
+            (Some(CorrelationId(5)), "Result".to_owned()),
+        ]
+    );
 }

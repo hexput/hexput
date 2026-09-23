@@ -134,7 +134,8 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 | tracing | 0.1.44 |
 | clap (`derive`) | 4.6.7 |
 | toml (`std`, `parse`, `serde`; no default features) | 1.1.6 |
-| tracing-subscriber (`fmt`, `std`; no default features) | 0.3.23 |
+| tracing-subscriber (`fmt`, `std`, `json`; no default features) | 0.3.23 |
+| serde_json (tests only) | 1.0.151 |
 
 **[Amended 2026-09-22, Epic 1 Story 1.9 decision 1]** `clap` is added: `hexput-cli-core` needs an argument parser for the eval command, and Story 1.10's check command and the daemon's own `--config` flag (AD-7) then inherit the same one rather than each hand-rolling a parser. It is pinned here and in `[workspace.dependencies]` like every other row. Adding it to this table is deliberate: "nothing not listed is permitted" governs *crate edges* in the dependency graph below, while the Stack table is the one place a third-party version lives.
 
@@ -143,6 +144,8 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 **[Amended 2026-09-23, Epic 2 Story 2.2 decision 5]** `rmpv` is added, with `with-serde`. `hexput-port` decodes a frame in two phases — bytes to an untyped MessagePack value through `rmp-serde` (whose nesting-depth limit bounds recursion), then the envelope map validated by hand so every failure gets its exact `protocol.*` code and the correlation id is recovered whenever it is readable. `rmpv::Value` is that untyped value and the Port's payload type; later stories convert a payload to its typed struct with `rmpv::ext::from_value`. It is the same project and release line as the already-pinned `rmp-serde`.
 
 **[Amended 2026-09-23, Epic 2 Stories 2.4 + 2.5]** `getrandom` is added, with no features. `hexput-session` draws each Client ID's 128 bits from the OS CSPRNG through `getrandom::fill`, so a Client ID is unguessable rather than merely unique; OQ-2's reconnect secret (Epic 5) will draw from the same source rather than add a second one. A Daemon that cannot read the CSPRNG issues no Client ID at all. The same stories put the already-pinned `dashmap` to its first use: the Session registry, keyed by Client ID.
+
+**[Amended 2026-09-23, Epic 2 Story 2.8]** `tracing-subscriber` gains its `json` feature, on the same 0.3.23 pin. System Config's `log_format = "json"` makes `hexput-daemon` write one JSON object per event, with the fields of every enclosing span — a connection's `connection` and `client_id`, a request's `id` — as JSON fields; plain text stays the default. The feature brings `serde_json` and `tracing-serde` in transitively; `serde_json` is also pinned — here and in `[workspace.dependencies]` — as a test-only dependency of `hexput-tests`, which parses those lines; no production crate depends on it directly. No crate edge changes.
 
 ## Structural Seed
 

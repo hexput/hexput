@@ -8,7 +8,8 @@
 //!
 //! # What lands in Stories 2.4 and 2.5
 //!
-//! [`Sessions`] is the registry. [`Sessions::create`] turns a decoded [`InitRequest`] into a
+//! [`Sessions`] is the registry. [`Sessions::connect`] issues a Connection its [`ConnectionId`]
+//! when it opens, before init; [`Sessions::create`] turns a decoded [`InitRequest`] into a
 //! Session keyed by a freshly issued [`ClientId`], born with its creating Connection attached.
 //! A Session holds a *set* of attached Connections — zero or more, never "exactly one" (AD-2).
 //! [`Sessions::detach`] removes one; detaching the last removes the Session from the registry in
@@ -29,9 +30,10 @@ pub use hexput_shared::ids::ClientId;
 
 pub use init::{Config, InitError, InitRequest, RegisteredFunction};
 
-/// One Connection's attachment to a Session. Local to this Daemon run and never on the wire,
-/// so it is not a `hexput-shared` id: two attachments of the same Connection never exist, and
-/// no two attachments in one run share a value.
+/// A Connection's identity for this Daemon run, issued by [`Sessions::connect`] when it opens —
+/// before init, so even its pre-init log events name it — and also its attachment to a Session.
+/// Local to this Daemon run and never on the wire, so it is not a `hexput-shared` id: no two
+/// Connections in one run share a value, and a Connection is attached under this id alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnectionId(u64);
 
@@ -70,8 +72,22 @@ impl Sessions {
         Self::default()
     }
 
-    /// Create a Session from a decoded `Init`, with one new Connection attached: the Connection
-    /// that sent it. Returns the Session's newly issued Client ID and that attachment.
+    /// Issue a new Connection its identity for this run. Called when a Connection opens, before
+    /// it sends anything; the same id is later its attachment in [`create`](Self::create) or
+    /// [`attach`](Self::attach). Takes no lock.
+    #[must_use]
+    pub fn connect(&self) -> ConnectionId {
+        // Uniqueness is all that is needed; no other memory is ordered by this counter.
+        ConnectionId(self.next_connection.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Create a Session from a decoded `Init`, with one Connection attached: `connection`, the
+    /// one that sent it (issued by [`connect`](Self::connect)). Returns the Session's newly
+    /// issued Client ID.
+    ///
+    /// Precondition, not checked: `connection` came from [`connect`](Self::connect) on this
+    /// registry and is attached to at most one Session, once — this call or one
+    /// [`attach`](Self::attach), never both, never twice.
     ///
     /// The Client ID is 128 bits from the OS CSPRNG. A collision with a live Session draws again
     /// rather than overwriting it.
@@ -81,8 +97,7 @@ impl Sessions {
     /// If the OS CSPRNG cannot be read. A Daemon that cannot issue unguessable identifiers must
     /// not issue guessable ones; the panic stays within the calling Connection's task.
     #[must_use]
-    pub fn create(&self, init: InitRequest) -> (ClientId, ConnectionId) {
-        let connection = self.next_connection_id();
+    pub fn create(&self, init: InitRequest, connection: ConnectionId) -> ClientId {
         let session = Session {
             config: init.config,
             registrations: init.registrations,
@@ -94,21 +109,30 @@ impl Sessions {
             if let Entry::Vacant(vacant) = self.sessions.entry(generate_client_id()) {
                 let client_id = *vacant.key();
                 vacant.insert(session);
-                return (client_id, connection);
+                return client_id;
             }
         }
     }
 
-    /// Attach one more Connection to a live Session. `None` when no Session has this Client ID.
+    /// Attach one more Connection — `connection`, issued by [`connect`](Self::connect) — to a
+    /// live Session. Returns whether a Session has this Client ID; when none does, nothing
+    /// changes.
+    ///
+    /// Precondition, not checked: `connection` came from [`connect`](Self::connect) on this
+    /// registry and is attached to at most one Session, once — this call or one
+    /// [`create`](Self::create), never both, never twice.
     ///
     /// Nothing on the wire reaches this before reconnect (Epic 5); it exists so a Session with
     /// several attachments is a state the registry supports from the start (AD-2).
     #[must_use]
-    pub fn attach(&self, client_id: ClientId) -> Option<ConnectionId> {
-        let mut session = self.sessions.get_mut(&client_id)?;
-        let connection = self.next_connection_id();
-        session.connections.insert(connection);
-        Some(connection)
+    pub fn attach(&self, client_id: ClientId, connection: ConnectionId) -> bool {
+        match self.sessions.get_mut(&client_id) {
+            Some(mut session) => {
+                session.connections.insert(connection);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Detach a Connection from its Session. When it was the last one attached, the Session is
@@ -162,11 +186,6 @@ impl Sessions {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
-    }
-
-    fn next_connection_id(&self) -> ConnectionId {
-        // Uniqueness is all that is needed; no other memory is ordered by this counter.
-        ConnectionId(self.next_connection.fetch_add(1, Ordering::Relaxed))
     }
 }
 

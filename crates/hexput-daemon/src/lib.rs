@@ -48,7 +48,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use clap::Parser;
-use hexput_config::{Loaded, LogLevel};
+use hexput_config::{Loaded, LogFormat, LogLevel};
 #[cfg(unix)]
 use hexput_session::Sessions;
 use tracing_subscriber::filter::LevelFilter;
@@ -171,7 +171,7 @@ where
         }
     };
 
-    let dispatch = logging(loaded.config.log_level, log);
+    let dispatch = logging(loaded.config.log_level, loaded.config.log_format, log);
     let runtime = {
         // Every runtime worker thread gets the same subscriber for its whole life. The guard is
         // leaked on purpose: dropping it would restore the previous default the moment the
@@ -245,7 +245,7 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                 }
                 accepted = listener.accept() => match accepted {
                     Ok(port) => {
-                        tracing::debug!("connection accepted");
+                        // `serve` logs the connection's opening inside its own span.
                         connections.spawn(hexput_connection::serve(port, Arc::clone(&sessions)));
                     }
                     Err(error) => {
@@ -313,9 +313,16 @@ fn listen(loaded: &Loaded) -> Result<hexput_transport::uds::UdsListener, String>
     Ok(listener)
 }
 
-/// A plain-text `fmt` subscriber writing to `log`, filtered at the System Config's `log_level`.
-/// Structured JSON output is Story 2.8's.
-fn logging<L: Write + Send + 'static>(level: LogLevel, log: L) -> tracing::Dispatch {
+/// A `fmt` subscriber writing to `log` in the System Config's `log_format`, filtered at its
+/// `log_level`. Plain text shows a connection's and a request's span fields in each line's
+/// context prefix; JSON writes one object per line, the fields of the innermost span under
+/// `span` and those of every enclosing span under `spans`. The level filters events only in
+/// effect: `hexput-connection` creates its spans at `ERROR`, so they pass any level.
+fn logging<L: Write + Send + 'static>(
+    level: LogLevel,
+    format: LogFormat,
+    log: L,
+) -> tracing::Dispatch {
     let filter = match level {
         LogLevel::Error => LevelFilter::ERROR,
         LogLevel::Warn => LevelFilter::WARN,
@@ -323,11 +330,19 @@ fn logging<L: Write + Send + 'static>(level: LogLevel, log: L) -> tracing::Dispa
         LogLevel::Debug => LevelFilter::DEBUG,
         LogLevel::Trace => LevelFilter::TRACE,
     };
-    let subscriber = tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_max_level(filter)
-        .with_writer(Mutex::new(log))
-        .finish();
-    tracing::Dispatch::new(subscriber)
+        .with_writer(Mutex::new(log));
+    match format {
+        LogFormat::Text => tracing::Dispatch::new(builder.finish()),
+        LogFormat::Json => tracing::Dispatch::new(
+            builder
+                .json()
+                .with_current_span(true)
+                .with_span_list(true)
+                .finish(),
+        ),
+    }
 }
 
 /// Completes on SIGINT or SIGTERM (Ctrl-C on Windows). The signal handlers are registered when

@@ -140,16 +140,40 @@ fn run_timed(
         sent: sent.clone(),
         fail,
     };
+    let dispatch = discarding_dispatch();
+    let worker_dispatch = dispatch.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .on_thread_start(move || {
+            std::mem::forget(tracing::dispatcher::set_default(&worker_dispatch));
+        })
         .build()
         .unwrap();
     let started = Instant::now();
-    runtime.block_on(hexput_connection::serve(port, Arc::clone(sessions)));
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(hexput_connection::serve(port, Arc::clone(sessions)));
+    });
     let elapsed = started.elapsed();
     drop(runtime);
     let written = sent.0.lock().unwrap().clone();
     let left = script.lock().unwrap().len();
     (written, left, elapsed)
+}
+
+/// A subscriber that enables every event and span and writes them nowhere, installed around every
+/// `serve` in this file (and on its blocking threads).
+///
+/// `tracing` caches whether a callsite is enabled process-wide, when the callsite is first hit.
+/// A callsite first hit with no subscriber at all, while another test is installing its own
+/// scoped subscriber, can be cached as disabled for good — which would strip the spans from
+/// what [`at_a_quiet_level_a_warning_keeps_its_span_fields`] observes. With a subscriber live
+/// wherever `hexput-connection` runs, no callsite is ever registered without one.
+fn discarding_dispatch() -> tracing::Dispatch {
+    tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(io::sink)
+            .finish(),
+    )
 }
 
 fn message(id: u64, message_type: MessageType) -> Received {
@@ -909,4 +933,106 @@ fn a_clean_close_waits_for_in_flight_executions_and_detaches_after() {
         sessions.is_empty(),
         "and only then was the Session detached"
     );
+}
+
+// --- Story 2.8: spans survive a quiet log level ---
+
+/// A Port whose every write fails as unframable, so the connection logs its one `warn`.
+struct Unframable(Arc<Mutex<VecDeque<Received>>>);
+struct UnframableIn(Arc<Mutex<VecDeque<Received>>>);
+struct UnframableOut;
+
+impl Port for Unframable {
+    type Inbound = UnframableIn;
+    type Outbound = UnframableOut;
+
+    fn split(self) -> (UnframableIn, UnframableOut) {
+        (UnframableIn(self.0), UnframableOut)
+    }
+}
+
+impl Inbound for UnframableIn {
+    async fn recv(&mut self) -> Received {
+        let next = self.0.lock().unwrap().pop_front();
+        next.unwrap_or(Received::Closed(None))
+    }
+}
+
+impl Outbound for UnframableOut {
+    async fn send(&mut self, _: Envelope<Value>) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::InvalidInput))
+    }
+}
+
+/// A log sink the test reads back.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The matrix's quiet-level row: at `warn`, `debug` events are filtered out, but the spans are
+/// still enabled, so the `warn` events that do pass keep `connection`, `client_id` and `id`.
+#[test]
+fn at_a_quiet_level_a_warning_keeps_its_span_fields() {
+    let log = Captured::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(Mutex::new(writer))
+        .finish();
+    let script = vec![
+        message(1, MessageType::ExecutionStart),
+        init(2, init_payload(&[])),
+        message(3, MessageType::Result),
+        // Its reply is written from the `Finished` arm, once the execution completes.
+        execution(4, "return 1;"),
+    ];
+    let port = Unframable(Arc::new(Mutex::new(VecDeque::from(script))));
+    let sessions = Arc::new(Sessions::new());
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let worker_dispatch = dispatch.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .on_thread_start(move || {
+            std::mem::forget(tracing::dispatcher::set_default(&worker_dispatch));
+        })
+        .build()
+        .unwrap();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(hexput_connection::serve(port, Arc::clone(&sessions)));
+    });
+    assert!(sessions.is_empty(), "the connection detached");
+
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    // One warning per reply: nothing below `warn` got through.
+    assert_eq!(events.len(), 4, "{text}");
+    let mut issued = None;
+    for (event, request) in events.iter().zip(["1", "2", "3", "4"]) {
+        assert_eq!(event["level"], "WARN", "{event}");
+        let spans = event["spans"].as_array().expect("span fields");
+        assert_eq!(spans[0]["name"], "connection");
+        assert!(spans[0]["connection"].is_u64(), "{event}");
+        assert_eq!(spans[1]["name"], "request");
+        assert_eq!(spans[1]["id"], request, "{event}");
+        let client_id = spans[0]["client_id"].as_str().expect("a client_id field");
+        if request == "1" {
+            assert_eq!(client_id, "none", "before init: {event}");
+        } else {
+            assert_eq!(client_id.len(), ClientId::TEXT_LEN, "{event}");
+            assert_eq!(*issued.get_or_insert(client_id.to_owned()), client_id);
+        }
+    }
 }

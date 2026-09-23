@@ -24,6 +24,7 @@
 //!
 //! ```toml
 //! log_level = "info"          # optional: error | warn | info | debug | trace — default "info"
+//! log_format = "text"         # optional: text | json — default "text"
 //! session_ttl_secs = 300      # optional: a whole number of seconds, at least 1 — default 300
 //!
 //! [transport.uds]             # at least one [transport.*] section is required
@@ -41,7 +42,8 @@
 //!
 //! `crates/hexput-config/config.example.toml` documents every field, and a test parses it so the
 //! example cannot drift from this parser. Every field inside a present transport section is
-//! required; only `log_level` and `session_ttl_secs` have defaults, and both are stated above.
+//! required; only `log_level`, `log_format` and `session_ttl_secs` have defaults, and all three are
+//! stated above.
 //! Unknown keys are rejected, so a typo cannot silently drop a setting. Paths are kept exactly as
 //! written; a relative path is relative to the Daemon's working directory, not to the file.
 //!
@@ -107,6 +109,8 @@ pub struct SystemConfig {
     pub transports: Transports,
     /// The least severe log event the Daemon emits. Defaults to [`LogLevel::Info`].
     pub log_level: LogLevel,
+    /// How each log event is written. Defaults to [`LogFormat::Text`].
+    pub log_format: LogFormat,
     /// How long a Session outlives its last Connection. Never zero; defaults to
     /// [`DEFAULT_SESSION_TTL`] (300 seconds).
     pub session_ttl: Duration,
@@ -198,6 +202,34 @@ impl LogLevel {
 }
 
 impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `log_format`: how each log event is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogFormat {
+    /// One human-readable line per event, span fields in its context prefix. The default.
+    Text,
+    /// One JSON object per line; span fields appear as JSON fields.
+    Json,
+}
+
+impl LogFormat {
+    /// Every format — also the order the accepted values are listed in errors.
+    pub const ALL: [LogFormat; 2] = [LogFormat::Text, LogFormat::Json];
+
+    /// The format as it is written in the file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogFormat::Text => "text",
+            LogFormat::Json => "json",
+        }
+    }
+}
+
+impl fmt::Display for LogFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }

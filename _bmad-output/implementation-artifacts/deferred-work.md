@@ -200,3 +200,11 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-2-7-keep-slow-executions-from-blocking-anything-else.md`
   summary: A panicking Direct Execution task is logged and its request goes unanswered, and neither behaviour has a test.
   evidence: Review findings (blind, edge-case, verification-gap layers). The `JoinError` carries no correlation id, and no `protocol.*` code exists for an internal failure; changing `continue` to `return` in `Finished(Err)` passes every test because nothing can make `direct_execution` panic. Settle with a panic-injection seam (e.g. a `#[cfg(test)]` executor hook inside `hexput-connection`) and, if a Backend should be told, `join_next_with_id` or `catch_unwind` plus an internal-error code — best with Epic 3's enforcement, which adds the first code paths that could plausibly panic.
+
+- source_spec: `spec-2-8-trace-every-request-back-to-its-client-id.md`
+  summary: A panicked Direct Execution task is logged in its connection's span only, without the request `id` span field.
+  evidence: Review finding (edge-case layer). The `JoinError` is observed in the loop after the task's request span is gone. Settle together with the 2.7 panic entry above, e.g. `JoinSet::join_next_with_id` mapping task ids to request spans, or `catch_unwind` inside the blocking closure so the panic is logged in the request span.
+
+- source_spec: `spec-2-8-trace-every-request-back-to-its-client-id.md`
+  summary: Debug-level Daemon tests asserting on log events may be sensitive to `tracing`'s process-wide callsite-interest cache (unverified, would be medium).
+  evidence: Review finding (edge-case layer). `tests/connection.rs` showed ~30% flake before a discarding subscriber was installed; `tests/daemon.rs` passed 40 consecutive runs and every `serve` there runs under a Daemon dispatcher. Settle by running the daemon binary repeatedly under `--test-threads` stress in CI; if it flakes, apply the same discarding-dispatch approach or split the Story 2.8 tests into their own binary.

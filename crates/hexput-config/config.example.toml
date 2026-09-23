@@ -16,6 +16,11 @@
 # Optional; defaults to "info".
 log_level = "info"
 
+# How each log event is written: "text" (one human-readable line per event) or "json" (one JSON
+# object per line, with the connection's Client ID and each request's id as JSON fields).
+# Optional; defaults to "text". log_level filters both formats alike.
+log_format = "text"
+
 # How long a Session outlives its last Connection, in whole seconds, at least 1.
 # Optional; defaults to 300.
 session_ttl_secs = 300

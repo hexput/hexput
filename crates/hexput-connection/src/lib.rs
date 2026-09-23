@@ -60,7 +60,26 @@
 //! down. The detach is an explicit call on the one exit path rather than a `Drop` guard, so
 //! teardown is never implied by `Drop` (AD-4); a panic inside `serve` skips it.
 //!
-//! Binds: AD-1, AD-2, AD-6.
+//! # Logging
+//!
+//! Everything [`serve`] logs is attributed through `tracing` span fields, never message text
+//! (FR-12). A connection runs inside a `connection` span carrying `connection` — its
+//! [`ConnectionId`], issued by [`Sessions::connect`] when it opens and also its Session
+//! attachment — and `client_id`, which is `"none"` until init completes: the field is marked,
+//! never omitted. Each well-formed request (and each malformed frame whose id is readable) is
+//! handled inside a child `request` span carrying its correlation `id` as a string (`"none"` when
+//! a request has none). That span is carried onto the blocking thread that runs a Direct Execution, and
+//! entered again while the execution's reply is written, so every event about a request —
+//! wherever it is emitted — names both the Client ID and the request.
+//!
+//! A successful init *replaces* the connection span with one carrying the issued Client ID,
+//! rather than recording into the old one: an unset field would be omitted from output, and a
+//! re-recorded one is written twice in text output. "init completed" is the first event of the
+//! new span. Both spans are created at `ERROR` level, so no configured log level disables them
+//! and strips their fields from the events that do pass. This crate only creates spans; the
+//! Daemon chooses how they are written.
+//!
+//! Binds: AD-1, AD-2, AD-6, FR-12.
 
 use std::io;
 use std::sync::Arc;
@@ -71,22 +90,64 @@ use hexput_port::{
 };
 use hexput_session::{ClientId, ConnectionId, InitRequest, Sessions};
 use tokio::task::{JoinError, JoinSet};
+use tracing::{Instrument, Span};
 
-/// A connection's attachment: the Session's Client ID and this connection's own attachment id.
-/// Never a copy of the Session's Config — that lives only in [`Sessions`] (AD-5).
-type Attachment = (ClientId, ConnectionId);
+/// The one connection's identity and state, as the loop sees it.
+struct Connection<'s> {
+    sessions: &'s Sessions,
+    /// Issued when the connection opened; also its attachment once init completes.
+    id: ConnectionId,
+    /// The Client ID of the Session this connection is attached to, once init completes. Never a
+    /// copy of the Session's Config — that lives only in [`Sessions`] (AD-5).
+    attached: Option<ClientId>,
+    /// The span everything about this connection is logged in; replaced once, on init.
+    span: Span,
+}
 
 /// Serve one connection until the peer leaves, a write fails, or a fatal protocol error closes
 /// it, then detach it from its Session if it completed init. Never panics on anything the peer
 /// sends; failures are logged at `debug`, since a peer leaving is routine.
 pub async fn serve<P: Port>(port: P, sessions: Arc<Sessions>) {
-    let mut attached: Option<Attachment> = None;
-    exchange(port, &sessions, &mut attached).await;
+    let id = sessions.connect();
+    let mut connection = Connection {
+        sessions: &sessions,
+        id,
+        attached: None,
+        span: connection_span(id, None),
+    };
+    connection
+        .span
+        .in_scope(|| tracing::debug!("connection opened"));
+    exchange(port, &mut connection).await;
     // The one exit path: however `exchange` ended — its executions finished or abandoned — a
     // completed init is undone here.
-    if let Some((client_id, connection)) = attached {
-        sessions.detach(client_id, connection);
-        tracing::debug!("connection detached from its Session");
+    if let Some(client_id) = connection.attached {
+        sessions.detach(client_id, id);
+        connection
+            .span
+            .in_scope(|| tracing::debug!("connection detached from its Session"));
+    }
+}
+
+/// The span a connection is served in. `ERROR` level, so no log level can disable it.
+fn connection_span(id: ConnectionId, client_id: Option<ClientId>) -> Span {
+    match client_id {
+        Some(client_id) => tracing::error_span!(
+            "connection",
+            connection = id.get(),
+            client_id = %client_id,
+        ),
+        // `%`, like the Client ID: plain text shows `client_id=none`, not `client_id="none"`.
+        None => tracing::error_span!("connection", connection = id.get(), client_id = %"none"),
+    }
+}
+
+/// The span one request is handled in, a child of its connection's. `ERROR` level, like it.
+fn request_span(connection: &Span, id: Option<CorrelationId>) -> Span {
+    match id {
+        // Always a string, `"none"` included, so the field has one type in every JSON line.
+        Some(id) => tracing::error_span!(parent: connection, "request", id = %id.get()),
+        None => tracing::error_span!(parent: connection, "request", id = %"none"),
     }
 }
 
@@ -100,7 +161,10 @@ enum Event {
 
 /// Read, answer and write until the connection ends. Returning drops `running`, which abandons
 /// every execution still in flight.
-async fn exchange<P: Port>(port: P, sessions: &Sessions, attached: &mut Option<Attachment>) {
+///
+/// No span guard is ever held across an `.await`: synchronous work runs in `Span::in_scope`,
+/// and each awaited future is `instrument`ed with the span it belongs to.
+async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
     let (mut inbound, mut outbound) = port.split();
     let mut running: JoinSet<Envelope<Value>> = JoinSet::new();
     // Whether the peer may still send; once it cannot, only in-flight executions are awaited.
@@ -109,58 +173,93 @@ async fn exchange<P: Port>(port: P, sessions: &Sessions, attached: &mut Option<A
         let event = if reading {
             // Both futures are cancel-safe: the branch that loses loses nothing.
             tokio::select! {
-                received = inbound.recv() => Event::Received(received),
+                received = inbound.recv().instrument(connection.span.clone()) => {
+                    Event::Received(received)
+                }
                 Some(finished) = running.join_next() => Event::Finished(finished),
             }
         } else {
-            match running.join_next().await {
+            match running
+                .join_next()
+                .instrument(connection.span.clone())
+                .await
+            {
                 Some(finished) => Event::Finished(finished),
                 None => return,
             }
         };
-        let reply = match event {
+        // The reply, and the request span it is written in (the connection's, for a malformed
+        // frame whose id is unreadable).
+        let (reply, span) = match event {
             Event::Received(Received::Message(request)) => {
-                match answer(request, sessions, attached) {
-                    Answer::Reply(reply) => reply,
+                let span = request_span(&connection.span, request.id);
+                match span.in_scope(|| answer(request, connection)) {
+                    Answer::Reply(reply) => (reply, span),
+                    Answer::Initialized(client_id, reply) => {
+                        // The Client ID becomes part of the connection span, so the span is
+                        // replaced (see "Logging"); "init completed" is its first event.
+                        connection.attached = Some(client_id);
+                        connection.span = connection_span(connection.id, Some(client_id));
+                        let span = request_span(&connection.span, reply.id);
+                        span.in_scope(|| tracing::debug!("init completed; Session created"));
+                        (reply, span)
+                    }
                     Answer::Execute(id, payload) => {
-                        // The blocking thread does not inherit the caller's span; carry it, so
-                        // everything the execution logs stays in the connection's span.
-                        let span = tracing::Span::current();
+                        // The blocking thread does not inherit the caller's span; carry the
+                        // request's, so everything the execution logs names its connection,
+                        // its Client ID and its request.
                         running.spawn_blocking(move || span.in_scope(|| execute(id, payload)));
                         continue;
                     }
                 }
             }
             Event::Received(Received::Malformed(failure)) => {
-                tracing::debug!(error = %failure, "rejected a malformed frame");
-                if failure.error.is_fatal() {
-                    tracing::debug!(
-                        "closing the connection after a fatal protocol error, once its executions finish"
-                    );
-                    reading = false;
-                }
-                failure.to_response()
+                let span = match failure.id {
+                    Some(id) => request_span(&connection.span, Some(id)),
+                    None => connection.span.clone(),
+                };
+                span.in_scope(|| {
+                    tracing::debug!(error = %failure, "rejected a malformed frame");
+                    if failure.error.is_fatal() {
+                        tracing::debug!(
+                            "closing the connection after a fatal protocol error, once its executions finish"
+                        );
+                        reading = false;
+                    }
+                });
+                (failure.to_response(), span)
             }
             Event::Received(Received::Closed(None)) => {
-                tracing::debug!("connection closed by the peer");
+                connection
+                    .span
+                    .in_scope(|| tracing::debug!("connection closed by the peer"));
                 reading = false;
                 continue;
             }
             Event::Received(Received::Closed(Some(error))) => {
                 // The stream is broken: nothing more can be written, so nothing is waited for.
-                tracing::debug!(%error, "connection lost");
+                connection
+                    .span
+                    .in_scope(|| tracing::debug!(%error, "connection lost"));
                 return;
             }
-            Event::Finished(Ok(reply)) => reply,
+            Event::Finished(Ok(reply)) => {
+                // Executions start only after init, so the connection span already names the
+                // Client ID the request was made under.
+                let span = request_span(&connection.span, reply.id);
+                (reply, span)
+            }
             Event::Finished(Err(error)) => {
                 // A task that panicked has no id left to answer with. It ends only itself.
-                tracing::error!(%error, "a Direct Execution task failed; its request goes unanswered");
+                connection.span.in_scope(|| {
+                    tracing::error!(%error, "a Direct Execution task failed; its request goes unanswered");
+                });
                 continue;
             }
         };
         // Every registry lock `answer` took is released by now: nothing is held across this
         // `.await`, and it is driven to completion, never raced.
-        if !deliver(&mut outbound, reply).await {
+        if !deliver(&mut outbound, reply).instrument(span).await {
             return;
         }
     }
@@ -203,20 +302,19 @@ async fn deliver<O: Outbound>(outbound: &mut O, reply: Envelope<Value>) -> bool 
 enum Answer {
     /// At once, with this reply.
     Reply(Envelope<Value>),
+    /// At once, with this reply: init completed and a Session with this Client ID now has the
+    /// connection attached.
+    Initialized(ClientId, Envelope<Value>),
     /// By a Direct Execution of this payload, dispatched as its own task, replying to this id.
     Execute(Option<CorrelationId>, Value),
 }
 
 /// Answer one well-formed message. Takes it by value so an execution's payload — up to a whole
 /// frame — moves to its task instead of being copied.
-fn answer(
-    request: Envelope<Value>,
-    sessions: &Sessions,
-    attached: &mut Option<Attachment>,
-) -> Answer {
+fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
     // Messages that need no Session.
     match request.message_type {
-        MessageType::Init => return Answer::Reply(init(&request, sessions, attached)),
+        MessageType::Init => return init(&request, connection),
         MessageType::ExecutionStart => {}
         other => {
             return Answer::Reply(refuse(
@@ -229,7 +327,7 @@ fn answer(
 
     // The init gate: the one check between a connection and everything that needs a Session.
     // Health/metrics (Epic 7) join the arm above to bypass it.
-    if attached.is_none() {
+    if connection.attached.is_none() {
         return Answer::Reply(refuse(
             request.id,
             ProtocolCode::InitNotCompleted,
@@ -260,39 +358,43 @@ fn execute(id: Option<CorrelationId>, payload: Value) -> Envelope<Value> {
 }
 
 /// Serve `Init`: decode the payload, create the Session with this connection attached, and
-/// answer its Client ID.
-fn init(
-    request: &Envelope<Value>,
-    sessions: &Sessions,
-    attached: &mut Option<Attachment>,
-) -> Envelope<Value> {
-    if attached.is_some() {
-        return refuse(
+/// answer its Client ID. The caller records the attachment and logs the completed init in the
+/// new connection span.
+fn init(request: &Envelope<Value>, connection: &Connection<'_>) -> Answer {
+    if connection.attached.is_some() {
+        return Answer::Reply(refuse(
             request.id,
             ProtocolCode::AlreadyInitialized,
             "this connection already completed init; its Session is unchanged".to_owned(),
-        );
+        ));
     }
     let init = match InitRequest::from_value(&request.payload) {
         Ok(init) => init,
         Err(error) => {
             tracing::debug!(%error, "refused an invalid init");
-            return refuse(request.id, ProtocolCode::InvalidPayload, error.to_string());
+            return Answer::Reply(refuse(
+                request.id,
+                ProtocolCode::InvalidPayload,
+                error.to_string(),
+            ));
         }
     };
-    let (client_id, connection) = sessions.create(init);
-    *attached = Some((client_id, connection));
-    tracing::debug!("init completed; Session created");
-    Envelope {
-        id: request.id,
-        message_type: MessageType::Result,
-        payload: Value::Map(vec![(
-            Value::from("client_id"),
-            Value::from(client_id.to_string()),
-        )]),
-    }
+    let client_id = connection.sessions.create(init, connection.id);
+    Answer::Initialized(
+        client_id,
+        Envelope {
+            id: request.id,
+            message_type: MessageType::Result,
+            payload: Value::Map(vec![(
+                Value::from("client_id"),
+                Value::from(client_id.to_string()),
+            )]),
+        },
+    )
 }
 
+/// A `protocol.*` refusal of request `id`, logged at `debug` in whatever span is current.
 fn refuse(id: Option<CorrelationId>, code: ProtocolCode, message: String) -> Envelope<Value> {
+    tracing::debug!(code = %code, "refused a request");
     error_response(id, &ErrorBody::from(&ProtocolError::new(code, message)))
 }

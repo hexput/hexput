@@ -282,6 +282,11 @@ fn every_broken_file_exits_one_naming_the_file() {
             "invalid value for `log_level`: expected one of error, warn, info, debug, trace",
         ),
         (
+            "format.toml",
+            "log_format = \"xml\"\n[transport.uds]\npath = \"x\"\n",
+            ":1:14: invalid value for `log_format`: expected one of text, json, got \"xml\"",
+        ),
+        (
             "ttl.toml",
             "session_ttl_secs = 0\n[transport.uds]\npath = \"x\"\n",
             "invalid value for `session_ttl_secs`",
@@ -1015,4 +1020,288 @@ fn every_startup_failure_exits_one_naming_the_cause_and_touches_nothing() {
         run.stderr
     );
     assert!(!socket.exists());
+}
+
+// --- Story 2.8: every request traced back to its Client ID ---
+
+/// An initialized client over the real socket, with the Client ID it was issued.
+#[cfg(unix)]
+fn traced_client(serving: &Serving, init_id: u64) -> (std::os::unix::net::UnixStream, String) {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let mut client = serving.connect();
+    let init = Envelope::new(
+        CorrelationId(init_id),
+        MessageType::Init,
+        Value::Map(vec![
+            (Value::from("config"), Value::Map(vec![])),
+            (Value::from("registrations"), Value::Array(vec![])),
+        ]),
+    );
+    wire::send(&mut client, &init);
+    let reply = wire::reply(&mut client).expect("an init reply");
+    assert_eq!(reply.message_type, MessageType::Result);
+    let client_id = reply.payload.as_map().expect("a map")[0]
+        .1
+        .as_str()
+        .expect("a Client ID")
+        .to_owned();
+    (client, client_id)
+}
+
+/// A Direct Execution request.
+#[cfg(unix)]
+fn traced_execution(id: u64, source: &str) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::ExecutionStart,
+        Value::Map(vec![
+            (Value::from("source"), Value::from(source)),
+            (Value::from("variables"), Value::Map(vec![])),
+        ]),
+    )
+}
+
+/// One parsed JSON log line.
+struct JsonEvent(serde_json::Value);
+
+impl JsonEvent {
+    fn message(&self) -> &str {
+        self.0["fields"]["message"].as_str().unwrap_or_default()
+    }
+
+    /// Every enclosing span, outermost first; empty outside any span.
+    fn spans(&self) -> &[serde_json::Value] {
+        self.0["spans"].as_array().map_or(&[], Vec::as_slice)
+    }
+
+    /// The `connection` span's fields, if the event is inside one.
+    fn connection(&self) -> Option<&serde_json::Value> {
+        self.spans()
+            .iter()
+            .find(|span| span["name"] == "connection")
+    }
+
+    /// The `request` span's `id`, if the event is inside one.
+    fn request(&self) -> Option<&serde_json::Value> {
+        self.spans()
+            .iter()
+            .find(|span| span["name"] == "request")
+            .map(|span| &span["id"])
+    }
+}
+
+/// Every log line, each of which must be exactly one JSON object.
+fn json_events(log: &str) -> Vec<JsonEvent> {
+    log.lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("not one JSON object ({error}): {line}"));
+            assert!(value.is_object(), "not an object: {line}");
+            JsonEvent(value)
+        })
+        .collect()
+}
+
+/// Story 2.8, the matrix's pre-init, init, execution, two-connection and JSON rows over the real
+/// socket: every event a connection logs carries `connection` and `client_id` as span fields —
+/// `"none"` before init, its own Client ID after — and every event for a request its `id`,
+/// including those emitted on the blocking thread that runs the Script.
+#[cfg(unix)]
+#[test]
+fn every_connection_event_carries_its_client_id_and_request_id_in_json() {
+    let sandbox = Sandbox::new();
+    let config = format!(
+        "log_level = \"debug\"\nlog_format = \"json\"\n{}",
+        sandbox.valid()
+    );
+    let serving = Serving::start(&sandbox, &config);
+
+    // Pre-init: refused, with nothing run.
+    let mut early = serving.connect();
+    wire::send(&mut early, &wire::request(41));
+    assert_eq!(
+        wire::refusal(&mut early),
+        (Some(41), "protocol.init_not_completed".to_owned())
+    );
+
+    // Malformed frames on the same connection: one whose id cannot be read, one whose id can.
+    wire::send_raw(&mut early, &hexput_port::encode_frame(&[0xc1]).unwrap());
+    assert_eq!(
+        wire::refusal(&mut early),
+        (None, "protocol.malformed_frame".to_owned())
+    );
+    let bogus = rmpv::Value::Map(vec![
+        (rmpv::Value::from("id"), rmpv::Value::from(50)),
+        (rmpv::Value::from("type"), rmpv::Value::from("Bogus")),
+        (rmpv::Value::from("payload"), rmpv::Value::Nil),
+    ]);
+    let mut body = Vec::new();
+    rmpv::encode::write_value(&mut body, &bogus).unwrap();
+    wire::send_raw(&mut early, &hexput_port::encode_frame(&body).unwrap());
+    assert_eq!(
+        wire::refusal(&mut early),
+        (Some(50), "protocol.unknown_message_type".to_owned())
+    );
+
+    // Two initialized connections; A's Script fails, B's succeeds.
+    let (mut a, a_id) = traced_client(&serving, 1);
+    let (mut b, b_id) = traced_client(&serving, 2);
+    assert_ne!(a_id, b_id);
+    wire::send(&mut a, &traced_execution(20, "return 1 / 0;"));
+    assert_eq!(
+        wire::refusal(&mut a),
+        (Some(20), "arithmetic.division_by_zero".to_owned())
+    );
+    wire::send(&mut b, &traced_execution(30, "return 1;"));
+    assert!(wire::reply(&mut b).is_some());
+
+    let run = serving.stop();
+    run.exit(0);
+    let events = json_events(&run.log);
+    assert!(!events.is_empty());
+
+    // Every event inside a connection span carries both fields; nothing names a Client ID in
+    // its message text.
+    for event in &events {
+        if let Some(connection) = event.connection() {
+            assert!(connection["connection"].is_u64(), "{}", event.0);
+            let client_id = connection["client_id"].as_str().expect("a client_id field");
+            assert!(
+                client_id == "none" || client_id.len() == 32,
+                "{client_id}: {}",
+                event.0
+            );
+        }
+        for id in [&a_id, &b_id] {
+            assert!(!event.message().contains(id.as_str()), "{}", event.0);
+        }
+    }
+    // Only the Daemon's own startup and shutdown events are outside any connection.
+    for event in events.iter().filter(|e| e.connection().is_none()) {
+        assert!(
+            [
+                "System Config loaded",
+                "listening on a Unix Domain Socket",
+                "daemon started; waiting for a shutdown signal",
+                "shutdown requested; daemon stopping",
+            ]
+            .contains(&event.message()),
+            "an unattributed event: {}",
+            event.0
+        );
+    }
+
+    // A request id is always a string, so the field has one type on every line.
+    let find = |message: &str, request: u64| -> &JsonEvent {
+        let request = serde_json::Value::from(request.to_string());
+        events
+            .iter()
+            .find(|e| e.message() == message && e.request() == Some(&request))
+            .unwrap_or_else(|| panic!("no {message:?} for request {request}:\n{}", run.log))
+    };
+
+    // Pre-init: the refusal carries the connection and the no-Client-ID marker.
+    let refused = find("refused a request", 41);
+    assert_eq!(refused.connection().unwrap()["client_id"], "none");
+    assert_eq!(refused.0["fields"]["code"], "protocol.init_not_completed");
+
+    // Init: "init completed" already carries the issued Client ID.
+    let a_init = find("init completed; Session created", 1);
+    let b_init = find("init completed; Session created", 2);
+    assert_eq!(a_init.connection().unwrap()["client_id"], a_id.as_str());
+    assert_eq!(b_init.connection().unwrap()["client_id"], b_id.as_str());
+
+    // Execution: logged on the blocking thread, with the Client ID and the request id.
+    let failed = find("a Direct Execution failed", 20);
+    assert_eq!(failed.connection().unwrap()["client_id"], a_id.as_str());
+    assert_eq!(failed.0["span"]["name"], "request", "the innermost span");
+    assert_eq!(failed.0["span"]["id"], "20");
+
+    // Malformed frames: a readable id gets its request span inside the connection span; an
+    // unreadable one is still logged in the connection span.
+    let readable = find("rejected a malformed frame", 50);
+    assert_eq!(readable.connection().unwrap()["client_id"], "none");
+    assert_eq!(readable.0["span"]["name"], "request");
+    let unreadable = events
+        .iter()
+        .find(|e| e.message() == "rejected a malformed frame" && e.request().is_none())
+        .expect("the unreadable frame's event");
+    let connection = unreadable.connection().expect("in the connection span");
+    assert!(connection["connection"].is_u64());
+    assert_eq!(connection["client_id"], "none");
+    assert_eq!(unreadable.0["span"]["name"], "connection");
+
+    // Two connections: each connection's events carry only its own Client ID, once it has one.
+    let connection_of = |event: &JsonEvent| event.connection().unwrap()["connection"].clone();
+    for (init, own) in [(a_init, &a_id), (b_init, &b_id)] {
+        let this = connection_of(init);
+        let named: std::collections::HashSet<&str> = events
+            .iter()
+            .filter(|e| e.connection().is_some() && connection_of(e) == this)
+            .map(|e| e.connection().unwrap()["client_id"].as_str().unwrap())
+            .collect();
+        assert!(named.contains(own.as_str()));
+        assert!(
+            named.iter().all(|id| *id == "none" || id == own),
+            "{named:?}"
+        );
+        // In log order, nothing on this connection after its "init completed" is unmarked.
+        let after_init: Vec<&str> = events
+            .iter()
+            .filter(|e| e.connection().is_some() && connection_of(e) == this)
+            .skip_while(|e| e.message() != "init completed; Session created")
+            .map(|e| e.connection().unwrap()["client_id"].as_str().unwrap())
+            .collect();
+        assert!(!after_init.is_empty());
+        assert!(after_init.iter().all(|id| id == own), "{after_init:?}");
+    }
+    assert_ne!(connection_of(a_init), connection_of(b_init));
+    assert_ne!(connection_of(refused), connection_of(a_init));
+}
+
+/// Story 2.8 in plain text, still the default: the Client ID appears in a line's span context,
+/// never in its message, and before init the context says `client_id=none`.
+#[cfg(unix)]
+#[test]
+fn plain_text_shows_the_client_id_in_span_context_not_in_messages() {
+    let sandbox = Sandbox::new();
+    let config = format!("log_level = \"debug\"\n{}", sandbox.valid());
+    let serving = Serving::start(&sandbox, &config);
+    let mut early = serving.connect();
+    wire::send(&mut early, &wire::request(41));
+    wire::refusal(&mut early);
+    let (mut client, client_id) = traced_client(&serving, 7);
+    wire::send(&mut client, &traced_execution(8, "return 1 / 0;"));
+    wire::refusal(&mut client);
+    let run = serving.stop();
+    run.exit(0);
+
+    let line = |needle: &str| -> &str {
+        run.log
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line containing {needle:?}:\n{}", run.log))
+    };
+    let refused = line("refused a request");
+    assert!(refused.contains("client_id=none"), "{refused}");
+    assert!(refused.contains("request{id=41}"), "{refused}");
+
+    for (message, request) in [
+        ("init completed; Session created", 7),
+        ("a Direct Execution failed", 8),
+    ] {
+        let found = line(message);
+        let context = format!("client_id={client_id}}}:request{{id={request}}}");
+        assert!(found.contains(&context), "{found}");
+        // The span context comes before the target and the message; the message is clean.
+        let (_, text) = found
+            .split_once("hexput_connection: ")
+            .expect("the target precedes the message");
+        assert!(!text.contains(&client_id), "{found}");
+    }
+    // Plain text is not JSON.
+    assert!(!run.log.trim_start().starts_with('{'), "{}", run.log);
 }

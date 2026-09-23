@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use hexput_config::{
-    ConfigError, ConfigSource, DEFAULT_SESSION_TTL, ENV_VAR, Location, LogLevel, Problem, parse,
-    resolve,
+    ConfigError, ConfigSource, DEFAULT_SESSION_TTL, ENV_VAR, Location, LogFormat, LogLevel,
+    Problem, parse, resolve,
 };
 
 /// A temporary directory, removed when the test ends.
@@ -76,6 +76,7 @@ fn a_file_with_every_field_parses_into_every_field() {
     let config = parse(
         r#"
 log_level = "debug"
+log_format = "json"
 session_ttl_secs = 42
 
 [transport.uds]
@@ -96,6 +97,7 @@ tls_key = "/tls/ws-key.pem"
     .expect("a valid file");
 
     assert_eq!(config.log_level, LogLevel::Debug);
+    assert_eq!(config.log_format, LogFormat::Json);
     assert_eq!(config.session_ttl, Duration::from_secs(42));
     let uds = config.transports.uds.expect("a UDS transport");
     assert_eq!(uds.path, Path::new("/run/hexput/hexput.sock"));
@@ -115,6 +117,11 @@ tls_key = "/tls/ws-key.pem"
 fn log_level_and_session_ttl_have_documented_defaults() {
     let config = parse(MINIMAL).expect("a minimal file");
     assert_eq!(config.log_level, LogLevel::Info);
+    assert_eq!(
+        config.log_format,
+        LogFormat::Text,
+        "plain text is the default"
+    );
     assert_eq!(config.session_ttl, Duration::from_secs(300));
     assert_eq!(DEFAULT_SESSION_TTL, Duration::from_secs(300));
     assert!(config.transports.tcp.is_none());
@@ -129,6 +136,20 @@ fn every_log_level_is_accepted() {
         let config = parse(&marked(level.as_str())).expect("a valid level");
         assert_eq!(config.log_level, level);
     }
+}
+
+#[test]
+fn every_log_format_is_accepted() {
+    for format in LogFormat::ALL {
+        let config = parse(&format!("log_format = \"{format}\"\n{MINIMAL}")).expect("a format");
+        assert_eq!(config.log_format, format);
+        assert_eq!(format.to_string(), format.as_str());
+    }
+    assert_eq!(
+        LogFormat::ALL.map(LogFormat::as_str),
+        ["text", "json"],
+        "the accepted values, in the order errors list them"
+    );
 }
 
 #[test]
@@ -409,6 +430,23 @@ fn half_a_websocket_tls_pair_is_rejected_naming_the_missing_half() {
 }
 
 // --- invalid values ---
+
+#[test]
+fn an_unknown_log_format_names_the_field_and_the_accepted_values() {
+    let (path, text) = rendered_error(&format!("log_format = \"xml\"\n{MINIMAL}"));
+    assert_eq!(
+        text,
+        format!(
+            "{}:1:14: invalid value for `log_format`: expected one of text, json, got \"xml\"",
+            path.display()
+        )
+    );
+    // A non-string is a shape error from the parser, naming the field.
+    match parse_err(&format!("log_format = 1\n{MINIMAL}")) {
+        Problem::Parse { message, .. } => assert!(message.contains("string"), "{message}"),
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+}
 
 #[test]
 fn an_unknown_log_level_names_the_field_and_the_accepted_values() {

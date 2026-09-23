@@ -14,14 +14,15 @@ use serde::Deserialize;
 use toml::Spanned;
 
 use crate::{
-    DEFAULT_SESSION_TTL, Location, LogLevel, Problem, SystemConfig, TcpTransport, Tls, Transports,
-    UdsTransport, WebSocketTransport,
+    DEFAULT_SESSION_TTL, Location, LogFormat, LogLevel, Problem, SystemConfig, TcpTransport, Tls,
+    Transports, UdsTransport, WebSocketTransport,
 };
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFile {
     log_level: Option<Spanned<String>>,
+    log_format: Option<Spanned<String>>,
     session_ttl_secs: Option<Spanned<i64>>,
     transport: Option<RawTransports>,
 }
@@ -78,6 +79,10 @@ impl Validator<'_> {
             None => LogLevel::Info,
             Some(level) => self.log_level(&level)?,
         };
+        let log_format = match raw.log_format {
+            None => LogFormat::Text,
+            Some(format) => self.log_format(&format)?,
+        };
         let session_ttl = match raw.session_ttl_secs {
             None => DEFAULT_SESSION_TTL,
             Some(ttl) => self.session_ttl(&ttl)?,
@@ -89,6 +94,7 @@ impl Validator<'_> {
         Ok(SystemConfig {
             transports,
             log_level,
+            log_format,
             session_ttl,
         })
     }
@@ -106,6 +112,24 @@ impl Validator<'_> {
                         "expected one of {}, got {:?}",
                         accepted.join(", "),
                         level.get_ref()
+                    ),
+                )
+            })
+    }
+
+    fn log_format(&self, format: &Spanned<String>) -> Result<LogFormat, Problem> {
+        LogFormat::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == format.get_ref())
+            .ok_or_else(|| {
+                let accepted: Vec<_> = LogFormat::ALL.iter().map(|f| f.as_str()).collect();
+                self.invalid(
+                    "log_format",
+                    format,
+                    format!(
+                        "expected one of {}, got {:?}",
+                        accepted.join(", "),
+                        format.get_ref()
                     ),
                 )
             })

@@ -34,6 +34,11 @@ hexput-script = { path = "../hexput-script" }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 serde = { workspace = true }
+# Story 2.8: the daemon's JSON log lines are parsed and asserted field by field; the connection
+# tests install the same kind of subscriber around `serve` to observe its spans directly.
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 # Story 2.3: the Port's halves are async; the adapter and connection tests run them on tokio.
 tokio = { workspace = true }
 

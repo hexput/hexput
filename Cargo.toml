@@ -58,7 +58,11 @@ getrandom = "0.4.3"
 moka = "0.12.16"
 criterion = "0.8.2"
 tracing = "0.1.44"
-# The daemon's log output (Story 2.1): plain `fmt` lines filtered at System Config's `log_level`.
-# JSON output is Story 2.8's, and adds its feature here when it lands.
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+# The daemon's log output (Story 2.1): `fmt` lines filtered at System Config's `log_level`.
+# Story 2.8 adds `json`, System Config's `log_format = "json"`: one JSON object per event, span
+# fields included.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "json"] }
 indexmap = "2.14.2"
+# Story 2.8: the daemon tests parse `log_format = "json"` output line by line. Already in the
+# graph through `tracing-subscriber`'s `json` feature; no production crate depends on it directly.
+serde_json = "1.0.151"

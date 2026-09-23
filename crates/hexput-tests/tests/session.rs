@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use hexput_port::Value;
-use hexput_session::{ClientId, InitRequest, Sessions};
+use hexput_session::{ClientId, ConnectionId, InitRequest, Sessions};
 
 fn s(text: &str) -> Value {
     Value::from(text)
@@ -160,10 +160,33 @@ fn a_duplicate_registration_is_named() {
 
 // --- the registry ---
 
+/// A Connection opening and completing init: what `hexput-connection` does, in that order.
+fn create(sessions: &Sessions, init: InitRequest) -> (ClientId, ConnectionId) {
+    let connection = sessions.connect();
+    (sessions.create(init, connection), connection)
+}
+
+#[test]
+fn a_connection_id_is_issued_before_init_and_becomes_its_attachment() {
+    let sessions = Sessions::new();
+    let first = sessions.connect();
+    let second = sessions.connect();
+    assert_ne!(first, second);
+    // Connecting creates no Session.
+    assert!(sessions.is_empty());
+    let id = sessions.create(valid(&[]), second);
+    assert_eq!(sessions.attached(id), Some(1));
+    // Detaching under the id it was created with is what removes it.
+    sessions.detach(id, first);
+    assert!(sessions.contains(id));
+    sessions.detach(id, second);
+    assert!(!sessions.contains(id));
+}
+
 #[test]
 fn create_issues_a_client_id_with_its_creator_attached() {
     let sessions = Sessions::new();
-    let (id, _) = sessions.create(valid(&["getUser"]));
+    let (id, _) = create(&sessions, valid(&["getUser"]));
     assert!(sessions.contains(id));
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions.attached(id), Some(1));
@@ -179,7 +202,7 @@ fn create_issues_a_client_id_with_its_creator_attached() {
 #[test]
 fn client_ids_and_attachments_are_unique() {
     let sessions = Sessions::new();
-    let created: Vec<_> = (0..1000).map(|_| sessions.create(valid(&[]))).collect();
+    let created: Vec<_> = (0..1000).map(|_| create(&sessions, valid(&[]))).collect();
     let ids: HashSet<_> = created.iter().map(|(id, _)| *id).collect();
     let connections: HashSet<_> = created.iter().map(|(_, c)| *c).collect();
     assert_eq!(ids.len(), 1000);
@@ -190,21 +213,28 @@ fn client_ids_and_attachments_are_unique() {
 #[test]
 fn detaching_the_last_connection_tears_the_session_down() {
     let sessions = Sessions::new();
-    let (id, connection) = sessions.create(valid(&["getUser"]));
-    let (other, _) = sessions.create(valid(&["other"]));
+    let (id, connection) = create(&sessions, valid(&["getUser"]));
+    let (other, _) = create(&sessions, valid(&["other"]));
     sessions.detach(id, connection);
     assert!(!sessions.contains(id));
     assert_eq!(sessions.attached(id), None);
     assert_eq!(sessions.registration_names(id), None);
-    assert!(sessions.attach(id).is_none(), "a torn-down Session is gone");
+    let late = sessions.connect();
+    assert!(!sessions.attach(id, late), "a torn-down Session is gone");
+    assert_eq!(
+        sessions.attached(id),
+        None,
+        "a refused attach creates nothing"
+    );
     assert!(sessions.contains(other), "no other Session is touched");
 }
 
 #[test]
 fn detaching_one_of_two_connections_keeps_the_session() {
     let sessions = Sessions::new();
-    let (id, first) = sessions.create(valid(&["getUser"]));
-    let second = sessions.attach(id).expect("the Session is live");
+    let (id, first) = create(&sessions, valid(&["getUser"]));
+    let second = sessions.connect();
+    assert!(sessions.attach(id, second), "the Session is live");
     assert_ne!(first, second);
     assert_eq!(sessions.attached(id), Some(2));
 
@@ -223,8 +253,8 @@ fn detaching_one_of_two_connections_keeps_the_session() {
 #[test]
 fn detaching_what_is_not_attached_changes_nothing() {
     let sessions = Sessions::new();
-    let (id, connection) = sessions.create(valid(&[]));
-    let (other, stranger) = sessions.create(valid(&[]));
+    let (id, connection) = create(&sessions, valid(&[]));
+    let (other, stranger) = create(&sessions, valid(&[]));
     // A connection of another Session.
     sessions.detach(id, stranger);
     assert_eq!(sessions.attached(id), Some(1));
@@ -245,8 +275,9 @@ fn concurrent_creates_and_detaches_leave_nothing_behind() {
         for _ in 0..8 {
             scope.spawn(|| {
                 for _ in 0..200 {
-                    let (id, first) = sessions.create(valid(&["f"]));
-                    let second = sessions.attach(id).unwrap();
+                    let (id, first) = create(&sessions, valid(&["f"]));
+                    let second = sessions.connect();
+                    assert!(sessions.attach(id, second));
                     sessions.detach(id, first);
                     assert!(sessions.contains(id));
                     sessions.detach(id, second);

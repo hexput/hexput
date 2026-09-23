@@ -1,4 +1,4 @@
-//! Stories 2.3–2.5: the core's side of a connection, driven through an in-memory `Port`.
+//! Stories 2.3–2.7: the core's side of a connection, driven through an in-memory `Port`.
 //!
 //! No socket is involved anywhere in this file. That is the point: `hexput_connection::serve`
 //! is generic over the Port, so exercising it with an adapter that is not a transport at all is
@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use hexput_port::{
     CorrelationId, Envelope, Inbound, MessageType, Outbound, Port, ProtocolCode, ProtocolError,
@@ -119,6 +120,18 @@ fn run(
     fail: Option<(usize, io::ErrorKind)>,
     probe: Option<Probe>,
 ) -> (Vec<Envelope<Value>>, usize) {
+    let (written, left, _) = run_timed(sessions, script, fail, probe);
+    (written, left)
+}
+
+/// [`run`], also returning how long `serve` took to return. That excludes the runtime's drop,
+/// which waits for any abandoned execution still running on the blocking pool.
+fn run_timed(
+    sessions: &Arc<Sessions>,
+    script: Vec<Received>,
+    fail: Option<(usize, io::ErrorKind)>,
+    probe: Option<Probe>,
+) -> (Vec<Envelope<Value>>, usize, Duration) {
     let script = Arc::new(Mutex::new(VecDeque::from(script)));
     let sent = Sent::default();
     let port = Scripted {
@@ -127,13 +140,16 @@ fn run(
         sent: sent.clone(),
         fail,
     };
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
-        .unwrap()
-        .block_on(hexput_connection::serve(port, Arc::clone(sessions)));
+        .unwrap();
+    let started = Instant::now();
+    runtime.block_on(hexput_connection::serve(port, Arc::clone(sessions)));
+    let elapsed = started.elapsed();
+    drop(runtime);
     let written = sent.0.lock().unwrap().clone();
     let left = script.lock().unwrap().len();
-    (written, left)
+    (written, left, elapsed)
 }
 
 fn message(id: u64, message_type: MessageType) -> Received {
@@ -200,6 +216,23 @@ fn malformed(id: Option<u64>, code: ProtocolCode) -> Received {
         id: id.map(CorrelationId),
         error: ProtocolError::new(code, "broken"),
     })
+}
+
+/// `answers` in correlation-id order, for replies whose arrival order is not defined.
+fn by_id(
+    mut answers: Vec<(Option<CorrelationId>, String)>,
+) -> Vec<(Option<CorrelationId>, String)> {
+    answers.sort_by_key(|(id, _)| id.map(CorrelationId::get));
+    answers
+}
+
+/// `"Result"` for a `Result` reply, otherwise the `Error`'s code.
+fn outcome(response: &Envelope<Value>) -> String {
+    if response.message_type == MessageType::Result {
+        "Result".to_owned()
+    } else {
+        code_of(response)
+    }
 }
 
 /// The `code` of an `Error` response's payload.
@@ -473,6 +506,9 @@ fn after_init_execution_runs_and_a_second_init_is_refused() {
             (r.id, code)
         })
         .collect();
+    // The execution's reply is written when it finishes, so where it lands among the inline
+    // answers is not defined (Story 2.7): compare by id.
+    let answers = by_id(answers);
     assert_eq!(
         answers,
         [
@@ -618,17 +654,8 @@ fn a_failing_script_is_answered_and_the_connection_keeps_serving() {
         None,
     );
     assert_eq!(left, 0);
-    let answers: Vec<_> = sent[1..]
-        .iter()
-        .map(|r| {
-            let code = if r.message_type == MessageType::Result {
-                "Result".to_owned()
-            } else {
-                code_of(r)
-            };
-            (r.id, code)
-        })
-        .collect();
+    // Replies arrive in completion order, which four independent executions do not define.
+    let answers = by_id(sent[1..].iter().map(|r| (r.id, outcome(r))).collect());
     assert_eq!(
         answers,
         [
@@ -643,5 +670,243 @@ fn a_failing_script_is_answered_and_the_connection_keeps_serving() {
             ),
             (Some(CorrelationId(5)), "Result".to_owned()),
         ]
+    );
+}
+
+// --- Story 2.7: slow executions block nothing ---
+
+/// How many turns the slow Script's loop takes — sized so it runs well over a fast Script in the
+/// test profile: about half a second in a debug build, against microseconds for a fast one.
+const SLOW_TURNS: i64 = 150_000;
+
+/// A slow execution: a counted loop, never a sleep, returning [`SLOW_TURNS`].
+fn slow(id: u64) -> Received {
+    execution(
+        id,
+        &format!("let i = 0; while (i < {SLOW_TURNS}) {{ i = i + 1; }}; return i;"),
+    )
+}
+
+/// The ids of `sent`, in the order they were written.
+fn ids(sent: &[Envelope<Value>]) -> Vec<u64> {
+    sent.iter().map(|r| r.id.expect("an id").get()).collect()
+}
+
+#[test]
+fn a_fast_execution_is_answered_before_a_slow_one_submitted_earlier() {
+    let (sent, left) = serve(
+        vec![
+            init(1, init_payload(&[])),
+            slow(2),
+            execution(3, "return 3;"),
+        ],
+        None,
+    );
+    assert_eq!(left, 0);
+    assert_eq!(
+        ids(&sent),
+        [1, 3, 2],
+        "completion order, not submission order"
+    );
+    assert_eq!(
+        sent[1].payload,
+        Value::Map(vec![(string("value"), Value::from(3))])
+    );
+    assert_eq!(
+        sent[2].payload,
+        Value::Map(vec![(string("value"), Value::from(SLOW_TURNS))]),
+        "the slow one still completes, with its own id"
+    );
+}
+
+#[test]
+fn while_a_slow_execution_runs_every_other_message_is_answered_at_once() {
+    let (sent, left) = serve(
+        vec![
+            init(1, init_payload(&[])),
+            slow(2),
+            init(3, init_payload(&[])),
+            malformed(Some(4), ProtocolCode::InvalidEnvelope),
+            execution(5, "return 5;"),
+        ],
+        None,
+    );
+    assert_eq!(left, 0);
+    assert_eq!(ids(&sent), [1, 3, 4, 5, 2]);
+    let outcomes: Vec<_> = sent.iter().map(outcome).collect();
+    assert_eq!(
+        outcomes,
+        [
+            "Result",
+            "protocol.already_initialized",
+            "protocol.invalid_envelope",
+            "Result",
+            "Result"
+        ]
+    );
+}
+
+#[test]
+fn many_executions_in_flight_are_each_answered_once_with_their_ids() {
+    let mut script = vec![init(1, init_payload(&[])), slow(2)];
+    script.extend((10..40).map(|k| execution(k, &format!("return {k};"))));
+    let (sent, left) = serve(script, None);
+    assert_eq!(left, 0);
+    assert_eq!(
+        sent.len(),
+        32,
+        "the init, the slow one and thirty fast ones"
+    );
+    let mut answered = ids(&sent[1..]);
+    answered.sort_unstable();
+    let expected: Vec<u64> = std::iter::once(2).chain(10..40).collect();
+    assert_eq!(answered, expected, "every one answered exactly once");
+    for reply in &sent[1..] {
+        let id = reply.id.unwrap().get();
+        let value = if id == 2 { SLOW_TURNS } else { id as i64 };
+        assert_eq!(
+            reply.payload,
+            Value::Map(vec![(string("value"), Value::from(value))]),
+            "request {id} got its own result"
+        );
+    }
+    assert_eq!(ids(&sent).last(), Some(&2), "the slow one finishes last");
+}
+
+#[test]
+fn a_failing_execution_among_slow_ones_is_answered_first_and_the_slow_one_completes() {
+    let (sent, _) = serve(
+        vec![
+            init(1, init_payload(&[])),
+            slow(2),
+            execution(3, "return 1 / 0;"),
+        ],
+        None,
+    );
+    assert_eq!(ids(&sent), [1, 3, 2]);
+    assert_eq!(code_of(&sent[1]), "arithmetic.division_by_zero");
+    assert_eq!(sent[2].message_type, MessageType::Result);
+}
+
+#[test]
+fn a_failed_write_abandons_executions_still_in_flight_and_detaches() {
+    let sessions = Arc::new(Sessions::new());
+    // How long the slow Script takes when it is waited for.
+    let (waited, _, full) = run_timed(
+        &sessions,
+        vec![init(1, init_payload(&[])), slow(2)],
+        None,
+        None,
+    );
+    assert_eq!(ids(&waited), [1, 2]);
+
+    // The fast reply's write fails: the connection ends without waiting for the slow one.
+    let (sent, left, abandoned) = run_timed(
+        &sessions,
+        vec![
+            init(1, init_payload(&[])),
+            slow(2),
+            execution(3, "return 3;"),
+        ],
+        Some((1, io::ErrorKind::BrokenPipe)),
+        None,
+    );
+    assert_eq!(ids(&sent), [1], "nothing after the failed write");
+    assert_eq!(left, 0);
+    assert!(
+        abandoned < full / 2,
+        "serve returned in {abandoned:?}, not after the slow Script's {full:?}"
+    );
+    assert!(
+        sessions.is_empty(),
+        "the Session was detached and torn down"
+    );
+}
+
+#[test]
+fn a_lost_stream_abandons_executions_still_in_flight_and_detaches() {
+    let sessions = Arc::new(Sessions::new());
+    // How long the slow Script takes when it is waited for.
+    let (waited, _, full) = run_timed(
+        &sessions,
+        vec![init(1, init_payload(&[])), slow(2)],
+        None,
+        None,
+    );
+    assert_eq!(ids(&waited), [1, 2]);
+
+    let (sent, left, abandoned) = run_timed(
+        &sessions,
+        vec![
+            init(1, init_payload(&[])),
+            slow(2),
+            Received::Closed(Some(io::Error::from(io::ErrorKind::ConnectionReset))),
+        ],
+        None,
+        None,
+    );
+    assert_eq!(ids(&sent), [1], "nothing is written to a lost stream");
+    assert_eq!(left, 0);
+    assert!(
+        abandoned < full / 2,
+        "serve returned in {abandoned:?}, not after the slow Script's {full:?}"
+    );
+    assert!(
+        sessions.is_empty(),
+        "the Session was detached and torn down"
+    );
+}
+
+#[test]
+fn a_fatal_frame_stops_reading_but_in_flight_executions_are_still_answered() {
+    let sessions = Arc::new(Sessions::new());
+    let (sent, left) = serve_with(
+        &sessions,
+        vec![
+            init(1, init_payload(&[])),
+            slow(2),
+            malformed(None, ProtocolCode::FrameTooLarge),
+            execution(3, "return 3;"),
+        ],
+        None,
+    );
+    let answers: Vec<_> = sent.iter().map(|r| (r.id, outcome(r))).collect();
+    assert_eq!(
+        answers,
+        [
+            (Some(CorrelationId(1)), "Result".to_owned()),
+            (None, "protocol.frame_too_large".to_owned()),
+            (Some(CorrelationId(2)), "Result".to_owned()),
+        ]
+    );
+    assert_eq!(left, 1, "nothing is read after the fatal frame");
+    assert!(
+        sessions.is_empty(),
+        "the Session was detached after the reply"
+    );
+}
+
+#[test]
+fn a_clean_close_waits_for_in_flight_executions_and_detaches_after() {
+    let sessions = Arc::new(Sessions::new());
+    let seen = Arc::new(Mutex::new(None));
+    let (registry, slot) = (Arc::clone(&sessions), Arc::clone(&seen));
+    let sent = serve_probed(
+        &sessions,
+        vec![init(1, init_payload(&[])), slow(2)],
+        move |sent| {
+            // The script ran out while the slow Script was still running.
+            *slot.lock().unwrap() = Some((ids(sent), registry.len()));
+        },
+    );
+    assert_eq!(seen.lock().unwrap().take(), Some((vec![1], 1)));
+    assert_eq!(
+        ids(&sent),
+        [1, 2],
+        "its reply was still written after the close"
+    );
+    assert!(
+        sessions.is_empty(),
+        "and only then was the Session detached"
     );
 }

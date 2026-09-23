@@ -712,7 +712,7 @@ fn a_script_runs_over_the_socket_and_a_failure_disturbs_no_one() {
     // A's Script fails; A's reply is the diagnostic, with A's id.
     wire::send(&mut a, &execution(20, "return 1 / 0;", vec![]));
     // B's is sent before A's reply is read. (Both finish at once: a slow Script's independence is
-    // Story 2.7's to show.)
+    // shown by `a_slow_script_delays_nothing_on_its_connection_or_another` below.)
     wire::send(
         &mut b,
         &execution(30, "return a + 1;", vec![(text("a"), Value::from(2))]),
@@ -740,6 +740,91 @@ fn a_script_runs_over_the_socket_and_a_failure_disturbs_no_one() {
             Value::Array(vec![Value::from(1), text("x"), Value::Nil])
         )])
     );
+    serving.stop().exit(0);
+}
+
+/// Story 2.7: a slow Script delays neither a fast one sent after it on the same connection nor
+/// one on another connection, over the real socket.
+#[cfg(unix)]
+#[test]
+fn a_slow_script_delays_nothing_on_its_connection_or_another() {
+    use std::io::Read;
+
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    // A counted loop, never a sleep: about half a second in a debug build.
+    const SLOW_TURNS: i64 = 150_000;
+    let text = |t: &str| Value::from(t);
+    let initialized = |serving: &Serving| {
+        let mut client = serving.connect();
+        let init = Envelope::new(
+            CorrelationId(1),
+            MessageType::Init,
+            Value::Map(vec![
+                (text("config"), Value::Map(vec![])),
+                (text("registrations"), Value::Array(vec![])),
+            ]),
+        );
+        wire::send(&mut client, &init);
+        assert_eq!(
+            wire::reply(&mut client).expect("a reply").message_type,
+            MessageType::Result
+        );
+        client
+    };
+    let execution = |id, source: &str| {
+        Envelope::new(
+            CorrelationId(id),
+            MessageType::ExecutionStart,
+            Value::Map(vec![
+                (text("source"), text(source)),
+                (text("variables"), Value::Map(vec![])),
+            ]),
+        )
+    };
+    let slow = format!("let i = 0; while (i < {SLOW_TURNS}) {{ i = i + 1; }}; return i;");
+    let value = |reply: &Envelope<Value>| {
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        reply.payload.clone()
+    };
+    let result = |v: i64| Value::Map(vec![(text("value"), Value::from(v))]);
+
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+
+    // Same connection: the fast Script sent second is answered first.
+    let mut a = initialized(&serving);
+    wire::send(&mut a, &execution(20, &slow));
+    wire::send(&mut a, &execution(21, "return 21;"));
+    let first = wire::reply(&mut a).expect("A's first reply");
+    assert_eq!(first.id, Some(CorrelationId(21)), "the fast one first");
+    assert_eq!(value(&first), result(21));
+    let second = wire::reply(&mut a).expect("A's second reply");
+    assert_eq!(second.id, Some(CorrelationId(20)));
+    assert_eq!(value(&second), result(SLOW_TURNS));
+
+    // Another connection: B inits and runs a fast Script while A's slow one is still running.
+    wire::send(&mut a, &execution(30, &slow));
+    let mut b = initialized(&serving);
+    wire::send(&mut b, &execution(40, "return 40;"));
+    let reply = wire::reply(&mut b).expect("B's reply");
+    assert_eq!(reply.id, Some(CorrelationId(40)));
+    assert_eq!(value(&reply), result(40));
+    a.set_nonblocking(true).unwrap();
+    let mut byte = [0; 1];
+    let pending = a
+        .read(&mut byte)
+        .expect_err("A's slow Script is still running");
+    assert_eq!(pending.kind(), std::io::ErrorKind::WouldBlock);
+    a.set_nonblocking(false).unwrap();
+    let reply = wire::reply(&mut a).expect("A's own reply, later");
+    assert_eq!(reply.id, Some(CorrelationId(30)));
+    assert_eq!(value(&reply), result(SLOW_TURNS));
     serving.stop().exit(0);
 }
 

@@ -178,8 +178,8 @@ Append-only. Each entry is work identified during a build but deliberately not d
   evidence: Review finding (verification-gap layer): replacing the vacant-entry loop with an overwriting `insert` passes every test, since 128-bit random draws never collide in a test; closing it needs a test seam such as `create_with(init, id_source)`, best added with Epic 5's reconnect when Client IDs carry authority.
 
 - source_spec: `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md`
-  summary: A Script that never ends (`while (true) {}`) pins a runtime worker forever and hangs Daemon shutdown, since `abort_all` only takes effect at an `.await` the task never reaches.
-  evidence: Direct Execution runs inline and synchronously in the connection task (by the spec's decision, until Story 2.7), and no Resource Budget exists yet; after `abort_all` the runtime's drop waits on the spinning worker. Moving the call to a task (2.7) or `spawn_blocking` does not make it cancellable. Settle with a step/time budget checked inside the evaluator loop (Epic 3, Story 3.5) so a runaway Script ends with a defined error.
+  summary: A Script that never ends (`while (true) {}`) pins a blocking-pool thread forever, keeps its connection and Session alive until shutdown, and hangs Daemon shutdown.
+  evidence: Since Story 2.7 (`spec-2-7-keep-slow-executions-from-blocking-anything-else.md`) Direct Execution runs through `spawn_blocking`, so it no longer pins a runtime worker — other connections and this connection's reads are unaffected. But a blocking task cannot be aborted once started, and no Resource Budget exists yet: a clean close waits for it (Story 2.7 decision 2), and at shutdown Tokio's `Runtime` drop waits indefinitely for running blocking tasks, so the Daemon never exits. Settle with a step/time budget checked inside the evaluator loop (Epic 3, Story 3.5) so a runaway Script ends with a defined error; until then `Runtime::shutdown_timeout` in `hexput-daemon` would at least let the process exit.
 
 - source_spec: `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md`
   summary: A Script result is bounded in wire bytes, not memory — about 16M one-byte scalars pass `check_result` and become an `rmpv::Value` tree of 512 MiB or more before encoding.
@@ -188,3 +188,15 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md`
   summary: AD-3's "every Daemon evaluation goes through `hexput_exec::execute`" is a convention in `hexput-script`, not a graph rule — the Spine's `script --> interp` edge lets it call `evaluate*` directly.
   evidence: Nothing but review stops Epic 4's Cached Execution from calling `hexput_interpreter::evaluate_with_variables` and skipping Epic 3's enforcement. Closing it means `hexput-exec` re-exporting the value and diagnostic types `hexput-script` needs, dropping the `script --> interp` edge in a dated Spine amendment, and pinning it in `check-crate-graph.py` — best done when Epic 3 puts real enforcement behind the Executor.
+
+- source_spec: `spec-2-7-keep-slow-executions-from-blocking-anything-else.md`
+  summary: A connection may have any number of Direct Executions in flight; nothing caps them, per connection or Daemon-wide.
+  evidence: By the spec's decision (no cap until Epic 3). Each in-flight execution holds its payload (up to one 16 MiB frame) and occupies one blocking-pool thread while it runs; Tokio's blocking pool defaults to 512 threads, beyond which executions queue behind each other Daemon-wide — the head-of-line blocking AD-6 forbids, reintroduced at scale. One local peer pipelining many slow Scripts can therefore exhaust the pool for every connection. Settle with a per-connection and/or per-Session in-flight cap refused with a defined error, alongside the connection cap and Resource Budgets (Epic 3), before Epic 5's network transports.
+
+- source_spec: `spec-2-7-keep-slow-executions-from-blocking-anything-else.md`
+  summary: Finished Direct Execution replies accumulate in a connection's `JoinSet` while its loop is blocked writing to a peer that reads slowly, each holding its whole result `Value`.
+  evidence: Review finding (blind layer). Before Story 2.7 at most one result per connection existed at a time; now every in-flight execution can finish and park its reply, multiplying the 2.6 entry's ~512 MiB-per-result amplification by the uncapped in-flight count. Settle with the in-flight cap (same entry above) and the write timeout deferred from Story 2.3.
+
+- source_spec: `spec-2-7-keep-slow-executions-from-blocking-anything-else.md`
+  summary: A panicking Direct Execution task is logged and its request goes unanswered, and neither behaviour has a test.
+  evidence: Review findings (blind, edge-case, verification-gap layers). The `JoinError` carries no correlation id, and no `protocol.*` code exists for an internal failure; changing `continue` to `return` in `Finished(Err)` passes every test because nothing can make `direct_execution` panic. Settle with a panic-injection seam (e.g. a `#[cfg(test)]` executor hook inside `hexput-connection`) and, if a Backend should be told, `join_next_with_id` or `catch_unwind` plus an internal-error code — best with Epic 3's enforcement, which adds the first code paths that could plausibly panic.

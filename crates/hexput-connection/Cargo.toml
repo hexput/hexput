@@ -11,11 +11,14 @@ rust-version.workspace = true
 # 2026-09-23, Story 2.3) — and never `hexput-transport`: it is generic over the adapter (AD-1).
 # It routes an initialized `ExecutionStart` to `hexput-script` (Spine amendment 2026-09-23,
 # Story 2.6), which owns everything about executing it. `scripts/check-crate-graph.py` pins this
-# set.
+# set. `tokio` is an external crate, which the graph check does not pin: the connection owns its
+# executions as tasks (`JoinSet`, `spawn_blocking`) and races them against reads with `select!`
+# (AD-6, Story 2.7).
 [dependencies]
 hexput-session = { path = "../hexput-session" }
 hexput-port = { path = "../hexput-port" }
 hexput-script = { path = "../hexput-script" }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [lints]

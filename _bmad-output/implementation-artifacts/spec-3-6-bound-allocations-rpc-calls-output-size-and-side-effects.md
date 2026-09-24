@@ -27,6 +27,9 @@ context:
 
 Each is its own `Dimension`, code (`budget.allocations_exceeded`, `budget.rpc_calls_exceeded`, `budget.output_size_exceeded`, `budget.side_effects_exceeded`, all in `Code::ALL`) and limit; setting one never stands in for another. The call that would cross an RPC or side-effect limit is refused before it is sent (spanned on the call); calls already made stand. Every decision and error lives in `hexput-enforce`, reached only from `hexput-exec`.
 
+**Decisions (2026-09-24, Erdem):**
+1. *Default limits* — allocations 1 000 000, RPC calls 100, output size 1 MiB, side effects 100 per execution; documented constants in `hexput-enforce` until Story 3.7 makes them Config values.
+
 **Never:** No Config keys or overrides (Story 3.7), no metrics (Epic 7), no Global Variables (Epic 6), no change to CPU time or memory semantics, no `unsafe`.
 
 ## I/O & Edge-Case Matrix
@@ -41,10 +44,6 @@ Each is its own `Dimension`, code (`budget.allocations_exceeded`, `budget.rpc_ca
 | Independence | each limit crossed alone | only that dimension's code | N/A |
 
 </frozen-after-approval>
-
-## Open Questions
-
-1. **Default limits (until Story 3.7 makes them Config values)** — options: (A, recommended) allocations 1 000 000, RPC calls 100, output size 1 MiB, side effects 100 per execution — rule scripts rarely call the host more than a handful of times, and 1 MiB keeps replies far below the 16 MiB frame / (B) looser: allocations 10 000 000, RPC calls 1 000, output 8 MiB, side effects 1 000 / (C) values you name.
 
 ## Code Map
 

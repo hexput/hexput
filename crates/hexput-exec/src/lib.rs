@@ -195,7 +195,18 @@ fn arguments(call: &HostCall) -> Result<Vec<hexput_rpc::Value>, Diagnostic> {
                     argument.span,
                 ));
             }
-            Err(wire::Unsendable::TooLarge | wire::Unsendable::Unrepresentable) => {
+            Err(wire::Unsendable::Unrepresentable) => {
+                return Err(host_error(
+                    Code::FUNCTION_FAILED,
+                    format!(
+                        "the call to `{}` could not be sent: an argument holds a value with no \
+                         wire representation",
+                        call.name()
+                    ),
+                    call,
+                ));
+            }
+            Err(wire::Unsendable::TooLarge) => {
                 return Err(host_error(
                     Code::FUNCTION_FAILED,
                     format!(

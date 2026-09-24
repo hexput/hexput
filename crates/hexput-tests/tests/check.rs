@@ -795,7 +795,7 @@ fn every_finding_code_spans_the_offending_source() {
             &LISTED,
             &ENABLED,
             Code::UNKNOWN_FUNCTION,
-            "log",
+            "log(1)",
         ),
         (
             "while (true) { break; };",
@@ -851,4 +851,20 @@ fn the_parser_rejects_what_the_pass_deliberately_does_not_check() {
         let diagnostic = parse(source).expect_err("the parser rejects this source");
         assert_eq!(diagnostic.code.as_str(), code, "for source: {source}");
     }
+}
+
+/// Story 3.1 review: the check and the runtime underline the same range for an unknown call —
+/// the whole call, name through closing parenthesis.
+#[test]
+fn an_unknown_call_is_spanned_like_the_runtime_capability_error() {
+    let source = "let x = 1;\nreturn getOrder(x).total;";
+    let program = parse(source).expect("the source parses");
+    let environment = Environment::new().with_callables(Vec::<String>::new());
+    let found = check(&program, &environment, &Policy::new());
+    let finding = &found.diagnostics()[0];
+    assert_eq!(finding.code, Code::UNKNOWN_FUNCTION);
+    assert_eq!(&source[finding.span.range()], "getOrder(x)");
+    let runtime = hexput_interpreter::evaluate(&program).unwrap_err();
+    assert_eq!(runtime.code, finding.code);
+    assert_eq!(runtime.span, finding.span);
 }

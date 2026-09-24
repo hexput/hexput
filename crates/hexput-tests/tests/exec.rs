@@ -390,6 +390,11 @@ fn a_malformed_reply_is_host_function_failed() {
         let error = result.unwrap_err();
         assert_eq!(error.code.as_str(), "host.function_failed", "{shown}");
         assert_eq!(error.span.offset, 7, "{shown}");
+        if shown.contains("Binary") {
+            // The path is rooted at the reply's `value`, never at `variables`.
+            assert!(error.message.contains("`value`"), "{}", error.message);
+            assert!(!error.message.contains("variables"), "{}", error.message);
+        }
     }
 }
 
@@ -434,4 +439,24 @@ fn a_call_that_cannot_be_framed_fails_and_a_stray_reply_is_handed_back() {
         "{}",
         error.message
     );
+}
+
+#[test]
+fn arguments_that_each_fit_a_frame_but_not_together_are_refused_and_nothing_is_sent() {
+    // Each string is over half a frame, so each alone fits and the two together cannot.
+    let half = "x".repeat(hexput_rpc::MAX_FRAME_LEN / 2 + 1);
+    let source = "return send(a, b);";
+    let (result, seen) = run_hosted(
+        source,
+        vec![
+            (Arc::from("a"), Value::String(Arc::from(half.as_str()))),
+            (Arc::from("b"), Value::String(Arc::from(half.as_str()))),
+        ],
+        &["send"],
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    let error = result.unwrap_err();
+    assert_eq!(error.code.as_str(), "host.function_failed");
+    assert_eq!(spanned(source, &error), "send(a, b)");
+    assert!(seen.is_empty());
 }

@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-18-2026 11:43
-last_updated: 09-24-2026 05:45
+last_updated: 09-24-2026 06:15
 project: hexput
 project_key: NOKEY
 tracking_system: file-system
@@ -60,7 +60,7 @@ development_status:
   epic-2-retrospective: optional
 
   epic-3: in-progress
-  3-1-call-a-registered-host-function-from-a-script: in-progress
+  3-1-call-a-registered-host-function-from-a-script: review
   3-2-grant-a-function-blanket-access-at-registration: backlog
   3-3-decide-per-call-whether-a-function-may-be-used: backlog
   3-4-deny-every-path-to-the-host-that-isn-t-a-registered-function: backlog

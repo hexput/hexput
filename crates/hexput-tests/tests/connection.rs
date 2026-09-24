@@ -274,7 +274,7 @@ fn code_of(response: &Envelope<Value>) -> String {
 }
 
 #[test]
-fn every_request_before_init_is_refused_with_its_id_echoed() {
+fn every_request_before_init_is_refused() {
     let sessions = Arc::new(Sessions::new());
     let (sent, _) = serve_with(
         &sessions,
@@ -299,14 +299,10 @@ fn every_request_before_init_is_refused_with_its_id_echoed() {
                 Some(CorrelationId(2)),
                 "protocol.invalid_payload".to_owned()
             ),
-            (
-                Some(CorrelationId(3)),
-                "protocol.unexpected_message".to_owned()
-            ),
-            (
-                Some(CorrelationId(4)),
-                "protocol.unexpected_message".to_owned()
-            ),
+            // A stray `Result`/`Error` is refused with a nil id: its id is in the Daemon's
+            // call-id space, never the Backend's (Story 3.1).
+            (None, "protocol.unexpected_message".to_owned()),
+            (None, "protocol.unexpected_message".to_owned()),
         ]
     );
 }
@@ -536,6 +532,8 @@ fn after_init_execution_runs_and_a_second_init_is_refused() {
     assert_eq!(
         answers,
         [
+            // The stray `Result` is refused with a nil id, which sorts first.
+            (None, "protocol.unexpected_message".to_owned()),
             (
                 Some(CorrelationId(1)),
                 "protocol.init_not_completed".to_owned()
@@ -545,10 +543,6 @@ fn after_init_execution_runs_and_a_second_init_is_refused() {
             (
                 Some(CorrelationId(4)),
                 "protocol.already_initialized".to_owned()
-            ),
-            (
-                Some(CorrelationId(5)),
-                "protocol.unexpected_message".to_owned()
             ),
         ]
     );
@@ -1342,27 +1336,27 @@ fn a_stray_reply_after_init_is_an_unexpected_message() {
         &["getOrder"],
         false,
         |mut backend| async move {
+            // Refused with a nil id: 42 names no call of the Daemon's, and echoing it would read
+            // as a failure of the Backend's own request 42.
             backend.reply(CorrelationId(42), MessageType::Result, Value::Nil);
             let reply = backend.next().await;
-            assert_eq!(reply.id, Some(CorrelationId(42)));
+            assert_eq!(reply.id, None);
             assert_eq!(code_of(&reply), "protocol.unexpected_message");
             // A reply to a call already answered is stray too.
             backend.send(execution(1, "return getOrder(1);"));
             let (id, _, _) = backend.call().await;
             let answer = Value::Map(vec![(string("value"), Value::from(1))]);
-            backend.reply(id, MessageType::Result, answer.clone());
-            assert_eq!(value_of(&backend.next().await), Value::from(1));
             backend.reply(id, MessageType::Result, answer);
-            assert_eq!(
-                code_of(&backend.next().await),
-                "protocol.unexpected_message"
-            );
-            // And a Backend never sends a `Call` of its own.
+            assert_eq!(value_of(&backend.next().await), Value::from(1));
+            backend.reply(id, MessageType::Error, Value::Nil);
+            let reply = backend.next().await;
+            assert_eq!(reply.id, None);
+            assert_eq!(code_of(&reply), "protocol.unexpected_message");
+            // And a Backend never sends a `Call` of its own; that refusal echoes its id.
             backend.reply(CorrelationId(7), MessageType::Call, Value::Nil);
-            assert_eq!(
-                code_of(&backend.next().await),
-                "protocol.unexpected_message"
-            );
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(7)));
+            assert_eq!(code_of(&reply), "protocol.unexpected_message");
             backend.close();
         },
     );
@@ -1421,4 +1415,50 @@ fn an_execution_waiting_on_a_reply_holds_no_thread_and_another_completes_meanwhi
         assert_eq!(value_of(&reply), Value::from(42));
         backend.close();
     });
+}
+
+#[test]
+fn a_fatal_frame_mid_call_fails_the_call_with_no_reply_and_serve_returns() {
+    let sessions = hosted(
+        &wired_runtime(),
+        &["getOrder"],
+        false,
+        |mut backend| async move {
+            backend.send(execution(5, "return getOrder(1);"));
+            let _ = backend.call().await;
+            backend.send(malformed(None, ProtocolCode::FrameTooLarge));
+            let refusal = backend.next().await;
+            assert_eq!(refusal.id, None);
+            assert_eq!(code_of(&refusal), "protocol.frame_too_large");
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(5)));
+            assert_eq!(code_of(&reply), "host.no_reply");
+            // `hosted` asserts `serve` returns; the peer is still connected here.
+        },
+    );
+    assert!(sessions.is_empty(), "the connection detached");
+}
+
+#[test]
+fn a_call_made_only_after_the_connection_stopped_reading_fails_at_once() {
+    let sessions = hosted(
+        &wired_runtime(),
+        &["getOrder"],
+        false,
+        |mut backend| async move {
+            // The Script is still looping when the peer closes, so its call is made only after
+            // the connection stopped reading — while the call table is still alive.
+            backend.send(execution(
+                6,
+                &format!(
+                    "let i = 0; while (i < {SLOW_TURNS}) {{ i = i + 1; }}; return getOrder(i);"
+                ),
+            ));
+            backend.close();
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(6)));
+            assert_eq!(code_of(&reply), "host.no_reply");
+        },
+    );
+    assert!(sessions.is_empty(), "the connection detached");
 }

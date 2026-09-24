@@ -586,7 +586,14 @@ impl<'p> Walk<'p> {
                     "`{}` is neither declared in this script nor a function this caller says is callable",
                     name.name
                 ),
-                name.span,
+                // The whole call, name through closing parenthesis — the span the runtime's
+                // `capability.unknown_function` uses, so both underline the same range.
+                Span::new(
+                    name.span.offset,
+                    link.span.end().saturating_sub(name.span.offset),
+                    name.span.line,
+                    name.span.column,
+                ),
             ));
         }
     }

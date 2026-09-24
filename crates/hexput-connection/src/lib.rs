@@ -21,7 +21,9 @@
 //!   Script ends nothing but itself.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
-//!   `protocol.unexpected_message`: the Daemon asked nothing it could answer.
+//!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
+//!   and the stray id is in the Daemon's call-id space, so echoing it would read, in the
+//!   Backend's own id space, as the failure of an unrelated request of its own.
 //! * `Call` from the Backend — `protocol.unexpected_message`: only the Daemon calls.
 //!
 //! A frame the codec rejects gets its `protocol.*` error response; the connection keeps
@@ -420,8 +422,14 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
         MessageType::Init => return init(&request, connection),
         MessageType::ExecutionStart => {}
         other => {
+            // A stray reply's id is the Daemon's call id, not a Backend request id: echoing it
+            // would fail whatever Backend request shares the number. Nil is allowed on `Error`.
+            let id = match other {
+                MessageType::Result | MessageType::Error => None,
+                _ => request.id,
+            };
             return Answer::Reply(refuse(
-                request.id,
+                id,
                 ProtocolCode::UnexpectedMessage,
                 format!("a Backend does not send `{other}` unless the Daemon asked for it"),
             ));

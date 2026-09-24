@@ -2,7 +2,7 @@
 title: 'Story 3.1: Call a registered host function from a script'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-review'
+status: 'done'
 baseline_commit: '5779a10024530d838b449bb3bb5e3d82d433f4b1'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -83,6 +83,29 @@ context:
 ## Spec Change Log
 
 ## Review Triage Log
+
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | verification-gap | Fatal-frame branch's `calls.close()` untested; removing it hangs `serve` with a call pending | medium | Pre-verified gap; no test sends `FrameTooLarge` with a call pending. **patch** (test) |
+| 2 | verification-gap + blind | A host call made *after* reading stops is untested (`Calls::close` closing the queue) | medium | Pre-verified; every test writes its call before closing or drops `Calls`. **patch** (test) |
+| 3 | verification-gap + blind | Shared argument frame budget (`TooLarge` → `host.function_failed`, nothing sent) untested | medium | Pre-verified; no test reaches `arguments()`'s `TooLarge` arm. **patch** (test) |
+| 4 | verification-gap | Malformed-reply message's `Path::reply` root never asserted | low | Pre-verified; direct assertion. **patch** (test) |
+| 5 | edge-case + blind + verification-gap | `Unsendable::Unrepresentable` reports "encode to more than the maximum frame" | low | Real (wrong text if reached; unreachable today since the interpreter refuses functions). Direct correction. **patch** |
+| 6 | blind | A stray Backend `Result`/`Error` is refused with its id echoed, which the Backend reads in its own id space as a failure of its request with that id | medium | Real: `answer`'s `UnexpectedMessage` refusal echoes the id; the new per-direction id spaces make that id meaningless to the Backend. Codec allows nil id on `Error`. **patch** (refuse with nil id) |
+| 7 | blind + edge-case | Argument checks (type/depth/size) run before the capability check; unregistered call with a deep argument reports `depth` | low | Real but unordered by the spec; `type.*` argument errors necessarily come first from the interpreter, so argument-first keeps them consistent. Missing piece is documentation. **patch** (LANGUAGE-REFERENCE §8 states the order) |
+| 8 | blind | LANGUAGE-REFERENCE §7 `type`/`host` rows and §12 not updated for the new codes | low | Real: §7 omits `type.function_argument`/`type.cyclic_argument` and the could-not-be-sent case; §12 silent on host calls. **patch** (docs) |
+| 9 | blind | `hexput-check`'s unknown-call finding spans the name; the runtime's `capability.unknown_function` spans the whole call | low | Real: `pass.rs` uses `name.span`, frozen matrix puts the runtime error on the call span; CLI/LSP underline differently. Direct correction. **patch** (check spans the call) |
+| 10 | blind | `Caller::call` is public, so `hexput-connection`/`hexput-script` could send a `Call` without `Capabilities::check_call`; AD-3's reach to a Registered Function becomes convention, not graph-enforced | medium | Real. Consequence of approved decision 3 (conn→rpc edge); closing it needs a sealed-grant mechanism (new public surface). **defer**, flagged to Erdem |
+| 11 | blind | Runtime decides host-vs-local dynamically (lookup at call time), the check lexically; `f()` before a later `let helper` can go to the host once, locally later | low | Real but only for a call preceding its name's `let` — the language already resolves every name dynamically (reads before `let` are `reference`); fix means lexical resolution. Rejected (low, rare, non-trivial fix); mentioned to Erdem |
+| 12 | blind | Status spellings disagree (`in-review` vs sprint `review`) | false | The workflow's step-05 syncs `sprint-status.yaml`; `in-review` is the spec template's value |
+| 13 | blind | Spec implementation note is stale | — | Rejected: fix edits this build's spec |
+| 14 | blind | `blocking` helper duplicated in `hexput-exec` and `hexput-script` | low | Rejected: no named divergence; sharing it adds public surface |
+| 15 | blind | `Machine::resume` without a pending call is a silent no-op | low | Rejected: unreachable through `HostCall::resume`; fix adds a guard |
+| 16 | blind | Lost stream (`Closed(Some)`) with a call pending untested | low | Rejected: dropping `JoinSet` aborts the tasks, nothing can hang; adds only a test of existing Epic 2 behaviour |
+| 17 | edge-case | `Frame::Declare` silently discards on a statement-kind mismatch | false | Unreachable: `Declare(at)` is pushed only for a `Let` statement of the same immutable `Arc<Program>` |
+| 18 | edge-case | `Frame::Branch` falls through when the branch index is missing | false | Unreachable: `Branch{at,index}` is pushed only by `next_branch` after `branches.get(index)` matched |
+| 19 | edge-case | Blocking segments lose the request span | false | Nothing in `hexput-exec`/`hexput-script`/the interpreter logs inside a blocking segment (no `tracing` use there) |
+| 20 | edge-case | `missingFn(x1)` now reports undeclared `x1`, and eval reports `capability` for a typo'd callee | false | Specified: arguments are evaluated before the call is judged (as for any call) and `hexput eval` reports host calls as `capability` (frozen Always) |
 
 ## Design Notes
 

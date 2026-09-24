@@ -1,7 +1,8 @@
 //! Story 2.6: the one Executor entry point (AD-3). Story 3.1: host calls through it — the
 //! capability check, the argument rules, and every way a call's reply can end the Script — driven
-//! against a stand-in for the connection that answers from the test. Story 3.2: only a blanket
-//! grant lets a call go ahead; every registration here states its grant.
+//! against a stand-in for the connection that answers from the test. Story 3.2: a blanket grant
+//! lets a call go ahead at once; every registration here states its grant. Story 3.3: a call
+//! without one is put to the Backend's per-call handler first, and only `true` lets it proceed.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +15,9 @@ fn program(source: &str) -> Arc<hexput_exec::Program> {
 }
 
 fn runtime() -> tokio::runtime::Runtime {
+    // Timers: a question for a per-call handler is waited for under a timeout (Story 3.3).
     tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .unwrap()
 }
@@ -71,6 +74,42 @@ type Made = (String, Vec<Wire>);
 /// Every call the stand-in saw.
 type Seen = Arc<Mutex<Vec<Made>>>;
 
+/// How the stand-in Backend's per-call handler answers one `Authorize` question.
+type Handler = Box<dyn Fn(&str, &[Wire]) -> Reply + Send>;
+
+/// What the stand-in does with one `Authorize` question.
+enum Reply {
+    /// Answer with this type and payload.
+    Answer(MessageType, Wire),
+    /// Never answer: the question stays pending.
+    Silent,
+    /// The connection ends: every pending question and call fails with no reply.
+    Hangup,
+}
+
+/// A handler answering every question `Result {value: <answer>}`.
+fn answering(answer: Wire) -> Handler {
+    Box::new(move |_, _| Reply::Answer(MessageType::Result, map(vec![("value", answer.clone())])))
+}
+
+/// Everything one hosted run produced.
+struct Run {
+    result: Result<Value, Diagnostic>,
+    /// Every `Call` the stand-in saw.
+    calls: Vec<Made>,
+    /// Every `Authorize` question the stand-in saw.
+    asked: Vec<Made>,
+    /// Every message the stand-in saw, in order: its type and the function's name.
+    order: Vec<(MessageType, String)>,
+    /// Every event the Executor logged at `debug` or above, one JSON object each.
+    events: Vec<serde_json::Value>,
+}
+
+/// A handler that refuses every question.
+fn refusing() -> Handler {
+    answering(Wire::Boolean(false))
+}
+
 fn s(text: &str) -> Wire {
     Wire::from(text)
 }
@@ -112,17 +151,30 @@ impl std::io::Write for Captured {
 }
 
 /// [`run_hosted`], also returning every event the Executor logged at `debug` or above, one JSON
-/// object each.
-///
-/// Every hosted run installs a subscriber, so no Executor callsite is ever first hit with none:
-/// `tracing` caches that interest process-wide, and a callsite cached as disabled would hide the
-/// events [`a_refused_call_is_logged_with_its_reason_and_the_script_cannot_tell`] reads.
+/// object each. Every question for a per-call handler is refused.
 fn run_logged(
     source: &str,
     variables: Vec<(Arc<str>, Value)>,
     registered: &[(&str, bool)],
     answer: Answer,
 ) -> (Result<Value, Diagnostic>, Vec<Made>, Vec<serde_json::Value>) {
+    let run = run_full(source, variables, registered, refusing(), answer);
+    (run.result, run.calls, run.events)
+}
+
+/// Run `source` against the stand-in: `authorize` answers each `Authorize` question, `answer`
+/// each `Call`.
+///
+/// Every hosted run installs a subscriber, so no Executor callsite is ever first hit with none:
+/// `tracing` caches that interest process-wide, and a callsite cached as disabled would hide the
+/// events [`a_refused_call_is_logged_with_its_reason_and_the_script_cannot_tell`] reads.
+fn run_full(
+    source: &str,
+    variables: Vec<(Arc<str>, Value)>,
+    registered: &[(&str, bool)],
+    authorize: Handler,
+    answer: Answer,
+) -> Run {
     let log = Captured::default();
     let writer = log.clone();
     let dispatch = tracing::Dispatch::new(
@@ -132,27 +184,34 @@ fn run_logged(
             .with_writer(Mutex::new(writer))
             .finish(),
     );
-    let (result, seen) = tracing::dispatcher::with_default(&dispatch, || {
-        hosted_run(source, variables, registered, answer)
+    let mut run = tracing::dispatcher::with_default(&dispatch, || {
+        hosted_run(source, variables, registered, authorize, answer)
     });
     let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-    let events = text
+    run.events = text
         .lines()
         .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
         .collect();
-    (result, seen, events)
+    run
 }
 
 fn hosted_run(
     source: &str,
     variables: Vec<(Arc<str>, Value)>,
     registered: &[(&str, bool)],
+    authorize: Handler,
     answer: Answer,
-) -> (Result<Value, Diagnostic>, Vec<Made>) {
+) -> Run {
     let seen: Seen = Arc::default();
+    let questions: Seen = Arc::default();
+    let order: Arc<Mutex<Vec<(MessageType, String)>>> = Arc::default();
     let runtime = runtime();
     let (mut calls, caller) = Calls::new();
-    let log = Arc::clone(&seen);
+    let (log, asked, sequence) = (
+        Arc::clone(&seen),
+        Arc::clone(&questions),
+        Arc::clone(&order),
+    );
     runtime.spawn(async move {
         while let Some(call) = calls.submitted().await {
             let envelope = calls.issue(call);
@@ -160,7 +219,6 @@ fn hosted_run(
             let Wire::Map(fields) = &envelope.payload else {
                 panic!("a Call payload is a map");
             };
-            assert_eq!(envelope.message_type, MessageType::Call);
             assert_eq!(fields.len(), 2, "exactly `name` and `arguments`");
             assert_eq!(fields[0].0, s("name"));
             assert_eq!(fields[1].0, s("arguments"));
@@ -168,17 +226,44 @@ fn hosted_run(
             let Wire::Array(arguments) = fields[1].1.clone() else {
                 panic!("`arguments` is an array");
             };
-            let (message_type, payload) = answer(&name, &arguments);
-            log.lock().unwrap().push((name, arguments));
-            calls
-                .complete(Envelope::new(id, message_type, payload))
-                .unwrap();
+            sequence
+                .lock()
+                .unwrap()
+                .push((envelope.message_type, name.clone()));
+            let reply = match envelope.message_type {
+                MessageType::Call => {
+                    let (message_type, payload) = answer(&name, &arguments);
+                    log.lock().unwrap().push((name, arguments));
+                    Reply::Answer(message_type, payload)
+                }
+                MessageType::Authorize => {
+                    let reply = authorize(&name, &arguments);
+                    asked.lock().unwrap().push((name, arguments));
+                    reply
+                }
+                other => panic!("the Executor sent a `{other}`"),
+            };
+            match reply {
+                Reply::Answer(message_type, payload) => calls
+                    .complete(Envelope::new(id, message_type, payload))
+                    .unwrap(),
+                Reply::Silent => {}
+                Reply::Hangup => calls.close(),
+            }
         }
     });
     let host = Host::new(registered.iter().copied(), caller);
     let result = runtime.block_on(execute(program(source), variables, host));
-    let seen = seen.lock().unwrap().clone();
-    (result, seen)
+    let calls = seen.lock().unwrap().clone();
+    let asked = questions.lock().unwrap().clone();
+    let order = order.lock().unwrap().clone();
+    Run {
+        result,
+        calls,
+        asked,
+        order,
+        events: Vec::new(),
+    }
 }
 
 /// The text a diagnostic's span covers in `source`.
@@ -288,59 +373,189 @@ fn an_unregistered_name_is_a_capability_error_and_nothing_is_sent() {
     assert!(seen.is_empty());
 }
 
+// --- Story 3.3: the per-call handler ---
+
 #[test]
-fn a_function_registered_without_a_grant_is_refused_exactly_like_an_unregistered_one() {
-    let source = "let x = 1;\nreturn getOrder(x);";
-    let (withheld, seen) = run_hosted(
-        source,
+fn a_call_without_a_grant_asks_the_handler_and_true_lets_it_proceed() {
+    let run = run_full(
+        "return getOrder(7, { a: 1 });",
         vec![],
         &[("getOrder", false)],
+        answering(Wire::Boolean(true)),
+        Box::new(|_, _| value(Wire::from(42))),
+    );
+    assert_eq!(run.result.unwrap().as_number(), Some(42.0));
+    let arguments = vec![Wire::from(7), map(vec![("a", Wire::from(1))])];
+    // The question carries exactly what the call does, and comes first.
+    assert_eq!(run.asked, [("getOrder".to_owned(), arguments.clone())]);
+    assert_eq!(run.calls, [("getOrder".to_owned(), arguments)]);
+    assert_eq!(
+        run.order,
+        [
+            (MessageType::Authorize, "getOrder".to_owned()),
+            (MessageType::Call, "getOrder".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn a_blanket_granted_call_asks_nothing() {
+    let run = run_full(
+        "return getOrder(7);",
+        vec![],
+        &[("getOrder", true)],
+        refusing(),
+        Box::new(|_, _| value(Wire::from(1))),
+    );
+    assert_eq!(run.result.unwrap().as_number(), Some(1.0));
+    assert!(run.asked.is_empty());
+    assert_eq!(run.order, [(MessageType::Call, "getOrder".to_owned())]);
+}
+
+#[test]
+fn the_handler_is_asked_on_every_call_never_cached() {
+    let answers = Arc::new(Mutex::new(vec![true, true]));
+    let run = run_full(
+        "let a = getOrder(1); let b = getOrder(2); return [a, b];",
+        vec![],
+        &[("getOrder", false)],
+        Box::new(move |_, _| {
+            let allowed = answers.lock().unwrap().pop().unwrap();
+            Reply::Answer(
+                MessageType::Result,
+                map(vec![("value", Wire::Boolean(allowed))]),
+            )
+        }),
+        Box::new(|_, arguments| value(arguments[0].clone())),
+    );
+    assert_eq!(run.result.unwrap().as_array().unwrap().len(), 2);
+    assert_eq!(run.asked.len(), 2, "asked once per call");
+    assert_eq!(run.calls.len(), 2);
+    assert_eq!(
+        run.order.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        [
+            MessageType::Authorize,
+            MessageType::Call,
+            MessageType::Authorize,
+            MessageType::Call
+        ]
+    );
+}
+
+/// Run `return getOrder(x);` with `getOrder` registered without a grant, its handler answering as
+/// `authorize` does: the Script's error, and the logged refusal's reason. Nothing may be called.
+fn denied(authorize: Handler) -> (Diagnostic, String, usize) {
+    let run = run_full(
+        "let x = 1;\nreturn getOrder(x);",
+        vec![],
+        &[("getOrder", false)],
+        authorize,
         Box::new(|_, _| value(Wire::Nil)),
     );
-    assert!(seen.is_empty(), "nothing is sent without a grant");
-    let (unregistered, seen) = run_hosted(
+    assert!(run.calls.is_empty(), "a denied call is never sent");
+    let refusals: Vec<_> = run
+        .events
+        .into_iter()
+        .filter(|event| event["fields"]["message"] == "refused a host call")
+        .collect();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    let event = &refusals[0];
+    assert_eq!(event["level"], "DEBUG");
+    assert_eq!(event["fields"]["function"], "getOrder");
+    (
+        run.result.unwrap_err(),
+        event["fields"]["reason"].as_str().unwrap().to_owned(),
+        run.asked.len(),
+    )
+}
+
+#[test]
+fn every_denial_is_the_error_an_unregistered_name_gets_and_only_the_log_tells_them_apart() {
+    let source = "let x = 1;\nreturn getOrder(x);";
+    let (unregistered, _) = run_hosted(
         source,
         vec![],
         &[("other", true)],
         Box::new(|_, _| value(Wire::Nil)),
     );
-    assert!(seen.is_empty());
-    let withheld = withheld.unwrap_err();
-    assert_eq!(withheld.code.as_str(), "capability.unknown_function");
-    assert_eq!(spanned(source, &withheld), "getOrder(x)");
-    // Same category, code, message and span: the Script cannot tell the two apart.
-    assert_eq!(withheld, unregistered.unwrap_err());
+    let unregistered = unregistered.unwrap_err();
+    assert_eq!(unregistered.code.as_str(), "capability.unknown_function");
+    assert_eq!(spanned(source, &unregistered), "getOrder(x)");
+
+    let error = |kind: MessageType, payload: Wire| -> Handler {
+        Box::new(move |_, _| Reply::Answer(kind, payload.clone()))
+    };
+    let cases: Vec<(&str, Handler, &str)> = vec![
+        ("false", answering(Wire::Boolean(false)), "refused"),
+        ("a string", answering(s("yes")), "handler_invalid"),
+        ("a number", answering(Wire::from(1)), "handler_invalid"),
+        ("null", answering(Wire::Nil), "handler_invalid"),
+        (
+            "a Result that is not {value}",
+            error(
+                MessageType::Result,
+                map(vec![("allowed", Wire::Boolean(true))]),
+            ),
+            "handler_invalid",
+        ),
+        (
+            "an Error",
+            error(
+                MessageType::Error,
+                map(vec![("code", s("x")), ("message", s("no"))]),
+            ),
+            "handler_failed",
+        ),
+        (
+            "a hangup",
+            Box::new(|_, _| Reply::Hangup),
+            "handler_no_reply",
+        ),
+    ];
+    for (what, authorize, expected) in cases {
+        let (denial, reason, asked) = denied(authorize);
+        assert_eq!(reason, expected, "{what}");
+        assert_eq!(asked, 1, "{what}");
+        // Same category, code, message and span.
+        assert_eq!(denial, unregistered, "{what}");
+    }
+}
+
+#[test]
+fn a_handler_that_never_answers_is_denied_after_the_timeout() {
+    assert_eq!(
+        hexput_exec::AUTHORIZATION_TIMEOUT,
+        std::time::Duration::from_secs(5)
+    );
+    let started = std::time::Instant::now();
+    let (denial, reason, asked) = denied(Box::new(|_, _| Reply::Silent));
+    assert!(started.elapsed() >= hexput_exec::AUTHORIZATION_TIMEOUT);
+    assert_eq!(reason, "handler_timeout");
+    assert_eq!(asked, 1);
+    assert_eq!(denial.code.as_str(), "capability.unknown_function");
 }
 
 #[test]
 fn a_refused_call_is_logged_with_its_reason_and_the_script_cannot_tell() {
-    let refused = |registered: &[(&str, bool)]| {
-        let (result, seen, events) = run_logged(
-            "return getOrder(1);",
-            vec![],
-            registered,
-            Box::new(|_, _| value(Wire::Nil)),
-        );
-        assert!(seen.is_empty());
-        let refusals: Vec<_> = events
-            .into_iter()
-            .filter(|event| event["fields"]["message"] == "refused a host call")
-            .collect();
-        assert_eq!(refusals.len(), 1, "{refusals:?}");
-        let event = &refusals[0];
-        assert_eq!(event["level"], "DEBUG");
-        assert_eq!(event["fields"]["function"], "getOrder");
-        (
-            result.unwrap_err(),
-            event["fields"]["reason"].as_str().unwrap().to_owned(),
-        )
-    };
-    let (withheld, reason) = refused(&[("getOrder", false)]);
-    assert_eq!(reason, "not_granted");
-    let (unregistered, reason) = refused(&[]);
-    assert_eq!(reason, "unregistered");
-    assert_eq!(withheld, unregistered);
-    assert!(!withheld.message.contains("grant"), "{}", withheld.message);
+    let (refused, reason, _) = denied(refusing());
+    assert_eq!(reason, "refused");
+    let (result, seen, events) = run_logged(
+        "let x = 1;\nreturn getOrder(x);",
+        vec![],
+        &[],
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    assert!(seen.is_empty());
+    let reasons: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "refused a host call")
+        .map(|event| event["fields"]["reason"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(reasons, ["unregistered"]);
+    let unregistered = result.unwrap_err();
+    assert_eq!(refused, unregistered);
+    assert!(!refused.message.contains("grant"), "{}", refused.message);
+    assert!(!refused.message.contains("refus"), "{}", refused.message);
 
     // A granted call logs no refusal.
     let (result, seen, events) = run_logged(

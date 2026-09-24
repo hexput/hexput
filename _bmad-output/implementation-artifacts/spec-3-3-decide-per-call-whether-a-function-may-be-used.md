@@ -2,7 +2,7 @@
 title: 'Story 3.3: Decide per call whether a function may be used'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'in-review'
 baseline_commit: 'c886f12eec35a84807460d20273cfeddf8cffeb8'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -57,18 +57,23 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hexput-shared`, `crates/hexput-enforce` -- message type; three-way decision and outcome classification.
-- [ ] `crates/hexput-rpc`, `crates/hexput-connection` -- issue, route, close for the question.
-- [ ] `crates/hexput-exec` -- ask with timeout, classify, dispatch or refuse, log reason.
-- [ ] `scripts/check-crate-graph.py` -- restricted name.
-- [ ] `crates/hexput-tests/tests/*` -- every matrix row; update Story 3.2 tests.
-- [ ] LANGUAGE-REFERENCE §8, Spine, `AGENTS.md`.
+- [x] `crates/hexput-shared`, `crates/hexput-enforce` -- message type; three-way decision and outcome classification.
+- [x] `crates/hexput-rpc`, `crates/hexput-connection` -- issue, route, close for the question.
+- [x] `crates/hexput-exec` -- ask with timeout, classify, dispatch or refuse, log reason.
+- [x] `scripts/check-crate-graph.py` -- restricted name.
+- [x] `crates/hexput-tests/tests/*` -- every matrix row; update Story 3.2 tests.
+- [x] LANGUAGE-REFERENCE §8, Spine, `AGENTS.md`.
 
 **Acceptance Criteria:**
 - Given any denial, when the Script's error is compared with an unregistered call's, then code, message and span are identical, and only the `debug` log's `reason` differs.
 - Given a question waiting for its answer, when another execution on the same connection runs, then it completes meanwhile (no thread held).
 
 ## Implementation Notes
+
+- `hexput-enforce`: `check_call -> Result<Decision, Refusal>`; `Decision::{Allowed, AskHandler(Question)}`; `Question::decide(HandlerAnswer) -> Result<(), Refusal>` is the only way to turn an answer into a decision. `Reason::NotGranted` is gone.
+- `hexput-exec` classifies the raw answer: `Result {value: bool}` → `Boolean`; any other value or a malformed `Result` → `NotBoolean` (`handler_invalid`); `Error` → `Failed`; an unframable question (the arguments pass the frame lower bound but the envelope still does not fit) is also `Failed` (`handler_failed`) — no seventh reason; connection gone → `NoReply`; `tokio::time::timeout` elapsed → `TimedOut`. The question's arguments are a clone of the call's.
+- A timed-out question stays in the connection's pending table until its answer arrives (then consumed and dropped silently) or the connection closes. A Backend that never answers therefore grows its own connection's table by one entry per timed-out question; bounded per connection, never shared.
+- `execute`/`direct_execution` now need a runtime with timers enabled when a question may be asked; the Daemon's runtime uses `enable_all`.
 
 ## Spec Change Log
 

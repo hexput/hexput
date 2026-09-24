@@ -62,6 +62,13 @@ pub enum MessageType {
     /// 3.1). The payload is `{name, arguments}`; a later Registered Method call adds `receiver`.
     /// The Backend answers with `Result {value}` or `Error` under the call's id.
     Call,
+    /// Request, from the Daemon to the Backend: may a Script make this call of a Registered
+    /// Function granted per call rather than blanket (Story 3.3)? The payload is
+    /// `{name, arguments}`, exactly what the `Call` would carry; the Backend's per-call handler
+    /// answers `Result {value: <bool>}` or `Error` under the question's id. Only `value: true`
+    /// lets the Daemon send the `Call`. Its id comes from the same per-connection counter as a
+    /// `Call`'s.
+    Authorize,
     /// Response: a request failed; the payload is the one wire error shape.
     Error,
 }
@@ -73,6 +80,7 @@ impl MessageType {
         Self::ExecutionStart,
         Self::Result,
         Self::Call,
+        Self::Authorize,
         Self::Error,
     ];
 
@@ -84,6 +92,7 @@ impl MessageType {
             Self::ExecutionStart => "ExecutionStart",
             Self::Result => "Result",
             Self::Call => "Call",
+            Self::Authorize => "Authorize",
             Self::Error => "Error",
         }
     }

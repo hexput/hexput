@@ -14,16 +14,18 @@ fn direct_execution(payload: &Value) -> Result<Value, Box<ErrorBody>> {
 }
 
 /// Serve one Direct Execution registering `registrations` — `(name, blanket)` pairs — on a runtime
-/// of its own. Its call table is never served, so a call that went ahead would never be answered:
-/// only use it with registrations that let no call through.
+/// of its own. Its call table is dropped at once, as if the connection were gone: every host call
+/// and every question for a per-call handler fails with no reply.
 fn direct_execution_registering(
     payload: &Value,
     registrations: Vec<(String, bool)>,
 ) -> Result<Value, Box<ErrorBody>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .unwrap();
-    let (_calls, caller) = hexput_rpc::Calls::new();
+    let (calls, caller) = hexput_rpc::Calls::new();
+    drop(calls);
     runtime.block_on(hexput_script::direct_execution(
         payload.clone(),
         registrations,
@@ -419,9 +421,11 @@ fn an_invalid_utf8_string_off_the_wire_is_refused() {
     assert!(body.message.contains("`variables.t`"), "{}", body.message);
 }
 
-/// Story 3.2: the registrations' grants reach the Executor, which refuses a call without one.
+/// Story 3.2: the registrations' grants reach the Executor. Story 3.3: a call without a blanket
+/// grant asks the per-call handler, and when no answer can come — here the connection is gone —
+/// it is refused with the same error as an unregistered name.
 #[test]
-fn a_function_registered_without_a_grant_is_a_capability_error() {
+fn a_function_registered_without_a_grant_is_a_capability_error_when_no_handler_answers() {
     let source = "return getOrder(1);";
     let body = *direct_execution_registering(
         &payload(source, vec![]),

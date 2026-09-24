@@ -23,15 +23,23 @@
 //!    exceed a frame cannot be sent, `host.function_failed` on the call. (A function or cyclic
 //!    argument was already refused by the interpreter, as a `type` error on that argument.)
 //! 2. asks `hexput-enforce` whether the call may go ahead (AD-3), from the Session's registrations
-//!    and their grants as they were when the execution was dispatched: only a name registered
-//!    with a blanket grant proceeds (Story 3.2). Anything else is `capability.unknown_function`,
-//!    identical whether the name is unregistered or merely not granted, and nothing is sent; the
-//!    Daemon logs the refusal at `debug` with the `function` and a `reason` of `unregistered` or
-//!    `not_granted`, which the Script never sees.
+//!    and their grants as they were when the execution was dispatched. A name registered with a
+//!    blanket grant proceeds at once (Story 3.2). A name registered without one is decided by the
+//!    Backend's per-call handler (Story 3.3): the Executor asks it through the [`Caller`] — an
+//!    `Authorize` question carrying the call's name and arguments, before any `Call` — and waits
+//!    at most [`AUTHORIZATION_TIMEOUT`], holding no thread and no lock. `hexput-enforce` turns
+//!    what came back into the decision: only an explicit `true` lets the call proceed. Nothing is
+//!    cached; every call asks anew. An unregistered name, a refusal (`false`), an answer that is
+//!    not a boolean, an `Error`, no answer in time, or a connection that ends first are all the
+//!    same `capability.unknown_function` on the call, and nothing more is sent. The Daemon logs
+//!    each refusal at `debug` with the `function` and a `reason` — `unregistered`, `refused`,
+//!    `handler_invalid`, `handler_failed`, `handler_timeout` or `handler_no_reply` — which the
+//!    Script never sees. A refusal ends the Script like every error: nothing can catch it.
 //! 3. hands the call to the connection through its [`Caller`] and awaits the reply — a plain
-//!    `.await`, holding no thread and no lock. [`Caller::dispatch_authorized`] is called from
-//!    here and nowhere else; `scripts/check-crate-graph.py` fails CI when the name appears in any
-//!    other production crate but `hexput-rpc`, which defines it.
+//!    `.await`, holding no thread and no lock. [`Caller::dispatch_authorized`] and
+//!    [`Caller::ask_authorization`] are called from here and nowhere else;
+//!    `scripts/check-crate-graph.py` fails CI when either name appears in any other production
+//!    crate but `hexput-rpc`, which defines them.
 //! 4. converts the reply's value back, in a new blocking segment, and resumes the Script with it.
 //!    An `Error` reply or a malformed one ends the Script with `host.function_failed`, and a
 //!    connection that ends first with `host.no_reply`, both spanned on the call.
@@ -44,7 +52,9 @@ pub mod wire;
 
 use std::sync::Arc;
 
-use hexput_enforce::{Capabilities, Refusal};
+use std::time::Duration;
+
+use hexput_enforce::{Capabilities, Decision, HandlerAnswer, Question, Refusal};
 use hexput_interpreter::{Category, Code, Execution, HostCall, Outcome};
 use hexput_rpc::CallFailure;
 
@@ -59,6 +69,13 @@ pub use hexput_rpc::Caller;
 ///
 /// A documented constant today; Story 3.7 makes it the default of a Backend-configurable limit.
 pub const ARGUMENT_DEPTH_LIMIT: usize = 12;
+
+/// How long the Executor waits for the Backend's per-call handler to answer an `Authorize`
+/// question: 5 seconds. No answer by then denies the call (`reason = handler_timeout`), and an
+/// answer arriving later is dropped.
+///
+/// A documented constant today; Story 3.7 makes it the default of a Config value.
+pub const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What an execution may reach outside itself: which host functions it may call, and the
 /// connection that carries the calls.
@@ -93,8 +110,9 @@ impl Host {
 enum Step {
     /// The Script ended with this result.
     Finished(Value),
-    /// The Script waits on this host call, whose arguments are ready to send.
-    Call(HostCall, Vec<hexput_rpc::Value>),
+    /// The Script waits on this host call, whose arguments are ready to send; when the call is
+    /// granted per call, the question for the Backend's handler comes first.
+    Call(HostCall, Vec<hexput_rpc::Value>, Option<Question>),
     /// The Script made a host call `hexput-enforce` refused: the function's name, and why.
     Refused(String, Refusal),
 }
@@ -106,7 +124,9 @@ enum Step {
 /// identifier, rejected a repeated name, and supplied only finite numbers — the obligations
 /// [`hexput_interpreter::evaluate_with_variables`] documents and cannot check itself.
 ///
-/// Must run inside a Tokio runtime: every segment of the Script runs on its blocking pool.
+/// Must run inside a Tokio runtime: every segment of the Script runs on its blocking pool. The
+/// runtime must have timers enabled when a Script may call a function granted per call, since the
+/// handler's answer is awaited under [`AUTHORIZATION_TIMEOUT`].
 ///
 /// # Errors
 ///
@@ -136,22 +156,20 @@ pub async fn execute(
         .await?
     };
     loop {
-        let (call, arguments) = match step {
+        let (call, arguments, question) = match step {
             Step::Finished(result) => return Ok(result),
-            Step::Call(call, arguments) => (call, arguments),
-            Step::Refused(function, refusal) => {
-                // Logged here, in the execution's own task, so the event carries the request's
-                // span; the reason is for the Daemon's log only, never the Script's error.
-                tracing::debug!(
-                    function,
-                    reason = refusal.reason().as_str(),
-                    "refused a host call"
-                );
-                return Err(refusal.into_diagnostic());
-            }
+            Step::Call(call, arguments, question) => (call, arguments, question),
+            Step::Refused(function, refusal) => return Err(refused(&function, refusal)),
         };
+        if let Some(question) = question {
+            let answer = ask(caller.as_ref(), &question, arguments.clone()).await;
+            if let Err(refusal) = question.decide(answer) {
+                return Err(refused(call.name(), refusal));
+            }
+        }
         let reply = match &caller {
-            // Authorized: `advance` returned this call only after `check_call` allowed it.
+            // Authorized: `advance` returned this call only after `check_call` allowed it, and a
+            // call granted per call reaches here only once its handler answered `true`.
             Some(caller) => caller.dispatch_authorized(call.name(), arguments).await,
             // Unreachable in practice: without a caller nothing is registered, so the capability
             // check refused the call already.
@@ -163,6 +181,41 @@ pub async fn execute(
             advance(call.resume(&value).run(), &capabilities)
         })
         .await?;
+    }
+}
+
+/// Log a refused host call and return the Script's error. Logged here, in the execution's own
+/// task, so the event carries the request's span; the reason is for the Daemon's log only, never
+/// the Script's error.
+fn refused(function: &str, refusal: Refusal) -> Diagnostic {
+    tracing::debug!(
+        function,
+        reason = refusal.reason().as_str(),
+        "refused a host call"
+    );
+    refusal.into_diagnostic()
+}
+
+/// Put `question` to the Backend's per-call handler, waiting at most [`AUTHORIZATION_TIMEOUT`],
+/// and report what came back. Holds no thread and no lock while it waits.
+async fn ask(
+    caller: Option<&Caller>,
+    question: &Question,
+    arguments: Vec<hexput_rpc::Value>,
+) -> HandlerAnswer {
+    // Unreachable in practice, like a dispatch without a caller: nothing is registered.
+    let Some(caller) = caller else {
+        return HandlerAnswer::NoReply;
+    };
+    let answer = caller.ask_authorization(question.name(), arguments);
+    match tokio::time::timeout(AUTHORIZATION_TIMEOUT, answer).await {
+        Err(_elapsed) => HandlerAnswer::TimedOut,
+        Ok(Ok(hexput_rpc::Value::Boolean(allowed))) => HandlerAnswer::Boolean(allowed),
+        // Any other value, or a `Result` that is not a well-formed `{value}`.
+        Ok(Ok(_) | Err(CallFailure::Malformed(_))) => HandlerAnswer::NotBoolean,
+        // An `Error`, or a question that could not be written: the handler gave no answer.
+        Ok(Err(CallFailure::Failed(_) | CallFailure::Unsendable(_))) => HandlerAnswer::Failed,
+        Ok(Err(CallFailure::NoReply)) => HandlerAnswer::NoReply,
     }
 }
 
@@ -190,10 +243,11 @@ fn advance(
         Outcome::HostCall(call) => call,
     };
     let arguments = arguments(&call)?;
-    if let Err(refusal) = capabilities.check_call(call.name(), call.span()) {
-        return Ok(Step::Refused(call.name().to_owned(), refusal));
+    match capabilities.check_call(call.name(), call.span()) {
+        Ok(Decision::Allowed) => Ok(Step::Call(call, arguments, None)),
+        Ok(Decision::AskHandler(question)) => Ok(Step::Call(call, arguments, Some(question))),
+        Err(refusal) => Ok(Step::Refused(call.name().to_owned(), refusal)),
     }
-    Ok(Step::Call(call, arguments))
 }
 
 /// A host call's arguments as wire values, each measured first.

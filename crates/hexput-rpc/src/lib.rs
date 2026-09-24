@@ -28,6 +28,22 @@
 //!   but `hexput-exec` and this one, or a `Call` envelope is built outside this crate. A sealed
 //!   token the compiler enforces is still open.
 //!
+//! # Asking the per-call handler (Story 3.3)
+//!
+//! A Registered Function granted per call rather than blanket is decided by the Backend's own
+//! handler, one call at a time. The question is its own message, sent before any `Call`:
+//! `Authorize` with the same `{name, arguments}` payload, under an id from the same per-connection
+//! counter, answered `Result {value}` or `Error` like a `Call`. [`Caller::ask_authorization`]
+//! queues it and waits exactly like [`Caller::dispatch_authorized`], and returns the raw answer —
+//! what it means is `hexput-enforce`'s decision, reached through `hexput-exec`, never this crate's.
+//! It too is for `hexput-exec` alone, under the same source-text guard: the question runs no host
+//! code, but only the Executor has a call to ask about. The question and the implementation stay
+//! two messages, so a Backend's guard is kept apart from the function it guards (FR-6).
+//!
+//! A waiting execution may stop waiting — the Executor gives the handler a bounded time. Its
+//! question stays pending, and an answer that arrives later is taken off the table and dropped:
+//! it names a question, so it is never mistaken for a stray reply, and it reaches no one.
+//!
 //! When the connection can no longer deliver a reply — its peer stopped sending, or the stream is
 //! gone — [`Calls::close`] (or dropping the [`Calls`]) fails every pending call and every later
 //! one with [`CallFailure::NoReply`] at once, so an execution the connection is still waiting for
@@ -66,9 +82,20 @@ pub enum CallFailure {
     Unsendable(String),
 }
 
-/// One call on its way from an execution to the connection's writer.
+/// What an execution asks the Backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Request {
+    /// Run the Registered Function: a `Call`.
+    Call,
+    /// May this call go ahead? An `Authorize`, for the per-call handler.
+    Authorize,
+}
+
+/// One call — or one question about a call — on its way from an execution to the connection's
+/// writer.
 #[derive(Debug)]
 pub struct Call {
+    request: Request,
     name: String,
     arguments: Vec<Value>,
     reply: oneshot::Sender<Result<Value, CallFailure>>,
@@ -99,9 +126,42 @@ impl Caller {
         name: impl Into<String>,
         arguments: Vec<Value>,
     ) -> Result<Value, CallFailure> {
+        self.submit(Request::Call, name.into(), arguments).await
+    }
+
+    /// Ask the Backend's per-call handler whether the Script may call the Registered Function
+    /// `name` with `arguments`, and wait for its answer: the reply's `value`, or why there is
+    /// none. Sends an `Authorize`, never a `Call`: nothing runs on the Backend but its handler.
+    ///
+    /// Returns the answer as the Backend gave it — any value; deciding what it means is
+    /// `hexput-enforce`'s. Only for `hexput-exec`, kept so by the same source-text guard as
+    /// [`Caller::dispatch_authorized`].
+    ///
+    /// Holds nothing while it waits, and may be dropped (timed out) at any point: the answer, if
+    /// one arrives later, is discarded.
+    ///
+    /// # Errors
+    /// The [`CallFailure`] describing why the handler gave no value.
+    pub async fn ask_authorization(
+        &self,
+        name: impl Into<String>,
+        arguments: Vec<Value>,
+    ) -> Result<Value, CallFailure> {
+        self.submit(Request::Authorize, name.into(), arguments)
+            .await
+    }
+
+    /// Queue `request` for the connection's writer and wait for its outcome.
+    async fn submit(
+        &self,
+        request: Request,
+        name: String,
+        arguments: Vec<Value>,
+    ) -> Result<Value, CallFailure> {
         let (reply, answer) = oneshot::channel();
         let call = Call {
-            name: name.into(),
+            request,
+            name,
             arguments,
             reply,
         };
@@ -146,15 +206,20 @@ impl Calls {
         self.queue.recv().await
     }
 
-    /// Give `call` the next Daemon-issued id, record it as pending, and return the `Call`
-    /// envelope to write: `{name, arguments}`.
+    /// Give `call` the next Daemon-issued id, record it as pending, and return the envelope to
+    /// write: a `Call`, or an `Authorize` for a question, either with the payload
+    /// `{name, arguments}`.
     pub fn issue(&mut self, call: Call) -> Envelope<Value> {
         let id = CorrelationId(self.next);
         self.next = self.next.wrapping_add(1);
         self.pending.insert(id, call.reply);
+        let message_type = match call.request {
+            Request::Call => MessageType::Call,
+            Request::Authorize => MessageType::Authorize,
+        };
         Envelope::new(
             id,
-            MessageType::Call,
+            message_type,
             Value::Map(vec![
                 (Value::from(NAME), Value::from(call.name)),
                 (Value::from(ARGUMENTS), Value::Array(call.arguments)),
@@ -162,8 +227,9 @@ impl Calls {
         )
     }
 
-    /// Route a Backend message to the pending call it answers: a `Result` or `Error` whose id
-    /// names a call written and not yet answered. Anything else — another message type, no id, an
+    /// Route a Backend message to the pending call (or question) it answers: a `Result` or
+    /// `Error` whose id names one written and not yet answered. When its execution stopped
+    /// waiting (a question that timed out), the answer is consumed and dropped. Anything else — another message type, no id, an
     /// id no call is pending on — is handed back untouched for the caller to answer.
     ///
     /// # Errors

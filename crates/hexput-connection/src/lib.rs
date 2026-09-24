@@ -24,7 +24,8 @@
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
 //!   and the stray id is in the Daemon's call-id space, so echoing it would read, in the
 //!   Backend's own id space, as the failure of an unrelated request of its own.
-//! * `Call` from the Backend — `protocol.unexpected_message`: only the Daemon calls.
+//! * `Call` or `Authorize` from the Backend — `protocol.unexpected_message`: only the Daemon calls,
+//!   and only the Daemon asks a per-call handler.
 //!
 //! A frame the codec rejects gets its `protocol.*` error response; the connection keeps
 //! reading unless the error is fatal (an oversized frame), after which it closes.
@@ -75,6 +76,13 @@
 //! waiting execution, which
 //! holds no thread while it waits. A `Call` the adapter cannot frame fails only that call. A
 //! Backend's `Error` is the Script's failure, never the Daemon's, and is logged at `debug`.
+//!
+//! A function registered without a blanket grant is decided by the Backend's per-call handler
+//! (Story 3.3). The Executor's question travels exactly like a call: `hexput-rpc` builds an
+//! `Authorize` envelope under an id from the same counter, the loop writes it, routes the
+//! Backend's `Result` or `Error` back through the same table, and closing the table fails a
+//! pending question like a pending call. An answer that arrives after the Executor stopped
+//! waiting is taken off the table and dropped, never answered as a stray reply.
 //!
 //! When the connection stops reading, or is lost, every pending call fails with `host.no_reply` at
 //! once, as does every call made after: no execution the connection is still waiting for can wait
@@ -183,7 +191,7 @@ enum Event {
     Received(Received),
     /// An execution task ended, with its reply or its failure.
     Finished(Result<Envelope<Value>, JoinError>),
-    /// An execution made a host call, to be written.
+    /// An execution made a host call, or asks whether it may, to be written.
     Call(Call),
 }
 
@@ -329,8 +337,8 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
     }
 }
 
-/// Hand a Backend `Result`/`Error` that answers a pending host call to the execution waiting on
-/// it. Returns the message when it answers none, for the caller to answer.
+/// Hand a Backend `Result`/`Error` that answers a pending host call or authorization question to
+/// the execution waiting on it. Returns the message when it answers none, for the caller to answer.
 fn route_reply(
     calls: &mut Calls,
     message: Envelope<Value>,
@@ -344,7 +352,7 @@ fn route_reply(
                 span.in_scope(|| {
                     tracing::debug!(
                         call = id.map(CorrelationId::get),
-                        "a host call failed on the Backend"
+                        "the Backend answered a host call or authorization question with Error"
                     );
                 });
             }

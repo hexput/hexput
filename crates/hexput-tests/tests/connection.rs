@@ -1138,8 +1138,29 @@ impl Backend {
 
     /// The next envelope, which must be a `Call`: its id, name and arguments.
     async fn call(&mut self) -> (CorrelationId, String, Vec<Value>) {
+        self.request(MessageType::Call).await
+    }
+
+    /// The next envelope, which must be an `Authorize` question for the per-call handler: its id,
+    /// name and arguments.
+    async fn question(&mut self) -> (CorrelationId, String, Vec<Value>) {
+        self.request(MessageType::Authorize).await
+    }
+
+    /// Answer the question `id` with `Result {value: allowed}`.
+    fn allow(&self, id: CorrelationId, allowed: Value) {
+        self.reply(
+            id,
+            MessageType::Result,
+            Value::Map(vec![(string("value"), allowed)]),
+        );
+    }
+
+    /// The next envelope, which must be a `message_type` request from the Daemon with the payload
+    /// `{name, arguments}`: its id, name and arguments.
+    async fn request(&mut self, message_type: MessageType) -> (CorrelationId, String, Vec<Value>) {
         let call = self.next().await;
-        assert_eq!(call.message_type, MessageType::Call, "{call:?}");
+        assert_eq!(call.message_type, message_type, "{call:?}");
         let Value::Map(fields) = call.payload else {
             panic!("a Call payload is a map");
         };
@@ -1154,7 +1175,11 @@ impl Backend {
         let Value::Array(arguments) = fields[1].1.clone() else {
             panic!("`arguments` is an array");
         };
-        (call.id.expect("a Call has an id"), name, arguments)
+        (
+            call.id.expect("a Daemon request has an id"),
+            name,
+            arguments,
+        )
     }
 
     /// The peer closes the connection.
@@ -1404,11 +1429,14 @@ fn a_stray_reply_after_init_is_an_unexpected_message() {
             let reply = backend.next().await;
             assert_eq!(reply.id, None);
             assert_eq!(code_of(&reply), "protocol.unexpected_message");
-            // And a Backend never sends a `Call` of its own; that refusal echoes its id.
-            backend.reply(CorrelationId(7), MessageType::Call, Value::Nil);
-            let reply = backend.next().await;
-            assert_eq!(reply.id, Some(CorrelationId(7)));
-            assert_eq!(code_of(&reply), "protocol.unexpected_message");
+            // And a Backend never sends a `Call` or an `Authorize` of its own; that refusal echoes
+            // its id.
+            for message_type in [MessageType::Call, MessageType::Authorize] {
+                backend.reply(CorrelationId(7), message_type, Value::Nil);
+                let reply = backend.next().await;
+                assert_eq!(reply.id, Some(CorrelationId(7)));
+                assert_eq!(code_of(&reply), "protocol.unexpected_message");
+            }
             backend.close();
         },
     );
@@ -1564,7 +1592,7 @@ fn init_with_registration(extra: Vec<(Value, Value)>) -> Value {
 }
 
 #[test]
-fn a_function_registered_without_a_grant_is_refused_like_an_unregistered_one() {
+fn a_function_registered_without_a_grant_asks_and_a_refusal_is_like_an_unregistered_name() {
     let runtime = wired_runtime();
     let withheld = [
         // `blanket` absent: no blanket grant.
@@ -1578,6 +1606,10 @@ fn a_function_registered_without_a_grant_is_refused_like_an_unregistered_one() {
                 let sessions = Arc::new(Sessions::new());
                 let (mut backend, serving) = connect(&sessions, init_payload, false).await;
                 backend.send(execution(1, "return getOrder(1);"));
+                let (id, name, arguments) = backend.question().await;
+                assert_eq!(name, "getOrder");
+                assert_eq!(arguments, [Value::from(1)]);
+                backend.allow(id, Value::from(false));
                 let refused = backend.next().await;
                 assert_eq!(refused.id, Some(CorrelationId(1)));
                 assert_eq!(code_of(&refused), "capability.unknown_function");
@@ -1616,11 +1648,13 @@ fn grants_never_leak_across_sessions() {
             let (mut c, c_serving) = connect(&sessions, init_payload(&[]), false).await;
             assert_eq!(sessions.len(), 3);
 
-            for other in [&mut b, &mut c] {
-                other.send(execution(1, "return getOrder(1);"));
-                let reply = other.next().await;
-                assert_eq!(code_of(&reply), "capability.unknown_function");
-            }
+            // B's handler is asked, on B's connection alone, and refuses.
+            b.send(execution(1, "return getOrder(1);"));
+            let (id, _, _) = b.question().await;
+            b.allow(id, Value::from(false));
+            assert_eq!(code_of(&b.next().await), "capability.unknown_function");
+            c.send(execution(1, "return getOrder(1);"));
+            assert_eq!(code_of(&c.next().await), "capability.unknown_function");
 
             a.send(execution(1, "return getOrder(1);"));
             let (id, name, _) = a.call().await;
@@ -1660,6 +1694,8 @@ fn a_refused_call_is_logged_at_debug_under_its_request() {
             let (mut backend, serving) =
                 connect(&sessions, init_payload(&[("getOrder", false)]), false).await;
             backend.send(execution(7, "return getOrder(1);"));
+            let (id, _, _) = backend.question().await;
+            backend.allow(id, Value::from(false));
             assert_eq!(
                 code_of(&backend.next().await),
                 "capability.unknown_function"
@@ -1680,10 +1716,10 @@ fn a_refused_call_is_logged_at_debug_under_its_request() {
         .filter(|event| event["fields"]["message"] == "refused a host call")
         .collect();
     assert_eq!(refusals.len(), 2, "{text}");
-    for (event, (request, function, reason)) in refusals.iter().zip([
-        ("7", "getOrder", "not_granted"),
-        ("8", "nope", "unregistered"),
-    ]) {
+    for (event, (request, function, reason)) in refusals
+        .iter()
+        .zip([("7", "getOrder", "refused"), ("8", "nope", "unregistered")])
+    {
         assert_eq!(event["level"], "DEBUG", "{event}");
         assert_eq!(event["fields"]["function"], function, "{event}");
         assert_eq!(event["fields"]["reason"], reason, "{event}");
@@ -1698,4 +1734,189 @@ fn a_refused_call_is_logged_at_debug_under_its_request() {
             "{event}"
         );
     }
+}
+
+// --- Story 3.3: the per-call handler ---
+
+#[test]
+fn a_handler_that_allows_is_asked_first_then_the_call_is_made() {
+    let sessions = hosted(
+        &wired_runtime(),
+        &[("getOrder", false)],
+        false,
+        |mut backend| async move {
+            backend.send(execution(1, "return getOrder(7, \"a\");"));
+            let (question, name, arguments) = backend.question().await;
+            assert_eq!(name, "getOrder");
+            assert_eq!(arguments, [Value::from(7), string("a")]);
+            backend.allow(question, Value::from(true));
+            let (call, name, arguments) = backend.call().await;
+            assert_eq!(name, "getOrder");
+            assert_eq!(arguments, [Value::from(7), string("a")]);
+            // One per-connection counter issues both ids.
+            assert_eq!(call, CorrelationId(question.get() + 1));
+            backend.reply(
+                call,
+                MessageType::Result,
+                Value::Map(vec![(string("value"), string("order"))]),
+            );
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(value_of(&reply), string("order"));
+            // Asked again on the next call: nothing is cached.
+            backend.send(execution(2, "return getOrder(8);"));
+            let (question, _, _) = backend.question().await;
+            backend.allow(question, Value::from(false));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(code_of(&reply), "capability.unknown_function");
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Call` for it"
+            );
+        },
+    );
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn every_handler_denial_sends_no_call_and_is_the_same_error() {
+    hosted(
+        &wired_runtime(),
+        &[("getOrder", false)],
+        false,
+        |mut backend| async move {
+            backend.send(execution(1, "return nope(1);"));
+            let unregistered = backend.next().await;
+            let answers = [
+                (
+                    MessageType::Result,
+                    Value::Map(vec![(string("value"), string("yes"))]),
+                ),
+                (
+                    MessageType::Result,
+                    Value::Map(vec![(string("value"), Value::from(1))]),
+                ),
+                (
+                    MessageType::Result,
+                    Value::Map(vec![(string("value"), Value::Nil)]),
+                ),
+                (MessageType::Result, Value::Nil),
+                (
+                    MessageType::Error,
+                    Value::Map(vec![(string("message"), string("denied"))]),
+                ),
+            ];
+            for (n, (message_type, payload)) in (2..).zip(answers) {
+                backend.send(execution(n, "return getOrder(1);"));
+                let (question, _, _) = backend.question().await;
+                backend.reply(question, message_type, payload);
+                let reply = backend.next().await;
+                assert_eq!(reply.id, Some(CorrelationId(n)));
+                assert_eq!(reply.message_type, MessageType::Error, "{reply:?}");
+                assert_eq!(code_of(&reply), "capability.unknown_function");
+                assert_eq!(
+                    message_of(&reply),
+                    message_of(&unregistered).replace("nope", "getOrder")
+                );
+            }
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Call` was written"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_question_pending_when_the_peer_closes_is_denied() {
+    let sessions = hosted(
+        &wired_runtime(),
+        &[("getOrder", false)],
+        false,
+        |mut backend| async move {
+            backend.send(execution(3, "return getOrder(1);"));
+            let _ = backend.question().await;
+            backend.close();
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(3)));
+            assert_eq!(code_of(&reply), "capability.unknown_function");
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Call` was written"
+            );
+        },
+    );
+    assert!(sessions.is_empty(), "the connection detached");
+}
+
+#[test]
+fn a_silent_handler_is_denied_after_the_timeout_and_its_late_answer_is_dropped() {
+    hosted(
+        &wired_runtime(),
+        &[("getOrder", false)],
+        false,
+        |mut backend| async move {
+            let started = tokio::time::Instant::now();
+            backend.send(execution(1, "return getOrder(1);"));
+            let (question, _, _) = backend.question().await;
+            let reply = backend.next().await;
+            assert!(started.elapsed() >= hexput_exec::AUTHORIZATION_TIMEOUT);
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "capability.unknown_function");
+            // The late answer reaches no one: no `Call`, and no `unexpected_message` either.
+            backend.allow(question, Value::from(true));
+            backend.send(execution(2, "return 2;"));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)), "{reply:?}");
+            assert_eq!(value_of(&reply), Value::from(2));
+            backend.close();
+            assert!(backend.from_daemon.recv().await.is_none());
+        },
+    );
+}
+
+/// The acceptance criterion: a question waiting for its answer holds no thread. With a pool of
+/// exactly one blocking thread, a second execution can only finish meanwhile if the first holds
+/// none.
+#[test]
+fn a_question_waiting_for_its_answer_holds_no_thread() {
+    let dispatch = discarding_dispatch();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .on_thread_start(move || {
+            std::mem::forget(tracing::dispatcher::set_default(&dispatch));
+        })
+        .build()
+        .unwrap();
+    hosted(
+        &runtime,
+        &[("getOrder", false)],
+        false,
+        |mut backend| async move {
+            backend.send(execution(1, "return getOrder(1) + 1;"));
+            let (question, _, _) = backend.question().await;
+            backend.send(execution(
+                2,
+                "let i = 0; while (i < 1000) { i = i + 1; }; return i;",
+            ));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(value_of(&reply), Value::from(1000));
+            backend.allow(question, Value::from(true));
+            let (call, _, _) = backend.call().await;
+            backend.reply(
+                call,
+                MessageType::Result,
+                Value::Map(vec![(string("value"), Value::from(41))]),
+            );
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(value_of(&reply), Value::from(42));
+            backend.close();
+        },
+    );
 }

@@ -44,13 +44,15 @@ const VALUE: &str = "value";
 /// `source` (the Script, a string) and `variables` (its starting variables, a map from §2
 /// identifier to value). The Script may call the Registered Functions in `registrations` — each
 /// `(name, blanket)`, the name and whether it holds a blanket grant — as the Executor allows,
-/// through `caller` (Stories 3.1 and 3.2).
+/// through `caller` (Stories 3.1–3.3).
 ///
 /// Returns the `Result` payload `{value: <the Script's result>}`. A number that is whole and
 /// within ±2^53 is sent as a MessagePack integer (`-0` as `0`), every other number as a
 /// float64; object keys keep their order.
 ///
-/// Must run inside a Tokio runtime: the work runs on its blocking pool.
+/// Must run inside a Tokio runtime: the work runs on its blocking pool. Its timers must be enabled
+/// when a registration lacks a blanket grant, since the Executor waits for a per-call handler's
+/// answer under a timeout.
 ///
 /// # Errors
 ///

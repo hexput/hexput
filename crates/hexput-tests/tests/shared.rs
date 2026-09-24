@@ -246,7 +246,14 @@ fn message_types_spell_pascal_case_and_parse_exactly() {
     let spellings: Vec<_> = MessageType::ALL.iter().map(|t| t.as_str()).collect();
     assert_eq!(
         spellings,
-        ["Init", "ExecutionStart", "Result", "Call", "Error"]
+        [
+            "Init",
+            "ExecutionStart",
+            "Result",
+            "Call",
+            "Authorize",
+            "Error"
+        ]
     );
     for t in MessageType::ALL {
         assert_eq!(t.as_str().parse::<MessageType>().unwrap(), *t);

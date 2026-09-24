@@ -23,8 +23,8 @@ pub struct Config {}
 ///
 /// On the wire a registration is `{name, blanket}`, `blanket` an optional boolean. A blanket
 /// grant (Story 3.2) makes the function callable by every Script of the Session with no per-call
-/// round trip. Without one the function is not callable at all until Story 3.3 adds the per-call
-/// handler: the Daemon fails closed. Whether a call may go ahead is decided in `hexput-enforce`,
+/// round trip. Without one every call is decided by the Backend's per-call handler (Story 3.3),
+/// asked anew each time. Whether a call may go ahead is decided in `hexput-enforce`,
 /// never here (AD-3) — this is only the Session's record of what the Backend said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredFunction {

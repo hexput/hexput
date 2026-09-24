@@ -141,6 +141,10 @@ EXACT_DEPENDENCIES = {
 # `Call` envelope itself; only `hexput-rpc` builds one (`hexput-shared` defines the variant and
 # `hexput-port` codes it).
 #
+# Story 3.3 (AD-3): the per-call handler's question is guarded the same way. Only `hexput-exec`
+# asks it (`Caller::ask_authorization`), because only the Executor holds a `hexput-enforce`
+# decision to ask about; only `hexput-rpc` builds the `MessageType::Authorize` envelope.
+#
 # This is a text guard, not a sealed token the compiler enforces. It scans raw source lines,
 # comments and doc text included, so docs in the other crates must not spell these names.
 RESTRICTED_NAMES = [
@@ -148,6 +152,10 @@ RESTRICTED_NAMES = [
      "only the Executor may send a host call, and only after hexput-enforce allowed it"),
     ("MessageType::Call", {"hexput-rpc", "hexput-shared", "hexput-port"}, "AD-3",
      "only hexput-rpc builds a `Call` envelope, for a call the Executor already authorized"),
+    ("ask_authorization", {"hexput-rpc", "hexput-exec"}, "AD-3",
+     "only the Executor asks a Backend's per-call handler, for a call hexput-enforce sent to it"),
+    ("MessageType::Authorize", {"hexput-rpc", "hexput-shared", "hexput-port"}, "AD-3",
+     "only hexput-rpc builds an `Authorize` envelope, for a question the Executor asks"),
 ]
 
 TEST_CRATES = {"hexput-tests"}

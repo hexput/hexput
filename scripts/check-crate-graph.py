@@ -136,10 +136,18 @@ EXACT_DEPENDENCIES = {
 # checks nothing — the capability decision is `hexput-enforce`'s, reached only through
 # `hexput-exec`. `hexput-connection` creates the `Caller` and `hexput-script` passes it on, so both
 # must be able to name the type; neither may dispatch through it. `hexput-tests` is not a
-# production crate and is exempt, like its dev-dependencies above.
+# production crate and is exempt, like its dev-dependencies above. `MessageType::Call` is guarded
+# too: `hexput-connection` is the single writer of the Outbound half and could otherwise build a
+# `Call` envelope itself; only `hexput-rpc` builds one (`hexput-shared` defines the variant and
+# `hexput-port` codes it).
+#
+# This is a text guard, not a sealed token the compiler enforces. It scans raw source lines,
+# comments and doc text included, so docs in the other crates must not spell these names.
 RESTRICTED_NAMES = [
     ("dispatch_authorized", {"hexput-rpc", "hexput-exec"}, "AD-3",
      "only the Executor may send a host call, and only after hexput-enforce allowed it"),
+    ("MessageType::Call", {"hexput-rpc", "hexput-shared", "hexput-port"}, "AD-3",
+     "only hexput-rpc builds a `Call` envelope, for a call the Executor already authorized"),
 ]
 
 TEST_CRATES = {"hexput-tests"}
@@ -267,9 +275,10 @@ def main() -> int:
         )
         return 1
 
-    checked = (len(FORBIDDEN_EDGES) + len(REQUIRED_EDGES)
-               + len(SOLE_DEPENDENTS) + len(EXACT_DEPENDENCIES) + len(RESTRICTED_NAMES))
-    print(f"Crate graph OK — {checked} Architecture Decision edges asserted.")
+    edges = (len(FORBIDDEN_EDGES) + len(REQUIRED_EDGES)
+             + len(SOLE_DEPENDENTS) + len(EXACT_DEPENDENCIES))
+    print(f"Crate graph OK — {edges} Architecture Decision edges and "
+          f"{len(RESTRICTED_NAMES)} restricted names asserted.")
     return 0
 
 

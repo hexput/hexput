@@ -21,10 +21,12 @@
 //! * [`Caller`] is the handle an execution holds. [`Caller::dispatch_authorized`] queues a call for
 //!   the loop to write and waits — a plain `.await`, no thread and no lock held — for its outcome.
 //!   It checks nothing: its caller must already hold `hexput-enforce`'s permission for the call,
-//!   which only `hexput-exec` can obtain (AD-3). The name is deliberately unmistakable, and
-//!   `scripts/check-crate-graph.py` fails CI when it appears in any production crate but
-//!   `hexput-exec` and this one — so `hexput-connection`, which creates the `Caller`, and
-//!   `hexput-script`, which passes it on, can hold it but never use it.
+//!   which only `hexput-exec` can obtain (AD-3). The name is deliberately unmistakable.
+//!   `hexput-connection`, which creates the `Caller`, and `hexput-script`, which passes it on, can
+//!   still call it as far as the compiler is concerned: what stops them is a source-text guard in
+//!   `scripts/check-crate-graph.py`, which fails CI when that name appears in any production crate
+//!   but `hexput-exec` and this one, or a `Call` envelope is built outside this crate. A sealed
+//!   token the compiler enforces is still open.
 //!
 //! When the connection can no longer deliver a reply — its peer stopped sending, or the stream is
 //! gone — [`Calls::close`] (or dropping the [`Calls`]) fails every pending call and every later
@@ -84,7 +86,8 @@ impl Caller {
     /// the reply's `value`, or why there is none.
     ///
     /// Only for a call `hexput-enforce` has already allowed: this sends whatever it is given.
-    /// `hexput-exec` is its one caller (AD-3), pinned by `scripts/check-crate-graph.py`.
+    /// `hexput-exec` is its one caller (AD-3), kept so by a source-text guard in
+    /// `scripts/check-crate-graph.py`, not by the compiler.
     ///
     /// Holds nothing while it waits. Every call ends: the connection answers it, or fails it
     /// with [`CallFailure::NoReply`] once no answer can arrive.

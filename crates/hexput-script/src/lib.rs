@@ -15,8 +15,10 @@
 //! The Script may call its Session's Registered Functions (Story 3.1): the connection passes the
 //! registrations with their grants, read once per execution, and the [`Caller`] its calls travel
 //! through, and the Executor decides (Story 3.2) and makes every call. This crate holds the
-//! `Caller` only to pass it on and never dispatches through it (AD-3). Decoding, parsing and converting the result run on
-//! the blocking pool, like the Script itself, so a large payload never occupies a runtime worker.
+//! `Caller` only to pass it on (AD-3). Nothing in the type system stops it dispatching through it:
+//! a source-text guard in `scripts/check-crate-graph.py` does, and a sealed token the compiler
+//! enforces is still open. Decoding, parsing and converting the result run on the blocking pool,
+//! like the Script itself, so a large payload never occupies a runtime worker.
 //!
 //! Not yet: the static check (no check mode exists in Config until Story 3.10), the AST Cache
 //! and Cached Execution (Epic 4), per-call grants and Resource Budgets (Epic 3, behind the same

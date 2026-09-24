@@ -33,12 +33,15 @@ pub struct Capabilities {
 }
 
 /// Why a host call was refused. For the Daemon's log only: the Script sees the same error for
-/// every reason.
+/// every reason. Non-exhaustive: Story 3.3's per-call handler adds reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Reason {
     /// No Registered Function of the Session has the name.
     Unregistered,
-    /// The name is registered, but holds no grant that lets this call go ahead.
+    /// The name is registered, but holds no grant that lets this call go ahead. The interim
+    /// fail-closed reason: until Story 3.3's per-call handler, a function registered without a
+    /// blanket grant is never callable.
     NotGranted,
 }
 
@@ -88,15 +91,18 @@ impl Capabilities {
     }
 
     /// The Registered Functions of a Session, as `(name, blanket)` pairs: each name, and whether
-    /// the Backend granted it blanket at registration.
+    /// the Backend granted it blanket at registration. A name listed more than once folds
+    /// fail-closed: it holds the blanket grant only if every listing grants it.
     #[must_use]
     pub fn registered<N: Into<String>>(registrations: impl IntoIterator<Item = (N, bool)>) -> Self {
-        Self {
-            registered: registrations
-                .into_iter()
-                .map(|(name, blanket)| (name.into(), blanket))
-                .collect(),
+        let mut registered = HashMap::new();
+        for (name, blanket) in registrations {
+            registered
+                .entry(name.into())
+                .and_modify(|granted: &mut bool| *granted &= blanket)
+                .or_insert(blanket);
         }
+        Self { registered }
     }
 
     /// Decide whether the Script may call the host function `name`; `span` is the call's.

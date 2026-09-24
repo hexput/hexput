@@ -56,3 +56,18 @@ fn nothing_is_callable_with_no_capabilities() {
         .unwrap_err();
     assert_eq!(refusal.reason(), Reason::Unregistered);
 }
+
+#[test]
+fn a_name_listed_twice_is_granted_only_if_every_listing_grants_it() {
+    for listed in [[("f", false), ("f", true)], [("f", true), ("f", false)]] {
+        let refusal = Capabilities::registered(listed)
+            .check_call("f", span())
+            .unwrap_err();
+        assert_eq!(refusal.reason(), Reason::NotGranted, "{listed:?}");
+    }
+    assert!(
+        Capabilities::registered([("f", true), ("f", true)])
+            .check_call("f", span())
+            .is_ok()
+    );
+}

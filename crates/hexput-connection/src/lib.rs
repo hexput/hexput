@@ -66,10 +66,13 @@
 //! A Script calls its Session's Registered Functions through this connection (Story 3.1). The
 //! connection holds one [`hexput_rpc::Calls`] table and hands each execution a
 //! [`hexput_rpc::Caller`], together with the Session's registrations and their grants, read once
-//! when the execution is dispatched; the Executor alone decides which calls may go ahead, and this
-//! crate never dispatches through the `Caller` itself (AD-3). When an execution makes a call, the loop writes the `Call` envelope
-//! under a Daemon-issued id — a per-connection counter, independent of the Backend's ids — and
-//! routes the Backend's `Result` or `Error` naming that id back to the waiting execution, which
+//! when the execution is dispatched; the Executor alone decides which calls may go ahead (AD-3).
+//! This crate must neither dispatch through the `Caller` nor build a `Call` envelope itself; a
+//! source-text guard in `scripts/check-crate-graph.py` enforces that, and a sealed token the
+//! compiler enforces is still open. When an execution makes a call, the loop writes the `Call`
+//! envelope `hexput-rpc` built under a Daemon-issued id — a per-connection counter, independent of
+//! the Backend's ids — and routes the Backend's `Result` or `Error` naming that id back to the
+//! waiting execution, which
 //! holds no thread while it waits. A `Call` the adapter cannot frame fails only that call. A
 //! Backend's `Error` is the Script's failure, never the Daemon's, and is logged at `debug`.
 //!

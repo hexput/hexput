@@ -2,7 +2,7 @@
 title: 'Story 3.5: Stop an execution that burns too much CPU or memory'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'in-review'
 baseline_commit: '7d160d51a159e91cc7e0b18f6b1deeda52c5b3ad'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -56,18 +56,24 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hexput-shared` -- `Dimension` enum; two codes.
-- [ ] `crates/hexput-interpreter` -- slices and memory metering with a ceiling.
-- [ ] `crates/hexput-enforce` -- `Budget`, defaults, decisions, diagnostics.
-- [ ] `crates/hexput-exec` -- charge between slices, exclude waits.
-- [ ] `crates/hexput-tests/tests/*` -- every matrix row.
-- [ ] LANGUAGE-REFERENCE §7, `deferred-work.md`, `AGENTS.md`.
+- [x] `crates/hexput-shared` -- `Dimension` enum; two codes.
+- [x] `crates/hexput-interpreter` -- slices and memory metering with a ceiling.
+- [x] `crates/hexput-enforce` -- `Budget`, defaults, decisions, diagnostics.
+- [x] `crates/hexput-exec` -- charge between slices, exclude waits.
+- [x] `crates/hexput-tests/tests/*` -- every matrix row.
+- [x] LANGUAGE-REFERENCE §7, `deferred-work.md`, `AGENTS.md`.
 
 **Acceptance Criteria:**
 - Given a reviewer tracing budget enforcement, when they follow the code, then every limit and decision is in `hexput-enforce` and reached only from `hexput-exec`; the interpreter only meters.
 - Given a runaway execution, when it is stopped, then the stop happens within a small fraction of its CPU limit past the limit (pinned by a test with a generous bound).
 
 ## Implementation Notes
+
+- **Strings meter themselves.** `RtValue::String` holds a `Text` — shared text plus a handle on the heap's atomic string counter — that credits its charge when its last handle drops. So a string shared by many bindings counts once, one no longer reachable stops counting at once, and `s = s + "x"` in a loop is linear, not quadratic. Slots are charged by footprint on allocation/growth and credited on release. Detach/attach stay zero-copy (`Text` wraps an `Arc<str>`). The frame and value stacks, `for … in` key snapshots and detached copies are not counted (deferred-work entry).
+- **Slices count work, not steps alone.** One unit per frame plus one per 256 string bytes an operation reads or writes (binary operands, unary operand, index keys; object keys at `for … in` start), so a slice of 64 MiB string compares is not 10 000 × 10 ms. `hexput_exec::SLICE` is 10 000 units.
+- **Memory is checked after every frame, and before a concatenation** whose result (an upper bound: a number spells in at most 32 bytes) would cross the ceiling — spanned on the `+`. A frame with no place of its own (scope exit, discard) keeps the last construct's span; after a host call's value arrives, the call is the running construct.
+- **The slice that finishes the Script is not charged**: the work is done, and failing a completed Script over its last few milliseconds helps no one. A host call's slice is charged before anything about the call is decided or sent.
+- **Test timing.** The Story 2.7 "slow Script" loops (connection/daemon tests) went from 150 000 to 50 000 turns: ~0.6 s in a debug build was too close to the 1 s CPU budget on a loaded machine, since the budget measures wall time on the thread.
 
 ## Spec Change Log
 

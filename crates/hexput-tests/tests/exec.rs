@@ -1019,3 +1019,176 @@ fn no_value_carries_a_reflective_member_or_a_method() {
         assert!(seen.is_empty(), "{source} sent {seen:?}");
     }
 }
+
+// --- Story 3.5: CPU time and memory budgets ---
+
+/// The Script's CPU time limit: `hexput-enforce`'s documented default.
+const CPU_TIME: std::time::Duration = hexput_enforce::DEFAULT_CPU_TIME;
+
+/// A loop that doubles `s` twelve times, to 64 KiB.
+const SIXTY_FOUR_KIB: &str =
+    "let s = \"xxxxxxxxxxxxxxxx\"; let i = 0; while (i < 12) { s = s + s; i = i + 1; };";
+
+#[test]
+fn the_budget_codes_are_budget_errors_distinct_from_every_other_category() {
+    use hexput_shared::budget::Dimension;
+    assert_eq!(
+        Dimension::ALL
+            .iter()
+            .map(|d| d.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "cpu_time",
+            "memory",
+            "allocations",
+            "rpc_calls",
+            "output_size",
+            "side_effects"
+        ]
+    );
+    let diagnostic = run("while (true) {}", vec![]).unwrap_err();
+    assert_eq!(diagnostic.category.as_str(), "budget");
+}
+
+#[test]
+fn a_runaway_loop_is_stopped_just_past_its_cpu_time_and_frees_its_thread() {
+    // One blocking thread: the second execution runs only if the runaway gave its thread back.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish(),
+    );
+    tracing::dispatcher::with_default(&dispatch, || {
+        let source = "let x = 0;\nwhile (true) { x = x + 1; }";
+        let started = std::time::Instant::now();
+        let diagnostic = runtime
+            .block_on(execute(program(source), vec![], Host::none()))
+            .unwrap_err();
+        let took = started.elapsed();
+        assert_eq!(diagnostic.code.as_str(), "budget.cpu_time_exceeded");
+        assert_eq!(diagnostic.category.as_str(), "budget");
+        assert_eq!(diagnostic.span.line, 2, "spanned inside the loop");
+        assert!(took >= CPU_TIME, "stopped after {took:?}");
+        // The acceptance criterion's generous bound: a slice is milliseconds even in a debug
+        // build, so half a second past the limit is far more than a runaway ever gets.
+        assert!(
+            took < CPU_TIME + std::time::Duration::from_millis(500),
+            "stopped after {took:?}"
+        );
+        let result = runtime
+            .block_on(execute(program("return 1;"), vec![], Host::none()))
+            .unwrap();
+        assert_eq!(result.as_number(), Some(1.0));
+    });
+}
+
+#[test]
+fn endless_recursion_within_the_call_depth_is_stopped_by_cpu_time() {
+    let source = "fn fib(n) { if (n < 2) { return n; }; return fib(n - 1) + fib(n - 2); };\n\
+                  return fib(60);";
+    let diagnostic = run(source, vec![]).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.cpu_time_exceeded");
+}
+
+#[test]
+fn a_growing_string_is_stopped_at_the_memory_budget() {
+    let source = "let s = \"x\";\nwhile (true) { s = s + s; }";
+    let diagnostic = run(source, vec![]).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.memory_exceeded");
+    assert_eq!(diagnostic.category.as_str(), "budget");
+    assert_eq!(
+        spanned(source, &diagnostic),
+        "+",
+        "the concatenation that would cross it"
+    );
+}
+
+#[test]
+fn a_growing_collection_is_stopped_at_the_memory_budget() {
+    // A thousand distinct 64 KiB elements is 64 MiB.
+    let source = format!(
+        "{SIXTY_FOUR_KIB}\nlet a = []; let n = 0;\nwhile (true) {{ a[n] = s + n; n = n + 1; }}"
+    );
+    let diagnostic = run(&source, vec![]).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.memory_exceeded");
+    assert_eq!(diagnostic.span.line, 3, "{:?}", diagnostic.span);
+}
+
+#[test]
+fn memory_a_script_lets_go_of_is_not_held_against_it() {
+    // Two thousand 64 KiB strings — 128 MiB made in all — but only one held at a time.
+    let source = format!(
+        "{SIXTY_FOUR_KIB} let n = 0; let t = \"\"; while (n < 2000) {{ t = s + n; n = n + 1; }}; \
+         return n;"
+    );
+    assert_eq!(run(&source, vec![]).unwrap().as_number(), Some(2000.0));
+}
+
+#[test]
+fn waiting_for_the_backend_is_never_charged_as_cpu_time() {
+    let wait = CPU_TIME + std::time::Duration::from_millis(300);
+    let (result, seen) = run_hosted(
+        "let a = slowly(1); return a + 1;",
+        vec![],
+        &[("slowly", true)],
+        Box::new(move |_, _| {
+            // The stand-in answers on the runtime's own thread; the execution is waiting.
+            std::thread::sleep(wait);
+            value(Wire::from(41))
+        }),
+    );
+    assert_eq!(result.unwrap().as_number(), Some(42.0));
+    assert_eq!(seen.len(), 1);
+}
+
+#[test]
+fn cpu_time_adds_up_across_host_calls_and_the_calls_already_made_stand() {
+    // Each segment runs well under the limit; together they pass it.
+    let source = "while (true) {\n  let j = 0; while (j < 2000) { j = j + 1; };\n  ping(j);\n}";
+    let run = run_full(
+        source,
+        vec![],
+        &[("ping", true)],
+        refusing(),
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    let diagnostic = run.result.unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.cpu_time_exceeded");
+    assert!(run.calls.len() > 1, "{} calls", run.calls.len());
+    let stopped: Vec<_> = run
+        .events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "stopped an execution over its budget")
+        .collect();
+    assert_eq!(stopped.len(), 1, "{:?}", run.events);
+    assert_eq!(stopped[0]["level"], "DEBUG");
+    assert_eq!(stopped[0]["fields"]["dimension"], "cpu_time");
+}
+
+#[test]
+fn a_memory_stop_is_logged_with_its_dimension() {
+    let run = run_full(
+        "let s = \"x\"; while (true) { s = s + s; }",
+        vec![],
+        &[],
+        refusing(),
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    assert_eq!(
+        run.result.unwrap_err().code.as_str(),
+        "budget.memory_exceeded"
+    );
+    let dimensions: Vec<_> = run
+        .events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "stopped an execution over its budget")
+        .map(|event| event["fields"]["dimension"].clone())
+        .collect();
+    assert_eq!(dimensions, ["memory"]);
+}

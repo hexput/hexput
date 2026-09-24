@@ -220,7 +220,7 @@ Every failure carries a category, a stable code, a message, and a source span (E
 | `depth` | Call-depth limit exceeded; a value sent in a `Call` nested past the configured argument depth (`depth.argument_too_deep`, §8) | Runtime |
 | `capability` | Call to an unregistered or denied Registered Function or Registered Method (FR-6, FR-7, FR-27) | Runtime |
 | `host` | The Backend answered a call with an error or answered it malformed, or the call could not be sent at all (`host.function_failed`); the connection ended before it answered (`host.no_reply`) | Runtime |
-| `budget` | A Resource Budget dimension exceeded (FR-8) | Runtime |
+| `budget` | A Resource Budget dimension exceeded (FR-8), one code per dimension: running Script code for longer than the CPU time budget (`budget.cpu_time_exceeded`; waiting on the Backend is never counted), or values holding more memory than the memory budget (`budget.memory_exceeded`). Spanned on the construct running when the limit was crossed | Runtime |
 | `policy` | A disabled language construct was used (FR-3) | Parse or runtime |
 
 **[DECISION] Reading a missing object key yields `null`, not an error** — optional fields are the common case for a rule author, and `if (input.discount)` should read as "if a discount was supplied" rather than blowing up. Writing to a missing key creates it.

@@ -19,6 +19,17 @@
 //! statement's position), never by reference, and the machine holds the Program through `P` —
 //! `Arc<Program>` for a resumable execution, `&Program` for a run-to-completion one. A test
 //! asserts `Machine<Arc<Program>>` is `Send + 'static`.
+//!
+//! # Metering (Story 3.5)
+//!
+//! A machine can be handed a [`Meter`]. With a slice size it stops with [`Stop::Paused`] once it
+//! has done that much work — one unit per frame, plus one per [`BYTES_PER_UNIT`] bytes a string
+//! operation reads or writes, so a slice of long-string steps is no longer than a slice of cheap
+//! ones — and carries on from the same frame when run again. With a memory ceiling it stops with
+//! [`Stop::OutOfMemory`] after the first frame that leaves the heap holding more than the
+//! ceiling, and before a string concatenation whose result alone would cross it. Either stop
+//! carries the span of the construct that was running. What the limits are, and what exceeding
+//! them means, is the Executor's: the machine only meters.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -33,7 +44,10 @@ use indexmap::IndexMap;
 
 use crate::convert::{number_to_string, to_number, to_string};
 use crate::heap::{DetachFailure, Heap, RtValue, SlotId};
-use crate::{CALL_DEPTH_LIMIT, Value};
+use crate::{CALL_DEPTH_LIMIT, Meter, Value};
+
+/// How many bytes a string operation reads or writes per unit of slice work.
+const BYTES_PER_UNIT: usize = 256;
 
 /// Where a statement sits: at the Program's top level (`block: None`) or in a block, by position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,8 +105,11 @@ enum Frame {
         operator: Spanned<BinaryOperator>,
         right: ExprId,
     },
-    /// `[e0 … eN-1]` → `[array]`.
-    BuildArray(usize),
+    /// `[e0 … eN-1]` → `[array]`, for the array literal with this id and element count.
+    BuildArray {
+        array: ExprId,
+        count: usize,
+    },
     /// `[v0 … vN-1]` → `[object]`, keyed by the entries of the object literal with this id.
     BuildObject(ExprId),
     /// `[receiver]` → applies the chain's `links[index]` onward. `in_target` marks an assignment
@@ -165,6 +182,7 @@ struct LoopFrame {
 
 enum LoopKind {
     While {
+        keyword: Span,
         condition: ExprId,
         body: BlockId,
     },
@@ -207,6 +225,24 @@ pub(crate) enum Stop {
     Finished(Value),
     /// The Script called a host function and waits for its value.
     HostCall(PendingCall),
+    /// The slice of work the [`Meter`] allows is done; running the machine again carries on.
+    /// The span is the construct that was running.
+    Paused(Span),
+    /// The heap holds, or a concatenation would make it hold, more than the [`Meter`]'s memory
+    /// ceiling. The span is the construct whose allocation crossed it. The machine must be
+    /// dropped.
+    OutOfMemory(Span),
+}
+
+/// What frame is running, cheaply: resolved to a span only when a metering stop needs one.
+#[derive(Clone, Copy)]
+enum Site {
+    Statement(StmtAt),
+    Expression(ExprId),
+    Span(Span),
+    Link(Chain, usize),
+    /// A frame that allocates nothing and ends nothing a user wrote (scope exit, discard).
+    Unknown,
 }
 
 /// A host call the machine is suspended on.
@@ -234,6 +270,12 @@ pub(crate) struct Machine<P> {
     depth: usize,
     /// The chain a host call suspended, to carry on with once its value arrives.
     suspended: Option<(Chain, bool)>,
+    /// The limits the machine meters against.
+    meter: Meter,
+    /// Work done in the current slice, in units (see the module documentation).
+    work: u64,
+    /// The last construct the machine ran, for a metering stop's span.
+    site: Site,
 }
 
 impl<P: Deref<Target = Program> + Clone> Machine<P> {
@@ -267,6 +309,9 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             definitions: HashMap::new(),
             depth: 0,
             suspended: None,
+            meter: Meter::UNMETERED,
+            work: 0,
+            site: Site::Unknown,
         };
         for (name, value) in variables {
             let attached = machine.heap.attach(&value);
@@ -276,19 +321,113 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         machine
     }
 
-    /// Run until the Script ends or calls the host. After an error, or after
-    /// [`Stop::Finished`], the machine must be dropped; after [`Stop::HostCall`], it continues
-    /// only through [`Machine::resume`].
+    /// Meter the rest of the run against `meter`.
+    pub(crate) fn set_meter(&mut self, meter: Meter) {
+        self.meter = meter;
+    }
+
+    /// Approximately how many bytes the execution's values hold (see `heap.rs`).
+    pub(crate) fn memory_used(&self) -> usize {
+        self.heap.used()
+    }
+
+    /// Run until the Script ends, calls the host, or the [`Meter`] stops it. After an error,
+    /// [`Stop::Finished`] or [`Stop::OutOfMemory`], the machine must be dropped; after
+    /// [`Stop::HostCall`], it continues only through [`Machine::resume`]; after
+    /// [`Stop::Paused`], it continues by running it again.
     pub(crate) fn execute(&mut self) -> Result<Stop, Diagnostic> {
         // One handle for the whole run, so every step borrows the tree apart from `self`.
         let program = self.program.clone();
         let tree: &Program = &program;
+        // A ceiling the starting variables or a host call's value already crossed stops the
+        // machine before it runs a step.
+        if self.over_ceiling() {
+            return Ok(Stop::OutOfMemory(site_span(tree, self.site)));
+        }
         while let Some(frame) = self.frames.pop() {
-            if let Some(stop) = self.step(tree, frame)? {
+            // A frame with no place of its own (a scope exit) keeps the last one.
+            if let site @ (Site::Statement(_)
+            | Site::Expression(_)
+            | Site::Span(_)
+            | Site::Link(..)) = self.site(&frame)
+            {
+                self.site = site;
+            }
+            let site = self.site;
+            let stop = self.step(tree, frame)?;
+            if self.over_ceiling() {
+                return Ok(Stop::OutOfMemory(site_span(tree, site)));
+            }
+            if let Some(stop) = stop {
                 return Ok(stop);
+            }
+            self.work = self.work.saturating_add(1);
+            if let Some(slice) = self.meter.slice
+                && self.work >= slice.get()
+                && !self.frames.is_empty()
+            {
+                self.work = 0;
+                return Ok(Stop::Paused(site_span(tree, site)));
             }
         }
         Ok(Stop::Finished(Value::Null))
+    }
+
+    /// Whether the heap holds more than the memory ceiling.
+    fn over_ceiling(&self) -> bool {
+        self.meter
+            .memory_ceiling
+            .is_some_and(|ceiling| self.heap.used() > ceiling)
+    }
+
+    /// Whether `extra` more bytes would take the heap past the memory ceiling.
+    fn would_cross_ceiling(&self, extra: usize) -> bool {
+        self.meter
+            .memory_ceiling
+            .is_some_and(|ceiling| self.heap.used().saturating_add(extra) > ceiling)
+    }
+
+    /// Count the work of reading or writing `bytes` of string towards the slice.
+    fn burn(&mut self, bytes: usize) {
+        self.work = self.work.saturating_add((bytes / BYTES_PER_UNIT) as u64);
+    }
+
+    /// Count the work of reading `value` towards the slice, when it is a string.
+    fn burn_text(&mut self, value: &RtValue) {
+        if let RtValue::String(text) = value {
+            self.burn(text.len());
+        }
+    }
+
+    /// Where `frame` is in the Script.
+    fn site(&self, frame: &Frame) -> Site {
+        match frame {
+            Frame::Statement(at)
+            | Frame::Declare(at)
+            | Frame::Branch { at, .. }
+            | Frame::ForStart(at) => Site::Statement(*at),
+            Frame::Eval(id)
+            | Frame::Return(id)
+            | Frame::BuildArray { array: id, .. }
+            | Frame::BuildObject(id)
+            | Frame::AssignName(id)
+            | Frame::AssignMember(id) => Site::Expression(*id),
+            Frame::Unary { operator, .. } => Site::Span(operator.span),
+            Frame::BinaryRight { operator, .. } | Frame::Binary { operator, .. } => {
+                Site::Span(operator.span)
+            }
+            Frame::Link { chain, index, .. }
+            | Frame::IndexRead { chain, index, .. }
+            | Frame::Invoke { chain, index, .. }
+            | Frame::CallEnd { chain, index, .. } => Site::Link(*chain, *index),
+            Frame::HostCall { chain, .. } => Site::Link(*chain, 0),
+            Frame::Loop(state) | Frame::LoopTest(state) => match &state.kind {
+                LoopKind::While { keyword, .. } | LoopKind::For { keyword, .. } => {
+                    Site::Span(*keyword)
+                }
+            },
+            Frame::ExitScope(_) | Frame::Discard => Site::Unknown,
+        }
     }
 
     /// Answer the host call the machine stopped on with `value`, which becomes the call's value
@@ -296,6 +435,8 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// nothing.
     pub(crate) fn resume(&mut self, value: &Value) {
         if let Some((chain, in_target)) = self.suspended.take() {
+            // Until the next frame runs, the host call is the running construct.
+            self.site = Site::Link(chain, 0);
             let value = self.heap.attach(value);
             self.values.push(value);
             self.frames.push(Frame::Link {
@@ -394,6 +535,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             }
             Frame::Unary { operator, operand } => {
                 let value = self.pop();
+                self.burn_text(&value);
                 let result = self.unary(tree, operator, operand, &value)?;
                 self.values.push(result);
             }
@@ -409,10 +551,18 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             } => {
                 let right_value = self.pop();
                 let left_value = self.pop();
+                self.burn_text(&left_value);
+                self.burn_text(&right_value);
+                if operator.kind == BinaryOperator::Add
+                    && let Some(joined) = concatenated_len(&left_value, &right_value)
+                    && self.would_cross_ceiling(joined)
+                {
+                    return Ok(Some(Stop::OutOfMemory(operator.span)));
+                }
                 let result = self.binary(tree, left, operator, right, &left_value, &right_value)?;
                 self.values.push(result);
             }
-            Frame::BuildArray(count) => {
+            Frame::BuildArray { count, .. } => {
                 let items = self.pop_many(count);
                 let array = self.heap.new_array(items);
                 self.values.push(array);
@@ -443,6 +593,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             } => {
                 let key = self.pop();
                 let receiver = self.pop();
+                self.burn_text(&key);
                 let (_, links) = chain_links(tree, chain);
                 let Some(link) = links.get(index) else {
                     return Err(internal(tree.expression(chain.access).span));
@@ -662,7 +813,11 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         };
         let (collection, keys) = match value {
             RtValue::Array(id) => (id, None),
-            RtValue::Object(id) => (id, Some(self.heap.object_keys(id))),
+            RtValue::Object(id) => {
+                let keys = self.heap.object_keys(id);
+                self.work = self.work.saturating_add(keys.len() as u64);
+                (id, Some(keys))
+            }
             other => {
                 return Err(Diagnostic::new(
                     Category::Type,
@@ -718,7 +873,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     ));
                 }
                 let item = match keys {
-                    Some(keys) => keys.get(*index).map(|key| RtValue::String(Arc::clone(key))),
+                    Some(keys) => keys.get(*index).map(|key| self.heap.shared_text(key)),
                     None => self.heap.array_get(*collection, *index),
                 };
                 let Some(item) = item else {
@@ -900,12 +1055,15 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             StatementKind::Function { .. } => {}
             StatementKind::If { .. } => self.next_branch(tree, at, 0),
             StatementKind::While {
-                condition, body, ..
+                keyword,
+                condition,
+                body,
             } => {
                 self.frames.push(Frame::Loop(Box::new(LoopFrame {
                     outer_scope: self.scope,
                     values: self.values.len(),
                     kind: LoopKind::While {
+                        keyword: *keyword,
                         condition: condition.expression,
                         body: *body,
                     },
@@ -964,7 +1122,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 Literal::Null => RtValue::Null,
                 Literal::Bool(b) => RtValue::Bool(*b),
                 Literal::Number(n) => RtValue::Number(*n),
-                Literal::String(s) => RtValue::String(Arc::from(s.as_str())),
+                Literal::String(s) => self.heap.text(s.as_str()),
             }),
             ExpressionKind::Identifier(name) => {
                 // A host function is not a value (§8): only calling a bare undeclared name
@@ -1000,7 +1158,10 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 self.frames.push(Frame::Eval(*left));
             }
             ExpressionKind::Array { elements, .. } => {
-                self.frames.push(Frame::BuildArray(elements.len()));
+                self.frames.push(Frame::BuildArray {
+                    array: id,
+                    count: elements.len(),
+                });
                 self.frames
                     .extend(elements.iter().rev().map(|e| Frame::Eval(*e)));
             }
@@ -1175,6 +1336,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             AccessKind::Index { expression, .. } => {
                 let key = self.pop();
                 let receiver = self.pop();
+                self.burn_text(&key);
                 let key_span = tree.expression(*expression).span;
                 match (&receiver, &key) {
                     (RtValue::Null, _) => {
@@ -1302,20 +1464,18 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         match operator.kind {
             Op::Add => {
                 if matches!(l, RtValue::String(_)) || matches!(r, RtValue::String(_)) {
-                    let text = |value: &RtValue, span: Span| {
-                        to_string(value).ok_or_else(|| {
-                            mismatch(
-                                span,
-                                format!("{} cannot be converted to a string", article(value)),
-                            )
-                        })
+                    let not_text = |value: &RtValue, span: Span| {
+                        mismatch(
+                            span,
+                            format!("{} cannot be converted to a string", article(value)),
+                        )
                     };
-                    let a = text(l, left_span)?;
-                    let b = text(r, right_span)?;
+                    let a = to_string(l).ok_or_else(|| not_text(l, left_span))?;
+                    let b = to_string(r).ok_or_else(|| not_text(r, right_span))?;
                     let mut joined = String::with_capacity(a.len() + b.len());
                     joined.push_str(&a);
                     joined.push_str(&b);
-                    Ok(RtValue::String(Arc::from(joined)))
+                    Ok(self.heap.text(joined))
                 } else {
                     finite(number(l, left_span)? + number(r, right_span)?)
                 }
@@ -1342,7 +1502,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             Op::Less | Op::LessEqual | Op::Greater | Op::GreaterEqual => {
                 let ordering = if let (RtValue::String(a), RtValue::String(b)) = (l, r) {
                     // UTF-8 byte order is Unicode code point order.
-                    a.as_ref().partial_cmp(b.as_ref())
+                    a.as_str().partial_cmp(b.as_str())
                 } else {
                     number(l, left_span)?.partial_cmp(&number(r, right_span)?)
                 };
@@ -1385,6 +1545,35 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 .unwrap_or(RtValue::Null)),
             other => Err(no_properties(other, name, link.span)),
         }
+    }
+}
+
+/// The byte length `left + right` would have as a string concatenation, when it is one: an upper
+/// bound, since a number's spelling is at most 32 bytes. `None` when neither side is a string.
+fn concatenated_len(left: &RtValue, right: &RtValue) -> Option<usize> {
+    if !matches!(left, RtValue::String(_)) && !matches!(right, RtValue::String(_)) {
+        return None;
+    }
+    let len = |value: &RtValue| match value {
+        RtValue::String(text) => text.len(),
+        _ => 32,
+    };
+    Some(len(left).saturating_add(len(right)))
+}
+
+/// The span of `site`; for a frame with none of its own, the whole Program.
+fn site_span(tree: &Program, site: Site) -> Span {
+    match site {
+        Site::Statement(at) => statement(tree, at).span,
+        Site::Expression(id) => tree.expression(id).span,
+        Site::Span(span) => span,
+        Site::Link(chain, index) => {
+            let (_, links) = chain_links(tree, chain);
+            links
+                .get(index)
+                .map_or_else(|| tree.expression(chain.access).span, |link| link.span)
+        }
+        Site::Unknown => tree.span,
     }
 }
 
@@ -1751,6 +1940,7 @@ mod tests {
         match machine.execute()? {
             Stop::Finished(value) => Ok(value),
             Stop::HostCall(call) => panic!("unexpected host call to `{}`", call.name),
+            Stop::Paused(_) | Stop::OutOfMemory(_) => panic!("these machines are unmetered"),
         }
     }
 
@@ -2011,5 +2201,24 @@ mod tests {
             n + 1,
             "the nested run peaks at n + 1 scopes; siblings add none"
         );
+        // Story 3.5: every reclaimed scope, and every string it held, gave its bytes back.
+        let empty = Build::new().0;
+        assert_eq!(machine.memory_used(), Machine::new(&empty).memory_used());
+    }
+
+    /// Story 3.5: a string's bytes count while any value holds it, once however many do, and
+    /// stop counting when the last one lets go.
+    #[test]
+    fn strings_meter_themselves_once_and_give_their_bytes_back() {
+        let heap = Heap::default();
+        let before = heap.used();
+        let text = heap.text("y".repeat(10_000));
+        let held = heap.used() - before;
+        assert!(held >= 10_000, "{held}");
+        let copies: Vec<RtValue> = (0..100).map(|_| text.clone()).collect();
+        assert_eq!(heap.used() - before, held, "a copy is the same string");
+        drop(copies);
+        drop(text);
+        assert_eq!(heap.used(), before);
     }
 }

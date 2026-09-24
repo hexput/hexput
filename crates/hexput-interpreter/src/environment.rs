@@ -19,13 +19,20 @@
 
 use std::collections::HashMap;
 
-use crate::heap::{Heap, RtValue, Slot, SlotId};
+use crate::heap::{BINDING, Heap, RtValue, Slot, SlotId};
 
 pub(crate) struct ScopeRecord {
     bindings: HashMap<String, RtValue>,
     parent: Option<SlotId>,
     /// Set once a function value closed over this scope (or over one nested inside it).
     captured: bool,
+}
+
+impl ScopeRecord {
+    /// What the bindings cost the heap's memory meter, their values' strings excepted.
+    pub(crate) fn footprint(&self) -> usize {
+        self.bindings.keys().map(|name| BINDING + name.len()).sum()
+    }
 }
 
 impl Heap {
@@ -89,8 +96,10 @@ impl Heap {
 
     /// Bind `name` in `scope`. The parser has already rejected same-block redeclaration.
     pub(crate) fn declare(&mut self, scope: SlotId, name: &str, value: RtValue) {
-        if let Some(record) = self.scope_mut(scope) {
-            record.bindings.insert(name.to_owned(), value);
+        if let Some(record) = self.scope_mut(scope)
+            && record.bindings.insert(name.to_owned(), value).is_none()
+        {
+            self.grow(BINDING + name.len());
         }
     }
 

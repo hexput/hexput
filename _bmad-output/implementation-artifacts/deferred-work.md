@@ -180,6 +180,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md`
   summary: A Script that never ends (`while (true) {}`) pins a blocking-pool thread forever, keeps its connection and Session alive until shutdown, and hangs Daemon shutdown.
   evidence: Since Story 2.7 (`spec-2-7-keep-slow-executions-from-blocking-anything-else.md`) Direct Execution runs through `spawn_blocking`, so it no longer pins a runtime worker — other connections and this connection's reads are unaffected. But a blocking task cannot be aborted once started, and no Resource Budget exists yet: a clean close waits for it (Story 2.7 decision 2), and at shutdown Tokio's `Runtime` drop waits indefinitely for running blocking tasks, so the Daemon never exits. Settle with a step/time budget checked inside the evaluator loop (Epic 3, Story 3.5) so a runaway Script ends with a defined error; until then `Runtime::shutdown_timeout` in `hexput-daemon` would at least let the process exit.
+  status: RESOLVED 2026-09-24 by `spec-3-5-stop-an-execution-that-burns-too-much-cpu-or-memory.md` — `hexput-exec` runs every Script in metered slices and charges each slice's time to the execution's `hexput_enforce::Budget`; past the CPU time budget (1 s by default) the execution ends with `budget.cpu_time_exceeded`, freeing its blocking thread, so its connection, its Session and Daemon shutdown are held at most that long. `tests/daemon.rs` pins shutdown with a runaway running.
 
 - source_spec: `spec-2-6-run-a-one-shot-script-and-get-the-result-back.md`
   summary: A Script result is bounded in wire bytes, not memory — about 16M one-byte scalars pass `check_result` and become an `rmpv::Value` tree of 512 MiB or more before encoding.
@@ -226,7 +227,12 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-2-grant-a-function-blanket-access-at-registration.md`
   summary: AGENTS.md's Epic 3 status sentence says "Stories 3.1 and 3.2 are implemented (host calls; it supersedes …)" — "it" and "host calls" no longer fit two stories, and the paragraph carries rename history ("renamed from `call`") instead of only current names.
   evidence: Review finding (blind layer, low); routed to defer because the fix edits an agent-context file. Tidy at the next AGENTS.md status update.
+  status: RESOLVED 2026-09-24 by `spec-3-5-stop-an-execution-that-burns-too-much-cpu-or-memory.md` — the sentence now names what the paragraph covers and says "this paragraph supersedes"; the rename history was already gone.
 
 - source_spec: `spec-3-3-decide-per-call-whether-a-function-may-be-used.md`
   summary: A per-call question that times out stays in its connection's `Calls.pending` table until an answer arrives or the connection closes, so a Backend whose handler stays silent grows that table by one entry per denied call for the connection's life.
   evidence: Review finding (blind, edge-case and verification-gap layers, medium). Kept on purpose so a late answer is dropped rather than answered as a stray reply (matrix row "No answer"). Self-inflicted and confined to the silent Backend's own connection. Settle with Story 3.6's RPC-call budget (bounds questions per execution) plus a bounded tombstone set, or an expiry sweep that remembers only recently timed-out ids.
+
+- source_spec: `spec-3-5-stop-an-execution-that-burns-too-much-cpu-or-memory.md`
+  summary: The memory budget counts the execution's heap — slots and strings — but not its frame and value stacks, a `for … in` loop's key snapshot, or the detached copies made of host-call arguments and the Script result.
+  evidence: By design the count is approximate (the spec's "approximate live-bytes accounting"). The stacks are bounded by program size times the call-depth limit, and the detached copies are transient and bounded by the frame limit on the way out, so none grows without bound inside one execution; but detaching a large structure briefly holds a second copy the budget does not see. Revisit with Story 3.6's output-size dimension, which measures the result anyway.

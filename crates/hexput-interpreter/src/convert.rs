@@ -1,7 +1,7 @@
 //! The §4.3 conversion rules. Each returns `None` where the language raises a `type` error; the
 //! caller owns the diagnostic because only it knows the operator and span.
 
-use std::sync::Arc;
+use std::borrow::Cow;
 
 use crate::heap::RtValue;
 
@@ -18,12 +18,12 @@ pub(crate) fn to_number(value: &RtValue) -> Option<f64> {
 }
 
 /// To-string (§4.3): collections and functions have no string form.
-pub(crate) fn to_string(value: &RtValue) -> Option<Arc<str>> {
+pub(crate) fn to_string(value: &RtValue) -> Option<Cow<'_, str>> {
     match value {
-        RtValue::Null => Some(Arc::from("null")),
-        RtValue::Bool(b) => Some(Arc::from(if *b { "true" } else { "false" })),
-        RtValue::Number(n) => Some(Arc::from(number_to_string(*n))),
-        RtValue::String(s) => Some(Arc::clone(s)),
+        RtValue::Null => Some(Cow::Borrowed("null")),
+        RtValue::Bool(b) => Some(Cow::Borrowed(if *b { "true" } else { "false" })),
+        RtValue::Number(n) => Some(Cow::Owned(number_to_string(*n))),
+        RtValue::String(s) => Some(Cow::Borrowed(s.as_str())),
         RtValue::Array(_) | RtValue::Object(_) | RtValue::Function(_) => None,
     }
 }

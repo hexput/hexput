@@ -46,16 +46,30 @@
 //!
 //! Every refusal happens before anything is sent.
 //!
+//! # Resource Budget (Story 3.5)
+//!
+//! Every execution gets one `hexput-enforce` [`Budget`](hexput_enforce::Budget), kept for its
+//! whole run across every host call. The Executor runs the Script metered: in slices of
+//! [`SLICE`] units of work, and with the budget's memory ceiling. It times each slice with a
+//! monotonic clock and charges it to the budget between slices, and again at a host call before
+//! anything is sent; the time spent waiting for a reply or a per-call handler's answer is never
+//! measured, let alone charged. The slice that finishes the Script cannot fail it: the work is
+//! done, so it is not charged. A charge that takes the execution past its CPU time ends it with
+//! `budget.cpu_time_exceeded`; values that come to hold more than the ceiling end it with
+//! `budget.memory_exceeded`. Both are spanned on the construct that was running, and both free
+//! the blocking thread at once — the execution's heap is dropped with it. Host calls it already
+//! made stand. The Daemon logs each at `debug` with the `dimension`.
+//!
 //! Binds: AD-3, AD-6.
 
 pub mod wire;
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use std::time::Duration;
-
-use hexput_enforce::{Capabilities, Decision, HandlerAnswer, Question, Refusal};
-use hexput_interpreter::{Category, Code, Execution, HostCall, Outcome};
+use hexput_enforce::{Budget, Capabilities, Decision, Exceeded, HandlerAnswer, Question, Refusal};
+use hexput_interpreter::{Category, Code, Execution, HostCall, Meter, Outcome};
 use hexput_rpc::CallFailure;
 
 pub use hexput_interpreter::{Diagnostic, Program, Value};
@@ -76,6 +90,12 @@ pub const ARGUMENT_DEPTH_LIMIT: usize = 12;
 ///
 /// A documented constant today; Story 3.7 makes it the default of a Config value.
 pub const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How much work a Script does between two CPU time charges: 10 000 units — one per evaluation
+/// step, plus one per 256 bytes a string operation reads or writes. A slice takes around a
+/// millisecond on a release build, so a runaway Script is stopped within a small fraction of its
+/// CPU time past the limit.
+pub const SLICE: NonZeroU64 = NonZeroU64::new(10_000).expect("non-zero");
 
 /// What an execution may reach outside itself: which host functions it may call, and the
 /// connection that carries the calls.
@@ -102,6 +122,37 @@ impl Host {
         Self {
             capabilities: Capabilities::registered(registrations),
             caller: Some(caller),
+        }
+    }
+}
+
+/// Why a segment ended the execution.
+enum Halt {
+    /// The Script failed.
+    Failed(Diagnostic),
+    /// The Script exceeded a Resource Budget dimension.
+    Exceeded(Exceeded),
+}
+
+impl From<Diagnostic> for Halt {
+    fn from(diagnostic: Diagnostic) -> Self {
+        Self::Failed(diagnostic)
+    }
+}
+
+impl Halt {
+    /// The Script's error. A budget error is logged here, in the execution's own task, so the
+    /// event carries the request's span.
+    fn into_diagnostic(self) -> Diagnostic {
+        match self {
+            Self::Failed(diagnostic) => diagnostic,
+            Self::Exceeded(exceeded) => {
+                tracing::debug!(
+                    dimension = exceeded.dimension().as_str(),
+                    "stopped an execution over its budget"
+                );
+                exceeded.into_diagnostic()
+            }
         }
     }
 }
@@ -147,13 +198,21 @@ pub async fn execute(
         caller,
     } = host;
     let capabilities = Arc::new(capabilities);
-    let mut step = {
+    let budget = Budget::new();
+    let meter = Meter {
+        slice: Some(SLICE),
+        memory_ceiling: Some(budget.memory_ceiling()),
+    };
+    let (mut step, mut budget) = {
         let capabilities = Arc::clone(&capabilities);
         blocking(move || {
-            let execution = Execution::with_variables(program, variables)?;
-            advance(execution.run(), &capabilities)
+            let mut budget = budget;
+            let execution = Execution::with_variables(program, variables)?.metered(meter);
+            let step = segment(execution, &mut budget, &capabilities)?;
+            Ok((step, budget))
         })
-        .await?
+        .await
+        .map_err(Halt::into_diagnostic)?
     };
     loop {
         let (call, arguments, question) = match step {
@@ -176,11 +235,48 @@ pub async fn execute(
             None => Err(CallFailure::NoReply),
         };
         let capabilities = Arc::clone(&capabilities);
-        step = blocking(move || {
+        (step, budget) = blocking(move || {
             let value = received(&call, reply)?;
-            advance(call.resume(&value).run(), &capabilities)
+            let step = segment(call.resume(&value), &mut budget, &capabilities)?;
+            Ok((step, budget))
         })
-        .await?;
+        .await
+        .map_err(Halt::into_diagnostic)?;
+    }
+}
+
+/// Run `execution` slice by slice, charging each slice's time to `budget`, until the Script ends
+/// or calls the host — or a limit ends it. Runs on the blocking pool; nothing here waits.
+fn segment(
+    mut execution: Execution,
+    budget: &mut Budget,
+    capabilities: &Capabilities,
+) -> Result<Step, Halt> {
+    loop {
+        let started = Instant::now();
+        let outcome = execution.run();
+        let elapsed = started.elapsed();
+        match outcome? {
+            Outcome::Paused(paused) => {
+                budget
+                    .charge_cpu(elapsed, paused.span())
+                    .map_err(Halt::Exceeded)?;
+                execution = paused.resume();
+            }
+            Outcome::OutOfMemory(stopped) => {
+                return Err(Halt::Exceeded(budget.memory_exceeded(stopped.span())));
+            }
+            // The Script is done, so its last slice cannot fail it, and nothing is charged
+            // after it.
+            Outcome::Finished(result) => return Ok(Step::Finished(result)),
+            Outcome::HostCall(call) => {
+                // Charged before anything about the call is decided or sent.
+                budget
+                    .charge_cpu(elapsed, call.span())
+                    .map_err(Halt::Exceeded)?;
+                return Ok(advance(call, capabilities)?);
+            }
+        }
     }
 }
 
@@ -232,16 +328,9 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
     }
 }
 
-/// Where a segment stopped: the result, or a host call that may go ahead, with its arguments
-/// ready to send.
-fn advance(
-    run: Result<Outcome, Diagnostic>,
-    capabilities: &Capabilities,
-) -> Result<Step, Diagnostic> {
-    let call = match run? {
-        Outcome::Finished(result) => return Ok(Step::Finished(result)),
-        Outcome::HostCall(call) => call,
-    };
+/// Where a host call leaves the execution: a call that may go ahead, with its arguments ready to
+/// send, or one `hexput-enforce` refused.
+fn advance(call: HostCall, capabilities: &Capabilities) -> Result<Step, Diagnostic> {
     let arguments = arguments(&call)?;
     match capabilities.check_call(call.name(), call.span()) {
         Ok(Decision::Allowed) => Ok(Step::Call(call, arguments, None)),

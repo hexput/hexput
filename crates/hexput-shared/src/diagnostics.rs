@@ -246,6 +246,16 @@ impl Code {
     /// Category `host`.
     pub const NO_REPLY: Self = Self::new("host.no_reply");
 
+    // --- Resource Budget (Story 3.5) ---
+
+    /// The execution ran Script code for longer than its CPU time budget (1 second by default).
+    /// Waiting on the Backend is never charged. Spanned on the construct running when the limit
+    /// was crossed. Category `budget`.
+    pub const CPU_TIME_EXCEEDED: Self = Self::new("budget.cpu_time_exceeded");
+    /// The execution's values came to hold more memory than its memory budget (64 MiB by
+    /// default). Spanned on the construct whose allocation crossed the limit. Category `budget`.
+    pub const MEMORY_EXCEEDED: Self = Self::new("budget.memory_exceeded");
+
     // --- static-check findings (Story 1.10) ---
 
     /// Code after a `return`, `break` or `continue` in the same block can never run. A
@@ -303,6 +313,8 @@ impl Code {
         Self::ARGUMENT_TOO_DEEP,
         Self::FUNCTION_FAILED,
         Self::NO_REPLY,
+        Self::CPU_TIME_EXCEEDED,
+        Self::MEMORY_EXCEEDED,
         Self::UNREACHABLE_CODE,
         Self::UNUSED_VARIABLE,
         Self::UNKNOWN_FUNCTION,

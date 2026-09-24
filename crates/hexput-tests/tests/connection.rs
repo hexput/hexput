@@ -729,8 +729,9 @@ fn a_failing_script_is_answered_and_the_connection_keeps_serving() {
 // --- Story 2.7: slow executions block nothing ---
 
 /// How many turns the slow Script's loop takes — sized so it runs well over a fast Script in the
-/// test profile: about half a second in a debug build, against microseconds for a fast one.
-const SLOW_TURNS: i64 = 150_000;
+/// test profile: about a fifth of a second in a debug build, against microseconds for a fast one,
+/// and far inside the CPU time budget (Story 3.5) however loaded the machine running the tests.
+const SLOW_TURNS: i64 = 50_000;
 
 /// A slow execution: a counted loop, never a sleep, returning [`SLOW_TURNS`].
 fn slow(id: u64) -> Received {
@@ -1990,4 +1991,55 @@ fn an_ambient_call_over_the_wire_is_refused_with_nothing_written_but_the_error()
             backend.close();
         },
     );
+}
+
+// --- Story 3.5: a runaway stops at its budget and disturbs no one ---
+
+#[test]
+fn a_runaway_gets_its_budget_error_and_its_neighbours_complete() {
+    let dispatch = discarding_dispatch();
+    tracing::dispatcher::with_default(&dispatch, || {
+        wired_runtime().block_on(async {
+            let sessions = Arc::new(Sessions::new());
+            let (mut a, serving_a) = connect(&sessions, init_payload(&[]), false).await;
+            let (mut b, serving_b) = connect(&sessions, init_payload(&[]), false).await;
+            a.send(execution(1, "while (true) {}"));
+            a.send(execution(2, "return 2;"));
+            b.send(execution(3, "return 3;"));
+            // Its neighbours on the same connection and on another are answered at once.
+            let reply = a.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(value_of(&reply), Value::from(2));
+            let reply = b.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(3)));
+            assert_eq!(value_of(&reply), Value::from(3));
+            // The runaway ends with its own error once its CPU time is spent.
+            let reply = a.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "budget.cpu_time_exceeded");
+            // And the connection carries on serving.
+            a.send(execution(4, "return 4;"));
+            let reply = a.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(4)));
+            assert_eq!(value_of(&reply), Value::from(4));
+            a.close();
+            b.close();
+            finished(serving_a).await;
+            finished(serving_b).await;
+        });
+    });
+}
+
+#[test]
+fn a_script_over_its_memory_budget_is_answered_with_a_budget_error() {
+    let (sent, _) = serve(
+        vec![
+            init(1, init_payload(&[])),
+            execution(2, "let s = \"x\"; while (true) { s = s + s; }"),
+        ],
+        None,
+    );
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].id, Some(CorrelationId(2)));
+    assert_eq!(code_of(&sent[1]), "budget.memory_exceeded");
 }

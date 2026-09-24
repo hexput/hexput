@@ -137,3 +137,72 @@ fn a_name_listed_twice_is_blanket_granted_only_if_every_listing_grants_it() {
         Ok(Decision::Allowed)
     ));
 }
+
+// --- Story 3.5: the CPU time and memory dimensions of the Resource Budget ---
+
+mod budget {
+    use std::time::Duration;
+
+    use hexput_enforce::{Budget, DEFAULT_CPU_TIME, DEFAULT_MEMORY, Dimension};
+
+    use super::span;
+
+    #[test]
+    fn the_defaults_are_one_second_and_sixty_four_mebibytes() {
+        assert_eq!(DEFAULT_CPU_TIME, Duration::from_secs(1));
+        assert_eq!(DEFAULT_MEMORY, 64 * 1024 * 1024);
+        let budget = Budget::new();
+        assert_eq!(budget.limits().cpu_time(), DEFAULT_CPU_TIME);
+        assert_eq!(budget.limits().memory(), DEFAULT_MEMORY);
+        assert_eq!(budget.memory_ceiling(), DEFAULT_MEMORY);
+        assert_eq!(budget.cpu_used(), Duration::ZERO);
+    }
+
+    #[test]
+    fn cpu_time_adds_up_and_the_charge_that_passes_the_limit_is_refused() {
+        let mut budget = Budget::new();
+        for _ in 0..4 {
+            budget
+                .charge_cpu(Duration::from_millis(250), span())
+                .unwrap();
+        }
+        assert_eq!(
+            budget.cpu_used(),
+            DEFAULT_CPU_TIME,
+            "exactly at the limit is within it"
+        );
+        let exceeded = budget
+            .charge_cpu(Duration::from_millis(1), span())
+            .unwrap_err();
+        assert_eq!(exceeded.dimension(), Dimension::CpuTime);
+        let diagnostic = exceeded.diagnostic();
+        assert_eq!(diagnostic.code.as_str(), "budget.cpu_time_exceeded");
+        assert_eq!(diagnostic.category.as_str(), "budget");
+        assert_eq!(diagnostic.span, span());
+        assert!(
+            diagnostic.message.contains("1000 ms"),
+            "{}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn the_memory_error_names_its_dimension_and_is_spanned() {
+        let exceeded = Budget::new().memory_exceeded(span());
+        assert_eq!(exceeded.dimension(), Dimension::Memory);
+        let diagnostic = exceeded.into_diagnostic();
+        assert_eq!(diagnostic.code.as_str(), "budget.memory_exceeded");
+        assert_eq!(diagnostic.category.as_str(), "budget");
+        assert_eq!(diagnostic.span, span());
+    }
+
+    #[test]
+    fn every_dimension_has_a_stable_distinct_name() {
+        let mut names: Vec<_> = Dimension::ALL.iter().map(|d| d.as_str()).collect();
+        assert_eq!(names.len(), 6);
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 6);
+        assert_eq!(Dimension::CpuTime.to_string(), "cpu_time");
+    }
+}

@@ -42,6 +42,14 @@
 //! [`evaluate`] and [`evaluate_with_variables`] run with no host at all, so every host call is
 //! refused there as `capability.unknown_function` — which is what `hexput eval` reports.
 //!
+//! # Metering (Story 3.5)
+//!
+//! An [`Execution`] can be handed a [`Meter`]: a slice size, after which [`Execution::run`]
+//! stops with [`Outcome::Paused`] so its driver can see how long the slice took and carry on or
+//! not, and a memory ceiling, past which it stops with [`Outcome::OutOfMemory`]. The interpreter
+//! only meters: the limits, and what crossing one means, belong to the Executor and
+//! `hexput-enforce`. [`evaluate`] and [`evaluate_with_variables`] run unmetered.
+//!
 //! # Starting variables
 //!
 //! [`evaluate`] runs a Script with nothing but what its own source declares. [`evaluate_with_variables`]
@@ -81,11 +89,35 @@ pub use hexput_ast::{
 /// the Spine gives no `hexput-ast` edge — can name what it runs.
 pub use hexput_ast::Program;
 
+/// How an [`Execution`] is metered: how much work it does before pausing, and how much memory
+/// its values may hold. Both `None` in [`Meter::UNMETERED`], the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Meter {
+    /// Pause after this many units of work: one per evaluation step, plus one per 256 bytes a
+    /// string operation reads or writes, so a slice takes about as long whatever the Script
+    /// does. `None` never pauses.
+    pub slice: Option<core::num::NonZeroU64>,
+    /// Stop once the execution's values hold more than this many bytes, by the interpreter's
+    /// approximate count — checked after every step, and before a string concatenation whose
+    /// result alone would cross it, so one step overshoots by at most its own allocation.
+    /// `None` never stops.
+    pub memory_ceiling: Option<usize>,
+}
+
+impl Meter {
+    /// No slices and no ceiling: the Script runs until it ends or calls the host.
+    pub const UNMETERED: Self = Self {
+        slice: None,
+        memory_ceiling: None,
+    };
+}
+
 /// How many calls may be active at once before a call raises `depth.call_depth_exceeded`.
 ///
 /// A documented constant, deliberately not a parameter: the interpreter's job is only to make
 /// unbounded recursion terminate with a defined error instead of overflowing the host stack.
-/// Story 3.5's Resource Budget owns a Backend-configurable limit.
+/// What recursion within the limit may cost is the Resource Budget's (CPU time and memory, Story
+/// 3.5), which the Executor enforces through a [`Meter`].
 pub const CALL_DEPTH_LIMIT: usize = 1024;
 
 /// Evaluate a parsed Script and return its result: the value of the first `return` reached, or
@@ -150,9 +182,24 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
     check_starting_variables(program, &variables)?;
     let mut machine = machine::Machine::with_variables(program, variables);
     // Consuming the machine on every path is the memory contract: the heap is dropped here and
-    // only the detached result escapes.
-    match machine.execute()? {
+    // only the detached result escapes. The machine is unmetered, so it never pauses and never
+    // stops at a ceiling; the arms below only keep that true should it ever be metered.
+    let stop = loop {
+        match machine.execute()? {
+            machine::Stop::Paused(_) => {}
+            stop => break stop,
+        }
+    };
+    match stop {
         machine::Stop::Finished(result) => Ok(result),
+        // Unreachable: an unmetered machine has no ceiling to stop at, and pauses are looped
+        // over above. Limits and their errors are the Executor's, so this is no budget error.
+        machine::Stop::Paused(span) | machine::Stop::OutOfMemory(span) => Err(Diagnostic::new(
+            Category::Syntax,
+            Code::EXPECTED_SYNTAX,
+            "internal error: an unmetered evaluation stopped at a meter",
+            span,
+        )),
         machine::Stop::HostCall(call) => Err(Diagnostic::new(
             Category::Capability,
             Code::UNKNOWN_FUNCTION,
@@ -236,7 +283,22 @@ impl Execution {
         self.machine.root_names()
     }
 
-    /// Run until the Script ends or calls the host.
+    /// Meter the rest of this execution against `meter` — until the next call, if any. A new
+    /// execution is [`Meter::UNMETERED`].
+    #[must_use]
+    pub fn metered(mut self, meter: Meter) -> Self {
+        self.machine.set_meter(meter);
+        self
+    }
+
+    /// Approximately how many bytes this execution's values hold right now, by the count its
+    /// memory ceiling is checked against.
+    #[must_use]
+    pub fn memory_used(&self) -> usize {
+        self.machine.memory_used()
+    }
+
+    /// Run until the Script ends, calls the host, or its [`Meter`] stops it.
     ///
     /// # Errors
     /// The Script's first runtime failure, as [`evaluate`] reports it — including a host call's
@@ -251,6 +313,16 @@ impl Execution {
                 span: call.span,
                 execution: Self { machine },
             })),
+            machine::Stop::Paused(span) => Ok(Outcome::Paused(Paused {
+                span,
+                execution: Self { machine },
+            })),
+            machine::Stop::OutOfMemory(span) => {
+                let used = machine.memory_used();
+                // The heap goes here, before the driver hears of it.
+                drop(machine);
+                Ok(Outcome::OutOfMemory(OutOfMemory { span, used }))
+            }
         }
     }
 }
@@ -261,6 +333,54 @@ pub enum Outcome {
     Finished(Value),
     /// The Script called the host and waits for the value.
     HostCall(HostCall),
+    /// The slice its [`Meter`] allows is done; [`Paused::resume`] hands the execution back.
+    Paused(Paused),
+    /// Its values came to hold more than its [`Meter`]'s memory ceiling. The execution is gone,
+    /// its heap already freed.
+    OutOfMemory(OutOfMemory),
+}
+
+/// An [`Execution`] paused at the end of a slice of work.
+pub struct Paused {
+    span: Span,
+    execution: Execution,
+}
+
+impl Paused {
+    /// The construct that was running when the slice ended.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+
+    /// The execution, ready to [`run`](Execution::run) on from where it paused.
+    #[must_use]
+    pub fn resume(self) -> Execution {
+        self.execution
+    }
+}
+
+/// An execution stopped at its memory ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutOfMemory {
+    span: Span,
+    used: usize,
+}
+
+impl OutOfMemory {
+    /// The construct whose allocation crossed the ceiling — or, for a concatenation stopped
+    /// before it allocated, its operator.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+
+    /// Approximately how many bytes the execution's values held when it stopped. At or below
+    /// the ceiling when a concatenation was stopped before it allocated.
+    #[must_use]
+    pub const fn used(&self) -> usize {
+        self.used
+    }
 }
 
 /// A host call an [`Execution`] is suspended on: a call to a bare name no scope declares (§8).

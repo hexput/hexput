@@ -757,8 +757,9 @@ fn a_slow_script_delays_nothing_on_its_connection_or_another() {
 
     use hexput_port::{CorrelationId, Envelope, MessageType, Value};
 
-    // A counted loop, never a sleep: about half a second in a debug build.
-    const SLOW_TURNS: i64 = 150_000;
+    // A counted loop, never a sleep: about a fifth of a second in a debug build, and far inside
+    // the CPU time budget (Story 3.5).
+    const SLOW_TURNS: i64 = 50_000;
     let text = |t: &str| Value::from(t);
     let initialized = |serving: &Serving| {
         let mut client = serving.connect();
@@ -831,6 +832,56 @@ fn a_slow_script_delays_nothing_on_its_connection_or_another() {
     assert_eq!(reply.id, Some(CorrelationId(30)));
     assert_eq!(value(&reply), result(SLOW_TURNS));
     serving.stop().exit(0);
+}
+
+/// Story 3.5: shutting the Daemon down while a runaway Script runs no longer hangs — the runaway
+/// ends at its CPU time budget, which frees the blocking thread the runtime's shutdown waits for.
+#[cfg(unix)]
+#[test]
+fn shutdown_while_a_runaway_runs_ends_once_it_hits_its_cpu_time() {
+    use std::time::{Duration, Instant};
+
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let text = |t: &str| Value::from(t);
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let mut client = serving.connect();
+    wire::send(
+        &mut client,
+        &Envelope::new(
+            CorrelationId(1),
+            MessageType::Init,
+            Value::Map(vec![
+                (text("config"), Value::Map(vec![])),
+                (text("registrations"), Value::Array(vec![])),
+            ]),
+        ),
+    );
+    assert_eq!(
+        wire::reply(&mut client).expect("a reply").message_type,
+        MessageType::Result
+    );
+    let started = Instant::now();
+    wire::send(
+        &mut client,
+        &Envelope::new(
+            CorrelationId(2),
+            MessageType::ExecutionStart,
+            Value::Map(vec![
+                (text("source"), text("while (true) {}")),
+                (text("variables"), Value::Map(vec![])),
+            ]),
+        ),
+    );
+    // Let the runaway get going, then shut down.
+    std::thread::sleep(Duration::from_millis(100));
+    serving.stop().exit(0);
+    let took = started.elapsed();
+    assert!(
+        took < hexput_enforce::DEFAULT_CPU_TIME + Duration::from_secs(2),
+        "the Daemon took {took:?} to exit"
+    );
 }
 
 #[cfg(unix)]

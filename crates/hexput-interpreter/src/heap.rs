@@ -9,9 +9,28 @@
 //! those no function value has captured (see `environment.rs`).
 //!
 //! Dropping the heap is flat by construction: slots hold handles, never owned children.
+//!
+//! # Memory metering (Story 3.5)
+//!
+//! The heap keeps an approximate count of the bytes the execution's values hold, which the
+//! machine compares against the ceiling the Executor hands it. It is two counters:
+//!
+//! * **slots** — each live slot's [`footprint`]: a fixed cost per slot, plus one per array
+//!   element, object entry (with its key's bytes) and scope binding (with its name's bytes).
+//!   Charged when a slot is allocated or grows, credited when a slot is released.
+//! * **strings** — every string the execution made, by its bytes plus a fixed overhead, for as
+//!   long as it lives. A [`Text`] credits its own charge when the last handle to it drops, so a
+//!   string shared by many bindings or elements counts once, and a string no longer reachable
+//!   stops counting at once.
+//!
+//! Both are deliberately approximate — allocator overhead, spare vector capacity, the frame and
+//! value stacks and the program itself are not counted — but each is monotone in what the
+//! Script holds, which is what a ceiling needs.
 
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
 
@@ -30,9 +49,9 @@ pub(crate) enum RtValue {
     Bool(bool),
     /// Always finite: every operation that would produce a non-finite result raises instead.
     Number(f64),
-    /// Strings are immutable and cannot contain other values, so sharing them through `Arc`
-    /// can never form a cycle.
-    String(Arc<str>),
+    /// Strings are immutable and cannot contain other values, so sharing them can never form a
+    /// cycle. A [`Text`] is metered: it counts towards the heap's memory while it lives.
+    String(Text),
     Array(SlotId),
     Object(SlotId),
     /// A function value: the defining scope plus which `Function` in the program it is. Like a
@@ -78,6 +97,86 @@ impl RtValue {
     }
 }
 
+/// Bytes held by the strings of one execution — every live [`Text`] it made. Shared by the heap
+/// and each `Text`, which credits its own charge when it drops, wherever it drops.
+#[derive(Clone, Default)]
+pub(crate) struct TextMeter(Arc<AtomicUsize>);
+
+impl TextMeter {
+    fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A string value inside an execution: shared text, metered for as long as any handle to it
+/// lives. Cloning one aliases the same text and charges nothing more.
+#[derive(Clone)]
+pub(crate) struct Text(Arc<Metered>);
+
+struct Metered {
+    text: Arc<str>,
+    /// What this string added to its meter, and so what it gives back on drop.
+    charge: usize,
+    meter: TextMeter,
+}
+
+impl Drop for Metered {
+    fn drop(&mut self) {
+        self.meter.0.fetch_sub(self.charge, Ordering::Relaxed);
+    }
+}
+
+/// The fixed cost of one string: its two reference-counted allocations' headers and the metered
+/// record itself.
+const TEXT_OVERHEAD: usize = size_of::<Metered>() + 4 * size_of::<usize>();
+
+impl Text {
+    /// The text as a shareable `Arc<str>`, for a detached value.
+    pub(crate) fn shared(&self) -> Arc<str> {
+        Arc::clone(&self.0.text)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0.text
+    }
+}
+
+impl Deref for Text {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0.text
+    }
+}
+
+impl PartialEq for Text {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+/// The fixed cost of one heap slot.
+const SLOT: usize = size_of::<Slot>();
+/// One array element.
+const ELEMENT: usize = size_of::<RtValue>();
+/// One object entry, excluding its key's bytes: the key handle, the value and the map's index.
+const ENTRY: usize = size_of::<Arc<str>>() + size_of::<RtValue>() + 2 * size_of::<usize>();
+/// One scope binding, excluding its name's bytes: the name, the value and the map's control word.
+pub(crate) const BINDING: usize = size_of::<String>() + size_of::<RtValue>() + size_of::<usize>();
+
+/// What a slot's contents cost the slots counter, strings excepted: they meter themselves.
+fn footprint(slot: &Slot) -> usize {
+    match slot {
+        Slot::Free => 0,
+        Slot::Array { items, .. } => SLOT + items.len() * ELEMENT,
+        Slot::Object { entries, .. } => {
+            SLOT + entries.keys().map(|key| ENTRY + key.len()).sum::<usize>()
+        }
+        Slot::Scope(record) => SLOT + record.footprint(),
+        Slot::Function(_) => SLOT,
+    }
+}
+
 /// What a function value points at: which `Function` of the program (an index into the
 /// machine's table, so the heap stays free of the program's lifetime) and the scope it closes
 /// over. The scope is held by handle, so the closure sees later mutations of its bindings (§6).
@@ -117,10 +216,48 @@ pub(crate) enum Slot {
 pub(crate) struct Heap {
     slots: Vec<Slot>,
     free: Vec<SlotId>,
+    /// The live slots' footprints, summed.
+    slot_bytes: usize,
+    /// The live strings' charges, summed.
+    texts: TextMeter,
 }
 
 impl Heap {
+    /// Approximately how many bytes the execution's values hold right now (see the module
+    /// documentation).
+    pub(crate) fn used(&self) -> usize {
+        self.slot_bytes.saturating_add(self.texts.get())
+    }
+
+    /// Record that a live slot grew by `bytes`.
+    pub(crate) fn grow(&mut self, bytes: usize) {
+        self.slot_bytes = self.slot_bytes.saturating_add(bytes);
+    }
+
+    /// A new string holding `text`, charged in full: its bytes are new to this execution.
+    pub(crate) fn text(&self, text: impl Into<Arc<str>>) -> RtValue {
+        let text = text.into();
+        let charge = TEXT_OVERHEAD + text.len();
+        self.metered(text, charge)
+    }
+
+    /// A string value over `text`, whose bytes the heap already counts elsewhere — an object key
+    /// a `for … in` loop yields. Only the handle's own overhead is charged.
+    pub(crate) fn shared_text(&self, text: &Arc<str>) -> RtValue {
+        self.metered(Arc::clone(text), TEXT_OVERHEAD)
+    }
+
+    fn metered(&self, text: Arc<str>, charge: usize) -> RtValue {
+        self.texts.0.fetch_add(charge, Ordering::Relaxed);
+        RtValue::String(Text(Arc::new(Metered {
+            text,
+            charge,
+            meter: self.texts.clone(),
+        })))
+    }
+
     pub(crate) fn alloc(&mut self, slot: Slot) -> SlotId {
+        self.grow(footprint(&slot));
         while let Some(id) = self.free.pop() {
             if let Some(free @ Slot::Free) = self.slots.get_mut(id.0) {
                 *free = slot;
@@ -137,8 +274,10 @@ impl Heap {
         if let Some(slot) = self.slots.get_mut(id.0)
             && !matches!(slot, Slot::Free)
         {
+            let freed = footprint(slot);
             *slot = Slot::Free;
             self.free.push(id);
+            self.slot_bytes = self.slot_bytes.saturating_sub(freed);
         }
     }
 
@@ -218,14 +357,17 @@ impl Heap {
         let Some(Slot::Array { items, version }) = self.slot_mut(id) else {
             return false;
         };
-        if let Some(slot) = items.get_mut(index) {
+        let grew = if let Some(slot) = items.get_mut(index) {
             *slot = value;
+            0
         } else if index == items.len() {
             items.push(value);
+            ELEMENT
         } else {
             return false;
-        }
+        };
         *version = version.wrapping_add(1);
+        self.grow(grew);
         true
     }
 
@@ -236,12 +378,15 @@ impl Heap {
     /// Replace an existing key in place, or append a new one at the end.
     pub(crate) fn object_store(&mut self, id: SlotId, key: &str, value: RtValue) {
         if let Some(Slot::Object { entries, version }) = self.slot_mut(id) {
-            if let Some(slot) = entries.get_mut(key) {
+            let grew = if let Some(slot) = entries.get_mut(key) {
                 *slot = value;
+                0
             } else {
                 entries.insert(Arc::from(key), value);
-            }
+                ENTRY + key.len()
+            };
             *version = version.wrapping_add(1);
+            self.grow(grew);
         }
     }
 
@@ -296,7 +441,7 @@ impl Heap {
                             continue;
                         }
                         RtValue::String(s) => {
-                            out.push(Value::String(s));
+                            out.push(Value::String(s.shared()));
                             continue;
                         }
                         RtValue::Function(_) => return Err(DetachFailure::Function),
@@ -370,7 +515,7 @@ impl Heap {
                     Value::Null => out.push(RtValue::Null),
                     Value::Bool(b) => out.push(RtValue::Bool(b)),
                     Value::Number(n) => out.push(RtValue::Number(n)),
-                    Value::String(s) => out.push(RtValue::String(s)),
+                    Value::String(s) => out.push(self.text(s)),
                     Value::Array(array) => {
                         let items = array.to_vec();
                         work.push(Visit::FinishArray(items.len()));
@@ -430,7 +575,7 @@ impl Heap {
             };
             for value in values {
                 if let RtValue::String(s) = value {
-                    found.push(Arc::clone(s));
+                    found.push(s.shared());
                 }
             }
         }

@@ -1709,6 +1709,9 @@ mod host_calls {
                     calls.push((call.name().to_owned(), arguments));
                     execution = call.resume(&value);
                 }
+                Outcome::Paused(_) | Outcome::OutOfMemory(_) => {
+                    panic!("an unmetered execution never stops at a meter")
+                }
             }
         }
     }
@@ -1867,4 +1870,176 @@ fn root_names_stay_the_root_scope_after_a_host_call_inside_a_function() {
     let resumed = call.resume(&Value::Null);
     // Not `y`/`local` of the function it stopped in: the root scope.
     assert_eq!(resumed.root_names(), ["inner", "input"]);
+}
+
+// --- Story 3.5: the interpreter meters, and only meters ---
+
+mod metering {
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+
+    use hexput_interpreter::{Execution, Meter, Outcome, Value, evaluate};
+
+    fn start(source: &str, meter: Meter) -> Execution {
+        let program = Arc::new(hexput_parser::parse(source).unwrap());
+        Execution::with_variables(program, Vec::<(&str, Value)>::new())
+            .unwrap()
+            .metered(meter)
+    }
+
+    fn slices(steps: u64) -> Meter {
+        Meter {
+            slice: NonZeroU64::new(steps),
+            memory_ceiling: None,
+        }
+    }
+
+    fn ceiling(bytes: usize) -> Meter {
+        Meter {
+            slice: None,
+            memory_ceiling: Some(bytes),
+        }
+    }
+
+    /// Run to the end, resuming every pause; the number of pauses and the result.
+    fn run_through_pauses(execution: Execution) -> (usize, Value) {
+        let mut pauses = 0;
+        let mut execution = execution;
+        loop {
+            match execution.run().unwrap() {
+                Outcome::Paused(paused) => {
+                    pauses += 1;
+                    execution = paused.resume();
+                }
+                Outcome::Finished(result) => return (pauses, result),
+                _ => panic!("no host call and no ceiling here"),
+            }
+        }
+    }
+
+    const COUNT_TO_A_THOUSAND: &str = "let n = 0; let total = 0; while (n < 1000) { total = total + n; n = n + 1; }; return total;";
+
+    #[test]
+    fn a_sliced_execution_pauses_and_carries_on_to_the_same_result() {
+        let (pauses, result) = run_through_pauses(start(COUNT_TO_A_THOUSAND, slices(100)));
+        assert!(pauses > 10, "{pauses} pauses");
+        assert_eq!(result.as_number(), Some(499_500.0));
+        let (pauses, result) = run_through_pauses(start(COUNT_TO_A_THOUSAND, Meter::UNMETERED));
+        assert_eq!(pauses, 0);
+        assert_eq!(result.as_number(), Some(499_500.0));
+    }
+
+    #[test]
+    fn a_runaway_loop_pauses_forever_inside_the_loop() {
+        let source = "let x = 0;\nwhile (true) { x = x + 1; }";
+        let mut execution = start(source, slices(1_000));
+        for _ in 0..50 {
+            let Outcome::Paused(paused) = execution.run().unwrap() else {
+                panic!("a runaway never finishes");
+            };
+            let span = paused.span();
+            assert!(span.offset >= source.find("while").unwrap(), "{span:?}");
+            execution = paused.resume();
+        }
+    }
+
+    #[test]
+    fn long_string_work_ends_a_slice_sooner() {
+        // Comparing two 64 KiB strings reads 128 KiB: 512 units, not one step.
+        let source = "let s = \"xxxxxxxxxxxxxxxx\"; let i = 0; while (i < 12) { s = s + s; i = i + 1; };\n\
+                      let n = 0; while (n < 100) { let same = s == s; n = n + 1; }; return n;";
+        let cheap = run_through_pauses(start(COUNT_TO_A_THOUSAND, slices(2_000))).0;
+        let costly = run_through_pauses(start(source, slices(2_000))).0;
+        assert!(
+            costly > 20,
+            "{costly} pauses (a thousand cheap steps take {cheap})"
+        );
+    }
+
+    #[test]
+    fn a_growing_string_stops_at_the_ceiling_before_it_allocates_past_it() {
+        let source = "let s = \"x\";\nwhile (true) { s = s + s; }";
+        let limit = 1024 * 1024;
+        let Outcome::OutOfMemory(stopped) = start(source, ceiling(limit)).run().unwrap() else {
+            panic!("the string outgrows the ceiling");
+        };
+        assert_eq!(&source[stopped.span().range()], "+");
+        assert!(
+            stopped.used() <= limit,
+            "stopped before allocating: {}",
+            stopped.used()
+        );
+        assert!(stopped.used() > limit / 4, "{}", stopped.used());
+    }
+
+    #[test]
+    fn a_growing_collection_stops_at_the_ceiling() {
+        let source = "let a = [];\nlet n = 0;\nwhile (true) { a[n] = [n]; n = n + 1; }";
+        let limit = 256 * 1024;
+        let Outcome::OutOfMemory(stopped) = start(source, ceiling(limit)).run().unwrap() else {
+            panic!("the collection outgrows the ceiling");
+        };
+        assert!(stopped.used() > limit, "{}", stopped.used());
+        // One step's own allocation past it at most: an element and a one-element array.
+        assert!(stopped.used() < limit + 1024, "{}", stopped.used());
+        let line = source.lines().nth(2).unwrap();
+        assert_eq!(stopped.span().line, 3, "{:?} in `{line}`", stopped.span());
+    }
+
+    #[test]
+    fn a_string_shared_many_times_counts_once() {
+        // 64 KiB, held by a thousand elements: well under a 1 MiB ceiling unless counted per use.
+        let source = "let s = \"xxxxxxxxxxxxxxxx\"; let i = 0; while (i < 12) { s = s + s; i = i + 1; };\n\
+                      let a = []; let n = 0; while (n < 1000) { a[n] = s; n = n + 1; }; return n;";
+        let execution = start(source, ceiling(1024 * 1024));
+        let Outcome::Finished(result) = execution.run().unwrap() else {
+            panic!("sharing a string allocates nothing");
+        };
+        assert_eq!(result.as_number(), Some(1000.0));
+    }
+
+    #[test]
+    fn memory_that_is_let_go_stops_counting() {
+        // Each iteration makes a 64 KiB string and drops the last: it never holds much at once.
+        let source = "let s = \"xxxxxxxxxxxxxxxx\"; let i = 0; while (i < 12) { s = s + s; i = i + 1; };\n\
+                      let n = 0; let t = \"\"; while (n < 500) { t = s + n; n = n + 1; }; return n;";
+        let execution = start(source, ceiling(512 * 1024));
+        let Outcome::Finished(result) = execution.run().unwrap() else {
+            panic!("only one copy lives at a time");
+        };
+        assert_eq!(result.as_number(), Some(500.0));
+    }
+
+    #[test]
+    fn memory_used_counts_starting_variables() {
+        let program = Arc::new(hexput_parser::parse("return 1;").unwrap());
+        let empty = Execution::with_variables(program.clone(), Vec::<(&str, Value)>::new())
+            .unwrap()
+            .memory_used();
+        let big = Value::String(Arc::from("y".repeat(100_000)));
+        let loaded = Execution::with_variables(program, vec![("big", big)])
+            .unwrap()
+            .memory_used();
+        assert!(loaded >= empty + 100_000, "{empty} -> {loaded}");
+    }
+
+    #[test]
+    fn a_starting_variable_over_the_ceiling_stops_before_anything_runs() {
+        let program = Arc::new(hexput_parser::parse("return 1;").unwrap());
+        let big = Value::String(Arc::from("y".repeat(100_000)));
+        let execution = Execution::with_variables(program, vec![("big", big)])
+            .unwrap()
+            .metered(ceiling(10_000));
+        assert!(matches!(execution.run(), Ok(Outcome::OutOfMemory(_))));
+    }
+
+    #[test]
+    fn evaluate_is_unmetered() {
+        let program = hexput_parser::parse(
+            "let s = \"x\"; let i = 0; while (i < 22) { s = s + s; i = i + 1; }; return i;",
+        )
+        .unwrap();
+        // Four million bytes and a few hundred thousand steps: no slice, no ceiling.
+        assert_eq!(evaluate(&program).unwrap().as_number(), Some(22.0));
+    }
 }

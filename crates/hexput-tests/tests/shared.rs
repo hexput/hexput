@@ -145,6 +145,8 @@ fn every_code_is_enumerated_exactly_once() {
         "depth.argument_too_deep",
         "host.function_failed",
         "host.no_reply",
+        "budget.cpu_time_exceeded",
+        "budget.memory_exceeded",
         "syntax.unreachable_code",
         "reference.unused_variable",
         "capability.unknown_function",

@@ -78,6 +78,25 @@ context:
 
 ## Review Triage Log
 
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | blind + edge-case | The AD-3 guard only blocks the name `dispatch_authorized`; `hexput-connection` (single writer of `Outbound`) can still build a `MessageType::Call` envelope itself, and `deferred-work.md`/rpc docs call the gap "RESOLVED" / "can never use it" | medium | Real: nothing stops `Envelope::new(_, MessageType::Call, _)` in the connection. **patch**: add `MessageType::Call` to `RESTRICTED_NAMES` (allowed only in `hexput-rpc`, plus `hexput-shared`/`hexput-port`), and reword the docs/deferred entry to "text guard; sealed token still open" |
+| 2 | verification-gap + blind | `restricted_name_uses` has no negative test; a typo or dropped `extend` would silence it | medium | Pre-verified gap; the script has no harness for any rule. **defer** (script test harness) |
+| 3 | edge-case + blind | `Capabilities::registered` lets the last duplicate win, so `(f,false),(f,true)` grants `f`; the AD-3 decision point relies on `hexput-session`'s dedup | low | Real for any future caller; direct fold. **patch**: a duplicate folds fail-closed (any `false` wins) + test |
+| 4 | blind | Guard matches comments/doc text too, undocumented | low | Real (why connection/script docs avoid the name). **patch**: say so beside `RESTRICTED_NAMES` |
+| 5 | blind | Success line counts restricted names as "edges" | low | Real, cosmetic, direct. **patch** (reword) |
+| 6 | blind | `hexput_enforce::Reason` is public and not `#[non_exhaustive]`; Story 3.3 adds reasons | low | Real; direct. **patch** (`#[non_exhaustive]`, doc that `NotGranted` is interim until 3.3) |
+| 7 | blind | Init wire shape `{name, blanket}` documented only in rustdoc and one LANGUAGE-REFERENCE sentence | low | Real; decision 1 makes it the Daemon's contract. **patch**: one line in the Spine's 2026-09-24 wire-contract amendment |
+| 8 | blind | Two new doc lines in `hexput-connection`/`hexput-script` exceed 100 columns | low | Real, direct. **patch** (reflow) |
+| 9 | blind | AGENTS.md sentence grammar ("it"), rename history inline | low | Real; fix edits an agent-context file. **defer** |
+| 10 | blind | Existing Backends' `{name}` registrations silently become uncallable; only a `debug` event | low | Real but decided: decision 2 is fail-closed, and no Backend is deployed yet. Rejected |
+| 11 | blind | Refused calls convert arguments before the grant decision | low | carried from Story 3.1 triage row 7 (order documented in LANGUAGE-REFERENCE §8). Rejected |
+| 12 | blind | Registrations copied three times per execution | low | Real, perf only, no named harm at current scale; fix reshapes Session storage. Rejected |
+| 13 | blind | `Step::Refused` clones the name | low | Rejected: negligible |
+| 14 | blind | No test that grants are re-read per execution | low | Unreachable today: nothing changes registrations after init until Story 3.8. Rejected |
+| 15 | edge-case | A macro-built name or an exec-exported wrapper evades the text scan | low | Real in principle; no such code, fix is the sealed token already deferred. Rejected (covered by row 1's deferred note) |
+| 16 | blind | Sprint status `in-progress` vs spec `in-review` | false | Step 5 of the workflow sets `review` when the story completes |
+
 ## Verification
 
 **Commands:**

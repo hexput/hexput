@@ -41,6 +41,8 @@ FR-16: Execution requests are processed asynchronously; a slow execution never b
 
 FR-6: A Backend can register a function as callable independently of the logic deciding whether a specific call is allowed — `context.allow()` at registration grants blanket access; otherwise a per-call handler must return `true` or the call is capability-denied.
 FR-7: A script cannot reach the filesystem, network, or host process memory except through an explicitly granted Registered Function; any other capability reference fails with a defined capability-denied error, not a host-level exception.
+FR-27: A Backend can register a function as a method bound to an object key (`registerMethod(objKey, fn)`); a script calls it as `value.name(args)` on a value whose Value Secret carries that key, the call reaching the Backend as the same generic `Call` message with the receiver itself attached; a registered method wins over an own property of the same name, an unregistered method name is a capability denial, and argument/receiver nesting is capped by a Config limit (default 12). **[Added 2026-09-24 by course correction — sprint-change-proposal-2026-09-24.md.]**
+FR-28: Every value crossing to the Backend carries a hidden Value Secret (`__secret`: Reference ID `ref`, optional `key`, further Backend fields) that the Backend can read and edit and a script can never observe or change — reading yields `null`, writing is silently ignored, iteration skips it; modifications the Backend makes to referenced values during a call are reported in the call's reply and applied inside the execution before the script resumes. **[Added 2026-09-24 by course correction.]**
 
 **Resource budgeting (PRD §4.4)**
 
@@ -133,6 +135,8 @@ FR-4: Epic 2 - Direct Execution: one-shot parse-and-run with no AST Cache entry
 FR-5: Epic 4 - Cached Execution: CodeRegister once, CachedExecutionStart many with fresh variables
 FR-6: Epic 3 - Function registration separate from per-call allow decision (context.allow / return true)
 FR-7: Epic 3 - No ambient host access; every reach outside the script is a granted Registered Function
+FR-27: Epic 3 (Daemon side) and Epic 8 (SDK `registerMethod`) - Registered Methods on keyed objects over the generic `Call` message
+FR-28: Epic 3 (Daemon side) and Epic 8 (SDK handling of Value Secrets and modifications) - Value Secret, Reference IDs, host-side modifications
 FR-8: Epic 3 - Six-dimension Resource Budget, independently enforced, configurable and overridable
 FR-9: Epic 5 - UDS, Named Pipe, TCP+TLS, WebSocket adapters with identical protocol semantics
 FR-10: Epic 8 - Phase 1 client SDKs: JavaScript and Python
@@ -153,7 +157,7 @@ FR-24: Epic 2 - File-based System Config with CLI > env > default-path discovery
 FR-25: Epic 6 - Global Variable behavior strategies: forever, ttl, separate_each_trigger, keyed
 FR-26: Epic 1 (the check pass itself) and Epic 3 (its Config mode and per-execution override)
 
-**Coverage check:** all 26 FRs (FR-1...FR-26) are mapped to an owning epic; FR-26 is the one requirement split across two, since the check pass and its policy surface belong to different layers. Epic 1 owns no FR directly — it is the enabling substrate the PRD assumes but never states as a requirement (the Hexput language itself), and is consumed by FR-4, FR-5, FR-14, FR-15, and FR-19.
+**Coverage check:** all 28 FRs (FR-1...FR-28) are mapped to an owning epic; FR-26, FR-27 and FR-28 are split across two, since the check pass and its policy surface belong to different layers, and the Daemon and SDK sides of a wire feature ship in different epics. Epic 1 owns no FR directly — it is the enabling substrate the PRD assumes but never states as a requirement (the Hexput language itself), and is consumed by FR-4, FR-5, FR-14, FR-15, and FR-19.
 
 
 ## Epic List
@@ -172,8 +176,8 @@ A Backend can start the daemon from a System Config file, connect over a Unix Do
 
 ### Epic 3: Expose the host safely
 
-A Backend can register the host functions a script may call, grant them either blanket at registration (`context.allow()`) or per call (`return true`), and bound every execution independently across CPU time, memory, allocations, RPC calls, output size, and side-effect count — tuning those limits and the language feature toggles per Config or per execution. This epic is the entire trust boundary of the system; there is no layer behind it.
-**FRs covered:** FR-6, FR-7, FR-8, FR-3, FR-26 (mode and override)
+A Backend can register the host functions — and, on keyed objects, the methods — a script may call, grant them either blanket at registration (`context.allow()`) or per call (`return true`), hand values across with hidden Value Secrets through which it tracks and changes them, and bound every execution independently across CPU time, memory, allocations, RPC calls, output size, and side-effect count — tuning those limits and the language feature toggles per Config or per execution. This epic is the entire trust boundary of the system; there is no layer behind it.
+**FRs covered:** FR-6, FR-7, FR-8, FR-3, FR-26 (mode and override), FR-27, FR-28 (Daemon side)
 
 ### Epic 4: Execute hot logic fast
 
@@ -198,7 +202,7 @@ An operator can confirm the daemon is alive and serving, scrape execution metric
 ### Epic 8: Connect from JavaScript and Python
 
 A backend engineer working in JavaScript or Python can install a thin client SDK and perform the full Phase 1 surface idiomatically — connect, send init Config and registrations, run Direct and Cached Executions, receive results, and reconnect via Client ID with its reconnect credential — without hand-writing MessagePack frames.
-**FRs covered:** FR-10
+**FRs covered:** FR-10, FR-27 and FR-28 (SDK side)
 
 ### Epic 9: Author Hexput scripts in an editor
 
@@ -667,7 +671,7 @@ So that Epic 7's audit requirements have a foundation rather than a retrofit.
 
 ## Epic 3: Expose the host safely
 
-A Backend can register the host functions a script may call, grant them either blanket at registration (`context.allow()`) or per call (`return true`), and bound every execution independently across CPU time, memory, allocations, RPC calls, output size, and side-effect count — tuning those limits and the language feature toggles per Config or per execution. This epic is the entire trust boundary of the system; there is no layer behind it.
+A Backend can register the host functions — and, on keyed objects, the methods — a script may call, grant them either blanket at registration (`context.allow()`) or per call (`return true`), hand values across with hidden Value Secrets through which it tracks and changes them, and bound every execution independently across CPU time, memory, allocations, RPC calls, output size, and side-effect count — tuning those limits and the language feature toggles per Config or per execution. This epic is the entire trust boundary of the system; there is no layer behind it.
 
 ### Story 3.1: Call a registered host function from a script
 
@@ -692,6 +696,18 @@ So that user-authored logic can reach my data without reaching anything else.
 **Given** a script calling a name that was never registered
 **When** it executes
 **Then** it fails with a capability-denied error rather than an unknown-identifier error, so unregistered and unauthorized are indistinguishable to the script
+
+**Given** a host call
+**When** the daemon sends it
+**Then** it is one generic `Call` message `{name, arguments}` — the same message Registered Methods (Story 3.12) extend with `receiver` — and the Backend answers with `Result {value}` or `Error` under the call's daemon-issued id (FR-6, Spine 2026-09-24 amendment) **[Added 2026-09-24]**
+
+**Given** a call the Backend answers with an error or a malformed reply, or one pending when the connection ends
+**When** the script resumes
+**Then** it fails with `host.function_failed` or `host.no_reply` respectively, spanned on the call — a `host` error, distinct from `capability` (LANGUAGE-REFERENCE §7, §8) **[Added 2026-09-24]**
+
+**Given** a script whose own binding shares a registered name, or an argument that is a function, cyclic, or nested deeper than 12 levels
+**When** it runs
+**Then** the local binding is called and nothing is sent; an unsendable argument fails with a `type` error, and a too-deep one with `depth.argument_too_deep`, spanned on that argument, before anything is sent (LANGUAGE-REFERENCE §8; the limit becomes configurable in Story 3.7) **[Added 2026-09-24]**
 
 ### Story 3.2: Grant a function blanket access at registration
 
@@ -818,6 +834,10 @@ So that an expensive report and a cheap rule check can coexist under one connect
 **When** it is submitted
 **Then** it is rejected with a defined error rather than silently clamped
 
+**Given** the argument depth limit for values sent in a `Call` (default 12, Story 3.1)
+**When** a Config or per-execution override sets it
+**Then** arguments and receivers nested past the configured depth fail with `depth.argument_too_deep` before anything is sent, and an out-of-range value is rejected like any other override (FR-27) **[Added 2026-09-24]**
+
 ### Story 3.8: Change execution policy without reconnecting
 
 As a Backend,
@@ -901,6 +921,92 @@ So that I can reject broken user-authored logic at submission time in developmen
 **Given** the check's outcome
 **When** a script passes it
 **Then** nothing about that pass grants a capability or reduces a budget charge — enforcement remains `hexput-enforce`'s alone through the `Executor`, unreachable from `hexput-check` (AD-3, AD-8)
+
+### Story 3.11: Carry hidden metadata on values the script cannot touch
+
+*[Added 2026-09-24 by course correction — sprint-change-proposal-2026-09-24.md.]*
+
+As a Backend,
+I want every value I hand a script, and every value a script hands me, to carry a Value Secret only I can read and edit,
+So that I can identify and annotate values across the boundary without a script ever seeing or forging that metadata.
+
+**Acceptance Criteria:**
+
+**Given** a starting variable or a `Call` result sent as a holder `{__secret: {ref, key?, ...}, value}`
+**When** the script runs
+**Then** the value behaves exactly as its plain `value`, and its Value Secret — `ref`, optional `key`, and every further field — is kept intact (FR-28)
+
+**Given** any value in a script
+**When** the script reads `__secret` by `.`, `[]` or `?.`, writes it by assignment or an object-literal key, or iterates the object with `for … in`
+**Then** reading yields `null`, writing is silently ignored, and iteration never yields `__secret` — no error, and no way to observe or change the metadata (LANGUAGE-REFERENCE §3)
+
+**Given** a value sent to the Backend in a `Call`
+**When** it, or any value nested inside it, has no Value Secret yet
+**Then** it travels as a holder with a Daemon-generated Reference ID, and the same value sent again in that execution carries the same Reference ID (FR-28)
+
+**Given** a referenced value
+**When** the script copies it by binding or passing, or computes a new value from it
+**Then** the copy carries the same Value Secret, and the computed value carries none; `==`, truthiness and conversion never see the Value Secret (LANGUAGE-REFERENCE §3)
+
+**Given** an execution's result containing values with Value Secrets
+**When** it is returned to the Backend
+**Then** each travels as a holder with its Value Secret unchanged, and values without one travel plain, so Story 2.6's results stay valid
+
+### Story 3.12: Call a Backend method on a keyed object
+
+*[Added 2026-09-24 by course correction.]*
+
+As a Backend,
+I want to register methods under an object key and have scripts call them on objects I marked with that key,
+So that host objects feel like objects with methods, as in other languages.
+
+**Acceptance Criteria:**
+
+**Given** an init registration naming a function with an object key (`registerMethod(objKey, fn)` in an SDK)
+**When** a script calls `value.name(args)` on a value whose Value Secret carries that key
+**Then** the daemon sends one `Call {name, receiver, arguments}` with the receiver itself, Value Secret included, and resumes the script with the returned value (FR-27)
+
+**Given** a keyed value that also has an own property of the method's name
+**When** the script calls it as a method
+**Then** the Registered Method is called, not the property (LANGUAGE-REFERENCE §8)
+
+**Given** a keyed value and a name registered for no method under its key and held by no own property
+**When** the script calls it
+**Then** it fails with the same `capability` error as an unregistered function (FR-7, FR-27)
+
+**Given** a value without a key
+**When** the script calls `value.name(args)`
+**Then** it is an ordinary property call, and nothing is sent to the Backend
+
+**Given** a Registered Method
+**When** its call is checked and counted
+**Then** it obeys the same Capability grants (Stories 3.2, 3.3) and counts against RPC calls and side effects exactly like a plain Registered Function call (Story 3.6), and `rpc_calls` disabled (Story 3.9) blocks it too
+
+### Story 3.13: Apply the Backend's changes to referenced values
+
+*[Added 2026-09-24 by course correction.]*
+
+As a Backend,
+I want to change the values a script handed me while I handle its call and have the script see those changes,
+So that I can update the script's objects and strings without a second round trip.
+
+**Acceptance Criteria:**
+
+**Given** a `Call` reply `Result {value, modifications: [{ref, value}]}`
+**When** the daemon receives it
+**Then** it applies every modification before the script resumes with `value` (FR-28)
+
+**Given** a modification naming a referenced object or array
+**When** it is applied
+**Then** the collection changes in place and keeps its identity, so every binding and container holding it observes the new content (LANGUAGE-REFERENCE §4.2, §8)
+
+**Given** a modification naming a referenced string, number or bool
+**When** it is applied
+**Then** every binding holding that referenced value observes the new value, while values previously computed from it are unchanged
+
+**Given** a modification naming a Reference ID the execution does not hold, or a malformed `modifications` list
+**When** the reply arrives
+**Then** an unknown Reference ID is ignored, and a malformed list fails the call with `host.function_failed`
 
 ---
 
@@ -1749,6 +1855,10 @@ So that the capability model works from my side of the socket.
 **When** the SDK handles it
 **Then** the failure is reported to the daemon as a host-side function error rather than crashing my process or the connection
 
+**Given** a method registered with `registerMethod(objKey, fn)`
+**When** a script calls it on a keyed object
+**Then** the SDK dispatches the `Call` to my method with the receiver, exposes every value's Value Secret (`ref`, `key`, extra fields) to me, and reports the changes I make to referenced values as the reply's `modifications` (FR-27, FR-28) **[Added 2026-09-24]**
+
 **Given** several inbound calls arriving concurrently
 **When** they are dispatched
 **Then** they are handled concurrently without serializing behind each other (NFR5)
@@ -1812,6 +1922,10 @@ So that capability decisions stay in my code.
 **Given** my implementation raising
 **When** the SDK handles it
 **Then** the failure is reported as a host-side function error without tearing down my process or the connection
+
+**Given** a method registered with `registerMethod(obj_key, fn)`
+**When** a script calls it on a keyed object
+**Then** the SDK dispatches the `Call` to my method with the receiver, exposes every value's Value Secret (`ref`, `key`, extra fields) to me, and reports the changes I make to referenced values as the reply's `modifications` (FR-27, FR-28) **[Added 2026-09-24]**
 
 **Given** several inbound calls arriving concurrently
 **When** they are dispatched

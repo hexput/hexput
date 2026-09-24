@@ -70,6 +70,9 @@ development_status:
   3-8-change-execution-policy-without-reconnecting: backlog
   3-9-switch-off-language-constructs-by-policy: backlog
   3-10-turn-the-static-check-on-or-off: backlog
+  3-11-carry-hidden-metadata-on-values-the-script-cannot-touch: backlog
+  3-12-call-a-backend-method-on-a-keyed-object: backlog
+  3-13-apply-the-backend-s-changes-to-referenced-values: backlog
   epic-3-retrospective: optional
 
   epic-4: backlog

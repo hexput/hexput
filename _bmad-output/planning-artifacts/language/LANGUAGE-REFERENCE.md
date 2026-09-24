@@ -3,6 +3,7 @@ title: Hexput Language Reference (v2)
 status: final
 created: 2026-09-18
 author: drafted by PM role during the sprint-planning readiness gate; approved by Erdem 2026-09-18 after four rounds of revision (@Global syntax, truthiness + implicit conversion, absent-key null, optional chaining + static check)
+amended: '2026-09-24 — §3, §7, §8 and §11 amended by course correction (Registered Methods, Value Secret and Reference IDs, host-call errors). See sprint-change-proposal-2026-09-24.md.'
 note: '[DECISION] markers are retained as provenance — they mark choices made here rather than inherited from the PRD, brief, or spine. They are approved, not open.'
 purpose: Close readiness-gate finding A — Epic 1 (lexer/parser/interpreter), Epic 6 (plugin syntax) and Epic 9 (tree-sitter grammar + LSP) all depend on a language definition that no planning artifact recorded.
 ---
@@ -53,6 +54,14 @@ ben";
 is one string containing two newlines. Consequently a string is unterminated only at end of input, never at end of line, and a string's source span may cover several lines (Story 1.8 renders multi-line spans without truncating the location). There is no line-continuation escape: a `\` immediately before a newline is an invalid escape, not a join.
 
 **[DECISION, 2026-09-19]** Object literals reject repeated decoded keys, including collisions between bare, quoted, and escaped spellings (for example, `a`, `"a"`, and `"\u{61}"`).
+
+**[DECISION, 2026-09-24] A value may carry a hidden Value Secret.** Any value — object, array, string, number, bool, even `null` — that crosses between the script and the Backend carries metadata the script cannot see: a Reference ID (`ref`), an optional object key (`key`, which selects Registered Methods, §8), and any further fields the Backend put there. It exists for the Backend, which reads and edits it; inside Hexput it is invisible rather than forbidden:
+
+- Reading `__secret` — `o.__secret`, `o["__secret"]`, `o?.__secret` — yields `null` on every value, as an absent key would.
+- Writing it — `o.__secret = x`, `o["__secret"] = x`, or a `__secret` key in an object literal — is silently ignored; the key never exists in the script's view.
+- `for (key in o)` never yields `__secret`.
+- The Value Secret travels **with the value**: a copy made by binding or passing it (`let m = n;`, `f(n)`, `[n]`) is the same referenced value, while a value computed from it (`n + 1`, `s + "!"`, a new object literal) is a new value with no Value Secret.
+- It never takes part in the language's own operations: `==`, truthiness, conversion and printing see only the value itself.
 
 Functions are values (§6) but are not storable in a Global Variable. **[DECISION]** — a function closes over an environment, and persisting one across Event invocations would make Global Variable lifetime semantics (FR-25) undefinable.
 
@@ -208,8 +217,9 @@ Every failure carries a category, a stable code, a message, and a source span (E
 | `reference` | Undeclared identifier, property access on `null`, an array write outside the appendable range | Runtime |
 | `arity` | Wrong argument count | Runtime |
 | `arithmetic` | Division by zero, non-finite result | Runtime |
-| `depth` | Call-depth limit exceeded | Runtime |
-| `capability` | Call to an unregistered or denied Registered Function (FR-6, FR-7) | Runtime |
+| `depth` | Call-depth limit exceeded; a value sent in a `Call` nested past the configured argument depth (`depth.argument_too_deep`, §8) | Runtime |
+| `capability` | Call to an unregistered or denied Registered Function or Registered Method (FR-6, FR-7, FR-27) | Runtime |
+| `host` | The Backend answered a call with an error, answered it malformed, or the connection ended before it answered (`host.function_failed`, `host.no_reply`) | Runtime |
 | `budget` | A Resource Budget dimension exceeded (FR-8) | Runtime |
 | `policy` | A disabled language construct was used (FR-3) | Parse or runtime |
 
@@ -256,6 +266,14 @@ applyDiscount(order.id, 10);
 ```
 
 There is no import, require, module, filesystem, network, environment, or process facility in the grammar at all — the absence is structural, not a runtime check (Epic 3 Story 3.4). A call to an unregistered name raises `capability`, indistinguishable from a denied call.
+
+**[DECISION, 2026-09-24] What makes a call a host call.** A call whose callee is a bare name that no scope declares is a host call; a local binding of the same name — a `let`, a parameter, a named `fn`, a starting variable — shadows the Registered Function, and the call is an ordinary local one. A host function is not a value: naming it without calling it (`let f = getOrder;`) is still `reference.undeclared_identifier`.
+
+**[DECISION, 2026-09-24] A host call suspends the script.** The Daemon sends the Backend one `Call` message — `{name, arguments}` — and the script resumes with the value the Backend returns. If the Backend answers with an error or a malformed reply, the script fails with `host.function_failed`; if the connection ends first, with `host.no_reply`; both are spanned on the call and, like every error, uncatchable (§7). Arguments are sent as data: a function, or a value containing a cycle, cannot be an argument (`type` error spanned on that argument), and a value nested deeper than the Backend's configured argument depth (default 12) is `depth.argument_too_deep`. Nothing is sent when any argument is refused.
+
+**[DECISION, 2026-09-24] Registered Methods.** A Backend may bind a Registered Function to an object key (`registerMethod(objKey, fn)`). On a value whose Value Secret (§3) carries that key, `value.name(args)` calls the method: the `Call` additionally carries the receiver itself, Value Secret included, under `receiver`. The Registered Method takes precedence over an own property of the same name, because the key — and so the method set — is the Backend's contract and a script cannot forge it. On a keyed value, a method name registered for no function under that key and held by no own property raises `capability`, exactly like an unregistered function. A value without a key has no methods; `o.name(args)` there is an ordinary property call.
+
+**[DECISION, 2026-09-24] Reference IDs and host-side modifications.** Every value sent in a `Call` — each argument, the receiver, and every value nested inside them — travels with its Value Secret, and one that has none yet is given a Daemon-generated Reference ID, stable for the rest of the execution. The Backend may change referenced values while handling the call and list those changes in its reply, each naming a Reference ID and the value's new content; the Daemon applies them before the script resumes. A modified object or array keeps its identity (§4.2) and changes in place; a modified string, number or bool is replaced in every binding holding that referenced value. A change naming a Reference ID the execution does not hold is ignored. Values the Backend supplies — starting variables and call results — may carry their own Value Secret, and every Value Secret returns to the Backend unchanged by the script, in `Call`s and in the execution's result alike.
 
 ## 9. Plugin source
 
@@ -324,7 +342,7 @@ fn audit(params) { logOrder(params.id); return { ok: true }; }
 
 ## 11. Deliberately absent
 
-Not in v2, and not an oversight: `try`/`catch`, `throw`, modules and imports, classes and inheritance, `this`, string interpolation, regular expressions, integer/float distinction, bitwise operators, ternary `?:`, switch, labeled break, generators, `async`/`await` inside scripts (concurrency is the daemon's concern, not the script's), and any standard library beyond what the host registers.
+Not in v2, and not an oversight: `try`/`catch`, `throw`, modules and imports, classes and inheritance, `this` (Registered Methods, §8, are Backend-bound functions selected by a hidden object key, not a class system), string interpolation, regular expressions, integer/float distinction, bitwise operators, ternary `?:`, switch, labeled break, generators, `async`/`await` inside scripts (concurrency is the daemon's concern, not the script's), and any standard library beyond what the host registers.
 
 **[DECISION]** There is no built-in standard library at all in v2 — not even `len()` or `push()`. Everything a script can do beyond the operators above comes from Registered Functions. This keeps the trust boundary exactly at the capability edge (NFR1) and is the single most likely item to need revisiting once real scripts are written.
 

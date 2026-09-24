@@ -7,9 +7,9 @@ paradigm: 'Hexagonal (Ports & Adapters) at the transport boundary, Actor model f
 scope: 'Hexput v2 daemon — the whole system covered by the v2 PRD'
 status: final
 created: '2026-09-18'
-updated: '2026-09-18'
-amended: '2026-09-18 — AD-8 and the check/ module added for FR-26 (optional static check); later the same day, Structural Seed rewritten from a single-crate module tree into a Cargo workspace, one crate per module plus language/tooling crates, all lib crates funneling into one hexput-bin crate for binaries. Both after this spine was first marked final. See .memlog.md.'
-binds: [FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-7, FR-8, FR-9, FR-11, FR-12, FR-13, FR-16, FR-17, FR-18, FR-19, FR-20, FR-21, FR-22, FR-23, FR-24, FR-25, FR-26]
+updated: '2026-09-24'
+amended: '2026-09-18 — AD-8 and the check/ module added for FR-26 (optional static check); later the same day, Structural Seed rewritten from a single-crate module tree into a Cargo workspace, one crate per module plus language/tooling crates, all lib crates funneling into one hexput-bin crate for binaries. Both after this spine was first marked final. 2026-09-24 — edge hexput-connection → hexput-rpc and the Call/Value Secret wire contract added for FR-27/FR-28 (course correction). See .memlog.md.'
+binds: [FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-7, FR-8, FR-9, FR-11, FR-12, FR-13, FR-16, FR-17, FR-18, FR-19, FR-20, FR-21, FR-22, FR-23, FR-24, FR-25, FR-26, FR-27, FR-28]
 sources: ['_bmad-output/planning-artifacts/prds/prd-hexput-2026-09-18/prd.md', '_bmad-output/planning-artifacts/briefs/brief-hexput-2026-09-18/brief.md']
 companions: []
 ---
@@ -224,6 +224,7 @@ graph TD
   conn[hexput-connection] --> session
   conn --> port
   conn --> script
+  conn --> rpc
   session --> globalvar
   script[hexput-script] --> parser
   script --> interp
@@ -275,6 +276,10 @@ What this graph makes a compile error rather than a review comment:
 
 **[Amended 2026-09-23, Epic 2 Story 2.6]** Two edges are added: `hexput-script --> hexput-port` and `hexput-connection --> hexput-script`. Direct Execution is served in `hexput-script`, which owns the `ExecutionStart` payload, the conversion between wire values and Hexput values, and the `ErrorBody` a failure becomes — all of which are `hexput-port` types, so the script crate reaches the codec directly instead of inventing a second error or value shape. `hexput-connection` only routes an initialized `ExecutionStart` to `hexput_script::direct_execution` and writes the reply on the same connection. Neither edge grants a reach an AD forbids: `hexput-port` holds no transport (AD-1), and `hexput-script` still reaches evaluation only through `hexput_exec::execute`, the one Executor (AD-3) — `hexput-enforce` keeps `hexput-exec` as its sole dependent. `scripts/check-crate-graph.py` now pins the exact sets of `hexput-script` and `hexput-exec`, and `hexput-connection`'s set gains `hexput-script`.
 
+**[Amended 2026-09-24, Epic 3 Story 3.1 decision 3 / course correction]** The edge `hexput-connection --> hexput-rpc` is added. A host call (FR-6, FR-27) is an outbound request the Daemon originates on the connection that submitted the execution, so its reply arrives on that connection's `Inbound` half and its request must be written by that connection's single writer. `hexput-rpc` owns the correlation — Daemon-issued call ids, the pending-call table, the `Call` payload and the decoding of its reply — and the connection actor holds one per connection: it writes the `Call`s handed to it and routes every Backend `Result`/`Error` naming a pending call back to it. Re-exporting `hexput-rpc`'s types through `hexput-exec` and `hexput-script` would hide the real dependency behind two crates that do not own it. The edge grants no reach an AD forbids: `hexput-rpc` does not depend on `hexput-enforce`, which keeps `hexput-exec` as its sole dependent (AD-3), and the capability and budget decisions for a call are still taken inside the Executor, not by the connection. `scripts/check-crate-graph.py` pins the exact sets of `hexput-rpc` and `hexput-enforce`, and `hexput-connection`'s set gains `hexput-rpc`.
+
+**[Amended 2026-09-24, course correction — FR-27/FR-28 wire contract]** Two shapes are fixed here because the Daemon, both SDKs (Epic 8) and every Backend would otherwise diverge on them. (1) Every host call — a Registered Function or a Registered Method — is one generic `Call` message, `{name, arguments}` plus `receiver` for a method; its reply is the ordinary `Result {value}` (optionally `modifications`) or `Error`. The id space is per direction: a Backend's `Result`/`Error` is always a reply to a Daemon `Call`, and the Daemon's `Result`/`Error` always a reply to a Backend request, so Daemon-issued call ids never collide with the Backend's. (2) A value carrying a Value Secret travels as a holder map with exactly the keys `__secret` and `value` — in Rust terms `ValueHolder { key: Option<String>, ref: String, value, rest }`, where `rest` keeps every further Backend field — and a value without one travels plain, so Story 2.6's wire values stay valid. The Value Secret lives in `hexput-interpreter`'s value model as hidden per-value metadata; it adds no crate edge.
+
 `[workspace.dependencies]` in the root `Cargo.toml` pins every version from the Stack table above exactly once; member crates inherit with `workspace = true` rather than re-pinning.
 
 ```mermaid
@@ -294,7 +299,8 @@ erDiagram
 | Connection & Session lifecycle (FR-1, FR-2, FR-3, FR-13, FR-21, FR-24) | `hexput-session`, `hexput-connection`, `hexput-config` | AD-2, AD-5 |
 | Script execution (FR-4, FR-5, FR-16) | `hexput-script`, `hexput-exec` | AD-3, AD-6 |
 | Static check (FR-26) | `hexput-check`, invoked from `hexput-script` and `hexput-plugin` | AD-8 |
-| Capability-based RPC (FR-6, FR-7) | `hexput-rpc`, `hexput-enforce` | AD-3 |
+| Capability-based RPC (FR-6, FR-7, FR-27) | `hexput-rpc`, `hexput-enforce`, driven by `hexput-exec` and written by `hexput-connection` | AD-3, AD-6 |
+| Value Secret, Reference IDs, host-side modifications (FR-28) | `hexput-interpreter` (hidden value metadata), `hexput-exec` (wire conversion, applying modifications) | AD-3 |
 | Resource Budgeting (FR-8) | `hexput-enforce` | AD-3 |
 | Transport layer (FR-9) | `hexput-transport`, `hexput-port` | AD-1 |
 | Plugin Registration & Events (FR-17…FR-23, FR-25) | `hexput-plugin`, `hexput-globalvar`, `hexput-exec` | AD-3, AD-4, AD-6 |

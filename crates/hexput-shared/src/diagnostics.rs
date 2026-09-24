@@ -249,8 +249,9 @@ impl Code {
     // --- Resource Budget (Story 3.5) ---
 
     /// The execution ran Script code for longer than its CPU time budget (1 second by default).
-    /// Waiting on the Backend is never charged. Spanned on the construct running when the limit
-    /// was crossed. Category `budget`.
+    /// CPU time is the time spent running Script code, measured on its thread: wall time,
+    /// excluding every wait on the Backend, which an oversubscribed host inflates. Spanned on the
+    /// construct running when the limit was crossed. Category `budget`.
     pub const CPU_TIME_EXCEEDED: Self = Self::new("budget.cpu_time_exceeded");
     /// The execution's values came to hold more memory than its memory budget (64 MiB by
     /// default). Spanned on the construct whose allocation crossed the limit. Category `budget`.

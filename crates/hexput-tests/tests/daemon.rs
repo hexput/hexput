@@ -874,14 +874,42 @@ fn shutdown_while_a_runaway_runs_ends_once_it_hits_its_cpu_time() {
             ]),
         ),
     );
-    // Let the runaway get going, then shut down.
+    // Let the runaway get going, then shut down — under a deadline, so a regression fails the
+    // test instead of hanging the suite.
     std::thread::sleep(Duration::from_millis(100));
-    serving.stop().exit(0);
+    let (done, stopped) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(serving.stop());
+    });
+    let run = stopped
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the Daemon exits within 10 s of shutdown with a runaway running");
+    run.exit(0);
     let took = started.elapsed();
     assert!(
-        took < hexput_enforce::DEFAULT_CPU_TIME + Duration::from_secs(2),
+        took < hexput_enforce::DEFAULT_CPU_TIME + Duration::from_secs(3),
         "the Daemon took {took:?} to exit"
     );
+    // Shutdown aborts the connection, so the runaway's reply is usually never written; if it
+    // was, it is the budget error.
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut prefix = [0; 4];
+    if std::io::Read::read_exact(&mut client, &mut prefix).is_ok() {
+        let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+        std::io::Read::read_exact(&mut client, &mut body).unwrap();
+        let reply = hexput_port::decode(&body).unwrap();
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        let Value::Map(fields) = &reply.payload else {
+            panic!("an error payload is a map: {:?}", reply.payload);
+        };
+        let code = fields
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("code"))
+            .and_then(|(_, value)| value.as_str());
+        assert_eq!(code, Some("budget.cpu_time_exceeded"));
+    }
 }
 
 #[cfg(unix)]

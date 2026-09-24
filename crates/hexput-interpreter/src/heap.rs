@@ -128,7 +128,7 @@ impl Drop for Metered {
 
 /// The fixed cost of one string: its two reference-counted allocations' headers and the metered
 /// record itself.
-const TEXT_OVERHEAD: usize = size_of::<Metered>() + 4 * size_of::<usize>();
+pub(crate) const TEXT_OVERHEAD: usize = size_of::<Metered>() + 4 * size_of::<usize>();
 
 impl Text {
     /// The text as a shareable `Arc<str>`, for a detached value.
@@ -239,12 +239,6 @@ impl Heap {
         let text = text.into();
         let charge = TEXT_OVERHEAD + text.len();
         self.metered(text, charge)
-    }
-
-    /// A string value over `text`, whose bytes the heap already counts elsewhere — an object key
-    /// a `for … in` loop yields. Only the handle's own overhead is charged.
-    pub(crate) fn shared_text(&self, text: &Arc<str>) -> RtValue {
-        self.metered(Arc::clone(text), TEXT_OVERHEAD)
     }
 
     fn metered(&self, text: Arc<str>, charge: usize) -> RtValue {

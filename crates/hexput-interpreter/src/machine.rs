@@ -43,7 +43,7 @@ use hexput_ast::{
 use indexmap::IndexMap;
 
 use crate::convert::{number_to_string, to_number, to_string};
-use crate::heap::{DetachFailure, Heap, RtValue, SlotId};
+use crate::heap::{DetachFailure, Heap, RtValue, SlotId, TEXT_OVERHEAD};
 use crate::{CALL_DEPTH_LIMIT, Meter, Value};
 
 /// How many bytes a string operation reads or writes per unit of slice work.
@@ -435,8 +435,6 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// nothing.
     pub(crate) fn resume(&mut self, value: &Value) {
         if let Some((chain, in_target)) = self.suspended.take() {
-            // Until the next frame runs, the host call is the running construct.
-            self.site = Site::Link(chain, 0);
             let value = self.heap.attach(value);
             self.values.push(value);
             self.frames.push(Frame::Link {
@@ -773,6 +771,10 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             ));
         }
         self.suspended = Some((chain, in_target));
+        let span = through(name.span, link.span);
+        // Until the next frame runs after it resumes, the host call is the running construct:
+        // a value it brings back that crosses the memory ceiling is spanned on it.
+        self.site = Site::Span(span);
         Ok(Stop::HostCall(PendingCall {
             name: name.name.clone(),
             arguments: detached,
@@ -873,7 +875,8 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     ));
                 }
                 let item = match keys {
-                    Some(keys) => keys.get(*index).map(|key| self.heap.shared_text(key)),
+                    // Charged in full like any new string: the value can outlive the object's key.
+                    Some(keys) => keys.get(*index).map(|key| self.heap.text(Arc::clone(key))),
                     None => self.heap.array_get(*collection, *index),
                 };
                 let Some(item) = item else {
@@ -1548,17 +1551,23 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     }
 }
 
-/// The byte length `left + right` would have as a string concatenation, when it is one: an upper
-/// bound, since a number's spelling is at most 32 bytes. `None` when neither side is a string.
+/// What `left + right` would allocate as a string concatenation, when it is one whose operands
+/// both convert (§4.3): the joined text and that string's fixed overhead — what the new value
+/// will hold. The transient copy made turning the built `String` into the shared string is not
+/// counted: it lives only within this one step, the overshoot the ceiling allows. An upper bound, since a number spells in
+/// at most 32 bytes. `None` when neither side is a string, or when either side cannot convert —
+/// that is a `type` error, which the ceiling must not mask.
 fn concatenated_len(left: &RtValue, right: &RtValue) -> Option<usize> {
     if !matches!(left, RtValue::String(_)) && !matches!(right, RtValue::String(_)) {
         return None;
     }
     let len = |value: &RtValue| match value {
-        RtValue::String(text) => text.len(),
-        _ => 32,
+        RtValue::String(text) => Some(text.len()),
+        RtValue::Null | RtValue::Bool(_) | RtValue::Number(_) => Some(32),
+        RtValue::Array(_) | RtValue::Object(_) | RtValue::Function(_) => None,
     };
-    Some(len(left).saturating_add(len(right)))
+    let joined = len(left)?.saturating_add(len(right)?);
+    Some(joined.saturating_add(TEXT_OVERHEAD))
 }
 
 /// The span of `site`; for a frame with none of its own, the whole Program.
@@ -1768,7 +1777,7 @@ fn invalid_target(span: Span) -> Diagnostic {
     )
 }
 
-fn internal(span: Span) -> Diagnostic {
+pub(crate) fn internal(span: Span) -> Diagnostic {
     Diagnostic::new(
         Category::Syntax,
         Code::EXPECTED_SYNTAX,

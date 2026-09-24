@@ -50,11 +50,15 @@
 //!
 //! Every execution gets one `hexput-enforce` [`Budget`](hexput_enforce::Budget), kept for its
 //! whole run across every host call. The Executor runs the Script metered: in slices of
-//! [`SLICE`] units of work, and with the budget's memory ceiling. It times each slice with a
-//! monotonic clock and charges it to the budget between slices, and again at a host call before
-//! anything is sent; the time spent waiting for a reply or a per-call handler's answer is never
-//! measured, let alone charged. The slice that finishes the Script cannot fail it: the work is
-//! done, so it is not charged. A charge that takes the execution past its CPU time ends it with
+//! [`SLICE`] units of work, and with the budget's memory ceiling. Everything it does for the
+//! Script on its blocking thread is timed with a monotonic clock and charged to the budget:
+//! binding the starting variables, each slice, measuring and converting a host call's arguments,
+//! and converting and binding its reply. A slice is charged when it pauses, when it stops at a
+//! host call — before anything about the call is sent — and when it finishes the Script, which
+//! fails too if that last charge crosses the limit, so the limit is a hard bound. The time spent
+//! waiting for a reply or a per-call handler's answer is never measured, let alone charged.
+//! What is measured is wall time on that thread, so an oversubscribed host inflates it. A charge
+//! that takes the execution past its CPU time ends it with
 //! `budget.cpu_time_exceeded`; values that come to hold more than the ceiling end it with
 //! `budget.memory_exceeded`. Both are spanned on the construct that was running, and both free
 //! the blocking thread at once — the execution's heap is dropped with it. Host calls it already
@@ -69,7 +73,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hexput_enforce::{Budget, Capabilities, Decision, Exceeded, HandlerAnswer, Question, Refusal};
-use hexput_interpreter::{Category, Code, Execution, HostCall, Meter, Outcome};
+use hexput_interpreter::{Category, Code, Execution, HostCall, Meter, Outcome, Span};
 use hexput_rpc::CallFailure;
 
 pub use hexput_interpreter::{Diagnostic, Program, Value};
@@ -203,12 +207,16 @@ pub async fn execute(
         slice: Some(SLICE),
         memory_ceiling: Some(budget.memory_ceiling()),
     };
+    // Where a charge with no construct of its own points: the whole Script.
+    let whole = program.span;
     let (mut step, mut budget) = {
         let capabilities = Arc::clone(&capabilities);
         blocking(move || {
             let mut budget = budget;
+            // Binding the starting variables is charged with the first slice.
+            let started = Instant::now();
             let execution = Execution::with_variables(program, variables)?.metered(meter);
-            let step = segment(execution, &mut budget, &capabilities)?;
+            let step = segment(execution, &mut budget, &capabilities, whole, started)?;
             Ok((step, budget))
         })
         .await
@@ -236,8 +244,12 @@ pub async fn execute(
         };
         let capabilities = Arc::clone(&capabilities);
         (step, budget) = blocking(move || {
+            // Converting and binding the reply is charged with the next slice, so a limit it
+            // helps cross is reported before the next call is sent.
+            let started = Instant::now();
             let value = received(&call, reply)?;
-            let step = segment(call.resume(&value), &mut budget, &capabilities)?;
+            let execution = call.resume(&value);
+            let step = segment(execution, &mut budget, &capabilities, whole, started)?;
             Ok((step, budget))
         })
         .await
@@ -246,35 +258,45 @@ pub async fn execute(
 }
 
 /// Run `execution` slice by slice, charging each slice's time to `budget`, until the Script ends
-/// or calls the host — or a limit ends it. Runs on the blocking pool; nothing here waits.
+/// or calls the host — or a limit ends it. `started` is when the Executor began working for the
+/// Script on this thread, so what it did before the first slice is charged with it. `whole` is
+/// the Program's span, for the finishing charge. Runs on the blocking pool; nothing here waits.
 fn segment(
     mut execution: Execution,
     budget: &mut Budget,
     capabilities: &Capabilities,
+    whole: Span,
+    mut started: Instant,
 ) -> Result<Step, Halt> {
     loop {
-        let started = Instant::now();
-        let outcome = execution.run();
-        let elapsed = started.elapsed();
-        match outcome? {
+        match execution.run()? {
             Outcome::Paused(paused) => {
                 budget
-                    .charge_cpu(elapsed, paused.span())
+                    .charge_cpu(started.elapsed(), paused.span())
                     .map_err(Halt::Exceeded)?;
+                started = Instant::now();
                 execution = paused.resume();
             }
             Outcome::OutOfMemory(stopped) => {
                 return Err(Halt::Exceeded(budget.memory_exceeded(stopped.span())));
             }
-            // The Script is done, so its last slice cannot fail it, and nothing is charged
-            // after it.
-            Outcome::Finished(result) => return Ok(Step::Finished(result)),
-            Outcome::HostCall(call) => {
-                // Charged before anything about the call is decided or sent.
+            // The last slice is charged like any other: crossing the limit in it fails the
+            // Script even though it finished.
+            Outcome::Finished(result) => {
                 budget
-                    .charge_cpu(elapsed, call.span())
+                    .charge_cpu(started.elapsed(), whole)
                     .map_err(Halt::Exceeded)?;
-                return Ok(advance(call, capabilities)?);
+                return Ok(Step::Finished(result));
+            }
+            Outcome::HostCall(call) => {
+                // The slice and the argument work are charged together, before anything about
+                // the call is sent.
+                let span = call.span();
+                let step = advance(call, capabilities)?;
+                budget
+                    .charge_cpu(started.elapsed(), span)
+                    .map_err(Halt::Exceeded)?;
+                return Ok(step);
             }
         }
     }

@@ -1987,6 +1987,35 @@ mod metering {
     }
 
     #[test]
+    fn keys_a_for_loop_hands_out_count_in_full_while_they_live() {
+        // Each key handed out is a string value that can outlive its object: collecting a 64 KiB
+        // key again and again must reach a 1 MiB ceiling, however the key's bytes are shared.
+        let source = "let s = \"xxxxxxxxxxxxxxxx\"; let i = 0; while (i < 12) { s = s + s; i = i + 1; };\n\
+                      let o = {}; o[s] = 1; let a = []; let n = 0;\n\
+                      while (true) { for (k in o) { a[n] = k; n = n + 1; }; }";
+        let Outcome::OutOfMemory(stopped) = start(source, ceiling(1024 * 1024)).run().unwrap()
+        else {
+            panic!("the collected keys outgrow the ceiling");
+        };
+        assert_eq!(stopped.span().line, 3, "{:?}", stopped.span());
+    }
+
+    #[test]
+    fn a_concatenation_that_cannot_convert_is_a_type_error_even_near_the_ceiling() {
+        // 64 KiB built under a 160 KiB ceiling, where `s + s` would cross it but `s + []` is a
+        // `type` error, not the ceiling.
+        let build =
+            "let s = \"xxxxxxxxxxxxxxxx\"; let i = 0; while (i < 12) { s = s + s; i = i + 1; };\n";
+        let crossing = start(&format!("{build}return s + s;"), ceiling(160 * 1024));
+        assert!(matches!(crossing.run(), Ok(Outcome::OutOfMemory(_))));
+        let error = start(&format!("{build}return s + [];"), ceiling(160 * 1024))
+            .run()
+            .err()
+            .expect("a type error");
+        assert_eq!(error.code.as_str(), "type.operand_mismatch");
+    }
+
+    #[test]
     fn a_string_shared_many_times_counts_once() {
         // 64 KiB, held by a thousand elements: well under a 1 MiB ceiling unless counted per use.
         let source = "let s = \"xxxxxxxxxxxxxxxx\"; let i = 0; while (i < 12) { s = s + s; i = i + 1; };\n\

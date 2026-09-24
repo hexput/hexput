@@ -194,12 +194,9 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
         machine::Stop::Finished(result) => Ok(result),
         // Unreachable: an unmetered machine has no ceiling to stop at, and pauses are looped
         // over above. Limits and their errors are the Executor's, so this is no budget error.
-        machine::Stop::Paused(span) | machine::Stop::OutOfMemory(span) => Err(Diagnostic::new(
-            Category::Syntax,
-            Code::EXPECTED_SYNTAX,
-            "internal error: an unmetered evaluation stopped at a meter",
-            span,
-        )),
+        machine::Stop::Paused(span) | machine::Stop::OutOfMemory(span) => {
+            Err(machine::internal(span))
+        }
         machine::Stop::HostCall(call) => Err(Diagnostic::new(
             Category::Capability,
             Code::UNKNOWN_FUNCTION,
@@ -283,8 +280,8 @@ impl Execution {
         self.machine.root_names()
     }
 
-    /// Meter the rest of this execution against `meter` — until the next call, if any. A new
-    /// execution is [`Meter::UNMETERED`].
+    /// Meter the rest of this execution against `meter`. The meter holds across every slice and
+    /// host call until `metered` is called again. A new execution is [`Meter::UNMETERED`].
     #[must_use]
     pub fn metered(mut self, meter: Meter) -> Self {
         self.machine.set_meter(meter);

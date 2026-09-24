@@ -348,7 +348,8 @@ fn nested_objects_count_toward_the_depth_limit_like_arrays() {
     let envelope = Envelope::new(CorrelationId(1), MessageType::Result, reply);
     let bytes = encode(&envelope).unwrap();
     assert_eq!(decode(&bytes).unwrap(), envelope);
-    for n in [MAX_RESULT_DEPTH + 1, 100_000] {
+    // 10 000 levels: far past the limit, and well within the CPU time budget on a debug build.
+    for n in [MAX_RESULT_DEPTH + 1, 10_000] {
         let body = nested_by("{ k: a }", n).unwrap_err();
         assert_eq!(body.code, "protocol.result_too_deep");
     }

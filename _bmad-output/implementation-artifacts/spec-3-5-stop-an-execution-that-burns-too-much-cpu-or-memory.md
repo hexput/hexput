@@ -2,7 +2,7 @@
 title: 'Story 3.5: Stop an execution that burns too much CPU or memory'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-review'
+status: 'done'
 baseline_commit: '7d160d51a159e91cc7e0b18f6b1deeda52c5b3ad'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -71,9 +71,11 @@ context:
 
 - **Strings meter themselves.** `RtValue::String` holds a `Text` — shared text plus a handle on the heap's atomic string counter — that credits its charge when its last handle drops. So a string shared by many bindings counts once, one no longer reachable stops counting at once, and `s = s + "x"` in a loop is linear, not quadratic. Slots are charged by footprint on allocation/growth and credited on release. Detach/attach stay zero-copy (`Text` wraps an `Arc<str>`). The frame and value stacks, `for … in` key snapshots and detached copies are not counted (deferred-work entry).
 - **Slices count work, not steps alone.** One unit per frame plus one per 256 string bytes an operation reads or writes (binary operands, unary operand, index keys; object keys at `for … in` start), so a slice of 64 MiB string compares is not 10 000 × 10 ms. `hexput_exec::SLICE` is 10 000 units.
-- **Memory is checked after every frame, and before a concatenation** whose result (an upper bound: a number spells in at most 32 bytes) would cross the ceiling — spanned on the `+`. A frame with no place of its own (scope exit, discard) keeps the last construct's span; after a host call's value arrives, the call is the running construct.
-- **The slice that finishes the Script is not charged**: the work is done, and failing a completed Script over its last few milliseconds helps no one. A host call's slice is charged before anything about the call is decided or sent.
+- **Memory is checked after every frame, and before a concatenation** whose operands both convert and whose cost (an upper bound: twice the joined length, for the `String` and the shared copy made from it, plus a string's fixed overhead; a number spells in at most 32 bytes) would cross the ceiling — spanned on the `+`. A value a host call brings back is spanned on the call. A frame with no place of its own (scope exit, discard) keeps the last construct's span; after a host call's value arrives, the call is the running construct.
+- **Every slice is charged, the last one included**, so the CPU limit is a hard bound: a Script whose finishing slice crosses it fails with `budget.cpu_time_exceeded` (spanned on the whole Program). The Executor's own blocking work for the Script is charged too — binding starting variables and converting/binding a host call's reply with the next slice, measuring and converting its arguments with the slice that stopped at it — and a host call's charge happens before anything about the call is sent.
 - **Test timing.** The Story 2.7 "slow Script" loops (connection/daemon tests) went from 150 000 to 50 000 turns: ~0.6 s in a debug build was too close to the 1 s CPU budget on a loaded machine, since the budget measures wall time on the thread.
+
+- Post-review verification (orchestrator): the patched pre-concatenation estimate counted the transient `String`→`Arc<str>` copy (2× the joined length), which refused a legitimate 32 MiB result under the 64 MiB budget; reverted to joined length + `TEXT_OVERHEAD` — the transient copy is the one-step overshoot the ceiling allows. `nested_objects_count_toward_the_depth_limit_like_arrays` builds 10 000 levels instead of 100 000 (the last slice is now charged, and 100 000 object levels exceed 1 s on a debug build; the test is about depth). `the_call_whose_charge_crosses_the_limit_is_never_sent` accepts a crossing at a slice boundary as well as at the call (timing-dependent under load); the never-sent property is still asserted. 565 tests pass, three consecutive full runs.
 
 ## Spec Change Log
 

@@ -223,6 +223,8 @@ pub(crate) struct Machine<P> {
     values: Vec<RtValue>,
     heap: Heap,
     scope: SlotId,
+    /// The root scope: the starting variables and the Script's top level.
+    root: SlotId,
     /// Every `Function` a function value points at, addressed by index so the heap never carries
     /// the program. `definitions` maps a `Function`'s position back to its index, so a closure
     /// created in a loop reuses one entry instead of adding one per iteration.
@@ -260,6 +262,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             values: Vec::new(),
             heap,
             scope,
+            root: scope,
             functions: Vec::new(),
             definitions: HashMap::new(),
             depth: 0,
@@ -303,15 +306,15 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         }
     }
 
+    /// The names bound in the root scope: the starting variables, the top-level named functions,
+    /// and whatever the Script's own top level has declared by now.
+    pub(crate) fn root_names(&self) -> Vec<String> {
+        self.heap.names(self.root)
+    }
+
     /// Schedule the statements of `block` (the top level for `None`) in the current scope, after
     /// hoisting the named functions they declare (decision 3: every `fn name` in a block is bound
     /// before the block runs, so mutual recursion works in any declaration order).
-    /// The names bound in the scope the machine currently runs in — before the first step, the
-    /// root scope: the starting variables and the top-level named functions, nothing else.
-    pub(crate) fn scope_names(&self) -> Vec<String> {
-        self.heap.names(self.scope)
-    }
-
     fn open(&mut self, tree: &Program, block: Option<BlockId>) {
         let statements = statements(tree, block);
         for (index, statement) in statements.iter().enumerate() {

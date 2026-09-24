@@ -226,13 +226,14 @@ impl Execution {
         })
     }
 
-    /// The names bound in this execution's root scope before it runs, sorted: its starting
+    /// The names bound in this execution's root scope, sorted. Before it runs: its starting
     /// variables and its top-level named functions (hoisted, §6) — and, by construction, no
-    /// builtin but [`BUILTINS`]. For enumerating everything a Script can reach (Story 3.4);
-    /// meaningless once [`Execution::run`] has started.
+    /// builtin but [`BUILTINS`]; once it has run up to a host call, also the top-level `let`s
+    /// that ran. Always the root scope, whatever scope the Script stopped in. For enumerating
+    /// everything a Script can reach (Story 3.4).
     #[must_use]
     pub fn root_names(&self) -> Vec<String> {
-        self.machine.scope_names()
+        self.machine.root_names()
     }
 
     /// Run until the Script ends or calls the host.

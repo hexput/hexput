@@ -1846,8 +1846,25 @@ fn module_and_import_syntax_does_not_exist() {
     for source in [
         "import fs;",
         "import { readFile } from \"fs\";",
+        "let fs = require \"fs\";",
         "export let x = 1;",
     ] {
-        assert!(parse(source).is_err(), "`{source}` should not parse");
+        let error = parse(source).expect_err(source);
+        assert_eq!(error.category.as_str(), "syntax", "`{source}`: {error:?}");
     }
+}
+
+#[test]
+fn root_names_stay_the_root_scope_after_a_host_call_inside_a_function() {
+    use hexput_interpreter::Outcome;
+    let source = "fn inner(y) { let local = y; return host(local); }; return inner(1);";
+    let program = std::sync::Arc::new(parse(source).unwrap());
+    let execution =
+        Execution::with_variables(program, vec![("input", Value::Number(1.0))]).unwrap();
+    let Ok(Outcome::HostCall(call)) = execution.run() else {
+        panic!("the Script stops at `host(local)`");
+    };
+    let resumed = call.resume(&Value::Null);
+    // Not `y`/`local` of the function it stopped in: the root scope.
+    assert_eq!(resumed.root_names(), ["inner", "input"]);
 }

@@ -946,3 +946,76 @@ fn a_member_call_on_an_ambient_name_is_still_just_an_undeclared_identifier() {
         assert!(seen.is_empty());
     }
 }
+
+#[test]
+fn an_ambient_call_asks_no_handler_whatever_the_session_registered() {
+    // With a per-call registration and with none at all, an unregistered ambient name is refused
+    // before any question or call: nothing reaches the Backend, and the log says `unregistered`.
+    for registered in [&[("getOrder", false)][..], &[][..]] {
+        for name in ["process", "fetch", "require"] {
+            let run = run_full(
+                &format!("return {name}(1);"),
+                vec![],
+                registered,
+                answering(Wire::Boolean(true)),
+                Box::new(|_, _| value(Wire::Nil)),
+            );
+            assert_eq!(
+                run.result.unwrap_err().code.as_str(),
+                "capability.unknown_function"
+            );
+            assert!(
+                run.asked.is_empty() && run.calls.is_empty(),
+                "{:?}",
+                run.order
+            );
+            assert!(
+                run.events
+                    .iter()
+                    .any(|event| event["fields"]["reason"] == "unregistered"),
+                "{:?}",
+                run.events
+            );
+        }
+    }
+}
+
+#[test]
+fn no_value_carries_a_reflective_member_or_a_method() {
+    // Reflection spellings are ordinary keys: absent on objects (null), and not properties of
+    // other values at all (a `type` error) — never a way out.
+    for source in [
+        "return ({}).constructor;",
+        "return ({}).__proto__;",
+        "return ({}).prototype;",
+    ] {
+        assert!(run(source, vec![]).unwrap().is_null(), "{source}");
+    }
+    for source in [
+        "return \"x\".constructor;",
+        "return [].__proto__;",
+        "return (fn() { return 1; }).prototype;",
+    ] {
+        assert_eq!(
+            run(source, vec![]).unwrap_err().category.as_str(),
+            "type",
+            "{source}"
+        );
+    }
+    // A method call on a plain value is an ordinary property call: nothing is sent.
+    for source in [
+        "return [].push(1);",
+        "return \"s\".len();",
+        "return ({ a: 1 }).exec(\"x\");",
+    ] {
+        let (result, seen) = run_hosted(
+            source,
+            vec![],
+            &[("push", true), ("len", true), ("exec", true)],
+            Box::new(|_, _| value(Wire::Nil)),
+        );
+        assert!(result.is_err(), "{source}");
+        assert_ne!(result.unwrap_err().category.as_str(), "host", "{source}");
+        assert!(seen.is_empty(), "{source} sent {seen:?}");
+    }
+}

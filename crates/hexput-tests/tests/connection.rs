@@ -1966,3 +1966,28 @@ fn a_question_waiting_for_its_answer_holds_no_thread() {
         },
     );
 }
+
+#[test]
+fn an_ambient_call_over_the_wire_is_refused_with_nothing_written_but_the_error() {
+    hosted(
+        &wired_runtime(),
+        &[("getOrder", true), ("guarded", false)],
+        false,
+        |mut backend| async move {
+            for (id, name) in [
+                (1, "process"),
+                (2, "fetch"),
+                (3, "require"),
+                (4, "globalThis"),
+            ] {
+                backend.send(execution(id, &format!("return {name}(\"/etc/passwd\");")));
+                // The next envelope is the refusal itself: no `Call`, no `Authorize` before it.
+                let reply = backend.next().await;
+                assert_eq!(reply.message_type, MessageType::Error, "{name}: {reply:?}");
+                assert_eq!(reply.id, Some(CorrelationId(id)));
+                assert_eq!(code_of(&reply), "capability.unknown_function", "{name}");
+            }
+            backend.close();
+        },
+    );
+}

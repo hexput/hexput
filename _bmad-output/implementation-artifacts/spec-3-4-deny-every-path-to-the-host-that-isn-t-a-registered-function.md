@@ -2,7 +2,7 @@
 title: 'Story 3.4: Deny every path to the host that isn''t a registered function'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'done'
 route: 'oneshot'
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/epic-3-context.md'
@@ -29,3 +29,18 @@ context:
 - `LANGUAGE-REFERENCE.md` §8 or §11: one sentence naming `hexput_interpreter::BUILTINS` as the enumerated (empty) builtin set, and that reads of undeclared names stay `reference`, calls `capability` (the AC's "capability-denied" for a mere reference is superseded by §7/§8).
 - `AGENTS.md` Project Status: Story 3.4 line.
 - Verification: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `python3 scripts/check-crate-graph.py`, `cargo test --workspace --locked`.
+
+## Review Triage Log
+
+- blind: new `Heap::names` / `Machine::scope_names` inserted inside `declare`'s / `open`'s doc blocks — **low, patched** (docs reattached).
+- blind: `Execution::root_names` read the *current* scope, so after `HostCall::resume` inside a function it listed that function's bindings — **low, patched** (the machine keeps its root `SlotId`; `root_names` always reads it; test `root_names_stay_the_root_scope_after_a_host_call_inside_a_function`).
+- blind: `BUILTINS` is not consulted by the evaluator, so a future evaluator-level builtin would evade the enumeration — **low, rejected**: no builtin exists to dispatch, a builtin would need a value and a spec; the enumeration test fails on any extra root binding (noted in Implementation Notes).
+- blind: reflection through member access (`({}).constructor`, `"x".constructor`, …) untested — **low, patched** (test: absent keys are `null`, non-object members are `type` errors).
+- blind: method calls on plain values (`[].push(1)`, …) untested — **low, patched** (test: ordinary property calls, nothing sent even when same-named functions are registered).
+- blind: "nothing reaches the Backend" checked only for `Call`, not `Authorize`; no handler/empty-registration variants — **low, patched** (test with a per-call registration and with none: no question, no call, log `reason = unregistered`).
+- blind: the frozen intent says "through the Daemon" but the sweep stopped at `hexput-exec` — **medium, patched** (`an_ambient_call_over_the_wire_is_refused_with_nothing_written_but_the_error` in `tests/connection.rs`).
+- blind: `module_and_import_syntax_does_not_exist` accepted any parse error and skipped `require … from`-style syntax — **low, patched** (asserts the `syntax` category; adds `let fs = require "fs";`).
+- blind: ambient sweep not run through `hexput check`/`hexput eval` — **low, rejected**: both judge host calls through paths already pinned (Story 1.10's unknown-call finding, Story 3.1's eval capability test).
+- blind: status disagreement across AGENTS.md / sprint status / spec — **false**: finalize sets `review` / `done`.
+- blind: AGENTS.md gained only a headline and a stale "521" count — **false**: the Story 3.4 sentence and "530" were added in the same commit (now 534).
+- blind: commit type `test(...)` understates added public API — **low, rejected**: history only.

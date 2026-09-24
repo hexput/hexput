@@ -2,7 +2,7 @@
 title: 'Story 3.6: Bound allocations, RPC calls, output size, and side effects'
 type: 'feature'
 created: '2026-09-24'
-status: 'draft'
+status: 'ready-for-dev'
 route: 'dispatch'
 review_loop_iteration: 0
 context:

@@ -79,6 +79,25 @@ context:
 
 ## Review Triage Log
 
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | blind | `for … in` hands object keys out via `Heap::shared_text` charged only `TEXT_OVERHEAD`, while the object's footprint credits the key bytes on release — a loop can keep unbounded key copies alive uncharged | high | Real: a memory-budget bypass on the trust boundary. **patch**: charge the key's full length when it is handed out (or make keys `Text`) + test |
+| 2 | blind + edge-case | CPU spent in `arguments()` (measure/`to_wire`), `received()`/`resume()` (reply attach) and `with_variables` (starting-variable attach) is never timed | medium | Real: `segment` times only `execution.run()`; a loop of frame-sized host calls works uncharged. **patch**: time and charge those regions too |
+| 3 | verification-gap + blind | The charge at a host call is untested; a Script whose segments end at a host call before one slice (`while (true) { ping(); }`) is not pinned, nor that the crossing call is never sent | medium | Pre-verified gap. **patch** (test) |
+| 4 | edge-case | The last slice of a finished Script is not charged, so the CPU limit is not a hard bound | low | Real (≤ one slice); the intent says crossing ends the execution. **patch**: charge it like every slice |
+| 5 | blind + edge-case | The pre-concatenation ceiling check ignores `TEXT_OVERHEAD` and the transient second copy when the `String` becomes an `Arc<str>` | low | Real; direct. **patch**: include overhead (and build the `Arc<str>` without a second full copy, or count it) |
+| 6 | edge-case | `"s" + []` near the ceiling reports `budget.memory_exceeded` instead of the `type` error the Script made | low | Real; direct. **patch**: pre-check only when both operands convert |
+| 7 | blind | Unreachable fallback in `evaluate_with_variables` reports `syntax.expected_syntax` | low | Real; direct. **patch**: use the interpreter's internal-error diagnostic |
+| 8 | blind | No test that a large reply crosses the ceiling, spanned on the call | low | Real gap. **patch** (test) |
+| 9 | blind | Daemon shutdown test hangs rather than fails on regression, and never checks the runaway's reply | low | Real. **patch**: deadline around the stop, assert the reply |
+| 10 | blind | Test name `…distinct_from_every_other_category` promises more than it checks, and burns 1 s duplicating the runaway test | low | Real; direct. **patch** (rename; drop the duplicate runaway) |
+| 11 | blind | Runaway timing bounds (`< limit + 500 ms`) are tight for loaded CI | low | Real flake risk; direct. **patch**: loosen to a generous bound (AC says "generous") |
+| 12 | blind | LANGUAGE-REFERENCE §7 and `Code::CPU_TIME_EXCEEDED` say "CPU time" without saying it is run time measured on the thread | low | Real; decision 2 says docs must. **patch** (docs) |
+| 13 | blind + verification-gap | `Execution::metered` doc reads as if the meter ends at a host call | low | Real; direct. **patch** (doc) |
+| 14 | blind | Several 1 s tests slow the suite; limits not injectable | low | Rejected: limits become Config values in Story 3.7, which makes them injectable |
+| 15 | edge-case | A Script whose final step leaves the heap over the ceiling loses its result to `budget.memory_exceeded` | false | By design: the values exceeded the budget; the error is the documented outcome |
+| 16 | blind | Sprint status `in-progress` vs spec `in-review` | false | Step 5 sets `review` |
+
 ## Verification
 
 **Commands:**

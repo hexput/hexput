@@ -257,6 +257,24 @@ impl Code {
     /// default). Spanned on the construct whose allocation crossed the limit. Category `budget`.
     pub const MEMORY_EXCEEDED: Self = Self::new("budget.memory_exceeded");
 
+    // --- Resource Budget (Story 3.6) ---
+
+    /// The execution constructed more strings, arrays and objects — counting each growth of a
+    /// collection past a power of two in length — than its allocation budget (1 000 000 by
+    /// default). Spanned on the construct whose allocation crossed the limit. Category `budget`.
+    pub const ALLOCATIONS_EXCEEDED: Self = Self::new("budget.allocations_exceeded");
+    /// The execution made more host calls than its RPC call budget (100 by default); a refused,
+    /// denied or failed call counts. Spanned on the call that would cross it, which is never
+    /// sent. Category `budget`.
+    pub const RPC_CALLS_EXCEEDED: Self = Self::new("budget.rpc_calls_exceeded");
+    /// The Script's result encodes to more bytes than its output size budget (1 MiB by default),
+    /// measured as the exact MessagePack length of the `{value}` payload. Category `budget`.
+    pub const OUTPUT_SIZE_EXCEEDED: Self = Self::new("budget.output_size_exceeded");
+    /// The execution performed more side effects — host calls plus committed Global Variable
+    /// writes — than its side-effect budget (100 by default). Spanned on the call that would
+    /// cross it, which is never sent. Category `budget`.
+    pub const SIDE_EFFECTS_EXCEEDED: Self = Self::new("budget.side_effects_exceeded");
+
     // --- static-check findings (Story 1.10) ---
 
     /// Code after a `return`, `break` or `continue` in the same block can never run. A
@@ -316,6 +334,10 @@ impl Code {
         Self::NO_REPLY,
         Self::CPU_TIME_EXCEEDED,
         Self::MEMORY_EXCEEDED,
+        Self::ALLOCATIONS_EXCEEDED,
+        Self::RPC_CALLS_EXCEEDED,
+        Self::OUTPUT_SIZE_EXCEEDED,
+        Self::SIDE_EFFECTS_EXCEEDED,
         Self::UNREACHABLE_CODE,
         Self::UNUSED_VARIABLE,
         Self::UNKNOWN_FUNCTION,

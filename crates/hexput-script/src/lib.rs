@@ -21,8 +21,8 @@
 //! like the Script itself, so a large payload never occupies a runtime worker.
 //!
 //! Not yet: the static check (no check mode exists in Config until Story 3.10), the AST Cache
-//! and Cached Execution (Epic 4), per-call grants and Resource Budgets (Epic 3, behind the same
-//! Executor).
+//! and Cached Execution (Epic 4), and Config-set Resource Budget limits (Story 3.7, behind the
+//! same Executor).
 //!
 //! Binds: AD-3, AD-6, AD-8.
 
@@ -64,9 +64,12 @@ const VALUE: &str = "value";
 ///   invalid UTF-8). The message names the key or path; nothing is parsed or run.
 /// * The parser's, interpreter's or Executor's [`Diagnostic`] — category, code, severity, message
 ///   and span — including `syntax.duplicate_declaration` for a starting variable the Script also
-///   declares, and every `capability`, `host` and argument error of a host call.
+///   declares, every `capability`, `host` and argument error of a host call, and every `budget`
+///   error.
 /// * `protocol.result_too_deep` — the result nests past [`MAX_RESULT_DEPTH`].
 /// * `protocol.response_too_large` — the result is certain to encode past the maximum frame.
+///   Under the default Resource Budget the Executor refuses any such result first, as
+///   `budget.output_size_exceeded` (Story 3.6): the output size budget is far below a frame.
 ///
 /// The error is boxed: it is the reply's payload, built once per failed execution, and a large
 /// `Err` would make every `Result` this returns as large as it.

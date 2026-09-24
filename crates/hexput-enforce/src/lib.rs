@@ -3,7 +3,7 @@
 //! which is what makes a second path into capability/budget enforcement a compile error rather
 //! than a review finding.
 //!
-//! # What exists today (Stories 3.1–3.3)
+//! # Capabilities (Stories 3.1–3.3)
 //!
 //! [`Capabilities`] is what an execution may call: its Session's Registered Functions with their
 //! grants, as they were when the execution was dispatched. [`Capabilities::check_call`] is the one
@@ -42,9 +42,30 @@
 //!   the error that ends it.
 //!
 //! Either is a `budget` error naming its dimension (`budget.cpu_time_exceeded`,
-//! `budget.memory_exceeded`), spanned on the construct that was running. The limits are the
-//! documented defaults [`DEFAULT_CPU_TIME`] and [`DEFAULT_MEMORY`] until Story 3.7 makes them
-//! Config values.
+//! `budget.memory_exceeded`), spanned on the construct that was running.
+//!
+//! # The four counted dimensions (Story 3.6)
+//!
+//! * **allocations** — the interpreter counts every string, array and object the Script
+//!   constructs, plus each growth of a collection past a power of two in length
+//!   (LANGUAGE-REFERENCE §7), and stops an execution whose count passes
+//!   [`Budget::allocation_ceiling`]; [`Budget::allocations_exceeded`] is the error that ends it.
+//! * **RPC calls** and **side effects** — [`Budget::charge_rpc_call`] counts every host call the
+//!   Script makes, when it stops at the call and before any capability decision, so a refused,
+//!   denied or failed call counts, and an `Authorize` question is part of its call. A host call is
+//!   also a side effect (as, from Epic 6, is every committed Global Variable write). The call that
+//!   would take either count past its limit is refused before it is sent; calls already made
+//!   stand.
+//! * **output size** — [`Budget::charge_output`] takes the exact MessagePack byte length of the
+//!   Script's `{value}` result payload and refuses one past [`Limits::output_size`].
+//!
+//! Each is its own `budget` error — `budget.allocations_exceeded`, `budget.rpc_calls_exceeded`,
+//! `budget.output_size_exceeded`, `budget.side_effects_exceeded` — and its own limit: no dimension
+//! ever stands in for another.
+//!
+//! The limits are the documented defaults — [`DEFAULT_CPU_TIME`], [`DEFAULT_MEMORY`],
+//! [`DEFAULT_ALLOCATIONS`], [`DEFAULT_RPC_CALLS`], [`DEFAULT_OUTPUT_SIZE`] and
+//! [`DEFAULT_SIDE_EFFECTS`] — until Story 3.7 makes them Config values.
 //!
 //! Binds: AD-3.
 
@@ -60,11 +81,28 @@ pub const DEFAULT_CPU_TIME: Duration = Duration::from_secs(1);
 /// The memory an execution's values may hold by default: 64 MiB.
 pub const DEFAULT_MEMORY: usize = 64 * 1024 * 1024;
 
-/// The limits of one execution's Resource Budget.
+/// The allocations an execution may make by default: 1 000 000.
+pub const DEFAULT_ALLOCATIONS: u64 = 1_000_000;
+
+/// The host calls an execution may make by default: 100.
+pub const DEFAULT_RPC_CALLS: u64 = 100;
+
+/// The bytes a Script's result payload may encode to by default: 1 MiB.
+pub const DEFAULT_OUTPUT_SIZE: usize = 1024 * 1024;
+
+/// The side effects an execution may perform by default: 100.
+pub const DEFAULT_SIDE_EFFECTS: u64 = 100;
+
+/// The limits of one execution's Resource Budget: one per dimension, each independent of the
+/// others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     cpu_time: Duration,
     memory: usize,
+    allocations: u64,
+    rpc_calls: u64,
+    output_size: usize,
+    side_effects: u64,
 }
 
 impl Default for Limits {
@@ -72,6 +110,10 @@ impl Default for Limits {
         Self {
             cpu_time: DEFAULT_CPU_TIME,
             memory: DEFAULT_MEMORY,
+            allocations: DEFAULT_ALLOCATIONS,
+            rpc_calls: DEFAULT_RPC_CALLS,
+            output_size: DEFAULT_OUTPUT_SIZE,
+            side_effects: DEFAULT_SIDE_EFFECTS,
         }
     }
 }
@@ -88,6 +130,72 @@ impl Limits {
     pub const fn memory(&self) -> usize {
         self.memory
     }
+
+    /// The allocation limit.
+    #[must_use]
+    pub const fn allocations(&self) -> u64 {
+        self.allocations
+    }
+
+    /// The RPC call limit.
+    #[must_use]
+    pub const fn rpc_calls(&self) -> u64 {
+        self.rpc_calls
+    }
+
+    /// The output size limit, in bytes.
+    #[must_use]
+    pub const fn output_size(&self) -> usize {
+        self.output_size
+    }
+
+    /// The side-effect limit.
+    #[must_use]
+    pub const fn side_effects(&self) -> u64 {
+        self.side_effects
+    }
+
+    /// These limits with the CPU time limit set to `limit`.
+    #[must_use]
+    pub const fn with_cpu_time(mut self, limit: Duration) -> Self {
+        self.cpu_time = limit;
+        self
+    }
+
+    /// These limits with the memory limit set to `limit` bytes.
+    #[must_use]
+    pub const fn with_memory(mut self, limit: usize) -> Self {
+        self.memory = limit;
+        self
+    }
+
+    /// These limits with the allocation limit set to `limit`.
+    #[must_use]
+    pub const fn with_allocations(mut self, limit: u64) -> Self {
+        self.allocations = limit;
+        self
+    }
+
+    /// These limits with the RPC call limit set to `limit`.
+    #[must_use]
+    pub const fn with_rpc_calls(mut self, limit: u64) -> Self {
+        self.rpc_calls = limit;
+        self
+    }
+
+    /// These limits with the output size limit set to `limit` bytes.
+    #[must_use]
+    pub const fn with_output_size(mut self, limit: usize) -> Self {
+        self.output_size = limit;
+        self
+    }
+
+    /// These limits with the side-effect limit set to `limit`.
+    #[must_use]
+    pub const fn with_side_effects(mut self, limit: u64) -> Self {
+        self.side_effects = limit;
+        self
+    }
 }
 
 /// One execution's Resource Budget: its limits, and what it has used of them. Created once per
@@ -96,6 +204,8 @@ impl Limits {
 pub struct Budget {
     limits: Limits,
     cpu_used: Duration,
+    rpc_calls: u64,
+    side_effects: u64,
 }
 
 /// A Resource Budget dimension the execution exceeded, and the error that ends it.
@@ -132,6 +242,15 @@ impl Budget {
         Self::default()
     }
 
+    /// A budget with `limits`.
+    #[must_use]
+    pub fn with_limits(limits: Limits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     /// This budget's limits.
     #[must_use]
     pub fn limits(&self) -> Limits {
@@ -154,18 +273,15 @@ impl Budget {
         if self.cpu_used <= self.limits.cpu_time {
             return Ok(());
         }
-        Err(Exceeded {
-            dimension: Dimension::CpuTime,
-            diagnostic: Diagnostic::new(
-                Category::Budget,
-                Code::CPU_TIME_EXCEEDED,
-                format!(
-                    "the Script ran for longer than its CPU time budget of {} ms",
-                    self.limits.cpu_time.as_millis()
-                ),
-                span,
+        Err(exceeded(
+            Dimension::CpuTime,
+            Code::CPU_TIME_EXCEEDED,
+            format!(
+                "the Script ran for longer than its CPU time budget of {} ms",
+                self.limits.cpu_time.as_millis()
             ),
-        })
+            span,
+        ))
     }
 
     /// How many bytes the execution's values may hold: the ceiling the interpreter is handed.
@@ -178,18 +294,119 @@ impl Budget {
     /// error that ends it, `budget.memory_exceeded`.
     #[must_use]
     pub fn memory_exceeded(&self, span: Span) -> Exceeded {
-        Exceeded {
-            dimension: Dimension::Memory,
-            diagnostic: Diagnostic::new(
-                Category::Budget,
-                Code::MEMORY_EXCEEDED,
+        exceeded(
+            Dimension::Memory,
+            Code::MEMORY_EXCEEDED,
+            format!(
+                "the Script's values need more than its memory budget of {} bytes",
+                self.limits.memory
+            ),
+            span,
+        )
+    }
+
+    /// How many allocations the execution may make: the ceiling the interpreter is handed.
+    #[must_use]
+    pub fn allocation_ceiling(&self) -> u64 {
+        self.limits.allocations
+    }
+
+    /// The Script made more allocations than [`Budget::allocation_ceiling`], at `span`: the
+    /// error that ends it, `budget.allocations_exceeded`.
+    #[must_use]
+    pub fn allocations_exceeded(&self, span: Span) -> Exceeded {
+        exceeded(
+            Dimension::Allocations,
+            Code::ALLOCATIONS_EXCEEDED,
+            format!(
+                "the Script made more than its allocation budget of {} strings, arrays, objects \
+                 and collection growths",
+                self.limits.allocations
+            ),
+            span,
+        )
+    }
+
+    /// The host calls charged so far.
+    #[must_use]
+    pub fn rpc_calls_used(&self) -> u64 {
+        self.rpc_calls
+    }
+
+    /// The side effects charged so far.
+    #[must_use]
+    pub fn side_effects_used(&self) -> u64 {
+        self.side_effects
+    }
+
+    /// Charge one host call the Script is making, `span` being the call's: one RPC call and one
+    /// side effect. Charged when the Script stops at the call, before anything about it is
+    /// decided or sent, so a call later refused, denied or failed counts; an `Authorize` question
+    /// is part of its call and is not charged again.
+    ///
+    /// # Errors
+    /// `budget.rpc_calls_exceeded` when this call would take the RPC call count past
+    /// [`Limits::rpc_calls`], otherwise `budget.side_effects_exceeded` when it would take the
+    /// side-effect count past [`Limits::side_effects`] — spanned on the call, which must then not
+    /// be sent. Nothing is charged for a refused call; the calls already charged stand.
+    pub fn charge_rpc_call(&mut self, span: Span) -> Result<(), Exceeded> {
+        if self.rpc_calls >= self.limits.rpc_calls {
+            return Err(exceeded(
+                Dimension::RpcCalls,
+                Code::RPC_CALLS_EXCEEDED,
                 format!(
-                    "the Script's values need more than its memory budget of {} bytes",
-                    self.limits.memory
+                    "the Script tried to make more than its RPC call budget of {} host calls",
+                    self.limits.rpc_calls
                 ),
                 span,
-            ),
+            ));
         }
+        if self.side_effects >= self.limits.side_effects {
+            return Err(exceeded(
+                Dimension::SideEffects,
+                Code::SIDE_EFFECTS_EXCEEDED,
+                format!(
+                    "the Script tried to perform more than its side-effect budget of {} side \
+                     effects",
+                    self.limits.side_effects
+                ),
+                span,
+            ));
+        }
+        self.rpc_calls += 1;
+        self.side_effects += 1;
+        Ok(())
+    }
+
+    /// Charge the Script's result, whose `{value}` payload encodes to `bytes` bytes of
+    /// MessagePack; `span` is where the error points (the whole Script).
+    ///
+    /// `bytes` may be any count past the limit when the exact length is not worth finishing: the
+    /// Executor stops measuring once it passes.
+    ///
+    /// # Errors
+    /// `budget.output_size_exceeded` when `bytes` is more than [`Limits::output_size`].
+    pub fn charge_output(&self, bytes: usize, span: Span) -> Result<(), Exceeded> {
+        if bytes <= self.limits.output_size {
+            return Ok(());
+        }
+        Err(exceeded(
+            Dimension::OutputSize,
+            Code::OUTPUT_SIZE_EXCEEDED,
+            format!(
+                "the Script's result encodes to more than its output size budget of {} bytes",
+                self.limits.output_size
+            ),
+            span,
+        ))
+    }
+}
+
+/// A `budget` error for `dimension`.
+fn exceeded(dimension: Dimension, code: Code, message: String, span: Span) -> Exceeded {
+    Exceeded {
+        dimension,
+        diagnostic: Diagnostic::new(Category::Budget, code, message, span),
     }
 }
 

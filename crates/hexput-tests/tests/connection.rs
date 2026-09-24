@@ -2043,3 +2043,54 @@ fn a_script_over_its_memory_budget_is_answered_with_a_budget_error() {
     assert_eq!(sent[1].id, Some(CorrelationId(2)));
     assert_eq!(code_of(&sent[1]), "budget.memory_exceeded");
 }
+
+// --- Story 3.6: RPC calls and output size over the wire ---
+
+#[test]
+fn an_rpc_flood_is_answered_with_a_budget_error_after_its_hundred_calls() {
+    hosted(
+        &wired_runtime(),
+        &[("ping", true)],
+        false,
+        |mut backend| async move {
+            backend.send(execution(
+                1,
+                "let n = 0;\nwhile (true) { n = n + 1; ping(n); }",
+            ));
+            for expected in 1..=100u64 {
+                let (id, name, arguments) = backend.call().await;
+                assert_eq!(name, "ping");
+                assert_eq!(arguments, [Value::from(expected)]);
+                backend.reply(
+                    id,
+                    MessageType::Result,
+                    Value::Map(vec![(string("value"), Value::Nil)]),
+                );
+            }
+            // The hundred-and-first call is never written: the next message is the error.
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(reply.message_type, MessageType::Error);
+            assert_eq!(code_of(&reply), "budget.rpc_calls_exceeded");
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_result_past_the_output_size_budget_is_answered_with_a_budget_error() {
+    // Two MiB of string: far inside a frame, past the 1 MiB output size budget.
+    let (sent, _) = serve(
+        vec![
+            init(1, init_payload(&[])),
+            execution(
+                2,
+                "let s = \"x\"; let i = 0; while (i < 21) { s = s + s; i = i + 1; }; return s;",
+            ),
+        ],
+        None,
+    );
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].id, Some(CorrelationId(2)));
+    assert_eq!(code_of(&sent[1]), "budget.output_size_exceeded");
+}

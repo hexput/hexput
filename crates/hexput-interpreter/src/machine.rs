@@ -30,6 +30,14 @@
 //! ceiling, and before a string concatenation whose result alone would cross it. Either stop
 //! carries the span of the construct that was running. What the limits are, and what exceeding
 //! them means, is the Executor's: the machine only meters.
+//!
+//! # Allocation counting (Story 3.6)
+//!
+//! The machine counts every string, array and object the Script constructs: each evaluation of a
+//! string literal, each concatenation and each to-string conversion of a concatenation's
+//! non-string operand, each key a `for … in` hands out, and each array or object literal. The
+//! heap adds each growth of a collection (see `heap.rs`). With an allocation ceiling the machine
+//! stops with [`Stop::AllocationsExceeded`] after the first frame that takes the count past it.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -232,6 +240,9 @@ pub(crate) enum Stop {
     /// ceiling. The span is the construct whose allocation crossed it. The machine must be
     /// dropped.
     OutOfMemory(Span),
+    /// The Script made more allocations than the [`Meter`]'s allocation ceiling. The span is the
+    /// construct whose allocation crossed it. The machine must be dropped.
+    AllocationsExceeded(Span),
 }
 
 /// What frame is running, cheaply: resolved to a span only when a metering stop needs one.
@@ -326,6 +337,11 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         self.meter = meter;
     }
 
+    /// How many allocations the Script has made (see the module documentation).
+    pub(crate) fn allocations(&self) -> u64 {
+        self.heap.allocations()
+    }
+
     /// Approximately how many bytes the execution's values hold (see `heap.rs`).
     pub(crate) fn memory_used(&self) -> usize {
         self.heap.used()
@@ -358,6 +374,9 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             if self.over_ceiling() {
                 return Ok(Stop::OutOfMemory(site_span(tree, site)));
             }
+            if self.over_allocation_ceiling() {
+                return Ok(Stop::AllocationsExceeded(site_span(tree, site)));
+            }
             if let Some(stop) = stop {
                 return Ok(stop);
             }
@@ -378,6 +397,13 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         self.meter
             .memory_ceiling
             .is_some_and(|ceiling| self.heap.used() > ceiling)
+    }
+
+    /// Whether the Script has made more allocations than the allocation ceiling.
+    fn over_allocation_ceiling(&self) -> bool {
+        self.meter
+            .allocation_ceiling
+            .is_some_and(|ceiling| self.heap.allocations() > ceiling)
     }
 
     /// Whether `extra` more bytes would take the heap past the memory ceiling.
@@ -562,6 +588,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             }
             Frame::BuildArray { count, .. } => {
                 let items = self.pop_many(count);
+                self.heap.allocated(1);
                 let array = self.heap.new_array(items);
                 self.values.push(array);
             }
@@ -576,6 +603,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     .zip(values)
                     .map(|(entry, value)| (Arc::from(entry.key.name.as_str()), value))
                     .collect();
+                self.heap.allocated(1);
                 let object = self.heap.new_object(map);
                 self.values.push(object);
             }
@@ -876,7 +904,11 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 }
                 let item = match keys {
                     // Charged in full like any new string: the value can outlive the object's key.
-                    Some(keys) => keys.get(*index).map(|key| self.heap.text(Arc::clone(key))),
+                    // A key handed out is a new string, counted as an allocation.
+                    Some(keys) => keys.get(*index).map(|key| {
+                        self.heap.allocated(1);
+                        self.heap.text(Arc::clone(key))
+                    }),
                     None => self.heap.array_get(*collection, *index),
                 };
                 let Some(item) = item else {
@@ -1125,7 +1157,10 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 Literal::Null => RtValue::Null,
                 Literal::Bool(b) => RtValue::Bool(*b),
                 Literal::Number(n) => RtValue::Number(*n),
-                Literal::String(s) => self.heap.text(s.as_str()),
+                Literal::String(s) => {
+                    self.heap.allocated(1);
+                    self.heap.text(s.as_str())
+                }
             }),
             ExpressionKind::Identifier(name) => {
                 // A host function is not a value (§8): only calling a bare undeclared name
@@ -1425,7 +1460,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     }
 
     fn binary(
-        &self,
+        &mut self,
         tree: &Program,
         left: ExprId,
         operator: Spanned<BinaryOperator>,
@@ -1478,6 +1513,10 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     let mut joined = String::with_capacity(a.len() + b.len());
                     joined.push_str(&a);
                     joined.push_str(&b);
+                    // The concatenation, and each operand converted to a string for it.
+                    let converted = u64::from(!matches!(l, RtValue::String(_)))
+                        + u64::from(!matches!(r, RtValue::String(_)));
+                    self.heap.allocated(1 + converted);
                     Ok(self.heap.text(joined))
                 } else {
                     finite(number(l, left_span)? + number(r, right_span)?)
@@ -1949,7 +1988,9 @@ mod tests {
         match machine.execute()? {
             Stop::Finished(value) => Ok(value),
             Stop::HostCall(call) => panic!("unexpected host call to `{}`", call.name),
-            Stop::Paused(_) | Stop::OutOfMemory(_) => panic!("these machines are unmetered"),
+            Stop::Paused(_) | Stop::OutOfMemory(_) | Stop::AllocationsExceeded(_) => {
+                panic!("these machines are unmetered")
+            }
         }
     }
 

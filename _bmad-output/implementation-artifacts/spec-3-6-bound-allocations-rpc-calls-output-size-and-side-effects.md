@@ -2,7 +2,7 @@
 title: 'Story 3.6: Bound allocations, RPC calls, output size, and side effects'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'in-review'
 baseline_commit: 'a280880e9d5a33f238bf97b3b31e40d90890b8fc'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -58,18 +58,25 @@ Each is its own `Dimension`, code (`budget.allocations_exceeded`, `budget.rpc_ca
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hexput-shared` -- codes.
-- [ ] `crates/hexput-interpreter` -- allocation count and ceiling.
-- [ ] `crates/hexput-enforce` -- limits, charges, errors.
-- [ ] `crates/hexput-exec` -- charge RPC/side effects at each call, output size on the result.
-- [ ] `crates/hexput-tests/tests/*` -- every matrix row.
-- [ ] LANGUAGE-REFERENCE §7, `AGENTS.md`.
+- [x] `crates/hexput-shared` -- codes.
+- [x] `crates/hexput-interpreter` -- allocation count and ceiling.
+- [x] `crates/hexput-enforce` -- limits, charges, errors.
+- [x] `crates/hexput-exec` -- charge RPC/side effects at each call, output size on the result.
+- [x] `crates/hexput-tests/tests/*` -- every matrix row.
+- [x] LANGUAGE-REFERENCE §7, `AGENTS.md`.
 
 **Acceptance Criteria:**
 - Given the six dimensions, when any one is exceeded alone, then the error names that one and no other.
 - Given a reviewer tracing the four new dimensions, when they follow the code, then every limit and decision is in `hexput-enforce`, reached only from `hexput-exec`.
 
 ## Implementation Notes
+
+- **To-string conversion** is counted per non-string operand a concatenation converts (`"a" + 1` = literal + conversion + concatenation = 3); the language has no other to-string site.
+- **Growth** is an append whose collection length *before* it is a power of two (1→2, 2→3, 4→5, 8→9); an array grown from `[]` to length 9 counts 4. Object keys grow the same way. Counted in `Heap::array_store`/`object_store`, which `Heap::attach` never calls, so starting variables and host-call values never count.
+- **Output size** is computed exactly without encoding (`hexput_exec::wire::payload_size`, an iterative walk that stops once past the limit), pinned against `rmp_serde` at every header boundary. It is charged before `hexput-script`'s frame/depth checks, so with the default 1 MiB limit `protocol.response_too_large` is unreachable through Direct Execution; the three `tests/script.rs` frame tests now assert the budget error and check `wire::check_result` directly.
+- **RPC and side effects** are charged together in `Budget::charge_rpc_call`; RPC is checked first when both would cross.
+- **`hexput_exec::execute_with_limits`** (re-exporting `hexput_enforce::Limits`, which gained `with_*` builders; `Budget::with_limits`) lets tests cross one dimension alone — a 1 000 000-allocation churn takes ~0.7 s of the 1 s CPU budget on a debug build, too close to rely on. Nothing in production calls it; Story 3.7 feeds it from Config.
+- Two Story 3.5 CPU tests made their per-segment loops 10x longer (20 000 turns) so CPU time crosses before the 100-call RPC budget.
 
 ## Spec Change Log
 

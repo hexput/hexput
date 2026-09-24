@@ -1709,7 +1709,7 @@ mod host_calls {
                     calls.push((call.name().to_owned(), arguments));
                     execution = call.resume(&value);
                 }
-                Outcome::Paused(_) | Outcome::OutOfMemory(_) => {
+                Outcome::Paused(_) | Outcome::OutOfMemory(_) | Outcome::AllocationsExceeded(_) => {
                     panic!("an unmetered execution never stops at a meter")
                 }
             }
@@ -1890,14 +1890,14 @@ mod metering {
     fn slices(steps: u64) -> Meter {
         Meter {
             slice: NonZeroU64::new(steps),
-            memory_ceiling: None,
+            ..Meter::UNMETERED
         }
     }
 
     fn ceiling(bytes: usize) -> Meter {
         Meter {
-            slice: None,
             memory_ceiling: Some(bytes),
+            ..Meter::UNMETERED
         }
     }
 
@@ -2070,5 +2070,203 @@ mod metering {
         .unwrap();
         // Four million bytes and a few hundred thousand steps: no slice, no ceiling.
         assert_eq!(evaluate(&program).unwrap().as_number(), Some(22.0));
+    }
+}
+
+// --- Story 3.6: the interpreter counts allocations, and stops at a ceiling it is handed ---
+
+mod allocations {
+    use std::sync::Arc;
+
+    use hexput_interpreter::{Execution, Meter, Outcome, Value};
+
+    fn start(source: &str, meter: Meter) -> Execution {
+        let program = Arc::new(hexput_parser::parse(source).unwrap());
+        Execution::with_variables(program, Vec::<(&str, Value)>::new())
+            .unwrap()
+            .metered(meter)
+    }
+
+    fn ceiling(count: u64) -> Meter {
+        Meter {
+            allocation_ceiling: Some(count),
+            ..Meter::UNMETERED
+        }
+    }
+
+    /// How many allocations `source` makes before it calls `done()`, its last statement.
+    fn counted(source: &str) -> u64 {
+        match start(&format!("{source}\ndone();"), Meter::UNMETERED)
+            .run()
+            .unwrap()
+        {
+            Outcome::HostCall(call) => {
+                assert_eq!(call.name(), "done");
+                call.resume(&Value::Null).allocations()
+            }
+            _ => panic!("the Script ends by calling `done`"),
+        }
+    }
+
+    /// Story 3.6's fixed Script: strings, a concatenation converting a number, an array grown to
+    /// length 9, an object literal grown by one key, the keys a `for … in` hands out, and an
+    /// object literal result.
+    pub const FIXED: &str = "let greeting = \"hello\";\n\
+                             let name = greeting + \", \" + 42;\n\
+                             let a = [];\n\
+                             let i = 0;\n\
+                             while (i < 9) { a[i] = i; i = i + 1; };\n\
+                             let o = { x: 1, y: \"z\" };\n\
+                             o.w = 2;\n\
+                             for (k in o) { let seen = k; };\n\
+                             let r = { name: name, n: i };";
+
+    #[test]
+    fn the_fixed_script_makes_exactly_seventeen_allocations() {
+        // "hello" 1; ", " 1, `greeting + ", "` 1, `+ 42` 1 and its conversion 1; `[]` 1; growth
+        // to 2, 3, 5 and 9 — 4; the object literal 1 and "z" 1; `o.w` takes 2 keys to 3 — 1; three
+        // keys handed out — 3; the result object 1.
+        assert_eq!(counted(FIXED), 17);
+    }
+
+    #[test]
+    fn each_construction_counts_once() {
+        assert_eq!(counted("let s = \"a\";"), 1);
+        assert_eq!(
+            counted("let s = \"a\" + \"b\";"),
+            3,
+            "two literals, one concatenation"
+        );
+        assert_eq!(counted("let s = \"a\" + 1;"), 3, "and one conversion");
+        assert_eq!(counted("let s = null + \"a\";"), 3);
+        assert_eq!(
+            counted("let a = [1, 2, 3];"),
+            1,
+            "a literal is one allocation"
+        );
+        assert_eq!(counted("let a = [[], []];"), 3);
+        assert_eq!(counted("let o = { a: 1, b: 2 };"), 1);
+        assert_eq!(counted("let o = { a: \"x\" };"), 2);
+        assert_eq!(
+            counted("let o = { a: 1, b: 2 }; for (k in o) { let seen = k; };"),
+            3
+        );
+        assert_eq!(
+            counted("let a = [1, 2]; for (v in a) { let seen = v; };"),
+            1
+        );
+    }
+
+    #[test]
+    fn scalars_rebindings_and_copies_do_not_count() {
+        assert_eq!(counted("let n = 1 + 2; let b = !n; let m = n; n = 7;"), 0);
+        assert_eq!(
+            counted("let s = \"a\"; let t = s; t = s; let u = [s, s];"),
+            2
+        );
+        assert_eq!(
+            counted("fn f(x) { return x; }; let y = f(1); let z = f(2);"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_growth_is_an_append_past_a_power_of_two() {
+        // An array appended from empty to length n: each append from length 1, 2, 4, 8, … grows.
+        for (length, growths) in [
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (8, 3),
+            (9, 4),
+            (17, 5),
+        ] {
+            let source =
+                format!("let a = []; let i = 0; while (i < {length}) {{ a[i] = i; i = i + 1; }};");
+            assert_eq!(counted(&source), 1 + growths, "array to length {length}");
+        }
+        // Replacing an element is no growth.
+        assert_eq!(counted("let a = [1, 2]; a[0] = 5; a[1] = 6;"), 1);
+        // An object grows by new keys alone, the same way.
+        assert_eq!(
+            counted("let o = {}; o.a = 1; o.b = 2; o.c = 3; o.a = 4;"),
+            3
+        );
+        assert_eq!(
+            counted("let o = {}; o[\"a\"] = 1;"),
+            2,
+            "the key's literal counts"
+        );
+    }
+
+    #[test]
+    fn starting_variables_and_host_call_values_do_not_count() {
+        let program = Arc::new(hexput_parser::parse("let x = get(); done();").unwrap());
+        let big = Value::Array(hexput_interpreter::Array::from_values(vec![
+            Value::String(Arc::from("s")),
+            Value::Null,
+        ]));
+        let execution = Execution::with_variables(program, vec![("input", big.clone())]).unwrap();
+        assert_eq!(execution.allocations(), 0);
+        let Outcome::HostCall(call) = execution.run().unwrap() else {
+            panic!("calls `get`");
+        };
+        let resumed = call.resume(&big);
+        assert_eq!(resumed.allocations(), 0);
+        let Outcome::HostCall(done) = resumed.run().unwrap() else {
+            panic!("calls `done`");
+        };
+        assert_eq!(done.resume(&Value::Null).allocations(), 0);
+    }
+
+    #[test]
+    fn the_ceiling_is_the_last_allocation_allowed() {
+        let source = format!("{FIXED}\nreturn 1;");
+        assert!(matches!(
+            start(&source, ceiling(17)).run(),
+            Ok(Outcome::Finished(_))
+        ));
+        let Outcome::AllocationsExceeded(stopped) = start(&source, ceiling(16)).run().unwrap()
+        else {
+            panic!("the seventeenth allocation crosses a ceiling of sixteen");
+        };
+        assert_eq!(stopped.count(), 17);
+        assert_eq!(&source[stopped.span().range()], "{ name: name, n: i }");
+    }
+
+    #[test]
+    fn churning_short_lived_strings_stops_at_the_ceiling_with_little_memory() {
+        let source = "let n = 0;\nwhile (true) { let t = \"x\" + n; n = n + 1; }";
+        let Outcome::AllocationsExceeded(stopped) = start(source, ceiling(10_000)).run().unwrap()
+        else {
+            panic!("the churn outgrows the ceiling");
+        };
+        assert!(
+            stopped.count() > 10_000 && stopped.count() <= 10_003,
+            "{}",
+            stopped.count()
+        );
+        assert_eq!(stopped.span().line, 2, "{:?}", stopped.span());
+    }
+
+    #[test]
+    fn the_allocation_ceiling_stands_alone() {
+        // Far past any memory ceiling's worth of allocations, but no memory held: only the
+        // allocation ceiling stops it, and a memory ceiling alone never does.
+        let source = "let n = 0;\nwhile (n < 20000) { let t = \"x\" + n; n = n + 1; };\nreturn n;";
+        let memory_only = Meter {
+            memory_ceiling: Some(64 * 1024),
+            ..Meter::UNMETERED
+        };
+        assert!(matches!(
+            start(source, memory_only).run(),
+            Ok(Outcome::Finished(_))
+        ));
+        assert!(matches!(
+            start(source, ceiling(1_000)).run(),
+            Ok(Outcome::AllocationsExceeded(_))
+        ));
     }
 }

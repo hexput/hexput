@@ -264,6 +264,102 @@ pub fn check_result(result: &Hexput) -> Result<(), Unsendable> {
     measure(result, MAX_RESULT_DEPTH, &mut budget)
 }
 
+/// The exact number of bytes the Script result `value` takes on the wire as the `{value}` payload
+/// of a `Result` — the map, its `value` key and the value, each MessagePack-encoded as [`to_wire`]
+/// converts it and the codec writes it (every integer, string, array and map header in its most
+/// compact form) — or, once the count passes `limit`, some count past `limit`: the walk stops
+/// there, so a result that shares one collection many times over is never expanded in full.
+///
+/// Walks without recursion, so a result of any depth is measured. Only the output size budget
+/// uses it; whether the result may be sent at all is [`check_result`]'s.
+#[must_use]
+pub fn payload_size(value: &Hexput, limit: usize) -> usize {
+    // A one-entry map (1 byte), its key `value` (a 5-byte fixstr: 6 bytes), then the value.
+    let mut size: usize = 1 + str_size(VALUE_KEY.len());
+    let mut pending: Vec<&Hexput> = vec![value];
+    while let Some(value) = pending.pop() {
+        if size > limit {
+            break;
+        }
+        let bytes = match value {
+            Hexput::Number(number) => number_size(*number),
+            Hexput::String(text) => str_size(text.len()),
+            Hexput::Array(array) => {
+                let before = pending.len();
+                pending.extend(array.iter());
+                container_size(pending.len() - before)
+            }
+            Hexput::Object(object) => {
+                let mut bytes = 0usize;
+                let mut entries = 0usize;
+                for (key, item) in object.iter() {
+                    bytes = bytes.saturating_add(str_size(key.len()));
+                    entries += 1;
+                    pending.push(item);
+                }
+                bytes.saturating_add(container_size(entries))
+            }
+            // `null`, a bool — and any kind with no wire form, which `to_wire` sends as nil.
+            _ => 1,
+        };
+        size = size.saturating_add(bytes);
+    }
+    size
+}
+
+/// The payload key a Script result travels under.
+const VALUE_KEY: &str = "value";
+
+/// A MessagePack string of `len` bytes: fixstr, str8, str16 or str32 header, then the bytes.
+const fn str_size(len: usize) -> usize {
+    let header = if len < 32 {
+        1
+    } else if len <= u8::MAX as usize {
+        2
+    } else if len <= u16::MAX as usize {
+        3
+    } else {
+        5
+    };
+    header + len
+}
+
+/// A MessagePack array or map header for `len` items: fix, 16 or 32.
+const fn container_size(len: usize) -> usize {
+    if len < 16 {
+        1
+    } else if len <= u16::MAX as usize {
+        3
+    } else {
+        5
+    }
+}
+
+/// A number as [`number_to_wire`] converts it, MessagePack-encoded.
+fn number_size(number: f64) -> usize {
+    match number_to_wire(number) {
+        Wire::Integer(integer) => match (integer.as_u64(), integer.as_i64()) {
+            (Some(unsigned), _) => match unsigned {
+                0..=0x7f => 1,
+                0x80..=0xff => 2,
+                0x100..=0xffff => 3,
+                0x1_0000..=0xffff_ffff => 5,
+                _ => 9,
+            },
+            (None, Some(signed)) => match signed {
+                -32..=-1 => 1,
+                -128..=-33 => 2,
+                -32_768..=-129 => 3,
+                -2_147_483_648..=-32_769 => 5,
+                _ => 9,
+            },
+            (None, None) => 9,
+        },
+        // A float64: its marker and eight bytes.
+        _ => 9,
+    }
+}
+
 /// One container level deeper, refused past `max_depth`.
 const fn nested(depth: usize, max_depth: usize) -> Result<usize, Unsendable> {
     let depth = depth + 1;

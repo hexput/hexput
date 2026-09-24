@@ -206,3 +206,125 @@ mod budget {
         assert_eq!(Dimension::CpuTime.to_string(), "cpu_time");
     }
 }
+
+// --- Story 3.6: allocations, RPC calls, output size and side effects ---
+
+mod counted {
+    use std::time::Duration;
+
+    use hexput_enforce::{
+        Budget, DEFAULT_ALLOCATIONS, DEFAULT_OUTPUT_SIZE, DEFAULT_RPC_CALLS, DEFAULT_SIDE_EFFECTS,
+        Dimension, Exceeded, Limits,
+    };
+
+    use super::span;
+
+    fn assert_dimension(exceeded: &Exceeded, dimension: Dimension, code: &str) {
+        assert_eq!(exceeded.dimension(), dimension);
+        let diagnostic = exceeded.diagnostic();
+        assert_eq!(diagnostic.code.as_str(), code);
+        assert_eq!(diagnostic.category.as_str(), "budget");
+        assert_eq!(diagnostic.span, span());
+    }
+
+    #[test]
+    fn the_defaults_are_the_decided_ones() {
+        assert_eq!(DEFAULT_ALLOCATIONS, 1_000_000);
+        assert_eq!(DEFAULT_RPC_CALLS, 100);
+        assert_eq!(DEFAULT_OUTPUT_SIZE, 1024 * 1024);
+        assert_eq!(DEFAULT_SIDE_EFFECTS, 100);
+        let limits = Budget::new().limits();
+        assert_eq!(limits.allocations(), DEFAULT_ALLOCATIONS);
+        assert_eq!(limits.rpc_calls(), DEFAULT_RPC_CALLS);
+        assert_eq!(limits.output_size(), DEFAULT_OUTPUT_SIZE);
+        assert_eq!(limits.side_effects(), DEFAULT_SIDE_EFFECTS);
+        assert_eq!(Budget::new().allocation_ceiling(), DEFAULT_ALLOCATIONS);
+    }
+
+    #[test]
+    fn a_host_call_is_one_rpc_call_and_one_side_effect_and_the_one_past_the_limit_is_refused() {
+        let mut budget = Budget::new();
+        for _ in 0..DEFAULT_RPC_CALLS {
+            budget.charge_rpc_call(span()).unwrap();
+        }
+        assert_eq!(budget.rpc_calls_used(), 100);
+        assert_eq!(budget.side_effects_used(), 100);
+        let exceeded = budget.charge_rpc_call(span()).unwrap_err();
+        assert_dimension(&exceeded, Dimension::RpcCalls, "budget.rpc_calls_exceeded");
+        assert_eq!(
+            budget.rpc_calls_used(),
+            100,
+            "the refused call is not charged"
+        );
+    }
+
+    #[test]
+    fn output_size_is_refused_only_past_the_limit() {
+        let budget = Budget::new();
+        budget.charge_output(DEFAULT_OUTPUT_SIZE, span()).unwrap();
+        let exceeded = budget
+            .charge_output(DEFAULT_OUTPUT_SIZE + 1, span())
+            .unwrap_err();
+        assert_dimension(
+            &exceeded,
+            Dimension::OutputSize,
+            "budget.output_size_exceeded",
+        );
+    }
+
+    #[test]
+    fn the_allocation_error_names_its_dimension() {
+        let exceeded = Budget::new().allocations_exceeded(span());
+        assert_dimension(
+            &exceeded,
+            Dimension::Allocations,
+            "budget.allocations_exceeded",
+        );
+    }
+
+    #[test]
+    fn each_limit_crossed_alone_names_only_its_own_dimension() {
+        // Side effects below RPC calls: the side-effect limit is what the call crosses.
+        let mut budget = Budget::with_limits(Limits::default().with_side_effects(3));
+        for _ in 0..3 {
+            budget.charge_rpc_call(span()).unwrap();
+        }
+        let exceeded = budget.charge_rpc_call(span()).unwrap_err();
+        assert_dimension(
+            &exceeded,
+            Dimension::SideEffects,
+            "budget.side_effects_exceeded",
+        );
+
+        // RPC calls below side effects: the RPC call limit is.
+        let mut budget = Budget::with_limits(Limits::default().with_rpc_calls(2));
+        for _ in 0..2 {
+            budget.charge_rpc_call(span()).unwrap();
+        }
+        let exceeded = budget.charge_rpc_call(span()).unwrap_err();
+        assert_dimension(&exceeded, Dimension::RpcCalls, "budget.rpc_calls_exceeded");
+
+        // Tight limits on every other dimension leave these two untouched, and the reverse.
+        let tight = Limits::default()
+            .with_cpu_time(Duration::from_millis(1))
+            .with_memory(1)
+            .with_allocations(1)
+            .with_output_size(1);
+        let mut budget = Budget::with_limits(tight);
+        for _ in 0..DEFAULT_RPC_CALLS {
+            budget.charge_rpc_call(span()).unwrap();
+        }
+        let budget = Budget::with_limits(
+            Limits::default()
+                .with_rpc_calls(0)
+                .with_side_effects(0)
+                .with_allocations(0),
+        );
+        budget.charge_output(DEFAULT_OUTPUT_SIZE, span()).unwrap();
+        assert_eq!(budget.memory_ceiling(), hexput_enforce::DEFAULT_MEMORY);
+        let mut budget = budget;
+        budget
+            .charge_cpu(hexput_enforce::DEFAULT_CPU_TIME, span())
+            .unwrap();
+    }
+}

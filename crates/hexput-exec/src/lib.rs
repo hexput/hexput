@@ -64,6 +64,22 @@
 //! the blocking thread at once — the execution's heap is dropped with it. Host calls it already
 //! made stand. The Daemon logs each at `debug` with the `dimension`.
 //!
+//! # The four counted dimensions (Story 3.6)
+//!
+//! The same budget bounds four counts, each on its own and each decided by `hexput-enforce`:
+//!
+//! * **allocations** — the Script runs with the budget's allocation ceiling in its meter; the
+//!   interpreter counts and stops, and the Executor turns the stop into
+//!   `budget.allocations_exceeded`, spanned on the constructing site.
+//! * **RPC calls** and **side effects** — every time the Script stops at a host call, after the
+//!   slice is charged and before the arguments are measured or the capability decided, the call
+//!   is charged as one of each. A call that would cross either limit is refused before anything
+//!   is sent (`budget.rpc_calls_exceeded` or `budget.side_effects_exceeded`, spanned on the call);
+//!   a call later refused, denied or failed has already counted.
+//! * **output size** — when the Script finishes, the exact MessagePack length of its `{value}`
+//!   result payload ([`wire::payload_size`]) is charged, and one past the limit is
+//!   `budget.output_size_exceeded`, spanned on the whole Script.
+//!
 //! Binds: AD-3, AD-6.
 
 pub mod wire;
@@ -73,6 +89,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hexput_enforce::{Budget, Capabilities, Decision, Exceeded, HandlerAnswer, Question, Refusal};
+
+/// The limits of an execution's Resource Budget, re-exported so a caller of
+/// [`execute_with_limits`] can state them. Only `hexput-enforce` decides anything from them.
+pub use hexput_enforce::Limits;
 use hexput_interpreter::{Category, Code, Execution, HostCall, Meter, Outcome, Span};
 use hexput_rpc::CallFailure;
 
@@ -197,15 +217,37 @@ pub async fn execute(
     variables: Vec<(Arc<str>, Value)>,
     host: Host,
 ) -> Result<Value, Diagnostic> {
+    execute_with_limits(program, variables, host, Limits::default()).await
+}
+
+/// [`execute`], under a Resource Budget with `limits` rather than the documented defaults.
+///
+/// Every limit is still enforced by `hexput-enforce`, exactly as under [`execute`]; only the
+/// numbers differ. No execution path sets them yet — Story 3.7 feeds them from the Session's
+/// Config and per-execution overrides — so today this is what lets a test cross one dimension
+/// alone without first crossing another.
+///
+/// # Errors
+/// As [`execute`].
+///
+/// # Panics
+/// As [`execute`].
+pub async fn execute_with_limits(
+    program: Arc<Program>,
+    variables: Vec<(Arc<str>, Value)>,
+    host: Host,
+    limits: Limits,
+) -> Result<Value, Diagnostic> {
     let Host {
         capabilities,
         caller,
     } = host;
     let capabilities = Arc::new(capabilities);
-    let budget = Budget::new();
+    let budget = Budget::with_limits(limits);
     let meter = Meter {
         slice: Some(SLICE),
         memory_ceiling: Some(budget.memory_ceiling()),
+        allocation_ceiling: Some(budget.allocation_ceiling()),
     };
     // Where a charge with no construct of its own points: the whole Script.
     let whole = program.span;
@@ -280,18 +322,31 @@ fn segment(
             Outcome::OutOfMemory(stopped) => {
                 return Err(Halt::Exceeded(budget.memory_exceeded(stopped.span())));
             }
+            Outcome::AllocationsExceeded(stopped) => {
+                return Err(Halt::Exceeded(budget.allocations_exceeded(stopped.span())));
+            }
             // The last slice is charged like any other: crossing the limit in it fails the
-            // Script even though it finished.
+            // Script even though it finished. Measuring the result is charged with it.
             Outcome::Finished(result) => {
+                let limit = budget.limits().output_size();
+                budget
+                    .charge_output(wire::payload_size(&result, limit), whole)
+                    .map_err(Halt::Exceeded)?;
                 budget
                     .charge_cpu(started.elapsed(), whole)
                     .map_err(Halt::Exceeded)?;
                 return Ok(Step::Finished(result));
             }
             Outcome::HostCall(call) => {
-                // The slice and the argument work are charged together, before anything about
-                // the call is sent.
+                // The slice, then the call itself — one RPC call and one side effect, whatever
+                // becomes of it — then the argument work: all before anything about the call is
+                // sent.
                 let span = call.span();
+                budget
+                    .charge_cpu(started.elapsed(), span)
+                    .map_err(Halt::Exceeded)?;
+                let started = Instant::now();
+                budget.charge_rpc_call(span).map_err(Halt::Exceeded)?;
                 let step = advance(call, capabilities)?;
                 budget
                     .charge_cpu(started.elapsed(), span)

@@ -26,6 +26,16 @@
 //! Both are deliberately approximate — allocator overhead, spare vector capacity, the frame and
 //! value stacks and the program itself are not counted — but each is monotone in what the
 //! Script holds, which is what a ceiling needs.
+//!
+//! # Allocation counting (Story 3.6)
+//!
+//! The heap also counts the allocations the Script makes, for the allocation budget. The count is
+//! defined by the language, not by what Rust allocates (LANGUAGE-REFERENCE §7): the machine counts
+//! each string, array and object the Script constructs ([`Heap::allocated`]), and the heap itself
+//! counts each *growth* of a collection — every append (an array element at its length, or a new
+//! object key) that takes the collection's length past a power of two: from 1 to 2, 2 to 3, 4 to
+//! 5, 8 to 9, and so on. Values copied in from outside — starting variables and host-call replies
+//! — are never counted: [`Heap::attach`] builds them without touching the count.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -220,6 +230,8 @@ pub(crate) struct Heap {
     slot_bytes: usize,
     /// The live strings' charges, summed.
     texts: TextMeter,
+    /// Allocations the Script has made (see the module documentation).
+    allocations: u64,
 }
 
 impl Heap {
@@ -227,6 +239,24 @@ impl Heap {
     /// documentation).
     pub(crate) fn used(&self) -> usize {
         self.slot_bytes.saturating_add(self.texts.get())
+    }
+
+    /// How many allocations the Script has made so far.
+    pub(crate) const fn allocations(&self) -> u64 {
+        self.allocations
+    }
+
+    /// Count `count` allocations the Script made.
+    pub(crate) fn allocated(&mut self, count: u64) {
+        self.allocations = self.allocations.saturating_add(count);
+    }
+
+    /// Count an append to a collection whose length was `before`: a growth when it takes the
+    /// length past a power of two.
+    fn appended(&mut self, before: usize) {
+        if before.is_power_of_two() {
+            self.allocated(1);
+        }
     }
 
     /// Record that a live slot grew by `bytes`.
@@ -351,16 +381,20 @@ impl Heap {
         let Some(Slot::Array { items, version }) = self.slot_mut(id) else {
             return false;
         };
+        let before = items.len();
         let grew = if let Some(slot) = items.get_mut(index) {
             *slot = value;
             0
-        } else if index == items.len() {
+        } else if index == before {
             items.push(value);
             ELEMENT
         } else {
             return false;
         };
         *version = version.wrapping_add(1);
+        if grew > 0 {
+            self.appended(before);
+        }
         self.grow(grew);
         true
     }
@@ -372,6 +406,7 @@ impl Heap {
     /// Replace an existing key in place, or append a new one at the end.
     pub(crate) fn object_store(&mut self, id: SlotId, key: &str, value: RtValue) {
         if let Some(Slot::Object { entries, version }) = self.slot_mut(id) {
+            let before = entries.len();
             let grew = if let Some(slot) = entries.get_mut(key) {
                 *slot = value;
                 0
@@ -380,6 +415,9 @@ impl Heap {
                 ENTRY + key.len()
             };
             *version = version.wrapping_add(1);
+            if grew > 0 {
+                self.appended(before);
+            }
             self.grow(grew);
         }
     }

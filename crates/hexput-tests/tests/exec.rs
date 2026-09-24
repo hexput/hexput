@@ -6,7 +6,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use hexput_exec::{ARGUMENT_DEPTH_LIMIT, Diagnostic, Host, Value, execute};
+use hexput_exec::{
+    ARGUMENT_DEPTH_LIMIT, Diagnostic, Host, Limits, Value, execute, execute_with_limits,
+};
 use hexput_port::{CorrelationId, Envelope, MessageType};
 use hexput_rpc::{Calls, Value as Wire};
 
@@ -177,6 +179,25 @@ fn run_full(
     authorize: Handler,
     answer: Answer,
 ) -> Run {
+    run_limited(
+        source,
+        variables,
+        registered,
+        authorize,
+        answer,
+        Limits::default(),
+    )
+}
+
+/// [`run_full`] under a Resource Budget with `limits` (Story 3.6).
+fn run_limited(
+    source: &str,
+    variables: Vec<(Arc<str>, Value)>,
+    registered: &[(&str, bool)],
+    authorize: Handler,
+    answer: Answer,
+    limits: Limits,
+) -> Run {
     let log = Captured::default();
     let writer = log.clone();
     let dispatch = tracing::Dispatch::new(
@@ -187,7 +208,7 @@ fn run_full(
             .finish(),
     );
     let mut run = tracing::dispatcher::with_default(&dispatch, || {
-        hosted_run(source, variables, registered, authorize, answer)
+        hosted_run(source, variables, registered, authorize, answer, limits)
     });
     let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
     run.events = text
@@ -203,6 +224,7 @@ fn hosted_run(
     registered: &[(&str, bool)],
     authorize: Handler,
     answer: Answer,
+    limits: Limits,
 ) -> Run {
     let seen: Seen = Arc::default();
     let questions: Seen = Arc::default();
@@ -256,7 +278,12 @@ fn hosted_run(
         }
     });
     let host = Host::new(registered.iter().copied(), caller);
-    let result = runtime.block_on(execute(program(source), variables, host));
+    let result = runtime.block_on(execute_with_limits(
+        program(source),
+        variables,
+        host,
+        limits,
+    ));
     let calls = seen.lock().unwrap().clone();
     let asked = questions.lock().unwrap().clone();
     let order = order.lock().unwrap().clone();
@@ -1148,8 +1175,9 @@ fn waiting_for_the_backend_is_never_charged_as_cpu_time() {
 
 #[test]
 fn cpu_time_adds_up_across_host_calls_and_the_calls_already_made_stand() {
-    // Each segment runs well under the limit; together they pass it.
-    let source = "while (true) {\n  let j = 0; while (j < 2000) { j = j + 1; };\n  ping(j);\n}";
+    // Each segment runs well under the limit; together they pass it — long enough each that the
+    // limit is passed well inside the RPC call budget (Story 3.6), even on a release build.
+    let source = "while (true) {\n  let j = 0; while (j < 20000) { j = j + 1; };\n  ping(j);\n}";
     let run = run_full(
         source,
         vec![],
@@ -1194,10 +1222,11 @@ fn a_memory_stop_is_logged_with_its_dimension() {
 
 #[test]
 fn the_call_whose_charge_crosses_the_limit_is_never_sent() {
-    // Each segment is well under a slice, so most charges are taken at a call, before the call is
-    // sent. The stand-in sees calls 1..=k, each answered at once, and no question: whatever
-    // call the Script stopped at, or was about to make, was never sent.
-    let source = "let n = 0;\nwhile (true) {\n  let j = 0; while (j < 200) { j = j + 1; };\n  \
+    // Charges are taken at slice boundaries and at each call, before the call is sent. The
+    // stand-in sees calls 1..=k, each answered at once, and no question: whatever call the Script
+    // stopped at, or was about to make, was never sent. Each segment is long enough that the
+    // limit is passed well inside the RPC call budget (Story 3.6), even on a release build.
+    let source = "let n = 0;\nwhile (true) {\n  let j = 0; while (j < 20000) { j = j + 1; };\n  \
                   n = n + 1;\n  ping(n);\n}";
     let run = run_full(
         source,
@@ -1245,4 +1274,433 @@ fn a_reply_that_crosses_the_memory_budget_ends_the_script_on_its_call() {
     assert_eq!(diagnostic.code.as_str(), "budget.memory_exceeded");
     assert_eq!(spanned(source, &diagnostic), "fetch()");
     assert_eq!(seen.len(), 1);
+}
+
+// --- Story 3.6: allocations, RPC calls, output size and side effects ---
+
+/// The fixed Script of Story 3.6 (the interpreter tests pin its seventeen allocations), making two
+/// host calls and returning `{ name: "hello, 42", n: 9 }`.
+const FIXED: &str = "let greeting = \"hello\";\n\
+                     let name = greeting + \", \" + 42;\n\
+                     let a = [];\n\
+                     let i = 0;\n\
+                     while (i < 9) { a[i] = i; i = i + 1; };\n\
+                     let o = { x: 1, y: \"z\" };\n\
+                     o.w = 2;\n\
+                     for (k in o) { let seen = k; };\n\
+                     ping(a); ping(o);\n\
+                     return { name: name, n: i };";
+
+/// The exact MessagePack bytes of a Script result's `{value}` payload, as the codec writes it.
+fn encoded_payload(result: &Value) -> Vec<u8> {
+    let payload = map(vec![("value", hexput_exec::wire::to_wire(result))]);
+    rmp_serde::to_vec(&payload).unwrap()
+}
+
+/// The stops the Executor logged, by dimension.
+fn stopped_dimensions(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "stopped an execution over its budget")
+        .map(|event| event["fields"]["dimension"].clone())
+        .collect()
+}
+
+#[test]
+fn the_fixed_script_makes_two_calls_and_a_twenty_six_byte_result() {
+    let (result, seen) = run_hosted(
+        FIXED,
+        vec![],
+        &[("ping", true)],
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    let result = result.unwrap();
+    assert_eq!(seen.len(), 2);
+    // A one-entry map 1, `value` 6, a two-entry map 1, `name` 5, "hello, 42" 10, `n` 2, 9 1.
+    assert_eq!(encoded_payload(&result).len(), 26);
+    assert_eq!(hexput_exec::wire::payload_size(&result, usize::MAX), 26);
+}
+
+#[test]
+fn the_fixed_script_uses_two_of_the_hundred_rpc_calls_and_side_effects() {
+    // Ninety-eight more calls fit exactly; ninety-nine do not.
+    for (more, fits) in [(98, true), (99, false)] {
+        let source = format!("let c = 0; while (c < {more}) {{ c = c + 1; ping(c); }};\n{FIXED}");
+        let (result, seen) = run_hosted(
+            &source,
+            vec![],
+            &[("ping", true)],
+            Box::new(|_, _| value(Wire::Nil)),
+        );
+        if fits {
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(seen.len(), 100);
+        } else {
+            let diagnostic = result.unwrap_err();
+            assert_eq!(diagnostic.code.as_str(), "budget.rpc_calls_exceeded");
+            assert_eq!(spanned(&source, &diagnostic), "ping(o)");
+            assert_eq!(
+                seen.len(),
+                100,
+                "the call that would cross it is never sent"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_payload_size_is_the_exact_encoded_length() {
+    let values = [
+        "null",
+        "true",
+        "0",
+        "-0",
+        "127",
+        "128",
+        "255",
+        "256",
+        "65535",
+        "65536",
+        "4294967295",
+        "4294967296",
+        "9007199254740992",
+        "-1",
+        "-32",
+        "-33",
+        "-128",
+        "-129",
+        "-32768",
+        "-32769",
+        "-2147483648",
+        "-2147483649",
+        "-9007199254740992",
+        "1.5",
+        "9007199254740994",
+        "\"\"",
+        "\"0123456789012345678901234567890\"",
+        "\"01234567890123456789012345678901\"",
+        "[]",
+        "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]",
+        "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]",
+        "{ a: [1, { b: \"c\" }], d: null }",
+    ];
+    for source in values {
+        let result = run(&format!("return {source};"), vec![]).unwrap();
+        assert_eq!(
+            hexput_exec::wire::payload_size(&result, usize::MAX),
+            encoded_payload(&result).len(),
+            "{source}"
+        );
+    }
+    // Long strings and collections, at each header size's boundaries.
+    for length in [255, 256, 65_535, 65_536] {
+        let text = Value::String(Arc::from("x".repeat(length)));
+        let array = Value::Array(hexput_interpreter::Array::from_values(
+            (0..length).map(|i| Value::Number(i as f64)).collect(),
+        ));
+        let keys: Vec<String> = (0..length).map(|i| format!("k{i}")).collect();
+        let object = Value::Object(hexput_interpreter::Object::from_entries(
+            keys.iter().map(|key| (key.as_str(), Value::Null)),
+        ));
+        let result = Value::Array(hexput_interpreter::Array::from_values(vec![
+            text, array, object,
+        ]));
+        assert_eq!(
+            hexput_exec::wire::payload_size(&result, usize::MAX),
+            encoded_payload(&result).len(),
+            "length {length}"
+        );
+    }
+}
+
+#[test]
+fn a_payload_past_the_limit_stops_being_measured() {
+    // `[x, x]` nested sixty times is 2^60 elements on the wire: measured only just past the
+    // limit, never expanded.
+    let mut value = Value::Array(hexput_interpreter::Array::from_values(vec![Value::Null]));
+    for _ in 0..60 {
+        value = Value::Array(hexput_interpreter::Array::from_values(vec![
+            value.clone(),
+            value,
+        ]));
+    }
+    let size = hexput_exec::wire::payload_size(&value, 1024);
+    assert!(size > 1024 && size < 2048, "{size}");
+}
+
+#[test]
+fn a_result_past_the_output_size_budget_is_refused_though_it_fits_a_frame() {
+    // A `{value}` payload of a string is 1 + 6 + 5 + its bytes: at the 1 MiB limit exactly, and
+    // one byte past it.
+    let limit = hexput_enforce::DEFAULT_OUTPUT_SIZE;
+    let fits = limit - 12;
+    let result = run(
+        "return s;",
+        vec![(Arc::from("s"), Value::String(Arc::from("x".repeat(fits))))],
+    )
+    .unwrap();
+    assert_eq!(encoded_payload(&result).len(), limit);
+
+    let run = run_full(
+        "return s;",
+        vec![(
+            Arc::from("s"),
+            Value::String(Arc::from("x".repeat(fits + 1))),
+        )],
+        &[],
+        refusing(),
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    let diagnostic = run.result.unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.output_size_exceeded");
+    assert_eq!(diagnostic.category.as_str(), "budget");
+    assert_eq!(stopped_dimensions(&run.events), ["output_size"]);
+}
+
+#[test]
+fn an_rpc_flood_is_stopped_at_the_call_that_would_cross_the_limit() {
+    let source = "let n = 0;\nwhile (true) { n = n + 1; ping(n); }";
+    let run = run_full(
+        source,
+        vec![],
+        &[("ping", true)],
+        refusing(),
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    let diagnostic = run.result.unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.rpc_calls_exceeded");
+    assert_eq!(diagnostic.category.as_str(), "budget");
+    assert_eq!(spanned(source, &diagnostic), "ping(n)");
+    // The hundred calls made stand, each answered; the hundred-and-first was never sent.
+    let sent: Vec<u64> = run
+        .calls
+        .iter()
+        .map(|(_, arguments)| arguments[0].as_u64().unwrap())
+        .collect();
+    assert_eq!(sent, (1..=100).collect::<Vec<u64>>());
+    assert_eq!(stopped_dimensions(&run.events), ["rpc_calls"]);
+}
+
+#[test]
+fn a_refused_call_counts_before_its_capability_is_decided() {
+    // A hundred calls made; the next call is to an unregistered name. It is charged before the
+    // capability decision, so it crosses the RPC call budget rather than being refused.
+    let over = "let n = 0; while (n < 100) { n = n + 1; ping(n); };\nnope();";
+    let (result, seen) = run_hosted(
+        over,
+        vec![],
+        &[("ping", true)],
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    let diagnostic = result.unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.rpc_calls_exceeded");
+    assert_eq!(spanned(over, &diagnostic), "nope()");
+    assert_eq!(seen.len(), 100);
+    // Ninety-nine calls: the refusal is the hundredth, a counted call ending in `capability`.
+    let within = "let n = 0; while (n < 99) { n = n + 1; ping(n); };\nnope();";
+    let (result, _) = run_hosted(
+        within,
+        vec![],
+        &[("ping", true)],
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    assert_eq!(
+        result.unwrap_err().code.as_str(),
+        "capability.unknown_function"
+    );
+}
+
+#[test]
+fn a_denied_call_counts_and_its_question_is_part_of_it() {
+    let registered = [("ping", true), ("ask", false)];
+    // Ninety-nine calls, then a question the handler refuses: counted as the hundredth call,
+    // ending in `capability` — the question is not a second count.
+    let within = "let n = 0; while (n < 99) { n = n + 1; ping(n); };\nask();";
+    let run = run_full(
+        within,
+        vec![],
+        &registered,
+        refusing(),
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    assert_eq!(
+        run.result.unwrap_err().code.as_str(),
+        "capability.unknown_function"
+    );
+    assert_eq!(run.asked.len(), 1);
+    // A hundred calls: the call is charged before anything is asked, and nothing is.
+    let over = "let n = 0; while (n < 100) { n = n + 1; ping(n); };\nask();";
+    let run = run_full(
+        over,
+        vec![],
+        &registered,
+        refusing(),
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    assert_eq!(
+        run.result.unwrap_err().code.as_str(),
+        "budget.rpc_calls_exceeded"
+    );
+    assert!(run.asked.is_empty(), "{:?}", run.asked);
+    // Allowed per call, ninety-nine answered `true` and the hundredth question ... a hundred
+    // calls in all, each one question and one call.
+    let allowed = "let n = 0; while (n < 100) { n = n + 1; ask(n); };\nreturn n;";
+    let run = run_full(
+        allowed,
+        vec![],
+        &registered,
+        answering(Wire::Boolean(true)),
+        Box::new(|_, _| value(Wire::Nil)),
+    );
+    assert_eq!(run.result.unwrap().as_number(), Some(100.0));
+    assert_eq!((run.asked.len(), run.calls.len()), (100, 100));
+}
+
+#[test]
+fn a_failed_call_counts() {
+    // Every call fails on the Backend and ends the Script, so a hundred calls cannot be made:
+    // the failed call is the first counted, and ends in `host`.
+    let (result, seen) = run_hosted(
+        "let n = 0; while (n < 100) { n = n + 1; ping(n); };\nfail();",
+        vec![],
+        &[("ping", true), ("fail", true)],
+        Box::new(|name, _| {
+            if name == "fail" {
+                (MessageType::Error, map(vec![("message", s("no"))]))
+            } else {
+                value(Wire::Nil)
+            }
+        }),
+    );
+    assert_eq!(
+        result.unwrap_err().code.as_str(),
+        "budget.rpc_calls_exceeded",
+        "the hundred-and-first call, failing or not, is past the budget"
+    );
+    assert_eq!(seen.len(), 100);
+}
+
+#[test]
+fn allocation_churn_is_stopped_though_memory_stays_low() {
+    // Each iteration builds a short string from twenty literals and lets it go: thirty-nine
+    // allocations, and a few bytes held. (Collections would do, but the heap keeps a collection
+    // until the execution ends.) A lower allocation limit than the default keeps the test far
+    // inside its CPU time on any machine; the default is `hexput-enforce`'s tested constant.
+    let literals = vec!["\"a\""; 20].join(" + ");
+    let source = format!("while (true) {{\n  let t = {literals};\n}}");
+    let run = run_limited(
+        &source,
+        vec![],
+        &[],
+        refusing(),
+        Box::new(|_, _| value(Wire::Nil)),
+        Limits::default().with_allocations(50_000),
+    );
+    let diagnostic = run.result.unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.allocations_exceeded");
+    assert_eq!(diagnostic.category.as_str(), "budget");
+    assert_eq!(diagnostic.span.line, 2, "{:?}", diagnostic.span);
+    assert_eq!(stopped_dimensions(&run.events), ["allocations"]);
+}
+
+#[test]
+fn the_allocation_limit_is_the_last_allocation_allowed() {
+    // The fixed Script makes seventeen allocations (pinned by the interpreter tests).
+    for (limit, fits) in [(17, true), (16, false)] {
+        let run = run_limited(
+            FIXED,
+            vec![],
+            &[("ping", true)],
+            refusing(),
+            Box::new(|_, _| value(Wire::Nil)),
+            Limits::default().with_allocations(limit),
+        );
+        match run.result {
+            Ok(_) => assert!(fits, "a limit of {limit}"),
+            Err(diagnostic) => {
+                assert!(!fits, "a limit of {limit}: {diagnostic:?}");
+                assert_eq!(diagnostic.code.as_str(), "budget.allocations_exceeded");
+                assert_eq!(spanned(FIXED, &diagnostic), "{ name: name, n: i }");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_side_effect_limit_is_its_own() {
+    // Three side effects allowed and a hundred RPC calls: the fourth call crosses the side-effect
+    // limit alone, and is never sent.
+    let source = "let n = 0;\nwhile (true) { n = n + 1; ping(n); }";
+    let run = run_limited(
+        source,
+        vec![],
+        &[("ping", true)],
+        refusing(),
+        Box::new(|_, _| value(Wire::Nil)),
+        Limits::default().with_side_effects(3),
+    );
+    let diagnostic = run.result.unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.side_effects_exceeded");
+    assert_eq!(spanned(source, &diagnostic), "ping(n)");
+    assert_eq!(run.calls.len(), 3);
+    assert_eq!(stopped_dimensions(&run.events), ["side_effects"]);
+}
+
+#[test]
+fn each_dimension_crossed_alone_names_only_itself() {
+    let fixed = || -> Answer { Box::new(|_, _| value(Wire::Nil)) };
+    let crossed = |limits: Limits| {
+        run_limited(
+            FIXED,
+            vec![],
+            &[("ping", true)],
+            refusing(),
+            fixed(),
+            limits,
+        )
+        .result
+        .unwrap_err()
+        .code
+        .as_str()
+        .to_owned()
+    };
+    // The fixed Script: seventeen allocations, two calls (two side effects), a 26-byte result.
+    let at_limits = Limits::default()
+        .with_allocations(17)
+        .with_rpc_calls(2)
+        .with_side_effects(2)
+        .with_output_size(26);
+    assert!(
+        run_limited(
+            FIXED,
+            vec![],
+            &[("ping", true)],
+            refusing(),
+            fixed(),
+            at_limits
+        )
+        .result
+        .is_ok()
+    );
+    assert_eq!(
+        crossed(at_limits.with_allocations(16)),
+        "budget.allocations_exceeded"
+    );
+    assert_eq!(
+        crossed(at_limits.with_rpc_calls(1)),
+        "budget.rpc_calls_exceeded"
+    );
+    assert_eq!(
+        crossed(at_limits.with_side_effects(1)),
+        "budget.side_effects_exceeded"
+    );
+    assert_eq!(
+        crossed(at_limits.with_output_size(25)),
+        "budget.output_size_exceeded"
+    );
+    assert_eq!(crossed(at_limits.with_memory(0)), "budget.memory_exceeded");
+    assert_eq!(
+        crossed(at_limits.with_cpu_time(std::time::Duration::ZERO)),
+        "budget.cpu_time_exceeded"
+    );
 }

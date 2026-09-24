@@ -356,34 +356,60 @@ fn nested_objects_count_toward_the_depth_limit_like_arrays() {
 }
 
 #[test]
-fn a_result_just_under_the_frame_is_sent() {
-    // The size check is a lower bound: a result that fits must never be refused by it.
+fn a_result_just_under_the_frame_passes_the_frame_check() {
+    // The size check is a lower bound: a result that fits must never be refused by it. Under the
+    // default Resource Budget such a result is refused first — as past the output size budget
+    // (Story 3.6) — so the frame check is asserted on its own.
     let text = "x".repeat(MAX_FRAME_LEN - 1024);
-    let reply = direct_execution(&payload("return t;", vec![("t", s(&text))]))
-        .expect("a result that fits is sent");
-    let envelope = Envelope::new(CorrelationId(1), MessageType::Result, reply);
+    let result = hexput_exec::Value::String(text.as_str().into());
+    assert_eq!(hexput_exec::wire::check_result(&result), Ok(()));
+    let envelope = Envelope::new(
+        CorrelationId(1),
+        MessageType::Result,
+        Value::Map(vec![(s("value"), hexput_exec::wire::to_wire(&result))]),
+    );
     let body = encode(&envelope).unwrap();
     encode_frame(&body).expect("its frame is within the maximum");
+    let body = failure(&payload("return t;", vec![("t", s(&text))]));
+    assert_eq!(body.code, "budget.output_size_exceeded");
 }
 
 #[test]
-fn a_result_certain_to_exceed_a_frame_is_refused() {
-    // 2^25 bytes of string: twice the maximum frame.
+fn a_result_certain_to_exceed_a_frame_is_past_the_output_size_budget_first() {
+    // 2^25 bytes of string: twice the maximum frame, and far past the 1 MiB output size budget,
+    // which is charged before the frame is checked.
     let body = failure(&payload(
         "let t = \"x\"; let i = 0; while (i < 25) { t = t + t; i = i + 1; }; return t;",
         vec![],
     ));
-    assert_eq!(body.code, "protocol.response_too_large");
+    assert_eq!(body.code, "budget.output_size_exceeded");
+    let result = hexput_exec::Value::String("x".repeat(MAX_FRAME_LEN + 1).into());
+    assert_eq!(
+        hexput_exec::wire::check_result(&result),
+        Err(hexput_exec::wire::Unsendable::TooLarge)
+    );
 }
 
 #[test]
 fn a_result_sharing_one_collection_exponentially_is_refused_without_expanding_it() {
     // Small in the execution — each level shares the one below — but 2^60 leaves on the wire.
+    // Neither the output size nor the frame check expands it.
     let body = failure(&payload(
         "let a = [1]; let i = 0; while (i < 60) { a = [a, a]; i = i + 1; }; return a;",
         vec![],
     ));
-    assert_eq!(body.code, "protocol.response_too_large");
+    assert_eq!(body.code, "budget.output_size_exceeded");
+    let mut shared = hexput_exec::Value::Null;
+    for _ in 0..60 {
+        shared = hexput_exec::Value::Array(hexput_interpreter::Array::from_values(vec![
+            shared.clone(),
+            shared,
+        ]));
+    }
+    assert_eq!(
+        hexput_exec::wire::check_result(&shared),
+        Err(hexput_exec::wire::Unsendable::TooLarge)
+    );
 }
 
 #[test]

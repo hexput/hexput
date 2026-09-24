@@ -50,6 +50,11 @@
 //! only meters: the limits, and what crossing one means, belong to the Executor and
 //! `hexput-enforce`. [`evaluate`] and [`evaluate_with_variables`] run unmetered.
 //!
+//! The same [`Meter`] carries an allocation ceiling (Story 3.6): the execution counts every
+//! string, array and object the Script constructs, plus each growth of a collection past a power
+//! of two in length (LANGUAGE-REFERENCE §7), and stops with [`Outcome::AllocationsExceeded`] once
+//! the count passes the ceiling. [`Execution::allocations`] reports the count.
+//!
 //! # Starting variables
 //!
 //! [`evaluate`] runs a Script with nothing but what its own source declares. [`evaluate_with_variables`]
@@ -89,8 +94,9 @@ pub use hexput_ast::{
 /// the Spine gives no `hexput-ast` edge — can name what it runs.
 pub use hexput_ast::Program;
 
-/// How an [`Execution`] is metered: how much work it does before pausing, and how much memory
-/// its values may hold. Both `None` in [`Meter::UNMETERED`], the default.
+/// How an [`Execution`] is metered: how much work it does before pausing, how much memory its
+/// values may hold, and how many allocations it may make. All `None` in [`Meter::UNMETERED`], the
+/// default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Meter {
     /// Pause after this many units of work: one per evaluation step, plus one per 256 bytes a
@@ -102,6 +108,13 @@ pub struct Meter {
     /// result alone would cross it, so one step overshoots by at most its own allocation.
     /// `None` never stops.
     pub memory_ceiling: Option<usize>,
+    /// Stop once the Script has made more than this many allocations: each string, array and
+    /// object it constructs — every string literal evaluated, concatenation, to-string
+    /// conversion of a concatenation's non-string operand, key a `for … in` hands out, and array
+    /// or object literal — plus each append that takes a collection's length past a power of two
+    /// (1 to 2, 2 to 3, 4 to 5, 8 to 9, …). Scalars, rebindings, starting variables and host-call
+    /// values are not counted. Checked after every step. `None` never stops.
+    pub allocation_ceiling: Option<u64>,
 }
 
 impl Meter {
@@ -109,6 +122,7 @@ impl Meter {
     pub const UNMETERED: Self = Self {
         slice: None,
         memory_ceiling: None,
+        allocation_ceiling: None,
     };
 }
 
@@ -194,9 +208,9 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
         machine::Stop::Finished(result) => Ok(result),
         // Unreachable: an unmetered machine has no ceiling to stop at, and pauses are looped
         // over above. Limits and their errors are the Executor's, so this is no budget error.
-        machine::Stop::Paused(span) | machine::Stop::OutOfMemory(span) => {
-            Err(machine::internal(span))
-        }
+        machine::Stop::Paused(span)
+        | machine::Stop::OutOfMemory(span)
+        | machine::Stop::AllocationsExceeded(span) => Err(machine::internal(span)),
         machine::Stop::HostCall(call) => Err(Diagnostic::new(
             Category::Capability,
             Code::UNKNOWN_FUNCTION,
@@ -295,6 +309,13 @@ impl Execution {
         self.machine.memory_used()
     }
 
+    /// How many allocations the Script has made so far, by the count its allocation ceiling is
+    /// checked against (see [`Meter::allocation_ceiling`]).
+    #[must_use]
+    pub fn allocations(&self) -> u64 {
+        self.machine.allocations()
+    }
+
     /// Run until the Script ends, calls the host, or its [`Meter`] stops it.
     ///
     /// # Errors
@@ -320,6 +341,15 @@ impl Execution {
                 drop(machine);
                 Ok(Outcome::OutOfMemory(OutOfMemory { span, used }))
             }
+            machine::Stop::AllocationsExceeded(span) => {
+                let count = machine.allocations();
+                // The heap goes here, before the driver hears of it.
+                drop(machine);
+                Ok(Outcome::AllocationsExceeded(AllocationsExceeded {
+                    span,
+                    count,
+                }))
+            }
         }
     }
 }
@@ -335,6 +365,9 @@ pub enum Outcome {
     /// Its values came to hold more than its [`Meter`]'s memory ceiling. The execution is gone,
     /// its heap already freed.
     OutOfMemory(OutOfMemory),
+    /// It made more allocations than its [`Meter`]'s allocation ceiling. The execution is gone,
+    /// its heap already freed.
+    AllocationsExceeded(AllocationsExceeded),
 }
 
 /// An [`Execution`] paused at the end of a slice of work.
@@ -377,6 +410,28 @@ impl OutOfMemory {
     #[must_use]
     pub const fn used(&self) -> usize {
         self.used
+    }
+}
+
+/// An execution stopped at its allocation ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocationsExceeded {
+    span: Span,
+    count: u64,
+}
+
+impl AllocationsExceeded {
+    /// The construct whose allocation crossed the ceiling.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+
+    /// How many allocations the execution had made when it stopped: past the ceiling by at most
+    /// the one step's own.
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.count
     }
 }
 

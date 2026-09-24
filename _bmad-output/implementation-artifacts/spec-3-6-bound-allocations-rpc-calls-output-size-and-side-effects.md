@@ -82,6 +82,24 @@ Each is its own `Dimension`, code (`budget.allocations_exceeded`, `budget.rpc_ca
 
 ## Review Triage Log
 
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | verification-gap + blind | Two Story 3.5 CPU tests cross the 100-call RPC limit before the CPU limit on a release build (measured: 100 segments take 0.925 s), so they pass only because CI builds debug | medium | Reproduced by the reviewer with `cargo test --release`. **patch**: run them under `execute_with_limits` with RPC-call and side-effect limits raised, so CPU time is the only dimension that can cross |
+| 2 | blind + edge-case | `type.function_argument`/`type.cyclic_argument` end the Script before it stops at the host call, so such calls are never counted, while a `depth.argument_too_deep` call is counted | low | Real inconsistency. **patch**: charge after the argument checks, so a call whose arguments cannot be sent is never a counted host call; document it in LANGUAGE-REFERENCE §7 |
+| 3 | blind | On finish, output size is charged before the last slice's CPU time | low | Real; direct. **patch**: charge CPU first |
+| 4 | blind + edge-case + verification-gap | `a_failed_call_counts` never makes a failed call (`fail()` is the 101st, refused unsent) | low | Real. **patch**: remove or rename to what it checks |
+| 5 | blind | Unfinished comment in `a_denied_call_counts_and_its_question_is_part_of_it` | low | Real; direct. **patch** |
+| 6 | edge-case | `payload_size` walk is uncapped when a caller passes a huge output limit | low | Real via `execute_with_limits`; direct. **patch**: cap the walk at `min(limit, MAX_FRAME_LEN)` |
+| 7 | edge-case | `Machine::execute` doc omits `AllocationsExceeded` among terminal stops | low | Real; direct. **patch** |
+| 8 | blind | Enforce independence test does not call `charge_rpc_call` on the zero-limit budget ("the reverse") | low | Real; direct. **patch** |
+| 9 | blind | `protocol.response_too_large` via Direct Execution lost its end-to-end test (unreachable under the 1 MiB default) | low | Real, becomes reachable in Story 3.7. **defer** |
+| 10 | blind | Side effects can only be charged with an RPC call; Global Variable writes (Epic 6) need a separate charge | low | Real, nothing to charge yet. **defer** |
+| 11 | blind | AGENTS.md's `Execution::run` outcome list is stale | low | Real; agent-context file. **defer** |
+| 12 | blind | The result is walked twice for size (`payload_size`, then `check_result`) | low | Rejected: perf only, two definitions are for different limits |
+| 13 | blind | Spec Change Log empty though earlier behaviour changed | — | Rejected: the log records review loopbacks; the changes are in Implementation Notes |
+| 14 | edge-case | The allocation comparison happens in the interpreter | low | Rejected: same design as Story 3.5's memory ceiling — `hexput-enforce` sets the ceiling and builds the error |
+| 15 | blind | Sprint status `in-progress` vs spec `in-review` | false | Step 5 sets `review` |
+
 ## Verification
 
 **Commands:**

@@ -236,3 +236,15 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-5-stop-an-execution-that-burns-too-much-cpu-or-memory.md`
   summary: The memory budget counts the execution's heap — slots and strings — but not its frame and value stacks, a `for … in` loop's key snapshot, or the detached copies made of host-call arguments and the Script result.
   evidence: By design the count is approximate (the spec's "approximate live-bytes accounting"). The stacks are bounded by program size times the call-depth limit, and the detached copies are transient and bounded by the frame limit on the way out, so none grows without bound inside one execution; but detaching a large structure briefly holds a second copy the budget does not see. Revisit with Story 3.6's output-size dimension, which measures the result anyway.
+
+- source_spec: `spec-3-6-bound-allocations-rpc-calls-output-size-and-side-effects.md`
+  summary: `protocol.response_too_large` from Direct Execution has no end-to-end test: under the 1 MiB default output budget no result can reach the frame check.
+  evidence: Review finding (blind, low). Becomes reachable once Story 3.7 lets Config raise the output limit above a frame; add the test there.
+
+- source_spec: `spec-3-6-bound-allocations-rpc-calls-output-size-and-side-effects.md`
+  summary: `hexput_enforce::Budget` charges side effects only together with an RPC call; committed Global Variable writes (Epic 6) need their own side-effect charge.
+  evidence: Review finding (blind, low). Nothing writes a Global Variable yet. Add `charge_side_effect(span)` with Epic 6's first write, and cover Registered Method calls (Stories 3.11–3.13) with the existing `charge_rpc_call`.
+
+- source_spec: `spec-3-6-bound-allocations-rpc-calls-output-size-and-side-effects.md`
+  summary: AGENTS.md's Epic 3 paragraph still gives `Execution::run(self) -> Outcome::{Finished, HostCall}`; the enum also has `Paused`, `OutOfMemory` and `AllocationsExceeded`.
+  evidence: Review finding (blind, low); routed to defer because the fix edits an agent-context file.

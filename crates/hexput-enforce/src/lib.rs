@@ -51,8 +51,9 @@
 //!   (LANGUAGE-REFERENCE §7), and stops an execution whose count passes
 //!   [`Budget::allocation_ceiling`]; [`Budget::allocations_exceeded`] is the error that ends it.
 //! * **RPC calls** and **side effects** — [`Budget::charge_rpc_call`] counts every host call the
-//!   Script makes, when it stops at the call and before any capability decision, so a refused,
-//!   denied or failed call counts, and an `Authorize` question is part of its call. A host call is
+//!   Script makes whose arguments can be sent, once they are checked and before any capability
+//!   decision, so a refused, denied or failed call counts, and an `Authorize` question is part of
+//!   its call. A call whose arguments cannot be sent ends the Script uncounted. A host call is
 //!   also a side effect (as, from Epic 6, is every committed Global Variable write). The call that
 //!   would take either count past its limit is refused before it is sent; calls already made
 //!   stand.
@@ -340,8 +341,8 @@ impl Budget {
     }
 
     /// Charge one host call the Script is making, `span` being the call's: one RPC call and one
-    /// side effect. Charged when the Script stops at the call, before anything about it is
-    /// decided or sent, so a call later refused, denied or failed counts; an `Authorize` question
+    /// side effect. Charged once its arguments are checked, before anything about it is decided or
+    /// sent, so a call later refused, denied or failed counts; an `Authorize` question
     /// is part of its call and is not charged again.
     ///
     /// # Errors

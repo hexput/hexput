@@ -314,6 +314,16 @@ mod counted {
         for _ in 0..DEFAULT_RPC_CALLS {
             budget.charge_rpc_call(span()).unwrap();
         }
+        // Only output size and CPU time tightened: host calls still go ahead.
+        let mut budget = Budget::with_limits(
+            Limits::default()
+                .with_output_size(0)
+                .with_cpu_time(Duration::ZERO),
+        );
+        for _ in 0..DEFAULT_RPC_CALLS {
+            budget.charge_rpc_call(span()).unwrap();
+        }
+        assert_eq!(budget.rpc_calls_used(), DEFAULT_RPC_CALLS);
         let budget = Budget::with_limits(
             Limits::default()
                 .with_rpc_calls(0)

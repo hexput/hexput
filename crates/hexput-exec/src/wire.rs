@@ -267,13 +267,15 @@ pub fn check_result(result: &Hexput) -> Result<(), Unsendable> {
 /// The exact number of bytes the Script result `value` takes on the wire as the `{value}` payload
 /// of a `Result` — the map, its `value` key and the value, each MessagePack-encoded as [`to_wire`]
 /// converts it and the codec writes it (every integer, string, array and map header in its most
-/// compact form) — or, once the count passes `limit`, some count past `limit`: the walk stops
-/// there, so a result that shares one collection many times over is never expanded in full.
+/// compact form) — or, once the count passes `limit` or [`MAX_FRAME_LEN`], whichever is smaller,
+/// some count past it: the walk stops there, so a result that shares one collection many times
+/// over is never expanded in full, however large a `limit` the caller passes.
 ///
 /// Walks without recursion, so a result of any depth is measured. Only the output size budget
 /// uses it; whether the result may be sent at all is [`check_result`]'s.
 #[must_use]
 pub fn payload_size(value: &Hexput, limit: usize) -> usize {
+    let limit = limit.min(MAX_FRAME_LEN);
     // A one-entry map (1 byte), its key `value` (a 5-byte fixstr: 6 bytes), then the value.
     let mut size: usize = 1 + str_size(VALUE_KEY.len());
     let mut pending: Vec<&Hexput> = vec![value];

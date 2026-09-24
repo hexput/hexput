@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-18-2026 11:43
-last_updated: 09-24-2026 13:30
+last_updated: 09-24-2026 13:50
 project: hexput
 project_key: NOKEY
 tracking_system: file-system
@@ -65,7 +65,7 @@ development_status:
   3-3-decide-per-call-whether-a-function-may-be-used: review
   3-4-deny-every-path-to-the-host-that-isn-t-a-registered-function: review
   3-5-stop-an-execution-that-burns-too-much-cpu-or-memory: review
-  3-6-bound-allocations-rpc-calls-output-size-and-side-effects: in-progress
+  3-6-bound-allocations-rpc-calls-output-size-and-side-effects: review
   3-7-tune-budgets-per-backend-and-per-execution: backlog
   3-8-change-execution-policy-without-reconnecting: backlog
   3-9-switch-off-language-constructs-by-policy: backlog

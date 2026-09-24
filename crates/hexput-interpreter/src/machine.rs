@@ -348,7 +348,8 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     }
 
     /// Run until the Script ends, calls the host, or the [`Meter`] stops it. After an error,
-    /// [`Stop::Finished`] or [`Stop::OutOfMemory`], the machine must be dropped; after
+    /// [`Stop::Finished`], [`Stop::OutOfMemory`] or [`Stop::AllocationsExceeded`], the machine
+    /// must be dropped; after
     /// [`Stop::HostCall`], it continues only through [`Machine::resume`]; after
     /// [`Stop::Paused`], it continues by running it again.
     pub(crate) fn execute(&mut self) -> Result<Stop, Diagnostic> {

@@ -1175,15 +1175,16 @@ fn waiting_for_the_backend_is_never_charged_as_cpu_time() {
 
 #[test]
 fn cpu_time_adds_up_across_host_calls_and_the_calls_already_made_stand() {
-    // Each segment runs well under the limit; together they pass it — long enough each that the
-    // limit is passed well inside the RPC call budget (Story 3.6), even on a release build.
-    let source = "while (true) {\n  let j = 0; while (j < 20000) { j = j + 1; };\n  ping(j);\n}";
-    let run = run_full(
+    // Each segment runs well under the limit; together they pass it. The RPC call and
+    // side-effect limits (Story 3.6) are lifted, so CPU time is the only dimension that can cross.
+    let source = "while (true) {\n  let j = 0; while (j < 2000) { j = j + 1; };\n  ping(j);\n}";
+    let run = run_limited(
         source,
         vec![],
         &[("ping", true)],
         refusing(),
         Box::new(|_, _| value(Wire::Nil)),
+        calls_unbounded(),
     );
     let diagnostic = run.result.unwrap_err();
     assert_eq!(diagnostic.code.as_str(), "budget.cpu_time_exceeded");
@@ -1196,6 +1197,14 @@ fn cpu_time_adds_up_across_host_calls_and_the_calls_already_made_stand() {
     assert_eq!(stopped.len(), 1, "{:?}", run.events);
     assert_eq!(stopped[0]["level"], "DEBUG");
     assert_eq!(stopped[0]["fields"]["dimension"], "cpu_time");
+}
+
+/// The default limits with the RPC call and side-effect limits lifted, so a test of CPU time can
+/// make as many calls as it takes.
+fn calls_unbounded() -> Limits {
+    Limits::default()
+        .with_rpc_calls(u64::MAX)
+        .with_side_effects(u64::MAX)
 }
 
 #[test]
@@ -1222,18 +1231,19 @@ fn a_memory_stop_is_logged_with_its_dimension() {
 
 #[test]
 fn the_call_whose_charge_crosses_the_limit_is_never_sent() {
-    // Charges are taken at slice boundaries and at each call, before the call is sent. The
-    // stand-in sees calls 1..=k, each answered at once, and no question: whatever call the Script
-    // stopped at, or was about to make, was never sent. Each segment is long enough that the
-    // limit is passed well inside the RPC call budget (Story 3.6), even on a release build.
-    let source = "let n = 0;\nwhile (true) {\n  let j = 0; while (j < 20000) { j = j + 1; };\n  \
+    // Each segment is well under a slice, so most charges are taken at a call, before the call is
+    // sent. The stand-in sees calls 1..=k, each answered at once, and no question: whatever
+    // call the Script stopped at, or was about to make, was never sent. The RPC call and
+    // side-effect limits (Story 3.6) are lifted, so CPU time is the only dimension that can cross.
+    let source = "let n = 0;\nwhile (true) {\n  let j = 0; while (j < 200) { j = j + 1; };\n  \
                   n = n + 1;\n  ping(n);\n}";
-    let run = run_full(
+    let run = run_limited(
         source,
         vec![],
         &[("ping", true)],
         refusing(),
         Box::new(|_, _| value(Wire::Nil)),
+        calls_unbounded(),
     );
     let diagnostic = run.result.unwrap_err();
     assert_eq!(diagnostic.code.as_str(), "budget.cpu_time_exceeded");
@@ -1542,8 +1552,8 @@ fn a_denied_call_counts_and_its_question_is_part_of_it() {
         "budget.rpc_calls_exceeded"
     );
     assert!(run.asked.is_empty(), "{:?}", run.asked);
-    // Allowed per call, ninety-nine answered `true` and the hundredth question ... a hundred
-    // calls in all, each one question and one call.
+    // Allowed per call: a hundred questions, each answered `true`, and a hundred calls count as
+    // a hundred RPC calls — exactly the budget — since each question is part of its call.
     let allowed = "let n = 0; while (n < 100) { n = n + 1; ask(n); };\nreturn n;";
     let run = run_full(
         allowed,
@@ -1557,27 +1567,30 @@ fn a_denied_call_counts_and_its_question_is_part_of_it() {
 }
 
 #[test]
-fn a_failed_call_counts() {
-    // Every call fails on the Backend and ends the Script, so a hundred calls cannot be made:
-    // the failed call is the first counted, and ends in `host`.
-    let (result, seen) = run_hosted(
-        "let n = 0; while (n < 100) { n = n + 1; ping(n); };\nfail();",
-        vec![],
-        &[("ping", true), ("fail", true)],
-        Box::new(|name, _| {
-            if name == "fail" {
-                (MessageType::Error, map(vec![("message", s("no"))]))
-            } else {
-                value(Wire::Nil)
-            }
-        }),
-    );
-    assert_eq!(
-        result.unwrap_err().code.as_str(),
-        "budget.rpc_calls_exceeded",
-        "the hundred-and-first call, failing or not, is past the budget"
-    );
-    assert_eq!(seen.len(), 100);
+fn a_call_whose_arguments_cannot_be_sent_is_not_counted() {
+    // A hundred calls made: a hundred-and-first with a sendable argument crosses the RPC call
+    // budget, but one whose argument cannot be sent ends in that argument's error — it never
+    // became a host call, so it is not counted.
+    let deep = "[".repeat(ARGUMENT_DEPTH_LIMIT + 1) + &"]".repeat(ARGUMENT_DEPTH_LIMIT + 1);
+    for (argument, code) in [
+        ("1", "budget.rpc_calls_exceeded"),
+        ("fn() {}", "type.function_argument"),
+        ("c", "type.cyclic_argument"),
+        (deep.as_str(), "depth.argument_too_deep"),
+    ] {
+        let source = format!(
+            "let c = []; c[0] = c; let n = 0; while (n < 100) {{ n = n + 1; ping(n); }};\n\
+             ping({argument});"
+        );
+        let (result, seen) = run_hosted(
+            &source,
+            vec![],
+            &[("ping", true)],
+            Box::new(|_, _| value(Wire::Nil)),
+        );
+        assert_eq!(result.unwrap_err().code.as_str(), code, "ping({argument})");
+        assert_eq!(seen.len(), 100);
+    }
 }
 
 #[test]

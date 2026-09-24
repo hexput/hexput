@@ -71,11 +71,14 @@
 //! * **allocations** — the Script runs with the budget's allocation ceiling in its meter; the
 //!   interpreter counts and stops, and the Executor turns the stop into
 //!   `budget.allocations_exceeded`, spanned on the constructing site.
-//! * **RPC calls** and **side effects** — every time the Script stops at a host call, after the
-//!   slice is charged and before the arguments are measured or the capability decided, the call
+//! * **RPC calls** and **side effects** — every time the Script stops at a host call whose
+//!   arguments can be sent, after the slice is charged and the arguments are measured and
+//!   converted, and before the capability is decided or any `Authorize` question asked, the call
 //!   is charged as one of each. A call that would cross either limit is refused before anything
 //!   is sent (`budget.rpc_calls_exceeded` or `budget.side_effects_exceeded`, spanned on the call);
-//!   a call later refused, denied or failed has already counted.
+//!   a call later refused, denied or failed has already counted. A call whose arguments cannot be
+//!   sent — a function or cyclic value, one nested too deep, or too large for a frame — ends the
+//!   Script with that argument's error and is not counted.
 //! * **output size** — when the Script finishes, the exact MessagePack length of its `{value}`
 //!   result payload ([`wire::payload_size`]) is charged, and one past the limit is
 //!   `budget.output_size_exceeded`, spanned on the whole Script.
@@ -328,26 +331,25 @@ fn segment(
             // The last slice is charged like any other: crossing the limit in it fails the
             // Script even though it finished. Measuring the result is charged with it.
             Outcome::Finished(result) => {
+                budget
+                    .charge_cpu(started.elapsed(), whole)
+                    .map_err(Halt::Exceeded)?;
                 let limit = budget.limits().output_size();
                 budget
                     .charge_output(wire::payload_size(&result, limit), whole)
                     .map_err(Halt::Exceeded)?;
-                budget
-                    .charge_cpu(started.elapsed(), whole)
-                    .map_err(Halt::Exceeded)?;
                 return Ok(Step::Finished(result));
             }
             Outcome::HostCall(call) => {
-                // The slice, then the call itself — one RPC call and one side effect, whatever
-                // becomes of it — then the argument work: all before anything about the call is
+                // The slice, then the argument work and the call itself — one RPC call and one
+                // side effect, whatever becomes of it — all before anything about the call is
                 // sent.
                 let span = call.span();
                 budget
                     .charge_cpu(started.elapsed(), span)
                     .map_err(Halt::Exceeded)?;
                 let started = Instant::now();
-                budget.charge_rpc_call(span).map_err(Halt::Exceeded)?;
-                let step = advance(call, capabilities)?;
+                let step = advance(call, capabilities, budget)?;
                 budget
                     .charge_cpu(started.elapsed(), span)
                     .map_err(Halt::Exceeded)?;
@@ -407,8 +409,15 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 
 /// Where a host call leaves the execution: a call that may go ahead, with its arguments ready to
 /// send, or one `hexput-enforce` refused.
-fn advance(call: HostCall, capabilities: &Capabilities) -> Result<Step, Diagnostic> {
+///
+/// A call whose arguments can be sent is charged to `budget` as one RPC call and one side effect,
+/// before the capability decision, so a refused or denied call counts; a call whose arguments
+/// cannot be sent never became a host call and is not charged.
+fn advance(call: HostCall, capabilities: &Capabilities, budget: &mut Budget) -> Result<Step, Halt> {
     let arguments = arguments(&call)?;
+    budget
+        .charge_rpc_call(call.span())
+        .map_err(Halt::Exceeded)?;
     match capabilities.check_call(call.name(), call.span()) {
         Ok(Decision::Allowed) => Ok(Step::Call(call, arguments, None)),
         Ok(Decision::AskHandler(question)) => Ok(Step::Call(call, arguments, Some(question))),

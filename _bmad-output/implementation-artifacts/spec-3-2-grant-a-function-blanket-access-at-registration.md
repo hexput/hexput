@@ -15,11 +15,16 @@ context:
 
 **Problem:** Since Story 3.1 every Registered Function is callable by any Script on its Session with no grant at all, so the Capability model (FR-6) does not exist yet: a Backend cannot say which functions are safe by definition, and the decision is not made where AD-3 says it must be.
 
-**Approach:** A registration carries an optional blanket grant (`context.allow()` in an SDK). `hexput-enforce`, reached only through the Executor, decides every host call from the Session's registrations as they are when the execution is dispatched: blanket-granted → the call proceeds with no authorization round trip; anything else → the same `capability.unknown_function` an unregistered name gets.
+**Approach:** A registration carries an optional blanket grant — a plain flag on the wire; how an SDK lets a Backend set it (the planning docs' `context.allow()` is only an example spelling) is the SDK's business, not the Daemon's. `hexput-enforce`, reached only through the Executor, decides every host call from the Session's registrations as they are when the execution is dispatched: blanket-granted → the call proceeds with no authorization round trip; anything else → the same `capability.unknown_function` an unregistered name gets.
 
 ## Boundaries & Constraints
 
 **Always:** The grant decision lives in `hexput-enforce::Capabilities::check_call`, fed per execution from `hexput-session`'s single live copy (AD-3, AD-5); neither `hexput-connection` nor `hexput-session` decides. Unregistered and not-granted are indistinguishable to the Script (same code, same message, same span); the Daemon log tells them apart at `debug` with a `reason` field. Grants are per Session and never leak. Every existing and new test states its grants explicitly.
+
+**Decisions (2026-09-24, Erdem):**
+1. *Wire spelling* — the Daemon sees only a flag: an `Init` registration is `{name, blanket: <bool>}`, `blanket` optional (absent or `false` = no blanket grant), anything but a boolean refused. `context.allow()` in the planning docs is an example of how an SDK might expose it, not a Daemon concept; the Daemon attaches no other meaning to it.
+2. *No grant, until Story 3.3* — fail closed: a function registered without the blanket grant is denied (`capability.unknown_function`, nothing sent); Story 3.3 turns "no grant" into "ask the per-call handler".
+3. *AD-3 hardening from Story 3.1* — folded in: `hexput_rpc::Caller::call` becomes one unmistakable name (e.g. `dispatch_authorized`), and `scripts/check-crate-graph.py` fails CI when that name appears in any production crate but `hexput-exec` and `hexput-rpc`; the Story 3.1 `deferred-work.md` entry is marked resolved.
 
 **Never:** No per-call handler or authorization message (Story 3.3), no Config keys, no budgets, no change to the `Call` message or its reply, no revocation or grant change after init (Story 3.8 territory), no `unsafe`.
 
@@ -28,18 +33,12 @@ context:
 | Scenario | Input / State | Expected Output / Behavior | Error Handling |
 |----------|--------------|---------------------------|----------------|
 | Blanket grant | `getOrder` registered with the grant; `return getOrder(1);` | exactly one `Call` written, no other message; Script gets the Backend's value | N/A |
-| No grant | `getOrder` registered without the grant | per open question 2 | per open question 2 |
+| No grant | `getOrder` registered without the grant (`blanket` absent or `false`) | `capability.unknown_function` on the call, identical to unregistered; nothing sent | debug log `reason = not_granted` |
 | Unregistered | `nope(1)` | `capability.unknown_function` on the call, nothing sent | N/A |
 | Cross-Session | Session A grants `getOrder`, Session B registers it without the grant (or not at all); B's Script calls it | B's call is `capability.unknown_function`; A's still proceeds | N/A |
-| Bad grant value | registration `{name, <grant key>: "yes"}` | `Init` refused with `protocol.invalid_payload` naming `registrations[i].<key>`; no Session | as other init errors |
+| Bad grant value | registration `{name, blanket: "yes"}` | `Init` refused with `protocol.invalid_payload` naming `registrations[i].blanket`; no Session | as other init errors |
 
 </frozen-after-approval>
-
-## Open Questions
-
-1. **Wire spelling of the blanket grant in an `Init` registration** — options: (A, recommended) `{name, allow: true}`; `allow` optional, absent or `false` = no blanket grant, any non-boolean refused — mirrors `context.allow()` and leaves room for `key` (Story 3.12) / a handler flag (3.3) beside it / (B) `{name, grant: "blanket" | "per_call"}` — one enum field that 3.3 fills in, but `per_call` would mean nothing until 3.3 ships.
-2. **A function registered *without* the grant, until Story 3.3 adds per-call handlers** — options: (A, recommended — fail closed) its calls are denied (`capability.unknown_function`, nothing sent); 3.3 later turns "no grant" into "ask the handler". Existing Backends must add the grant to keep calling. / (B, fail open) it stays callable exactly as in 3.1 until 3.3; the trust boundary is open by default in between.
-3. **The AD-3 hardening deferred from Story 3.1** (`hexput_rpc::Caller::call` is public, so `hexput-connection`/`hexput-script` could send a `Call` without `check_call`; a compile-time seal is impossible within the crate graph, since `hexput-rpc` may not depend on `hexput-enforce` or `hexput-exec`) — options: (A, recommended) fold it in: rename the method to one unmistakable name (e.g. `dispatch_authorized`) and make `scripts/check-crate-graph.py` fail CI when that name appears in any production crate but `hexput-exec` and `hexput-rpc` / (B) keep it deferred to Story 3.3 / (C) accept it as a documented convention and close the deferred entry.
 
 ## Code Map
 
@@ -49,8 +48,8 @@ context:
 - `crates/hexput-exec/src/lib.rs` -- `Host::new(registrations, caller)`; log a refused call at `debug` with `reason = "unregistered" | "not_granted"`, never in the Script-visible message.
 - `crates/hexput-script/src/lib.rs` (L77), `crates/hexput-connection/src/lib.rs` (L245) -- pass the registrations with grants through.
 - `crates/hexput-tests/tests/{session,enforce,exec,connection,script,daemon}.rs` -- the matrix; ~35 existing `registrations` payloads/helpers (e.g. `init_payload`) state grants explicitly.
-- Per Q3(A): `crates/hexput-rpc/src/lib.rs` (`Caller::call`), `crates/hexput-exec/src/lib.rs`, `scripts/check-crate-graph.py`, `deferred-work.md` entry closed.
-- LANGUAGE-REFERENCE §8, PRD untouched unless Q2 changes documented behaviour; `AGENTS.md` Project Status.
+- Per decision 3: `crates/hexput-rpc/src/lib.rs` (`Caller::call`), `crates/hexput-exec/src/lib.rs`, `scripts/check-crate-graph.py`, `deferred-work.md` entry closed.
+- LANGUAGE-REFERENCE §8: one sentence that a Registered Function is callable only with a grant (blanket today, per-call from Story 3.3). `AGENTS.md` Project Status.
 
 ## Tasks & Acceptance
 
@@ -58,7 +57,7 @@ context:
 - [ ] `crates/hexput-session/src/{init.rs,lib.rs}` -- decode and expose the grant.
 - [ ] `crates/hexput-enforce/src/lib.rs` -- the grant decision.
 - [ ] `crates/hexput-exec`, `crates/hexput-script`, `crates/hexput-connection` -- thread grants through; debug log with reason.
-- [ ] per Q3 -- the AD-3 guard.
+- [ ] `crates/hexput-rpc`, `crates/hexput-exec`, `scripts/check-crate-graph.py`, `deferred-work.md` -- the AD-3 guard (decision 3).
 - [ ] `crates/hexput-tests/tests/*` -- every matrix row; explicit grants in existing tests.
 - [ ] `AGENTS.md` -- Project Status.
 

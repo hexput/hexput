@@ -2,7 +2,7 @@
 title: 'Story 3.2: Grant a function blanket access at registration'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'in-review'
 baseline_commit: 'f2101288401c64f817488f0fcd2dad0cb56a7f46'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -55,18 +55,24 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hexput-session/src/{init.rs,lib.rs}` -- decode and expose the grant.
-- [ ] `crates/hexput-enforce/src/lib.rs` -- the grant decision.
-- [ ] `crates/hexput-exec`, `crates/hexput-script`, `crates/hexput-connection` -- thread grants through; debug log with reason.
-- [ ] `crates/hexput-rpc`, `crates/hexput-exec`, `scripts/check-crate-graph.py`, `deferred-work.md` -- the AD-3 guard (decision 3).
-- [ ] `crates/hexput-tests/tests/*` -- every matrix row; explicit grants in existing tests.
-- [ ] `AGENTS.md` -- Project Status.
+- [x] `crates/hexput-session/src/{init.rs,lib.rs}` -- decode and expose the grant.
+- [x] `crates/hexput-enforce/src/lib.rs` -- the grant decision.
+- [x] `crates/hexput-exec`, `crates/hexput-script`, `crates/hexput-connection` -- thread grants through; debug log with reason.
+- [x] `crates/hexput-rpc`, `crates/hexput-exec`, `scripts/check-crate-graph.py`, `deferred-work.md` -- the AD-3 guard (decision 3).
+- [x] `crates/hexput-tests/tests/*` -- every matrix row; explicit grants in existing tests.
+- [x] `AGENTS.md` -- Project Status.
 
 **Acceptance Criteria:**
 - Given a blanket-granted call, when the connection's written envelopes are inspected, then the only envelope for it is the one `Call` — no authorization request.
 - Given a refused call, when the Daemon log is read at `debug`, then the event names the function and whether it was unregistered or not granted, while the Script's error is identical in both cases.
 
 ## Implementation Notes
+
+- Grants travel as `(name, blanket)` pairs from `hexput-connection` through `hexput-script` to `hexput_exec::Host::new` and `hexput_enforce::Capabilities::registered`: `hexput-script` cannot name `hexput_session::RegisteredFunction`, and a shared type would need a new crate edge.
+- `check_call` returns a `Refusal { reason: Reason, diagnostic }`; the diagnostic is built identically for both reasons.
+- The `debug` refusal event is emitted from `execute`'s async loop, not from the blocking segment, so it inherits the execution task's `request` span (connection, Client ID, request id); a test in `tests/connection.rs` pins that.
+- A present-but-nil `blanket` is refused as not a boolean (only an absent key means "no grant").
+- The AD-3 guard is a source-text scan (`RESTRICTED_NAMES` in `scripts/check-crate-graph.py`) over every `.rs` file of every workspace crate except `hexput-tests`, `hexput-exec` and `hexput-rpc`, matching the whole word `dispatch_authorized`.
 
 ## Spec Change Log
 

@@ -21,12 +21,28 @@ fn payload(config: Value, registrations: Value) -> Value {
     map(vec![("config", config), ("registrations", registrations)])
 }
 
-fn named(names: &[&str]) -> Value {
-    Value::Array(names.iter().map(|n| entry(s(n))).collect())
+/// Registrations, each stating its blanket grant explicitly.
+fn named(registrations: &[(&str, bool)]) -> Value {
+    Value::Array(
+        registrations
+            .iter()
+            .map(|(name, blanket)| map(vec![("name", s(name)), ("blanket", Value::from(*blanket))]))
+            .collect(),
+    )
 }
 
-fn valid(names: &[&str]) -> InitRequest {
-    InitRequest::from_value(&payload(Value::Map(vec![]), named(names))).unwrap()
+fn valid(registrations: &[(&str, bool)]) -> InitRequest {
+    InitRequest::from_value(&payload(Value::Map(vec![]), named(registrations))).unwrap()
+}
+
+/// A Session's registrations as `(name, blanket)` pairs.
+fn registrations(sessions: &Sessions, id: ClientId) -> Option<Vec<(String, bool)>> {
+    sessions.registrations(id).map(|registered| {
+        registered
+            .iter()
+            .map(|r| (r.name().to_owned(), r.blanket()))
+            .collect()
+    })
 }
 
 /// The refusal message for `value`, which must be refused.
@@ -40,9 +56,91 @@ fn refusal(value: &Value) -> String {
 
 #[test]
 fn a_valid_init_keeps_its_registrations_in_order() {
-    let init = valid(&["getUser", "sendMail"]);
+    let init = valid(&[("getUser", true), ("sendMail", true)]);
     let names: Vec<_> = init.registrations().iter().map(|r| r.name()).collect();
     assert_eq!(names, ["getUser", "sendMail"]);
+}
+
+#[test]
+fn a_registration_carries_its_blanket_grant_and_absent_means_none() {
+    let init = InitRequest::from_value(&payload(
+        Value::Map(vec![]),
+        Value::Array(vec![
+            map(vec![("name", s("granted")), ("blanket", Value::from(true))]),
+            map(vec![
+                ("name", s("withheld")),
+                ("blanket", Value::from(false)),
+            ]),
+            // No `blanket` key at all: no blanket grant.
+            entry(s("unstated")),
+            // Key order does not matter.
+            map(vec![("blanket", Value::from(true)), ("name", s("first"))]),
+        ]),
+    ))
+    .unwrap();
+    let grants: Vec<_> = init
+        .registrations()
+        .iter()
+        .map(|r| (r.name(), r.blanket()))
+        .collect();
+    assert_eq!(
+        grants,
+        [
+            ("granted", true),
+            ("withheld", false),
+            ("unstated", false),
+            ("first", true)
+        ]
+    );
+}
+
+#[test]
+fn a_blanket_grant_that_is_not_a_boolean_is_refused_by_index() {
+    for bad in [
+        s("yes"),
+        Value::from(1),
+        Value::Nil,
+        Value::Array(vec![]),
+        Value::Map(vec![]),
+    ] {
+        let message = refusal(&payload(
+            Value::Map(vec![]),
+            Value::Array(vec![
+                map(vec![("name", s("a")), ("blanket", Value::from(true))]),
+                map(vec![("name", s("b")), ("blanket", bad.clone())]),
+            ]),
+        ));
+        assert_eq!(
+            message, "`registrations[1].blanket` is not a boolean",
+            "{bad:?}"
+        );
+    }
+    let message = refusal(&payload(
+        Value::Map(vec![]),
+        Value::Array(vec![map(vec![
+            ("name", s("a")),
+            ("blanket", Value::from(true)),
+            ("blanket", Value::from(false)),
+        ])]),
+    ));
+    assert_eq!(message, "`registrations[0]` repeats the key `blanket`");
+}
+
+#[test]
+fn grants_belong_to_their_session() {
+    let sessions = Sessions::new();
+    let (a, _) = create(&sessions, valid(&[("getOrder", true)]));
+    let (b, _) = create(&sessions, valid(&[("getOrder", false)]));
+    let (c, _) = create(&sessions, valid(&[]));
+    assert_eq!(
+        registrations(&sessions, a),
+        Some(vec![("getOrder".to_owned(), true)])
+    );
+    assert_eq!(
+        registrations(&sessions, b),
+        Some(vec![("getOrder".to_owned(), false)])
+    );
+    assert_eq!(registrations(&sessions, c), Some(vec![]));
 }
 
 #[test]
@@ -150,7 +248,7 @@ fn a_malformed_part_names_the_offending_key_or_index() {
 fn a_duplicate_registration_is_named() {
     let message = refusal(&payload(
         Value::Map(vec![]),
-        named(&["getUser", "sendMail", "getUser"]),
+        named(&[("getUser", true), ("sendMail", true), ("getUser", true)]),
     ));
     assert_eq!(
         message,
@@ -186,13 +284,13 @@ fn a_connection_id_is_issued_before_init_and_becomes_its_attachment() {
 #[test]
 fn create_issues_a_client_id_with_its_creator_attached() {
     let sessions = Sessions::new();
-    let (id, _) = create(&sessions, valid(&["getUser"]));
+    let (id, _) = create(&sessions, valid(&[("getUser", true)]));
     assert!(sessions.contains(id));
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions.attached(id), Some(1));
     assert_eq!(
-        sessions.registration_names(id),
-        Some(vec!["getUser".to_owned()])
+        registrations(&sessions, id),
+        Some(vec![("getUser".to_owned(), true)])
     );
     let text = id.to_string();
     assert_eq!(text.len(), ClientId::TEXT_LEN);
@@ -213,12 +311,12 @@ fn client_ids_and_attachments_are_unique() {
 #[test]
 fn detaching_the_last_connection_tears_the_session_down() {
     let sessions = Sessions::new();
-    let (id, connection) = create(&sessions, valid(&["getUser"]));
-    let (other, _) = create(&sessions, valid(&["other"]));
+    let (id, connection) = create(&sessions, valid(&[("getUser", true)]));
+    let (other, _) = create(&sessions, valid(&[("other", true)]));
     sessions.detach(id, connection);
     assert!(!sessions.contains(id));
     assert_eq!(sessions.attached(id), None);
-    assert_eq!(sessions.registration_names(id), None);
+    assert_eq!(registrations(&sessions, id), None);
     let late = sessions.connect();
     assert!(!sessions.attach(id, late), "a torn-down Session is gone");
     assert_eq!(
@@ -232,7 +330,7 @@ fn detaching_the_last_connection_tears_the_session_down() {
 #[test]
 fn detaching_one_of_two_connections_keeps_the_session() {
     let sessions = Sessions::new();
-    let (id, first) = create(&sessions, valid(&["getUser"]));
+    let (id, first) = create(&sessions, valid(&[("getUser", true)]));
     let second = sessions.connect();
     assert!(sessions.attach(id, second), "the Session is live");
     assert_ne!(first, second);
@@ -242,8 +340,8 @@ fn detaching_one_of_two_connections_keeps_the_session() {
     assert!(sessions.contains(id));
     assert_eq!(sessions.attached(id), Some(1));
     assert_eq!(
-        sessions.registration_names(id),
-        Some(vec!["getUser".to_owned()])
+        registrations(&sessions, id),
+        Some(vec![("getUser".to_owned(), true)])
     );
 
     sessions.detach(id, second);
@@ -275,7 +373,7 @@ fn concurrent_creates_and_detaches_leave_nothing_behind() {
         for _ in 0..8 {
             scope.spawn(|| {
                 for _ in 0..200 {
-                    let (id, first) = create(&sessions, valid(&["f"]));
+                    let (id, first) = create(&sessions, valid(&[("f", true)]));
                     let second = sessions.connect();
                     assert!(sessions.attach(id, second));
                     sessions.detach(id, first);
@@ -314,7 +412,10 @@ fn a_refusal_echoes_a_bounded_amount_of_backend_input() {
     );
 
     // So is a huge duplicate name.
-    let message = refusal(&payload(Value::Map(vec![]), named(&[&long, &long])));
+    let message = refusal(&payload(
+        Value::Map(vec![]),
+        named(&[(long.as_str(), true), (long.as_str(), true)]),
+    ));
     assert!(
         message.contains('…') && message.len() < 300,
         "{} bytes",

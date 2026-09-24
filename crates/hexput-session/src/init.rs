@@ -18,11 +18,18 @@ use hexput_port::Value;
 #[non_exhaustive]
 pub struct Config {}
 
-/// A function the Backend exposes to its Scripts, named at init (FR-1, FR-6). Capability grants
-/// join it in Story 3.2.
+/// A function the Backend exposes to its Scripts, named at init (FR-1, FR-6), with its
+/// Capability grant.
+///
+/// On the wire a registration is `{name, blanket}`, `blanket` an optional boolean. A blanket
+/// grant (Story 3.2) makes the function callable by every Script of the Session with no per-call
+/// round trip. Without one the function is not callable at all until Story 3.3 adds the per-call
+/// handler: the Daemon fails closed. Whether a call may go ahead is decided in `hexput-enforce`,
+/// never here (AD-3) — this is only the Session's record of what the Backend said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredFunction {
     name: String,
+    blanket: bool,
 }
 
 impl RegisteredFunction {
@@ -30,6 +37,12 @@ impl RegisteredFunction {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether the Backend granted it blanket at registration.
+    #[must_use]
+    pub fn blanket(&self) -> bool {
+        self.blanket
     }
 }
 
@@ -72,6 +85,7 @@ impl core::error::Error for InitError {}
 const CONFIG: &str = "config";
 const REGISTRATIONS: &str = "registrations";
 const NAME: &str = "name";
+const BLANKET: &str = "blanket";
 
 impl InitRequest {
     /// Decode an `Init` payload: a map with exactly the keys `config` and `registrations`.
@@ -242,19 +256,38 @@ fn decode_registrations(value: &Value) -> Result<Vec<RegisteredFunction>, InitEr
             return Err(InitError::new(format!("{} is not a map", at())));
         };
         let mut name = None;
+        let mut blanket = None;
         for (key, value) in fields {
-            if key.as_str() != Some(NAME) {
+            let (slot, spelled) = match key.as_str() {
+                Some(NAME) => (&mut name, NAME),
+                Some(BLANKET) => (&mut blanket, BLANKET),
+                _ => {
+                    return Err(InitError::new(format!(
+                        "{} has an unknown key {}",
+                        at(),
+                        describe_key(key)
+                    )));
+                }
+            };
+            if slot.is_some() {
                 return Err(InitError::new(format!(
-                    "{} has an unknown key {}",
-                    at(),
-                    describe_key(key)
+                    "{} repeats the key `{spelled}`",
+                    at()
                 )));
             }
-            if name.is_some() {
-                return Err(InitError::new(format!("{} repeats the key `{NAME}`", at())));
-            }
-            name = Some(value);
+            *slot = Some(value);
         }
+        // Absent means no blanket grant; anything present must be a boolean, so a Backend never
+        // believes it granted (or withheld) something the Daemon read otherwise.
+        let blanket = match blanket {
+            None => false,
+            Some(Value::Boolean(blanket)) => *blanket,
+            Some(_) => {
+                return Err(InitError::new(format!(
+                    "`{REGISTRATIONS}[{index}].{BLANKET}` is not a boolean"
+                )));
+            }
+        };
         let field = || format!("`{REGISTRATIONS}[{index}].{NAME}`");
         let Some(name) = name else {
             return Err(InitError::new(format!("{} is missing", field())));
@@ -274,6 +307,7 @@ fn decode_registrations(value: &Value) -> Result<Vec<RegisteredFunction>, InitEr
         }
         registrations.push(RegisteredFunction {
             name: name.to_owned(),
+            blanket,
         });
     }
     Ok(registrations)

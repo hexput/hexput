@@ -18,16 +18,21 @@
 //!   Backend's `Result`/`Error` is always a reply to a Daemon `Call`, so the two id spaces never
 //!   meet), keeps the pending-call table, builds each `Call` envelope, and routes a Backend reply
 //!   to the call it names.
-//! * [`Caller`] is the handle an execution holds. [`Caller::call`] queues a call for the loop to
-//!   write and waits — a plain `.await`, no thread and no lock held — for its outcome.
+//! * [`Caller`] is the handle an execution holds. [`Caller::dispatch_authorized`] queues a call for
+//!   the loop to write and waits — a plain `.await`, no thread and no lock held — for its outcome.
+//!   It checks nothing: its caller must already hold `hexput-enforce`'s permission for the call,
+//!   which only `hexput-exec` can obtain (AD-3). The name is deliberately unmistakable, and
+//!   `scripts/check-crate-graph.py` fails CI when it appears in any production crate but
+//!   `hexput-exec` and this one — so `hexput-connection`, which creates the `Caller`, and
+//!   `hexput-script`, which passes it on, can hold it but never use it.
 //!
 //! When the connection can no longer deliver a reply — its peer stopped sending, or the stream is
 //! gone — [`Calls::close`] (or dropping the [`Calls`]) fails every pending call and every later
 //! one with [`CallFailure::NoReply`] at once, so an execution the connection is still waiting for
 //! can never wait on a reply that cannot come.
 //!
-//! Registration grants (Stories 3.2 and 3.3) land here later; the decision itself stays in
-//! `hexput-enforce`.
+//! Registration grants are decided in `hexput-enforce`, never here; the Session's registrations
+//! reach it through `hexput-exec`.
 //!
 //! Binds: AD-3.
 
@@ -78,12 +83,15 @@ impl Caller {
     /// Call the Registered Function `name` with `arguments`, and wait for the Backend's answer:
     /// the reply's `value`, or why there is none.
     ///
+    /// Only for a call `hexput-enforce` has already allowed: this sends whatever it is given.
+    /// `hexput-exec` is its one caller (AD-3), pinned by `scripts/check-crate-graph.py`.
+    ///
     /// Holds nothing while it waits. Every call ends: the connection answers it, or fails it
     /// with [`CallFailure::NoReply`] once no answer can arrive.
     ///
     /// # Errors
     /// The [`CallFailure`] describing why the call produced no value.
-    pub async fn call(
+    pub async fn dispatch_authorized(
         &self,
         name: impl Into<String>,
         arguments: Vec<Value>,
@@ -184,7 +192,7 @@ impl Calls {
     }
 
     /// No reply can arrive any more: fail every pending call and every submitted one with
-    /// [`CallFailure::NoReply`], and every later [`Caller::call`] at once.
+    /// [`CallFailure::NoReply`], and every later [`Caller::dispatch_authorized`] at once.
     pub fn close(&mut self) {
         self.queue.close();
         // Dropping a call's sender is its `NoReply`.

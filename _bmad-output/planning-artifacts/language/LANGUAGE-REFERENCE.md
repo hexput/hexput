@@ -265,7 +265,7 @@ let order = getOrder(orderId);
 applyDiscount(order.id, 10);
 ```
 
-There is no import, require, module, filesystem, network, environment, or process facility in the grammar at all — the absence is structural, not a runtime check (Epic 3 Story 3.4). A call to an unregistered name raises `capability`, indistinguishable from a denied call.
+There is no import, require, module, filesystem, network, environment, or process facility in the grammar at all — the absence is structural, not a runtime check (Epic 3 Story 3.4). A call to an unregistered name raises `capability`, indistinguishable from a denied call. A Registered Function is callable only with a Capability grant — today a blanket grant the Backend gives it at registration; from Story 3.3 also the Backend's per-call decision — and a call with no grant is that same `capability.unknown_function` error, with nothing sent. *(Story 3.2.)*
 
 **[DECISION, 2026-09-24] What makes a call a host call.** A call whose callee is a bare name that no scope declares is a host call; a local binding of the same name — a `let`, a parameter, a named `fn`, a starting variable — shadows the Registered Function, and the call is an ordinary local one. A host function is not a value: naming it without calling it (`let f = getOrder;`) is still `reference.undeclared_identifier`.
 

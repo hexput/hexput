@@ -3,26 +3,81 @@
 //! which is what makes a second path into capability/budget enforcement a compile error rather
 //! than a review finding.
 //!
-//! # What exists today (Story 3.1)
+//! # What exists today (Stories 3.1 and 3.2)
 //!
-//! [`Capabilities`] is what an execution may call: the names of its Session's Registered
-//! Functions, read once per execution. [`Capabilities::check_call`] is the one decision on
-//! whether a host call may go ahead. An unregistered name is a `capability` error
-//! (`capability.unknown_function`) — never `reference`, since the name is a host call's, not a
-//! variable's. Grants (`context.allow()`, per-call handlers — Stories 3.2 and 3.3) will refine
-//! the same decision, and a denied call will raise exactly the same error as an unregistered one,
-//! so a Script can never tell the two apart.
+//! [`Capabilities`] is what an execution may call: its Session's Registered Functions with their
+//! grants, as they were when the execution was dispatched. [`Capabilities::check_call`] is the one
+//! decision on whether a host call may go ahead:
+//!
+//! * a name registered with a blanket grant proceeds, with no authorization round trip;
+//! * a name registered without one is refused — fail closed until Story 3.3 turns "no grant" into
+//!   "ask the Backend's per-call handler";
+//! * an unregistered name is refused.
+//!
+//! Every refusal is the same `capability.unknown_function` error — same code, same message, same
+//! span — never `reference`, since the name is a host call's, not a variable's. A Script can
+//! therefore never tell an unregistered function from one it may not call. Only the
+//! [`Refusal::reason`] tells them apart, for the Daemon's own log.
 //!
 //! Binds: AD-3.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use hexput_shared::diagnostics::{Category, Code, Diagnostic, Span};
 
 /// The host functions one execution may call.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
-    registered: HashSet<String>,
+    /// Registered name -> whether it holds a blanket grant.
+    registered: HashMap<String, bool>,
+}
+
+/// Why a host call was refused. For the Daemon's log only: the Script sees the same error for
+/// every reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// No Registered Function of the Session has the name.
+    Unregistered,
+    /// The name is registered, but holds no grant that lets this call go ahead.
+    NotGranted,
+}
+
+impl Reason {
+    /// The reason as a log field value: `unregistered` or `not_granted`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unregistered => "unregistered",
+            Self::NotGranted => "not_granted",
+        }
+    }
+}
+
+/// A refused host call: the error the Script sees, and why, which it never does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refusal {
+    reason: Reason,
+    diagnostic: Diagnostic,
+}
+
+impl Refusal {
+    /// Why the call was refused — for logging, never for the Script.
+    #[must_use]
+    pub fn reason(&self) -> Reason {
+        self.reason
+    }
+
+    /// The error the Script sees: identical whatever the reason.
+    #[must_use]
+    pub fn diagnostic(&self) -> &Diagnostic {
+        &self.diagnostic
+    }
+
+    /// The error the Script sees, by value.
+    #[must_use]
+    pub fn into_diagnostic(self) -> Diagnostic {
+        self.diagnostic
+    }
 }
 
 impl Capabilities {
@@ -32,28 +87,38 @@ impl Capabilities {
         Self::default()
     }
 
-    /// The Registered Functions of a Session, by name.
+    /// The Registered Functions of a Session, as `(name, blanket)` pairs: each name, and whether
+    /// the Backend granted it blanket at registration.
     #[must_use]
-    pub fn registered<N: Into<String>>(names: impl IntoIterator<Item = N>) -> Self {
+    pub fn registered<N: Into<String>>(registrations: impl IntoIterator<Item = (N, bool)>) -> Self {
         Self {
-            registered: names.into_iter().map(Into::into).collect(),
+            registered: registrations
+                .into_iter()
+                .map(|(name, blanket)| (name.into(), blanket))
+                .collect(),
         }
     }
 
     /// Decide whether the Script may call the host function `name`; `span` is the call's.
     ///
     /// # Errors
-    /// `capability.unknown_function`, spanned on the call, when `name` is not a Registered
-    /// Function of this execution's Session. The message is the same for every refusal.
-    pub fn check_call(&self, name: &str, span: Span) -> Result<(), Diagnostic> {
-        if self.registered.contains(name) {
-            return Ok(());
-        }
-        Err(Diagnostic::new(
-            Category::Capability,
-            Code::UNKNOWN_FUNCTION,
-            format!("`{name}` is not declared, and it is not a function this Script may call"),
-            span,
-        ))
+    /// A [`Refusal`] carrying `capability.unknown_function`, spanned on the call, when `name` is
+    /// not a Registered Function of this execution's Session or holds no grant. The error is the
+    /// same for every refusal; only [`Refusal::reason`] differs.
+    pub fn check_call(&self, name: &str, span: Span) -> Result<(), Refusal> {
+        let reason = match self.registered.get(name) {
+            Some(true) => return Ok(()),
+            Some(false) => Reason::NotGranted,
+            None => Reason::Unregistered,
+        };
+        Err(Refusal {
+            reason,
+            diagnostic: Diagnostic::new(
+                Category::Capability,
+                Code::UNKNOWN_FUNCTION,
+                format!("`{name}` is not declared, and it is not a function this Script may call"),
+                span,
+            ),
+        })
     }
 }

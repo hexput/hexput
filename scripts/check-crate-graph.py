@@ -17,8 +17,10 @@ Run: python3 scripts/check-crate-graph.py
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
+from pathlib import Path
 
 # (crate, forbidden dependency, architecture decision, why it matters)
 FORBIDDEN_EDGES = [
@@ -127,18 +129,24 @@ EXACT_DEPENDENCIES = {
     "hexput-bin": {"hexput-daemon", "hexput-cli-core", "hexput-lsp-core"},
 }
 
+# Names only some production crates may use. A graph edge cannot express "may hold this type but
+# never call this method", so these are asserted over the source text instead.
+#
+# Story 3.2 (AD-3): `hexput_rpc::Caller::dispatch_authorized` sends a `Call` to the Backend and
+# checks nothing — the capability decision is `hexput-enforce`'s, reached only through
+# `hexput-exec`. `hexput-connection` creates the `Caller` and `hexput-script` passes it on, so both
+# must be able to name the type; neither may dispatch through it. `hexput-tests` is not a
+# production crate and is exempt, like its dev-dependencies above.
+RESTRICTED_NAMES = [
+    ("dispatch_authorized", {"hexput-rpc", "hexput-exec"}, "AD-3",
+     "only the Executor may send a host call, and only after hexput-enforce allowed it"),
+]
 
-def workspace_graph() -> dict[str, set[str]]:
-    """Map each workspace crate to its workspace-internal *normal* dependencies.
+TEST_CRATES = {"hexput-tests"}
 
-    Dev-dependencies are excluded deliberately. Every rule here is about what production
-    code can reach — "only the Executor may reach enforcement", "only the wiring root may
-    reach a transport". A dev-dependency compiles into tests and nothing else, so it grants
-    no such reach. This is what lets `hexput-tests` test any crate in the workspace without
-    either weakening these rules or being exempted by name.
 
-    Build-dependencies are still counted: a build script runs as part of producing the crate.
-    """
+def workspace_metadata() -> dict:
+    """The workspace's `cargo metadata`, without external packages."""
     result = subprocess.run(
         ["cargo", "metadata", "--format-version", "1", "--locked", "--no-deps"],
         capture_output=True,
@@ -153,8 +161,20 @@ def workspace_graph() -> dict[str, set[str]]:
             "If you just edited a Cargo.toml, run `cargo generate-lockfile`.\n\n"
             f"{result.stderr.strip()}"
         )
-    meta = json.loads(result.stdout)
+    return json.loads(result.stdout)
 
+
+def dependency_graph(meta: dict) -> dict[str, set[str]]:
+    """Map each workspace crate to its workspace-internal *normal* dependencies.
+
+    Dev-dependencies are excluded deliberately. Every rule here is about what production
+    code can reach — "only the Executor may reach enforcement", "only the wiring root may
+    reach a transport". A dev-dependency compiles into tests and nothing else, so it grants
+    no such reach. This is what lets `hexput-tests` test any crate in the workspace without
+    either weakening these rules or being exempted by name.
+
+    Build-dependencies are still counted: a build script runs as part of producing the crate.
+    """
     members = {pkg["name"] for pkg in meta["packages"]}
     return {
         pkg["name"]: {
@@ -166,8 +186,33 @@ def workspace_graph() -> dict[str, set[str]]:
     }
 
 
+def restricted_name_uses(meta: dict) -> list[str]:
+    """Every use of a `RESTRICTED_NAMES` name in a production crate not allowed it."""
+    failures: list[str] = []
+    for name, allowed, ad, why in RESTRICTED_NAMES:
+        pattern = re.compile(rf"\b{re.escape(name)}\b")
+        for pkg in meta["packages"]:
+            crate = pkg["name"]
+            if crate in allowed or crate in TEST_CRATES:
+                continue
+            root = Path(pkg["manifest_path"]).parent
+            for source in sorted(root.rglob("*.rs")):
+                if "target" in source.relative_to(root).parts:
+                    continue
+                text = source.read_text(encoding="utf-8")
+                for line_no, line in enumerate(text.splitlines(), start=1):
+                    if pattern.search(line):
+                        failures.append(
+                            f"{ad}: `{name}` appears in `{crate}` "
+                            f"({source.relative_to(root.parent.parent)}:{line_no}); "
+                            f"only {sorted(allowed)} may use it — {why}"
+                        )
+    return failures
+
+
 def main() -> int:
-    graph = workspace_graph()
+    meta = workspace_metadata()
+    graph = dependency_graph(meta)
     failures: list[str] = []
 
     for crate, expected in EXACT_DEPENDENCIES.items():
@@ -209,6 +254,8 @@ def main() -> int:
                 f"{'; '.join(detail)} — {why}"
             )
 
+    failures.extend(restricted_name_uses(meta))
+
     if failures:
         print("Crate graph violates the Architecture Spine:\n", file=sys.stderr)
         for f in failures:
@@ -221,7 +268,7 @@ def main() -> int:
         return 1
 
     checked = (len(FORBIDDEN_EDGES) + len(REQUIRED_EDGES)
-               + len(SOLE_DEPENDENTS) + len(EXACT_DEPENDENCIES))
+               + len(SOLE_DEPENDENTS) + len(EXACT_DEPENDENCIES) + len(RESTRICTED_NAMES))
     print(f"Crate graph OK — {checked} Architecture Decision edges asserted.")
     return 0
 

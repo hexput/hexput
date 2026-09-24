@@ -13,12 +13,13 @@
 //! converts a host call's values the same way.
 //!
 //! The Script may call its Session's Registered Functions (Story 3.1): the connection passes the
-//! registration names, read once per execution, and the [`Caller`] its calls travel through, and
-//! the Executor decides and makes every call. Decoding, parsing and converting the result run on
+//! registrations with their grants, read once per execution, and the [`Caller`] its calls travel
+//! through, and the Executor decides (Story 3.2) and makes every call. This crate holds the
+//! `Caller` only to pass it on and never dispatches through it (AD-3). Decoding, parsing and converting the result run on
 //! the blocking pool, like the Script itself, so a large payload never occupies a runtime worker.
 //!
 //! Not yet: the static check (no check mode exists in Config until Story 3.10), the AST Cache
-//! and Cached Execution (Epic 4), grants and Resource Budgets (Epic 3, behind the same
+//! and Cached Execution (Epic 4), per-call grants and Resource Budgets (Epic 3, behind the same
 //! Executor).
 //!
 //! Binds: AD-3, AD-6, AD-8.
@@ -39,8 +40,9 @@ const VALUE: &str = "value";
 
 /// Serve one Direct Execution: `payload` is an `ExecutionStart` payload, a map with exactly
 /// `source` (the Script, a string) and `variables` (its starting variables, a map from §2
-/// identifier to value). The Script may call the Registered Functions named in `registrations`,
-/// through `caller` (Story 3.1).
+/// identifier to value). The Script may call the Registered Functions in `registrations` — each
+/// `(name, blanket)`, the name and whether it holds a blanket grant — as the Executor allows,
+/// through `caller` (Stories 3.1 and 3.2).
 ///
 /// Returns the `Result` payload `{value: <the Script's result>}`. A number that is whole and
 /// within ±2^53 is sent as a MessagePack integer (`-0` as `0`), every other number as a
@@ -70,7 +72,7 @@ const VALUE: &str = "value";
 /// If the work on the blocking pool panics, the panic continues here.
 pub async fn direct_execution(
     payload: Value,
-    registrations: Vec<String>,
+    registrations: Vec<(String, bool)>,
     caller: Caller,
 ) -> Result<Value, Box<ErrorBody>> {
     let (program, variables) = blocking(move || prepare(&payload)).await?;

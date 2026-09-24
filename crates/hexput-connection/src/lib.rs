@@ -65,8 +65,9 @@
 //!
 //! A Script calls its Session's Registered Functions through this connection (Story 3.1). The
 //! connection holds one [`hexput_rpc::Calls`] table and hands each execution a
-//! [`hexput_rpc::Caller`], together with the Session's registration names, read once when the
-//! execution is dispatched. When an execution makes a call, the loop writes the `Call` envelope
+//! [`hexput_rpc::Caller`], together with the Session's registrations and their grants, read once
+//! when the execution is dispatched; the Executor alone decides which calls may go ahead, and this
+//! crate never dispatches through the `Caller` itself (AD-3). When an execution makes a call, the loop writes the `Call` envelope
 //! under a Daemon-issued id — a per-connection counter, independent of the Backend's ids — and
 //! routes the Backend's `Result` or `Error` naming that id back to the waiting execution, which
 //! holds no thread while it waits. A `Call` the adapter cannot frame fails only that call. A
@@ -239,11 +240,15 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         (reply, span)
                     }
                     Answer::Execute(id, payload) => {
-                        // The Session's registrations as they are now, read once per execution.
+                        // The Session's registrations and grants as they are now, read once per
+                        // execution.
                         let registrations = connection
                             .attached
-                            .and_then(|client_id| connection.sessions.registration_names(client_id))
-                            .unwrap_or_default();
+                            .and_then(|client_id| connection.sessions.registrations(client_id))
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|r| (r.name().to_owned(), r.blanket()))
+                            .collect();
                         // The task carries the request's span, so everything the execution logs
                         // names its connection, its Client ID and its request.
                         running.spawn(
@@ -458,7 +463,7 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
 async fn execute(
     id: Option<CorrelationId>,
     payload: Value,
-    registrations: Vec<String>,
+    registrations: Vec<(String, bool)>,
     caller: Caller,
 ) -> Envelope<Value> {
     match hexput_script::direct_execution(payload, registrations, caller).await {

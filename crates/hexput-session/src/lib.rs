@@ -163,17 +163,14 @@ impl Sessions {
         self.sessions.get(&client_id).map(|s| s.connections.len())
     }
 
-    /// The names of the Session's Registered Functions, in registration order; `None` when it
-    /// does not exist.
+    /// The Session's Registered Functions with their grants, in registration order, as they are
+    /// now; `None` when it does not exist. A copy for one execution to decide its host calls from
+    /// — read afresh per execution, never cached (AD-5).
     #[must_use]
-    pub fn registration_names(&self, client_id: ClientId) -> Option<Vec<String>> {
-        self.sessions.get(&client_id).map(|session| {
-            session
-                .registrations
-                .iter()
-                .map(|r| r.name().to_owned())
-                .collect()
-        })
+    pub fn registrations(&self, client_id: ClientId) -> Option<Vec<RegisteredFunction>> {
+        self.sessions
+            .get(&client_id)
+            .map(|session| session.registrations.clone())
     }
 
     /// How many Sessions are live.

@@ -274,6 +274,7 @@ dependencies = [
  "hexput-interpreter",
  "hexput-rpc",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -387,6 +388,7 @@ dependencies = [
  "hexput-config",
  "hexput-connection",
  "hexput-daemon",
+ "hexput-enforce",
  "hexput-exec",
  "hexput-interpreter",
  "hexput-lexer",

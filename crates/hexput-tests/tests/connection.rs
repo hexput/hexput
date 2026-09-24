@@ -184,11 +184,17 @@ fn string(s: &str) -> Value {
     Value::from(s)
 }
 
-/// A well-formed `Init` payload registering `names`.
-fn init_payload(names: &[&str]) -> Value {
-    let registrations = names
+/// A well-formed `Init` payload registering `registrations`, each `(name, blanket)` stating its
+/// blanket grant explicitly.
+fn init_payload(registrations: &[(&str, bool)]) -> Value {
+    let registrations = registrations
         .iter()
-        .map(|name| Value::Map(vec![(string("name"), string(name))]))
+        .map(|(name, blanket)| {
+            Value::Map(vec![
+                (string("name"), string(name)),
+                (string("blanket"), Value::from(*blanket)),
+            ])
+        })
         .collect();
     Value::Map(vec![
         (string("config"), Value::Map(vec![])),
@@ -422,7 +428,7 @@ fn a_reply_too_large_to_frame_is_answered_as_too_large_and_the_connection_stays_
 
 /// What the registry held for a Session while its connection was still open:
 /// `(live Sessions, attached Connections, registration names)`.
-type Snapshot = (usize, Option<usize>, Option<Vec<String>>);
+type Snapshot = (usize, Option<usize>, Option<Vec<(String, bool)>>);
 
 /// Serve `script`, then — before the connection closes — record what the registry holds for the
 /// Session whose Client ID reply number `init_reply` carried.
@@ -439,7 +445,12 @@ fn serve_and_look(
             *snapshot.lock().unwrap() = Some((
                 sessions.len(),
                 sessions.attached(id),
-                sessions.registration_names(id),
+                sessions.registrations(id).map(|registered| {
+                    registered
+                        .iter()
+                        .map(|r| (r.name().to_owned(), r.blanket()))
+                        .collect()
+                }),
             ));
         })
     };
@@ -450,10 +461,14 @@ fn serve_and_look(
 #[test]
 fn init_creates_a_session_with_this_connection_attached_and_answers_its_client_id() {
     let sessions = Arc::new(Sessions::new());
-    let (sent, seen) = serve_and_look(&sessions, vec![init(5, init_payload(&["getUser"]))], 0);
+    let (sent, seen) = serve_and_look(
+        &sessions,
+        vec![init(5, init_payload(&[("getUser", true)]))],
+        0,
+    );
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].id, Some(CorrelationId(5)));
-    assert_eq!(seen, (1, Some(1), Some(vec!["getUser".to_owned()])));
+    assert_eq!(seen, (1, Some(1), Some(vec![("getUser".to_owned(), true)])));
     // The connection closed, it was the last attached, so its Session went with it.
     let client_id = client_id_of(&sent[0]);
     assert!(!sessions.contains(client_id));
@@ -481,7 +496,27 @@ fn an_invalid_init_creates_no_session_and_names_what_is_wrong() {
             Value::Map(vec![(string("config"), Value::Map(vec![]))]),
             "missing `registrations`",
         ),
-        (init_payload(&["getUser", "getUser"]), "`getUser`"),
+        (
+            init_payload(&[("getUser", true), ("getUser", true)]),
+            "`getUser`",
+        ),
+        // Story 3.2: a blanket grant is a boolean or nothing.
+        (
+            Value::Map(vec![
+                (string("config"), Value::Map(vec![])),
+                (
+                    string("registrations"),
+                    Value::Array(vec![
+                        Value::Map(vec![(string("name"), string("a"))]),
+                        Value::Map(vec![
+                            (string("name"), string("getOrder")),
+                            (string("blanket"), string("yes")),
+                        ]),
+                    ]),
+                ),
+            ]),
+            "`registrations[1].blanket` is not a boolean",
+        ),
     ];
     for (payload, expected) in cases {
         let sessions = Arc::new(Sessions::new());
@@ -508,9 +543,9 @@ fn after_init_execution_runs_and_a_second_init_is_refused() {
         &sessions,
         vec![
             message(1, MessageType::ExecutionStart),
-            init(2, init_payload(&["getUser"])),
+            init(2, init_payload(&[("getUser", true)])),
             execution(3, "return 1;"),
-            init(4, init_payload(&["other"])),
+            init(4, init_payload(&[("other", true)])),
             message(5, MessageType::Result),
         ],
         1,
@@ -547,7 +582,7 @@ fn after_init_execution_runs_and_a_second_init_is_refused() {
         ]
     );
     // The second init left the first Session as it was, and created no other.
-    assert_eq!(seen, (1, Some(1), Some(vec!["getUser".to_owned()])));
+    assert_eq!(seen, (1, Some(1), Some(vec![("getUser".to_owned(), true)])));
     assert!(sessions.is_empty());
 }
 
@@ -560,11 +595,11 @@ fn two_connections_get_two_sessions_each_reply_on_its_own_connection() {
     // B inits while A is still attached, from inside A's probe: both Sessions are live at once.
     let a_sent = serve_probed(
         &sessions,
-        vec![init(1, init_payload(&["a"]))],
+        vec![init(1, init_payload(&[("a", true)]))],
         move |a_sent| {
             // On its own thread: a runtime cannot be started inside A's.
             let (b_sent, b_seen) = std::thread::spawn(move || {
-                serve_and_look(&registry, vec![init(1, init_payload(&["b"]))], 0)
+                serve_and_look(&registry, vec![init(1, init_payload(&[("b", true)]))], 0)
             })
             .join()
             .unwrap();
@@ -576,7 +611,7 @@ fn two_connections_get_two_sessions_each_reply_on_its_own_connection() {
     assert_eq!(b_sent.len(), 1, "B received only its own reply");
     let b_id = client_id_of(&b_sent[0]);
     assert_ne!(a_id, b_id);
-    assert_eq!(b_seen, (2, Some(1), Some(vec!["b".to_owned()])));
+    assert_eq!(b_seen, (2, Some(1), Some(vec![("b".to_owned(), true)])));
     assert!(sessions.is_empty());
 }
 
@@ -604,7 +639,7 @@ fn every_way_a_connection_ends_detaches_and_tears_down_its_session() {
     ];
     for (tail, fail) in ends {
         let sessions = Arc::new(Sessions::new());
-        let mut script = vec![init(1, init_payload(&["getUser"]))];
+        let mut script = vec![init(1, init_payload(&[("getUser", true)]))];
         script.extend(tail);
         let (sent, _) = serve_with(&sessions, script, fail);
         let client_id = client_id_of(&sent[0]);
@@ -1129,10 +1164,11 @@ impl Backend {
 }
 
 /// Serve one wired connection on `runtime` while `drive` plays the Backend. `drive` gets the
-/// Client ID's init reply already read; `registered` is what the init registered.
+/// Client ID's init reply already read; `registered` is what the init registered, as
+/// `(name, blanket)` pairs.
 fn hosted<F, Fut>(
     runtime: &tokio::runtime::Runtime,
-    registered: &[&str],
+    registered: &[(&str, bool)],
     refuse_calls: bool,
     drive: F,
 ) -> Arc<Sessions>
@@ -1140,6 +1176,27 @@ where
     F: FnOnce(Backend) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    let sessions = Arc::new(Sessions::new());
+    let dispatch = discarding_dispatch();
+    let registry = Arc::clone(&sessions);
+    let init_payload = init_payload(registered);
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let (backend, serving) = connect(&registry, init_payload, refuse_calls).await;
+            drive(backend).await;
+            finished(serving).await;
+        });
+    });
+    sessions
+}
+
+/// Open one wired connection on `sessions` and complete its init with `init_payload`: the
+/// stand-in Backend, with the init reply read, and the running `serve`.
+async fn connect(
+    sessions: &Arc<Sessions>,
+    init_payload: Value,
+    refuse_calls: bool,
+) -> (Backend, tokio::task::JoinHandle<()>) {
     let (to_daemon, from_test) = tokio::sync::mpsc::unbounded_channel();
     let (to_test, from_daemon) = tokio::sync::mpsc::unbounded_channel();
     let port = Wired {
@@ -1147,28 +1204,23 @@ where
         to_test,
         refuse_calls,
     };
-    let sessions = Arc::new(Sessions::new());
-    let dispatch = discarding_dispatch();
-    let registry = Arc::clone(&sessions);
-    let init_payload = init_payload(registered);
-    tracing::dispatcher::with_default(&dispatch, || {
-        runtime.block_on(async move {
-            let serving = tokio::spawn(hexput_connection::serve(port, registry));
-            let mut backend = Backend {
-                to_daemon: Some(to_daemon),
-                from_daemon,
-            };
-            backend.reply(CorrelationId(0), MessageType::Init, init_payload);
-            let reply = backend.next().await;
-            client_id_of(&reply);
-            drive(backend).await;
-            tokio::time::timeout(Duration::from_secs(10), serving)
-                .await
-                .expect("serve returned once the Backend left")
-                .unwrap();
-        });
-    });
-    sessions
+    let serving = tokio::spawn(hexput_connection::serve(port, Arc::clone(sessions)));
+    let mut backend = Backend {
+        to_daemon: Some(to_daemon),
+        from_daemon,
+    };
+    backend.reply(CorrelationId(0), MessageType::Init, init_payload);
+    let reply = backend.next().await;
+    client_id_of(&reply);
+    (backend, serving)
+}
+
+/// Wait for a connection's `serve` to return once its Backend left.
+async fn finished(serving: tokio::task::JoinHandle<()>) {
+    tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .expect("serve returned once the Backend left")
+        .unwrap();
 }
 
 fn wired_runtime() -> tokio::runtime::Runtime {
@@ -1200,7 +1252,7 @@ fn value_of(response: &Envelope<Value>) -> Value {
 fn a_host_call_round_trips_and_the_script_resumes_with_the_backend_value() {
     let sessions = hosted(
         &wired_runtime(),
-        &["getOrder"],
+        &[("getOrder", true)],
         false,
         |mut backend| async move {
             // The Backend's own ids and the Daemon's call ids are separate spaces: this execution's
@@ -1231,7 +1283,7 @@ fn a_host_call_round_trips_and_the_script_resumes_with_the_backend_value() {
 fn a_backend_error_fails_only_its_script() {
     hosted(
         &wired_runtime(),
-        &["getOrder"],
+        &[("getOrder", true)],
         false,
         |mut backend| async move {
             backend.send(execution(1, "let x = 7;\nreturn getOrder(x);"));
@@ -1258,7 +1310,7 @@ fn a_backend_error_fails_only_its_script() {
 fn an_unregistered_or_shadowed_call_sends_nothing() {
     hosted(
         &wired_runtime(),
-        &["getOrder"],
+        &[("getOrder", true)],
         false,
         |mut backend| async move {
             backend.send(execution(1, "return nope(1);"));
@@ -1286,7 +1338,7 @@ fn an_unregistered_or_shadowed_call_sends_nothing() {
 fn concurrent_calls_are_routed_by_id_whatever_order_the_replies_come_in() {
     hosted(
         &wired_runtime(),
-        &["echo"],
+        &[("echo", true)],
         false,
         |mut backend| async move {
             backend.send(execution(10, "return echo(\"first\");"));
@@ -1315,7 +1367,7 @@ fn concurrent_calls_are_routed_by_id_whatever_order_the_replies_come_in() {
 fn a_peer_that_closes_mid_call_fails_the_call_with_no_reply_and_is_answered_then_detached() {
     let sessions = hosted(
         &wired_runtime(),
-        &["getOrder"],
+        &[("getOrder", true)],
         false,
         |mut backend| async move {
             backend.send(execution(5, "return getOrder(1);"));
@@ -1333,7 +1385,7 @@ fn a_peer_that_closes_mid_call_fails_the_call_with_no_reply_and_is_answered_then
 fn a_stray_reply_after_init_is_an_unexpected_message() {
     hosted(
         &wired_runtime(),
-        &["getOrder"],
+        &[("getOrder", true)],
         false,
         |mut backend| async move {
             // Refused with a nil id: 42 names no call of the Daemon's, and echoing it would read
@@ -1366,7 +1418,7 @@ fn a_stray_reply_after_init_is_an_unexpected_message() {
 fn a_call_that_cannot_be_framed_fails_only_its_script() {
     hosted(
         &wired_runtime(),
-        &["getOrder"],
+        &[("getOrder", true)],
         true,
         |mut backend| async move {
             backend.send(execution(1, "return getOrder(1);"));
@@ -1394,34 +1446,39 @@ fn an_execution_waiting_on_a_reply_holds_no_thread_and_another_completes_meanwhi
         })
         .build()
         .unwrap();
-    hosted(&runtime, &["getOrder"], false, |mut backend| async move {
-        backend.send(execution(1, "return getOrder(1) + 1;"));
-        let (id, _, _) = backend.call().await;
-        // The call is outstanding; a second execution runs to completion meanwhile.
-        backend.send(execution(
-            2,
-            "let i = 0; while (i < 1000) { i = i + 1; }; return i;",
-        ));
-        let reply = backend.next().await;
-        assert_eq!(reply.id, Some(CorrelationId(2)));
-        assert_eq!(value_of(&reply), Value::from(1000));
-        backend.reply(
-            id,
-            MessageType::Result,
-            Value::Map(vec![(string("value"), Value::from(41))]),
-        );
-        let reply = backend.next().await;
-        assert_eq!(reply.id, Some(CorrelationId(1)));
-        assert_eq!(value_of(&reply), Value::from(42));
-        backend.close();
-    });
+    hosted(
+        &runtime,
+        &[("getOrder", true)],
+        false,
+        |mut backend| async move {
+            backend.send(execution(1, "return getOrder(1) + 1;"));
+            let (id, _, _) = backend.call().await;
+            // The call is outstanding; a second execution runs to completion meanwhile.
+            backend.send(execution(
+                2,
+                "let i = 0; while (i < 1000) { i = i + 1; }; return i;",
+            ));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(value_of(&reply), Value::from(1000));
+            backend.reply(
+                id,
+                MessageType::Result,
+                Value::Map(vec![(string("value"), Value::from(41))]),
+            );
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(value_of(&reply), Value::from(42));
+            backend.close();
+        },
+    );
 }
 
 #[test]
 fn a_fatal_frame_mid_call_fails_the_call_with_no_reply_and_serve_returns() {
     let sessions = hosted(
         &wired_runtime(),
-        &["getOrder"],
+        &[("getOrder", true)],
         false,
         |mut backend| async move {
             backend.send(execution(5, "return getOrder(1);"));
@@ -1443,7 +1500,7 @@ fn a_fatal_frame_mid_call_fails_the_call_with_no_reply_and_serve_returns() {
 fn a_call_made_only_after_the_connection_stopped_reading_fails_at_once() {
     let sessions = hosted(
         &wired_runtime(),
-        &["getOrder"],
+        &[("getOrder", true)],
         false,
         |mut backend| async move {
             // The Script is still looping when the peer closes, so its call is made only after
@@ -1461,4 +1518,184 @@ fn a_call_made_only_after_the_connection_stopped_reading_fails_at_once() {
         },
     );
     assert!(sessions.is_empty(), "the connection detached");
+}
+
+// --- Story 3.2: blanket grants at registration ---
+
+#[test]
+fn a_blanket_granted_call_writes_exactly_one_call_and_nothing_else() {
+    let sessions = hosted(
+        &wired_runtime(),
+        &[("getOrder", true)],
+        false,
+        |mut backend| async move {
+            backend.send(execution(1, "return getOrder(1);"));
+            // The first envelope is the `Call` itself: no authorization request precedes it.
+            let (id, name, arguments) = backend.call().await;
+            assert_eq!(name, "getOrder");
+            assert_eq!(arguments, [Value::from(1)]);
+            backend.reply(
+                id,
+                MessageType::Result,
+                Value::Map(vec![(string("value"), string("order"))]),
+            );
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(value_of(&reply), string("order"));
+            backend.close();
+            // Nothing else was written for it.
+            assert!(backend.from_daemon.recv().await.is_none());
+        },
+    );
+    assert!(sessions.is_empty());
+}
+
+/// An `Init` payload registering one `getOrder` whose registration map is `extra` plus its name.
+fn init_with_registration(extra: Vec<(Value, Value)>) -> Value {
+    let mut registration = vec![(string("name"), string("getOrder"))];
+    registration.extend(extra);
+    Value::Map(vec![
+        (string("config"), Value::Map(vec![])),
+        (
+            string("registrations"),
+            Value::Array(vec![Value::Map(registration)]),
+        ),
+    ])
+}
+
+#[test]
+fn a_function_registered_without_a_grant_is_refused_like_an_unregistered_one() {
+    let runtime = wired_runtime();
+    let withheld = [
+        // `blanket` absent: no blanket grant.
+        init_with_registration(vec![]),
+        init_with_registration(vec![(string("blanket"), Value::from(false))]),
+    ];
+    let dispatch = discarding_dispatch();
+    for init_payload in withheld {
+        tracing::dispatcher::with_default(&dispatch, || {
+            runtime.block_on(async {
+                let sessions = Arc::new(Sessions::new());
+                let (mut backend, serving) = connect(&sessions, init_payload, false).await;
+                backend.send(execution(1, "return getOrder(1);"));
+                let refused = backend.next().await;
+                assert_eq!(refused.id, Some(CorrelationId(1)));
+                assert_eq!(code_of(&refused), "capability.unknown_function");
+                backend.send(execution(2, "return nope(1);"));
+                let unregistered = backend.next().await;
+                assert_eq!(code_of(&unregistered), "capability.unknown_function");
+                backend.close();
+                assert!(
+                    backend.from_daemon.recv().await.is_none(),
+                    "no `Call` was written"
+                );
+                finished(serving).await;
+                // The Script cannot tell the two apart: the same error, bar the callee's name.
+                assert_eq!(
+                    message_of(&refused),
+                    message_of(&unregistered).replace("nope", "getOrder")
+                );
+            });
+        });
+    }
+}
+
+#[test]
+fn grants_never_leak_across_sessions() {
+    let runtime = wired_runtime();
+    let dispatch = discarding_dispatch();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let sessions = Arc::new(Sessions::new());
+            // Three Sessions live at once on one registry: A grants `getOrder`, B registers it
+            // without the grant, C does not register it at all.
+            let (mut a, a_serving) =
+                connect(&sessions, init_payload(&[("getOrder", true)]), false).await;
+            let (mut b, b_serving) =
+                connect(&sessions, init_payload(&[("getOrder", false)]), false).await;
+            let (mut c, c_serving) = connect(&sessions, init_payload(&[]), false).await;
+            assert_eq!(sessions.len(), 3);
+
+            for other in [&mut b, &mut c] {
+                other.send(execution(1, "return getOrder(1);"));
+                let reply = other.next().await;
+                assert_eq!(code_of(&reply), "capability.unknown_function");
+            }
+
+            a.send(execution(1, "return getOrder(1);"));
+            let (id, name, _) = a.call().await;
+            assert_eq!(name, "getOrder");
+            a.reply(
+                id,
+                MessageType::Result,
+                Value::Map(vec![(string("value"), Value::from(5))]),
+            );
+            assert_eq!(value_of(&a.next().await), Value::from(5));
+
+            for (mut backend, serving) in [(a, a_serving), (b, b_serving), (c, c_serving)] {
+                backend.close();
+                assert!(backend.from_daemon.recv().await.is_none());
+                finished(serving).await;
+            }
+            assert!(sessions.is_empty());
+        });
+    });
+}
+
+#[test]
+fn a_refused_call_is_logged_at_debug_under_its_request() {
+    let log = Captured::default();
+    let writer = log.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(writer))
+            .finish(),
+    );
+    let runtime = wired_runtime();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let sessions = Arc::new(Sessions::new());
+            let (mut backend, serving) =
+                connect(&sessions, init_payload(&[("getOrder", false)]), false).await;
+            backend.send(execution(7, "return getOrder(1);"));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "capability.unknown_function"
+            );
+            backend.send(execution(8, "return nope(1);"));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "capability.unknown_function"
+            );
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let refusals: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["message"] == "refused a host call")
+        .collect();
+    assert_eq!(refusals.len(), 2, "{text}");
+    for (event, (request, function, reason)) in refusals.iter().zip([
+        ("7", "getOrder", "not_granted"),
+        ("8", "nope", "unregistered"),
+    ]) {
+        assert_eq!(event["level"], "DEBUG", "{event}");
+        assert_eq!(event["fields"]["function"], function, "{event}");
+        assert_eq!(event["fields"]["reason"], reason, "{event}");
+        // Logged from the execution's own task, so it names its connection and request.
+        assert_eq!(event["span"]["name"], "request", "{event}");
+        assert_eq!(event["span"]["id"], request, "{event}");
+        let spans = event["spans"].as_array().expect("span fields");
+        assert_eq!(spans[0]["name"], "connection", "{event}");
+        assert_eq!(
+            spans[0]["client_id"].as_str().map(str::len),
+            Some(ClientId::TEXT_LEN),
+            "{event}"
+        );
+    }
 }

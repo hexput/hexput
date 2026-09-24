@@ -10,14 +10,23 @@ use rmpv::Integer;
 
 /// Serve one Direct Execution with no Registered Functions, on a runtime of its own.
 fn direct_execution(payload: &Value) -> Result<Value, Box<ErrorBody>> {
+    direct_execution_registering(payload, Vec::new())
+}
+
+/// Serve one Direct Execution registering `registrations` — `(name, blanket)` pairs — on a runtime
+/// of its own. Its call table is never served, so a call that went ahead would never be answered:
+/// only use it with registrations that let no call through.
+fn direct_execution_registering(
+    payload: &Value,
+    registrations: Vec<(String, bool)>,
+) -> Result<Value, Box<ErrorBody>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    // A call table nobody serves: nothing is registered, so no call is ever made on it.
     let (_calls, caller) = hexput_rpc::Calls::new();
     runtime.block_on(hexput_script::direct_execution(
         payload.clone(),
-        Vec::new(),
+        registrations,
         caller,
     ))
 }
@@ -408,4 +417,18 @@ fn an_invalid_utf8_string_off_the_wire_is_refused() {
     let body = failure(&envelope.payload);
     assert_eq!(body.code, "protocol.invalid_payload");
     assert!(body.message.contains("`variables.t`"), "{}", body.message);
+}
+
+/// Story 3.2: the registrations' grants reach the Executor, which refuses a call without one.
+#[test]
+fn a_function_registered_without_a_grant_is_a_capability_error() {
+    let source = "return getOrder(1);";
+    let body = *direct_execution_registering(
+        &payload(source, vec![]),
+        vec![("getOrder".to_owned(), false)],
+    )
+    .expect_err("refused before anything is sent");
+    assert_eq!(body.code, "capability.unknown_function");
+    let unregistered = failure(&payload(source, vec![]));
+    assert_eq!(body, unregistered, "the same error as an unregistered name");
 }

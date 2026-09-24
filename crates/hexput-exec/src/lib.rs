@@ -22,10 +22,16 @@
 //!    `depth.argument_too_deep`, spanned on that argument; arguments that together are certain to
 //!    exceed a frame cannot be sent, `host.function_failed` on the call. (A function or cyclic
 //!    argument was already refused by the interpreter, as a `type` error on that argument.)
-//! 2. asks `hexput-enforce` whether the Session registered the name (AD-3): if not, the call is a
-//!    `capability` error and nothing is sent.
+//! 2. asks `hexput-enforce` whether the call may go ahead (AD-3), from the Session's registrations
+//!    and their grants as they were when the execution was dispatched: only a name registered
+//!    with a blanket grant proceeds (Story 3.2). Anything else is `capability.unknown_function`,
+//!    identical whether the name is unregistered or merely not granted, and nothing is sent; the
+//!    Daemon logs the refusal at `debug` with the `function` and a `reason` of `unregistered` or
+//!    `not_granted`, which the Script never sees.
 //! 3. hands the call to the connection through its [`Caller`] and awaits the reply — a plain
-//!    `.await`, holding no thread and no lock.
+//!    `.await`, holding no thread and no lock. [`Caller::dispatch_authorized`] is called from
+//!    here and nowhere else; `scripts/check-crate-graph.py` fails CI when the name appears in any
+//!    other production crate but `hexput-rpc`, which defines it.
 //! 4. converts the reply's value back, in a new blocking segment, and resumes the Script with it.
 //!    An `Error` reply or a malformed one ends the Script with `host.function_failed`, and a
 //!    connection that ends first with `host.no_reply`, both spanned on the call.
@@ -38,7 +44,7 @@ pub mod wire;
 
 use std::sync::Arc;
 
-use hexput_enforce::Capabilities;
+use hexput_enforce::{Capabilities, Refusal};
 use hexput_interpreter::{Category, Code, Execution, HostCall, Outcome};
 use hexput_rpc::CallFailure;
 
@@ -69,10 +75,11 @@ impl Host {
         Self::default()
     }
 
-    /// A Session's host: its Registered Functions, by name, reached through `caller`.
+    /// A Session's host: its Registered Functions as `(name, blanket)` pairs — each name, and
+    /// whether the Backend granted it blanket at registration — reached through `caller`.
     #[must_use]
     pub fn new<N: Into<String>>(
-        registrations: impl IntoIterator<Item = N>,
+        registrations: impl IntoIterator<Item = (N, bool)>,
         caller: Caller,
     ) -> Self {
         Self {
@@ -88,6 +95,8 @@ enum Step {
     Finished(Value),
     /// The Script waits on this host call, whose arguments are ready to send.
     Call(HostCall, Vec<hexput_rpc::Value>),
+    /// The Script made a host call `hexput-enforce` refused: the function's name, and why.
+    Refused(String, Refusal),
 }
 
 /// Run a parsed Script whose root scope binds `variables` — its starting variables — reaching the
@@ -130,9 +139,20 @@ pub async fn execute(
         let (call, arguments) = match step {
             Step::Finished(result) => return Ok(result),
             Step::Call(call, arguments) => (call, arguments),
+            Step::Refused(function, refusal) => {
+                // Logged here, in the execution's own task, so the event carries the request's
+                // span; the reason is for the Daemon's log only, never the Script's error.
+                tracing::debug!(
+                    function,
+                    reason = refusal.reason().as_str(),
+                    "refused a host call"
+                );
+                return Err(refusal.into_diagnostic());
+            }
         };
         let reply = match &caller {
-            Some(caller) => caller.call(call.name(), arguments).await,
+            // Authorized: `advance` returned this call only after `check_call` allowed it.
+            Some(caller) => caller.dispatch_authorized(call.name(), arguments).await,
             // Unreachable in practice: without a caller nothing is registered, so the capability
             // check refused the call already.
             None => Err(CallFailure::NoReply),
@@ -170,7 +190,9 @@ fn advance(
         Outcome::HostCall(call) => call,
     };
     let arguments = arguments(&call)?;
-    capabilities.check_call(call.name(), call.span())?;
+    if let Err(refusal) = capabilities.check_call(call.name(), call.span()) {
+        return Ok(Step::Refused(call.name().to_owned(), refusal));
+    }
     Ok(Step::Call(call, arguments))
 }
 

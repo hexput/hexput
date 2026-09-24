@@ -16,6 +16,8 @@ hexput-interpreter = { path = "../hexput-interpreter" }
 hexput-rpc = { path = "../hexput-rpc" }
 hexput-globalvar = { path = "../hexput-globalvar" }
 tokio = { workspace = true }
+# External: a refused host call is logged at `debug` with its reason (Story 3.2).
+tracing = { workspace = true }
 
 [lints]
 workspace = true

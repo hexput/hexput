@@ -625,10 +625,10 @@ fn init_over_the_socket_answers_a_client_id() {
     let sandbox = Sandbox::new();
     let serving = Serving::start(&sandbox, &sandbox.valid());
     let init = |id| {
-        let registrations = Value::Array(vec![Value::Map(vec![(
-            Value::from("name"),
-            Value::from("getUser"),
-        )])]);
+        let registrations = Value::Array(vec![Value::Map(vec![
+            (Value::from("name"), Value::from("getUser")),
+            (Value::from("blanket"), Value::from(true)),
+        ])]);
         Envelope::new(
             CorrelationId(id),
             MessageType::Init,

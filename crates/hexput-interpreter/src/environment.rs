@@ -78,6 +78,16 @@ impl Heap {
     }
 
     /// Bind `name` in `scope`. The parser has already rejected same-block redeclaration.
+    /// The names bound directly in `scope` (not its parents), sorted.
+    pub(crate) fn names(&self, scope: SlotId) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .scope(scope)
+            .map(|record| record.bindings.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
     pub(crate) fn declare(&mut self, scope: SlotId, name: &str, value: RtValue) {
         if let Some(record) = self.scope_mut(scope) {
             record.bindings.insert(name.to_owned(), value);

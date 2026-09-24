@@ -848,3 +848,101 @@ fn arguments_that_each_fit_a_frame_but_not_together_are_refused_and_nothing_is_s
     assert_eq!(spanned(source, &error), "send(a, b)");
     assert!(seen.is_empty());
 }
+
+// --- Story 3.4: no path to the host but a Registered Function ---
+
+/// Spellings a Script might reach for to touch the filesystem, network, process, environment,
+/// host memory, modules or reflection. None is bound: there is no standard library (§11).
+const AMBIENT: &[&str] = &[
+    "fs",
+    "readFile",
+    "writeFile",
+    "open",
+    "require",
+    "import",
+    "process",
+    "env",
+    "exec",
+    "spawn",
+    "system",
+    "exit",
+    "socket",
+    "fetch",
+    "http",
+    "net",
+    "eval",
+    "Function",
+    "globalThis",
+    "global",
+    "window",
+    "self",
+    "Deno",
+    "std",
+    "os",
+    "io",
+    "__proto__",
+    "constructor",
+    "prototype",
+    "memory",
+    "ptr",
+    "alloc",
+    "sleep",
+    "setTimeout",
+    "print",
+    "console",
+    "len",
+    "push",
+];
+
+#[test]
+fn no_ambient_name_is_bound_so_reading_one_is_an_undeclared_identifier() {
+    for name in AMBIENT {
+        let source = format!("return {name};");
+        let error = run(&source, vec![]).unwrap_err();
+        assert_eq!(
+            error.code.as_str(),
+            "reference.undeclared_identifier",
+            "reading `{name}`"
+        );
+    }
+}
+
+#[test]
+fn calling_an_ambient_name_is_a_capability_denial_and_nothing_reaches_the_backend() {
+    for name in AMBIENT {
+        let source = format!("return {name}(\"/etc/passwd\");");
+        // The Session registered something else, granted blanket: only that is reachable.
+        let (result, seen) = run_hosted(
+            &source,
+            vec![],
+            &[("getOrder", true)],
+            Box::new(|_, _| value(Wire::Nil)),
+        );
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code.as_str(),
+            "capability.unknown_function",
+            "calling `{name}`"
+        );
+        assert!(seen.is_empty(), "calling `{name}` sent {seen:?}");
+    }
+}
+
+#[test]
+fn a_member_call_on_an_ambient_name_is_still_just_an_undeclared_identifier() {
+    // `process.exit(1)`: the base is read first, and nothing named `process` exists.
+    for source in ["return process.exit(1);", "return fs.readFile(\"x\");"] {
+        let (result, seen) = run_hosted(
+            source,
+            vec![],
+            &[("getOrder", true)],
+            Box::new(|_, _| value(Wire::Nil)),
+        );
+        assert_eq!(
+            result.unwrap_err().code.as_str(),
+            "reference.undeclared_identifier",
+            "{source}"
+        );
+        assert!(seen.is_empty());
+    }
+}

@@ -226,6 +226,15 @@ impl Execution {
         })
     }
 
+    /// The names bound in this execution's root scope before it runs, sorted: its starting
+    /// variables and its top-level named functions (hoisted, §6) — and, by construction, no
+    /// builtin but [`BUILTINS`]. For enumerating everything a Script can reach (Story 3.4);
+    /// meaningless once [`Execution::run`] has started.
+    #[must_use]
+    pub fn root_names(&self) -> Vec<String> {
+        self.machine.scope_names()
+    }
+
     /// Run until the Script ends or calls the host.
     ///
     /// # Errors
@@ -296,6 +305,17 @@ impl HostCall {
         execution
     }
 }
+
+/// Every name a Script can reach that it neither declared nor was given as a starting variable:
+/// the language's builtins. **Empty in v2** — there is no standard library at all, not even
+/// `len()` (LANGUAGE-REFERENCE §11) — so the only other names a Script can reach are its
+/// Session's Registered Functions, and only by calling them (§8, FR-7).
+///
+/// This is the one enumeration Story 3.4 asserts: a fresh [`Execution`]'s root scope binds its
+/// starting variables, its top-level named functions and these names, and nothing else
+/// ([`Execution::root_names`]). Adding a name here widens the trust boundary (NFR1) and needs a
+/// spec of its own.
+pub const BUILTINS: &[&str] = &[];
 
 /// Format a number the way the language does (§4.3): shortest round-tripping digits, plain
 /// notation for magnitudes in `[1e-6, 1e21)` and exponent notation outside it, whole values with

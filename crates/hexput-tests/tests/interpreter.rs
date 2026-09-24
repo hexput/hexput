@@ -1,5 +1,7 @@
 use hexput_ast::{Category, Code, Diagnostic};
-use hexput_interpreter::{Array, Object, Value, evaluate, evaluate_with_variables};
+use hexput_interpreter::{
+    Array, BUILTINS, Execution, Object, Value, evaluate, evaluate_with_variables,
+};
 use hexput_parser::parse;
 
 fn eval(source: &str) -> Result<Value, Diagnostic> {
@@ -1803,5 +1805,49 @@ mod host_calls {
             .err()
             .expect("a duplicate declaration");
         assert_eq!(error.code.as_str(), "syntax.duplicate_declaration");
+    }
+}
+
+// --- Story 3.4: everything a Script can reach, enumerated ---
+
+#[test]
+fn the_language_has_no_builtins() {
+    // No standard library at all in v2 (LANGUAGE-REFERENCE §11): a name added here widens the
+    // trust boundary and needs its own spec.
+    assert!(BUILTINS.is_empty(), "builtins: {BUILTINS:?}");
+}
+
+#[test]
+fn a_fresh_execution_binds_its_starting_variables_its_functions_and_nothing_else() {
+    let source = "fn helper() { return 1; }; let later = 2; return helper() + later + input;";
+    let program = std::sync::Arc::new(parse(source).unwrap());
+    let execution =
+        Execution::with_variables(program, vec![("input", Value::Number(1.0))]).unwrap();
+    let mut expected: Vec<String> = BUILTINS.iter().map(|b| (*b).to_owned()).collect();
+    // Starting variables and hoisted top-level functions; `let later` binds only when it runs.
+    expected.extend(["helper".to_owned(), "input".to_owned()]);
+    expected.sort();
+    assert_eq!(execution.root_names(), expected);
+}
+
+#[test]
+fn with_nothing_given_and_nothing_declared_the_root_scope_is_empty() {
+    let program = std::sync::Arc::new(parse("return 1;").unwrap());
+    let execution = Execution::with_variables(program, Vec::<(&str, Value)>::new()).unwrap();
+    assert!(
+        execution.root_names().is_empty(),
+        "{:?}",
+        execution.root_names()
+    );
+}
+
+#[test]
+fn module_and_import_syntax_does_not_exist() {
+    for source in [
+        "import fs;",
+        "import { readFile } from \"fs\";",
+        "export let x = 1;",
+    ] {
+        assert!(parse(source).is_err(), "`{source}` should not parse");
     }
 }

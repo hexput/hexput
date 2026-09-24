@@ -306,6 +306,12 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// Schedule the statements of `block` (the top level for `None`) in the current scope, after
     /// hoisting the named functions they declare (decision 3: every `fn name` in a block is bound
     /// before the block runs, so mutual recursion works in any declaration order).
+    /// The names bound in the scope the machine currently runs in — before the first step, the
+    /// root scope: the starting variables and the top-level named functions, nothing else.
+    pub(crate) fn scope_names(&self) -> Vec<String> {
+        self.heap.names(self.scope)
+    }
+
     fn open(&mut self, tree: &Program, block: Option<BlockId>) {
         let statements = statements(tree, block);
         for (index, statement) in statements.iter().enumerate() {

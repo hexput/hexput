@@ -42,7 +42,7 @@ FR-16: Execution requests are processed asynchronously; a slow execution never b
 FR-6: A Backend can register a function as callable independently of the logic deciding whether a specific call is allowed — `context.allow()` at registration grants blanket access; otherwise a per-call handler must return `true` or the call is capability-denied.
 FR-7: A script cannot reach the filesystem, network, or host process memory except through an explicitly granted Registered Function; any other capability reference fails with a defined capability-denied error, not a host-level exception.
 FR-27: A Backend can register a function as a method bound to an object key (`registerMethod(objKey, fn)`); a script calls it as `value.name(args)` on a value whose Value Secret carries that key, the call reaching the Backend as the same generic `Call` message with the receiver itself attached; a registered method wins over an own property of the same name, an unregistered method name is a capability denial, and argument/receiver nesting is capped by a Config limit (default 12). **[Added 2026-09-24 by course correction — sprint-change-proposal-2026-09-24.md.]**
-FR-28: Every value crossing to the Backend carries a hidden Value Secret (`__secret`: Reference ID `ref`, optional `key`, further Backend fields) that the Backend can read and edit and a script can never observe or change — reading yields `null`, writing is silently ignored, iteration skips it; modifications the Backend makes to referenced values during a call are reported in the call's reply and applied inside the execution before the script resumes. **[Added 2026-09-24 by course correction.]**
+FR-28: Every value crossing to the Backend carries a hidden Value Secret (`__secret`: Reference ID `ref`, optional `key`, further Backend fields) that the Backend can read and edit and a script can never observe or change — reading yields `null`, writing is silently ignored, iteration skips it; modifications flow both ways by Reference ID — changes the Backend makes during a call are reported in the call's reply and applied before the script resumes, and referenced locations the script writes are reported in the execution's result; a Reference ID names a collection itself or the location a scalar or string arrived in, never a copy; a script can never override a Registered Method (`capability.method_override`, also a static-check finding). **[Added 2026-09-24 by course correction.]**
 
 **Resource budgeting (PRD §4.4)**
 
@@ -945,8 +945,8 @@ So that I can identify and annotate values across the boundary without a script 
 **Then** it travels as a holder with a Daemon-generated Reference ID, and the same value sent again in that execution carries the same Reference ID (FR-28)
 
 **Given** a referenced value
-**When** the script copies it by binding or passing, or computes a new value from it
-**Then** the copy carries the same Value Secret, and the computed value carries none; `==`, truthiness and conversion never see the Value Secret (LANGUAGE-REFERENCE §3)
+**When** the script copies it by binding (`let m = n;`) or computes a new value from it
+**Then** a referenced object or array stays the same collection wherever it is held, while a copied or computed scalar or string is a plain value with no Value Secret; `==`, truthiness and conversion never see the Value Secret (LANGUAGE-REFERENCE §3)
 
 **Given** an execution's result containing values with Value Secrets
 **When** it is returned to the Backend
@@ -970,6 +970,10 @@ So that host objects feel like objects with methods, as in other languages.
 **When** the script calls it as a method
 **Then** the Registered Method is called, not the property (LANGUAGE-REFERENCE §8)
 
+**Given** a keyed value
+**When** the script writes a property named like a Registered Method under its key
+**Then** it fails with `capability.method_override` on the assignment target and the object is unchanged; with the static check on and the target a starting variable the environment declares keyed, the same mistake is an error finding before execution (FR-26, FR-27)
+
 **Given** a keyed value and a name registered for no method under its key and held by no own property
 **When** the script calls it
 **Then** it fails with the same `capability` error as an unregistered function (FR-7, FR-27)
@@ -982,13 +986,13 @@ So that host objects feel like objects with methods, as in other languages.
 **When** its call is checked and counted
 **Then** it obeys the same Capability grants (Stories 3.2, 3.3) and counts against RPC calls and side effects exactly like a plain Registered Function call (Story 3.6), and `rpc_calls` disabled (Story 3.9) blocks it too
 
-### Story 3.13: Apply the Backend's changes to referenced values
+### Story 3.13: Keep referenced values in step between Backend and script
 
 *[Added 2026-09-24 by course correction.]*
 
 As a Backend,
-I want to change the values a script handed me while I handle its call and have the script see those changes,
-So that I can update the script's objects and strings without a second round trip.
+I want to change the values a script handed me while I handle its call, and to learn which of my values the script changed,
+So that my state and the script's stay in step without a second round trip.
 
 **Acceptance Criteria:**
 
@@ -1000,9 +1004,13 @@ So that I can update the script's objects and strings without a second round tri
 **When** it is applied
 **Then** the collection changes in place and keeps its identity, so every binding and container holding it observes the new content (LANGUAGE-REFERENCE §4.2, §8)
 
-**Given** a modification naming a referenced string, number or bool
+**Given** a modification naming a referenced string, number, bool or `null`
 **When** it is applied
-**Then** every binding holding that referenced value observes the new value, while values previously computed from it are unchanged
+**Then** the value at the location its Reference ID names — the variable, property or element it arrived in or was passed from — is replaced, and copies and values previously computed from it are unchanged
+
+**Given** a starting variable `n` supplied as `8` with Reference ID `r1`, and the Script `n = 9; return { ok: true };`
+**When** the execution finishes
+**Then** its result is `{ ok: true }` with `modifications: [{ ref: "r1", value: 9 }]` — every referenced location the script wrote (a reassigned variable or property, a store into a referenced collection) is listed once with its final value, and unwritten ones are not (FR-28)
 
 **Given** a modification naming a Reference ID the execution does not hold, or a malformed `modifications` list
 **When** the reply arrives
@@ -1857,7 +1865,7 @@ So that the capability model works from my side of the socket.
 
 **Given** a method registered with `registerMethod(objKey, fn)`
 **When** a script calls it on a keyed object
-**Then** the SDK dispatches the `Call` to my method with the receiver, exposes every value's Value Secret (`ref`, `key`, extra fields) to me, and reports the changes I make to referenced values as the reply's `modifications` (FR-27, FR-28) **[Added 2026-09-24]**
+**Then** the SDK dispatches the `Call` to my method with the receiver, exposes every value's Value Secret (`ref`, `key`, extra fields) to me, and reports the changes I make to referenced values as the reply's `modifications`, and hands me the `modifications` an execution's result reports (FR-27, FR-28) **[Added 2026-09-24]**
 
 **Given** several inbound calls arriving concurrently
 **When** they are dispatched
@@ -1925,7 +1933,7 @@ So that capability decisions stay in my code.
 
 **Given** a method registered with `registerMethod(obj_key, fn)`
 **When** a script calls it on a keyed object
-**Then** the SDK dispatches the `Call` to my method with the receiver, exposes every value's Value Secret (`ref`, `key`, extra fields) to me, and reports the changes I make to referenced values as the reply's `modifications` (FR-27, FR-28) **[Added 2026-09-24]**
+**Then** the SDK dispatches the `Call` to my method with the receiver, exposes every value's Value Secret (`ref`, `key`, extra fields) to me, and reports the changes I make to referenced values as the reply's `modifications`, and hands me the `modifications` an execution's result reports (FR-27, FR-28) **[Added 2026-09-24]**
 
 **Given** several inbound calls arriving concurrently
 **When** they are dispatched
@@ -2052,6 +2060,10 @@ So that I can fix a rule without deciphering a stack trace.
 **Given** a document that parses cleanly but has static-check findings (Story 1.10)
 **When** diagnostics are published
 **Then** those findings appear as diagnostics at their own spans, with warning-severity findings distinguished from error-severity ones — this is what lets the language server report more than syntax errors (FR-15, FR-26)
+
+**Given** a document that assigns a property named like a Registered Method on a starting variable its environment declares keyed
+**When** diagnostics are published
+**Then** the `capability.method_override` finding appears at the assignment target (FR-27; LANGUAGE-REFERENCE §8, §10) **[Added 2026-09-24]**
 
 ### Story 9.5: Get basic completion while writing
 

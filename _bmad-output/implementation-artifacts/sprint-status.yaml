@@ -72,7 +72,7 @@ development_status:
   3-10-turn-the-static-check-on-or-off: backlog
   3-11-carry-hidden-metadata-on-values-the-script-cannot-touch: backlog
   3-12-call-a-backend-method-on-a-keyed-object: backlog
-  3-13-apply-the-backend-s-changes-to-referenced-values: backlog
+  3-13-keep-referenced-values-in-step-between-backend-and-script: backlog
   epic-3-retrospective: optional
 
   epic-4: backlog

@@ -3,7 +3,7 @@ title: 'Sprint Change Proposal — Registered Methods and Value Secrets'
 date: '2026-09-24'
 trigger: 'Story 3.1 planning (spec-3-1-call-a-registered-host-function-from-a-script.md)'
 scope: 'Moderate — new FRs and stories inside the existing epic structure'
-status: 'applied — awaiting Erdem''s confirmation of the four defaults in §4'
+status: 'applied — decisions confirmed by Erdem 2026-09-24'
 mode: 'batch'
 ---
 
@@ -28,7 +28,7 @@ Requirements as stated (2026-09-24):
   - 3.1 gains its wire, error and depth criteria.
   - 3.7 gains the configurable argument depth.
 
-  Epic 8's host-call stories (8.3, 8.6) gain a `registerMethod` criterion. No epic becomes obsolete. No order change is needed: Epic 3 still precedes Epic 8.
+  Epic 8's host-call stories (8.3, 8.6) gain a `registerMethod` criterion, and Epic 9's Story 9.4 gains the method-override diagnostic. No epic becomes obsolete. No order change is needed: Epic 3 still precedes Epic 8.
 - **PRD.**
   - New FR-27 (Registered Methods) and FR-28 (Value Secret, Reference IDs, host-side modifications).
   - FR-6 gains the generic `Call` and `host`-error consequence.
@@ -76,35 +76,29 @@ All edits below are applied in place. Each carries a dated `[Added 2026-09-24]` 
 | `implementation-artifacts/deferred-work.md` | methods entry marked promoted |
 | `AGENTS.md` | status paragraph, story count, vocabulary, next step |
 
-**Defaults chosen by the agent. Erdem's decisions were requested but not yet given; each is a one-line revision if overridden:**
+**Decisions (Erdem, 2026-09-24), replacing the agent's first defaults:**
 
-1. **Aliasing (A2).**
-   - What it means:
-     - The Value Secret travels with the value, so `let m = n;` shares `n`'s Reference ID.
-     - A Backend modification of that ref is seen by every binding holding it, including strings and numbers.
-     - Computed values (`n + 1`) carry no Value Secret.
-   - Why: chosen because Erdem wants strings (and any value) tracked.
-   - Rejected alternatives:
-     - Modifications apply only to objects and arrays.
-     - Modifications update only the sent variable.
-2. **Reference ID lifetime and source.**
-   - What it means:
-     - The Backend supplies the ref on values it sends.
-     - The Daemon generates one the first time a value without one crosses to the Backend.
-     - A ref is stable within one execution and meaningless after it ends.
-     - Every value nested in a `Call` travels as a holder.
-     - An execution result sends holders only for values that already carry a Value Secret.
-3. **Modification report shape.**
-   - What it means:
-     - `Result {value, modifications: [{ref, value}]}`, where each entry is a whole-value replacement, not a patch.
-     - Collections change in place and keep their identity.
-     - An unknown ref is ignored.
-     - A malformed list is `host.function_failed`.
-4. **Method precedence (D2).**
-   - What it means:
-     - A Registered Method wins over an own property of the same name.
-     - On a keyed value, a name that is neither a method nor an own property is `capability`.
-     - A value without a key has no methods.
+1. **Locations, not copies (A3).** A Reference ID names a location:
+   - For an object or array, the collection itself, shared by identity.
+   - For a string, number, bool or `null`, the variable, property or element it arrived in or was passed from.
+   - A copy (`let m = n;`) or a computed value carries no Value Secret.
+   - A Backend modification of a scalar ref replaces the value at that location only.
+2. **Modifications flow both ways.** A script writing a referenced location is reported back in the execution's `Result` under `modifications`, once per ref, with its final value. Erdem's example: Backend-supplied `n = 8`, then `n = 9; return { ok: true };` gives `modifications: [{ ref, value: 9 }]`.
+3. **Reference ID source and lifetime (B).**
+   - The Backend supplies the ref on values it sends.
+   - The Daemon generates one the first time a value without one crosses to the Backend.
+   - A ref is stable within one execution.
+   - Every value nested in a `Call` travels as a holder.
+   - An execution result sends holders only for values that already carry a Value Secret.
+4. **Report shape (C).**
+   - `modifications: [{ref, value}]`, where each entry is a whole-value replacement.
+   - Collections change in place.
+   - An unknown ref is ignored.
+   - A malformed list is `host.function_failed`.
+5. **Method precedence and no override (D2).**
+   - A Registered Method wins over an own property of the same name.
+   - A script can never override one: a write is `capability.method_override`.
+   - The static check reports the write, and so the language server shows it, when the environment declares a never-reassigned starting variable keyed. It stays silent otherwise, per the no-false-positive rule. Story 9.4 gained the matching criterion.
 
 ## 5. Implementation Handoff
 

@@ -185,6 +185,7 @@ A Backend can register a function as a method bound to an object key (`registerM
 **Consequences (testable):**
 - A method call reaches the Backend as the same generic `Call` message a plain Registered Function call uses, carrying the receiver value itself (with its Value Secret) alongside the arguments.
 - A registered method takes precedence over an own property of the same name; a method name not registered for the receiver's key fails with the same capability-denied error as an unregistered function.
+- A script can never override a Registered Method: writing a property of that name on a keyed value is a defined error, reported by the static check (FR-26) and the language server (FR-15) wherever the target is provably keyed.
 - Registered Methods obey the same Capability grants (FR-6) and Resource Budget dimensions (FR-8) as plain Registered Functions.
 - The nesting depth of arguments and receiver sent in a `Call` is bounded by a Config limit (default 12, overridable per execution per FR-3); a deeper value fails before anything is sent.
 
@@ -194,7 +195,8 @@ Every value that crosses to the Backend carries a Value Secret with a Reference 
 **Consequences (testable):**
 - Reading `__secret` in a script yields `null`, writing it is silently ignored, and iterating an object never yields it — the Value Secret is invisible, not an error.
 - A value the Backend supplies may carry its own Reference ID; any value sent to the Backend without one is given a Daemon-generated one, stable for the rest of that execution.
-- A `Call` reply may list modifications by Reference ID; the Daemon applies them before the script resumes, and every binding holding that referenced value observes the change.
+- A Reference ID names a location: an object or array itself, or the variable, property or element a scalar or string arrived in; copies and computed values carry none.
+- Modifications flow both ways by Reference ID: a `Call` reply may list changes the Backend made, applied before the script resumes; and an execution's result lists every referenced location the script wrote (e.g. a Backend-supplied `n = 8` reassigned to `9`) with its final value.
 - Value Secrets always travel back to the Backend unchanged by the script, including in an execution's result.
 
 **Feature-specific NFRs:**

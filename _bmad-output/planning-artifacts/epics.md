@@ -749,6 +749,8 @@ So that access can depend on who the script is acting for, not just which functi
 **When** the script continues
 **Then** the denial is a catchable, defined script-level error naming the function — never a host-level exception surfacing into the script (FR-7)
 
+[Note 2026-09-24: LANGUAGE-REFERENCE §7 wins — a denial, like every error, ends the Script and cannot be caught; it is the defined `capability.unknown_function`, never a host-level exception.]
+
 ### Story 3.4: Deny every path to the host that isn't a registered function
 
 As a Backend operating in a multi-tenant daemon,

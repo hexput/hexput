@@ -85,6 +85,8 @@ enum Reply {
     Silent,
     /// The connection ends: every pending question and call fails with no reply.
     Hangup,
+    /// The question could not be framed: the connection fails it as unsendable.
+    Unframable,
 }
 
 /// A handler answering every question `Result {value: <answer>}`.
@@ -214,7 +216,7 @@ fn hosted_run(
     );
     runtime.spawn(async move {
         while let Some(call) = calls.submitted().await {
-            let envelope = calls.issue(call);
+            let envelope = calls.issue(call).expect("the execution waits for it");
             let id = envelope.id.unwrap();
             let Wire::Map(fields) = &envelope.payload else {
                 panic!("a Call payload is a map");
@@ -249,6 +251,7 @@ fn hosted_run(
                     .unwrap(),
                 Reply::Silent => {}
                 Reply::Hangup => calls.close(),
+                Reply::Unframable => calls.unsendable(id, "its frame would be too large"),
             }
         }
     });
@@ -414,7 +417,8 @@ fn a_blanket_granted_call_asks_nothing() {
 
 #[test]
 fn the_handler_is_asked_on_every_call_never_cached() {
-    let answers = Arc::new(Mutex::new(vec![true, true]));
+    // Popped from the end: `true` for the first call, `false` for the second.
+    let answers = Arc::new(Mutex::new(vec![false, true]));
     let run = run_full(
         "let a = getOrder(1); let b = getOrder(2); return [a, b];",
         vec![],
@@ -428,18 +432,29 @@ fn the_handler_is_asked_on_every_call_never_cached() {
         }),
         Box::new(|_, arguments| value(arguments[0].clone())),
     );
-    assert_eq!(run.result.unwrap().as_array().unwrap().len(), 2);
+    // The first call was allowed and made; the second, asked anew, was denied.
+    assert_eq!(
+        run.result.unwrap_err().code.as_str(),
+        "capability.unknown_function"
+    );
     assert_eq!(run.asked.len(), 2, "asked once per call");
-    assert_eq!(run.calls.len(), 2);
+    assert_eq!(run.calls, [("getOrder".to_owned(), vec![Wire::from(1)])]);
     assert_eq!(
         run.order.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
         [
             MessageType::Authorize,
             MessageType::Call,
-            MessageType::Authorize,
-            MessageType::Call
+            MessageType::Authorize
         ]
     );
+}
+
+#[test]
+fn a_question_that_cannot_be_framed_is_denied_as_handler_failed() {
+    let (denial, reason, asked) = denied(Box::new(|_, _| Reply::Unframable));
+    assert_eq!(reason, "handler_failed");
+    assert_eq!(asked, 1);
+    assert_eq!(denial.code.as_str(), "capability.unknown_function");
 }
 
 /// Run `return getOrder(x);` with `getOrder` registered without a grant, its handler answering as
@@ -796,7 +811,7 @@ fn a_call_that_cannot_be_framed_fails_and_a_stray_reply_is_handed_back() {
     ));
     let error = runtime.block_on(async move {
         let call = calls.submitted().await.unwrap();
-        let envelope = calls.issue(call);
+        let envelope = calls.issue(call).unwrap();
         let id = envelope.id.unwrap();
         // A reply naming no pending call comes back untouched.
         let stray = Envelope::new(CorrelationId(id.get() + 1), MessageType::Result, Wire::Nil);

@@ -23,10 +23,10 @@ fn question(capabilities: &Capabilities, name: &str) -> Question {
 
 #[test]
 fn a_blanket_granted_function_may_be_called_without_asking() {
-    assert_eq!(
+    assert!(matches!(
         session().check_call("getOrder", span()),
         Ok(Decision::Allowed)
-    );
+    ));
 }
 
 #[test]
@@ -132,8 +132,8 @@ fn a_name_listed_twice_is_blanket_granted_only_if_every_listing_grants_it() {
             "{listed:?}: {decision:?}"
         );
     }
-    assert_eq!(
+    assert!(matches!(
         Capabilities::registered([("f", true), ("f", true)]).check_call("f", span()),
         Ok(Decision::Allowed)
-    );
+    ));
 }

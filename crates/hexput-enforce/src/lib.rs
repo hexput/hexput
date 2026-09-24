@@ -76,7 +76,7 @@ impl Reason {
 }
 
 /// Whether a host call that was not refused outright may go ahead.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 #[must_use]
 pub enum Decision {
     /// The call may go ahead at once: its function holds a blanket grant.
@@ -88,7 +88,8 @@ pub enum Decision {
 
 /// A host call waiting for the Backend's per-call handler. Obtained only from
 /// [`Capabilities::check_call`], and consumed by [`Question::decide`]: one question, one decision.
-#[derive(Debug, Clone, PartialEq)]
+/// Neither `Clone` nor comparable, so one question can never be decided twice.
+#[derive(Debug)]
 #[must_use]
 pub struct Question {
     name: String,

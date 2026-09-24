@@ -209,7 +209,15 @@ impl Calls {
     /// Give `call` the next Daemon-issued id, record it as pending, and return the envelope to
     /// write: a `Call`, or an `Authorize` for a question, either with the payload
     /// `{name, arguments}`.
-    pub fn issue(&mut self, call: Call) -> Envelope<Value> {
+    ///
+    /// `None` when its execution already stopped waiting — a question whose timeout elapsed while
+    /// it was still queued: nothing is written and nothing is left pending, so the Backend is
+    /// never asked about a call the Script already failed on.
+    pub fn issue(&mut self, call: Call) -> Option<Envelope<Value>> {
+        if call.reply.is_closed() {
+            tracing::debug!(name = %call.name, "dropped a request nobody waits for any more");
+            return None;
+        }
         let id = CorrelationId(self.next);
         self.next = self.next.wrapping_add(1);
         self.pending.insert(id, call.reply);
@@ -217,20 +225,21 @@ impl Calls {
             Request::Call => MessageType::Call,
             Request::Authorize => MessageType::Authorize,
         };
-        Envelope::new(
+        Some(Envelope::new(
             id,
             message_type,
             Value::Map(vec![
                 (Value::from(NAME), Value::from(call.name)),
                 (Value::from(ARGUMENTS), Value::Array(call.arguments)),
             ]),
-        )
+        ))
     }
 
     /// Route a Backend message to the pending call (or question) it answers: a `Result` or
     /// `Error` whose id names one written and not yet answered. When its execution stopped
-    /// waiting (a question that timed out), the answer is consumed and dropped. Anything else — another message type, no id, an
-    /// id no call is pending on — is handed back untouched for the caller to answer.
+    /// waiting (a question that timed out), the answer is consumed and dropped. Anything else —
+    /// another message type, no id, an id nothing is pending on — is handed back untouched for
+    /// the caller to answer.
     ///
     /// # Errors
     /// The message itself, when it answers no pending call.
@@ -241,15 +250,21 @@ impl Calls {
         ) {
             return Err(message);
         }
-        let Some(reply) = message.id.and_then(|id| self.pending.remove(&id)) else {
+        let Some((id, reply)) = message
+            .id
+            .and_then(|id| self.pending.remove(&id).map(|reply| (id, reply)))
+        else {
             return Err(message);
         };
         let outcome = match message.message_type {
             MessageType::Result => value_of(message.payload),
             _ => Err(CallFailure::Failed(message_of(&message.payload))),
         };
-        // The execution may be gone already (its connection abandoned it); nothing to tell.
-        let _ = reply.send(outcome);
+        // The execution may be gone already — a question it stopped waiting for, or a connection
+        // that abandoned it. The answer is still routed, never a stray reply; it reaches no one.
+        if reply.send(outcome).is_err() {
+            tracing::debug!(id = id.get(), "dropped an answer nobody waits for");
+        }
         Ok(())
     }
 
@@ -260,8 +275,9 @@ impl Calls {
         }
     }
 
-    /// No reply can arrive any more: fail every pending call and every submitted one with
-    /// [`CallFailure::NoReply`], and every later [`Caller::dispatch_authorized`] at once.
+    /// No reply can arrive any more: fail every pending call and question and every submitted
+    /// one with [`CallFailure::NoReply`], and every later [`Caller::dispatch_authorized`] and
+    /// [`Caller::ask_authorization`] at once.
     pub fn close(&mut self) {
         self.queue.close();
         // Dropping a call's sender is its `NoReply`.
@@ -269,7 +285,7 @@ impl Calls {
         self.pending.clear();
     }
 
-    /// How many calls are written and waiting for the Backend.
+    /// How many calls and questions are written and waiting for the Backend.
     #[must_use]
     pub fn pending(&self) -> usize {
         self.pending.len()

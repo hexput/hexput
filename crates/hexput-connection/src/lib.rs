@@ -312,7 +312,11 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                 (reply, span)
             }
             Event::Call(call) => {
-                let call = calls.issue(call);
+                // Nothing to write when its execution already stopped waiting (a question that
+                // timed out while queued).
+                let Some(call) = connection.span.in_scope(|| calls.issue(call)) else {
+                    continue;
+                };
                 if !send_call(&mut outbound, &mut calls, call)
                     .instrument(connection.span.clone())
                     .await

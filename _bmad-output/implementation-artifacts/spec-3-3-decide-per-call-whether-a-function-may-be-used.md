@@ -21,6 +21,10 @@ context:
 
 **Always:** The decision stays in `hexput-enforce` and is driven only by `hexput-exec` (AD-3); the question travels through `hexput-rpc`'s correlation and the connection's single writer, and waiting for its answer holds no thread and no lock (AD-6). Blanket-granted calls still send exactly one `Call` and no question (Story 3.2). A denial is never catchable — it ends the Script like every error (LANGUAGE-REFERENCE §7 wins over the story's "catchable"). The Script's error is identical for every denial reason and for an unregistered name; the Daemon logs each denial at `debug` with `function` and a distinct `reason` (`refused`, `handler_invalid`, `handler_failed`, `handler_timeout`, `handler_no_reply`, `unregistered`). The new message type joins `RESTRICTED_NAMES` like `MessageType::Call`.
 
+**Decisions (2026-09-24, Erdem):**
+1. *How the Daemon asks* — a separate message before the call: `MessageType::Authorize` with payload `{name, arguments}` under a Daemon-issued id (the same per-connection counter as `Call`), answered `Result {value: <bool>}` or `Error`. Only `value: true` proceeds, and the Daemon then sends the ordinary `Call`: two round trips, the guard kept apart from the implementation (FR-6).
+2. *Timeout* — a documented constant, `AUTHORIZATION_TIMEOUT` = 5 seconds, which Story 3.7 later makes the default of a Config value. An answer arriving after it is dropped (routed to no one).
+
 **Never:** No Config keys or per-execution override for the timeout (Story 3.7), no budget counting (Story 3.6), no grant change after init, no caching of a handler's answer across calls, no `unsafe`.
 
 ## I/O & Edge-Case Matrix
@@ -38,14 +42,9 @@ context:
 
 </frozen-after-approval>
 
-## Open Questions
-
-1. **How the Daemon asks** — options: (A, recommended) a separate message before the call: `Authorize {name, arguments}` under a Daemon-issued id, answered `Result {value: <bool>}` or `Error`; on `true` the Daemon then sends the ordinary `Call` — two round trips, the guard kept apart from the implementation exactly as FR-6 separates registration from call handling / (B) one round trip: the `Call` itself carries `authorize: true` and the Backend's reply is either the value or a distinct denial — cheaper, but the guard and the implementation become one Backend step, and "handler said no" needs a new reply shape.
-2. **How long "never answers" waits** — options: (A, recommended) a documented constant of 5 seconds (`AUTHORIZATION_TIMEOUT`), which Story 3.7 later makes the default of a Config value / (B) another value you name / (C) no timeout until Story 3.7 — a silent Backend then pins the execution until the connection closes, and the matrix's "No answer" row would wait for 3.7.
-
 ## Code Map
 
-- `crates/hexput-shared/src/wire.rs` -- `MessageType` gains the question's variant (per Q1); `ALL`/`as_str` updated.
+- `crates/hexput-shared/src/wire.rs` -- `MessageType` gains `Authorize`; `ALL`/`as_str` updated.
 - `crates/hexput-enforce/src/lib.rs` -- `check_call` becomes three-way: allowed (blanket), ask the handler (registered, no blanket — replaces 3.2's interim `Reason::NotGranted`, which `#[non_exhaustive]` anticipated), refused (unregistered); a helper turns a handler outcome into allow or a `Refusal` with its reason, same diagnostic for all.
 - `crates/hexput-rpc/src/lib.rs` -- `Calls::issue` builds either envelope; the pending table routes the answer back; `Caller` gains the question alongside `dispatch_authorized` (the question sends nothing that runs host code, but it too is only for `hexput-exec`).
 - `crates/hexput-exec/src/lib.rs` -- `execute`'s loop: on "ask", await the answer under `tokio::time::timeout`, classify it, then dispatch or refuse; the refusal log already lives in this loop (Story 3.2).

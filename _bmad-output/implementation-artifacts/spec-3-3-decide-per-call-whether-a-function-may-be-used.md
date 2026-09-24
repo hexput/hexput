@@ -2,7 +2,8 @@
 title: 'Story 3.3: Decide per call whether a function may be used'
 type: 'feature'
 created: '2026-09-24'
-status: 'ready-for-dev'
+status: 'in-progress'
+baseline_commit: 'c886f12eec35a84807460d20273cfeddf8cffeb8'
 route: 'dispatch'
 review_loop_iteration: 0
 context:

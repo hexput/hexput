@@ -2,7 +2,7 @@
 title: 'Story 3.5: Stop an execution that burns too much CPU or memory'
 type: 'feature'
 created: '2026-09-24'
-status: 'draft'
+status: 'ready-for-dev'
 route: 'dispatch'
 review_loop_iteration: 0
 context:

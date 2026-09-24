@@ -2,7 +2,8 @@
 title: 'Story 3.5: Stop an execution that burns too much CPU or memory'
 type: 'feature'
 created: '2026-09-24'
-status: 'ready-for-dev'
+status: 'in-progress'
+baseline_commit: '7d160d51a159e91cc7e0b18f6b1deeda52c5b3ad'
 route: 'dispatch'
 review_loop_iteration: 0
 context:

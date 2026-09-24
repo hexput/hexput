@@ -2,7 +2,8 @@
 title: 'Story 3.1: Call a registered host function from a script'
 type: 'feature'
 created: '2026-09-24'
-status: 'ready-for-dev'
+status: 'in-progress'
+baseline_commit: '5779a10024530d838b449bb3bb5e3d82d433f4b1'
 route: 'dispatch'
 review_loop_iteration: 0
 context:
@@ -76,6 +77,8 @@ context:
 - Given any Daemon execution path, when traced, then it reaches the interpreter only through `hexput_exec::execute`.
 
 ## Implementation Notes
+
+- Planning-side amendments already landed in the 2026-09-24 course correction: the Spine's `conn --> rpc` edge and wire-contract amendments, LANGUAGE-REFERENCE §7 (`host`, `depth.argument_too_deep`) and §8, and AGENTS.md's summary. Code-side, `scripts/check-crate-graph.py` and AGENTS.md's Project Status still need this story's updates. LANGUAGE-REFERENCE §3/§8 also describe Value Secrets, Reference IDs, methods and modifications — those are Stories 3.11–3.13, out of scope here (decision 4).
 
 ## Spec Change Log
 

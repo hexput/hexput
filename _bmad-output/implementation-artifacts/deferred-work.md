@@ -226,3 +226,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-2-grant-a-function-blanket-access-at-registration.md`
   summary: AGENTS.md's Epic 3 status sentence says "Stories 3.1 and 3.2 are implemented (host calls; it supersedes …)" — "it" and "host calls" no longer fit two stories, and the paragraph carries rename history ("renamed from `call`") instead of only current names.
   evidence: Review finding (blind layer, low); routed to defer because the fix edits an agent-context file. Tidy at the next AGENTS.md status update.
+
+- source_spec: `spec-3-3-decide-per-call-whether-a-function-may-be-used.md`
+  summary: A per-call question that times out stays in its connection's `Calls.pending` table until an answer arrives or the connection closes, so a Backend whose handler stays silent grows that table by one entry per denied call for the connection's life.
+  evidence: Review finding (blind, edge-case and verification-gap layers, medium). Kept on purpose so a late answer is dropped rather than answered as a stray reply (matrix row "No answer"). Self-inflicted and confined to the silent Backend's own connection. Settle with Story 3.6's RPC-call budget (bounds questions per execution) plus a bounded tombstone set, or an expiry sweep that remembers only recently timed-out ids.

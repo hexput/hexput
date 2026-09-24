@@ -79,6 +79,24 @@ context:
 
 ## Review Triage Log
 
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | blind | `Authorize` (and `Call`) carry only `{name, arguments}`; a Backend with several executions in flight on one connection cannot tell which execution a question belongs to, though the story's point is "who the Script acts for" | medium | Real: the payload names no execution. Fix changes frozen decision 1's payload → **intent_gap**, surfaced to Erdem; code kept because the fix is additive (an optional field), not a re-derivation |
+| 2 | blind + edge-case + verification-gap | A timed-out question's entry stays in `Calls.pending` until an answer or close; a silent handler grows its own connection's table | medium | Real, self-inflicted by the Backend and confined to its connection; removing entries early turns late answers into stray replies, which the matrix rules out. **defer** (bound with Story 3.6's RPC budget / a tombstone scheme) |
+| 3 | edge-case | A question whose timeout elapses while still queued is written anyway, asking the Backend about a call the Script already failed on | low | Real; direct fix. **patch**: `Calls::issue`/the loop skips a call whose reply receiver is gone |
+| 4 | blind + edge-case | `Question` derives `Clone`, contradicting "one question, one decision" | low | Real; direct. **patch**: drop `Clone`/`PartialEq` from `Question` (and `Decision` if needed) |
+| 5 | blind + verification-gap | `Calls::close`/`pending()` docs name only `dispatch_authorized`/"calls" | low | Real; direct. **patch** |
+| 6 | blind + verification-gap | `Calls::complete` doc line ~128 columns | low | Real; direct. **patch** (reflow) |
+| 7 | blind | `epics.md` Story 3.3 still requires a "catchable" denial | low | Real; LANGUAGE-REFERENCE wins but the epic carries no note. **patch**: dated note on that criterion |
+| 8 | verification-gap + blind | An unframable `Authorize` (`CallFailure::Unsendable`) → `handler_failed` is untested | low | Pre-verified gap; cheap test. **patch** (test) |
+| 9 | blind | "Not cached" tests answer `true` twice, proving nothing | low | Real; direct. **patch**: answer `true` then `false`, expect the second call denied |
+| 10 | blind | A late answer is dropped with no log | low | Real; direct. **patch**: `debug` event when a routed answer finds its receiver gone |
+| 11 | blind | The Spine amendment for `Authorize` is appended inside the FR-27/FR-28 paragraph | low | Real; direct. **patch**: its own paragraph |
+| 12 | blind | The 5 s timeout also counts queueing before the question is written | low | Real but the writer queue is normally immediate; fix needs a written-notification. Rejected |
+| 13 | blind + edge-case | A runtime without timers panics inside `tokio::time::timeout` | low | The Daemon's runtime always enables timers; documented on `execute`/`direct_execution`. Rejected |
+| 14 | blind | The two timeout tests each wait a real 5 s | low | Real; fix needs tokio `test-util` pinned workspace-wide. Rejected |
+| 15 | blind | Status spellings disagree | false | Step 5 sets `review` |
+
 ## Verification
 
 **Commands:**

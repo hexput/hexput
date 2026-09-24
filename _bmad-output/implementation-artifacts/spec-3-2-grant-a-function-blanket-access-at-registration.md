@@ -2,7 +2,8 @@
 title: 'Story 3.2: Grant a function blanket access at registration'
 type: 'feature'
 created: '2026-09-24'
-status: 'ready-for-dev'
+status: 'in-progress'
+baseline_commit: 'f2101288401c64f817488f0fcd2dad0cb56a7f46'
 route: 'dispatch'
 review_loop_iteration: 0
 context:

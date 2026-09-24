@@ -83,10 +83,14 @@ pub enum Category {
     Arity,
     /// Division by zero, non-finite result. Detected at runtime.
     Arithmetic,
-    /// Call-depth limit exceeded. Detected at runtime.
+    /// Call-depth limit exceeded, or a host call's argument nested past the argument depth.
+    /// Detected at runtime.
     Depth,
     /// Call to an unregistered or denied Registered Function. Detected at runtime.
     Capability,
+    /// The Backend answered a host call with an error or a malformed reply, or the connection
+    /// ended before it answered (§7, §8). Detected at runtime.
+    Host,
     /// A Resource Budget dimension exceeded. Detected at runtime.
     Budget,
     /// A disabled language construct was used. Detected at parse time or runtime.
@@ -106,6 +110,7 @@ impl Category {
             Self::Arithmetic => "arithmetic",
             Self::Depth => "depth",
             Self::Capability => "capability",
+            Self::Host => "host",
             Self::Budget => "budget",
             Self::Policy => "policy",
         }
@@ -222,6 +227,25 @@ impl Code {
     /// a collection *nested* inside it is fine. Category `reference`.
     pub const COLLECTION_MUTATED: Self = Self::new("reference.collection_mutated");
 
+    // --- host calls (Story 3.1) ---
+
+    /// A host call's argument is a function, or contains one (`getOrder(fn() {})`). Arguments
+    /// travel to the Backend as data, and a function has no wire representation (§8). Spanned on
+    /// that argument. Category `type`.
+    pub const FUNCTION_ARGUMENT: Self = Self::new("type.function_argument");
+    /// A host call's argument contains a value referring back to itself, so it has no finite
+    /// form to send (§8). Spanned on that argument. Category `type`.
+    pub const CYCLIC_ARGUMENT: Self = Self::new("type.cyclic_argument");
+    /// A host call's argument nests deeper than the argument depth limit (§8; 12 by default).
+    /// Spanned on that argument; nothing is sent. Category `depth`.
+    pub const ARGUMENT_TOO_DEEP: Self = Self::new("depth.argument_too_deep");
+    /// The Backend answered a host call with an `Error`, or with a reply that is not a valid
+    /// `{value}` — or the call could not be sent at all. Spanned on the call. Category `host`.
+    pub const FUNCTION_FAILED: Self = Self::new("host.function_failed");
+    /// The connection ended before the Backend answered a host call. Spanned on the call.
+    /// Category `host`.
+    pub const NO_REPLY: Self = Self::new("host.no_reply");
+
     // --- static-check findings (Story 1.10) ---
 
     /// Code after a `return`, `break` or `continue` in the same block can never run. A
@@ -235,6 +259,9 @@ impl Code {
     /// caller supplied — a typo'd host call, caught before it becomes a runtime `capability`
     /// failure. Raised only when a callable-name list was supplied at all. Category
     /// `capability`.
+    ///
+    /// Also the runtime failure itself (Story 3.1): a host call to a name the Session did not
+    /// register, or any host call where there is no host (`hexput eval`).
     pub const UNKNOWN_FUNCTION: Self = Self::new("capability.unknown_function");
     /// A language construct the active policy disables (FR-3), named by its toggle. Category
     /// `policy`.
@@ -271,6 +298,11 @@ impl Code {
         Self::ARGUMENT_COUNT,
         Self::CALL_DEPTH_EXCEEDED,
         Self::COLLECTION_MUTATED,
+        Self::FUNCTION_ARGUMENT,
+        Self::CYCLIC_ARGUMENT,
+        Self::ARGUMENT_TOO_DEEP,
+        Self::FUNCTION_FAILED,
+        Self::NO_REPLY,
         Self::UNREACHABLE_CODE,
         Self::UNUSED_VARIABLE,
         Self::UNKNOWN_FUNCTION,

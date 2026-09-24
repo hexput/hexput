@@ -66,6 +66,25 @@ fn runtime_codes_are_stable_and_distinct() {
 }
 
 #[test]
+fn host_call_codes_are_stable_and_distinct() {
+    use hexput_shared::diagnostics::{Category, Code};
+    let codes = [
+        (Code::FUNCTION_ARGUMENT, "type.function_argument"),
+        (Code::CYCLIC_ARGUMENT, "type.cyclic_argument"),
+        (Code::ARGUMENT_TOO_DEEP, "depth.argument_too_deep"),
+        (Code::FUNCTION_FAILED, "host.function_failed"),
+        (Code::NO_REPLY, "host.no_reply"),
+    ];
+    for (i, (code, text)) in codes.iter().enumerate() {
+        assert_eq!(code.as_str(), *text);
+        for (other, _) in &codes[i + 1..] {
+            assert_ne!(code, other);
+        }
+    }
+    assert_eq!(Category::Host.as_str(), "host");
+}
+
+#[test]
 fn finding_codes_are_stable_and_distinct() {
     use hexput_shared::diagnostics::Code;
     let codes = [
@@ -121,6 +140,11 @@ fn every_code_is_enumerated_exactly_once() {
         "arity.argument_count",
         "depth.call_depth_exceeded",
         "reference.collection_mutated",
+        "type.function_argument",
+        "type.cyclic_argument",
+        "depth.argument_too_deep",
+        "host.function_failed",
+        "host.no_reply",
         "syntax.unreachable_code",
         "reference.unused_variable",
         "capability.unknown_function",
@@ -150,6 +174,7 @@ fn every_code_is_enumerated_exactly_once() {
         "arithmetic",
         "depth",
         "capability",
+        "host",
         "budget",
         "policy",
     ];
@@ -219,7 +244,10 @@ fn client_id_serializes_as_a_string() {
 fn message_types_spell_pascal_case_and_parse_exactly() {
     use hexput_shared::wire::MessageType;
     let spellings: Vec<_> = MessageType::ALL.iter().map(|t| t.as_str()).collect();
-    assert_eq!(spellings, ["Init", "ExecutionStart", "Result", "Error"]);
+    assert_eq!(
+        spellings,
+        ["Init", "ExecutionStart", "Result", "Call", "Error"]
+    );
     for t in MessageType::ALL {
         assert_eq!(t.as_str().parse::<MessageType>().unwrap(), *t);
         assert_eq!(t.to_string(), t.as_str());

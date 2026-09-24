@@ -1036,3 +1036,389 @@ fn at_a_quiet_level_a_warning_keeps_its_span_fields() {
         }
     }
 }
+
+// --- Story 3.1: host calls on the connection ---
+
+/// A Port wired to the test: it reads what the test sends and hands the test everything written.
+/// Dropping the test's sender is the peer closing. With `refuse_calls`, every `Call` fails to
+/// write as unframable, as a too-large frame would.
+struct Wired {
+    from_test: tokio::sync::mpsc::UnboundedReceiver<Received>,
+    to_test: tokio::sync::mpsc::UnboundedSender<Envelope<Value>>,
+    refuse_calls: bool,
+}
+struct WiredIn(tokio::sync::mpsc::UnboundedReceiver<Received>);
+struct WiredOut(tokio::sync::mpsc::UnboundedSender<Envelope<Value>>, bool);
+
+impl Port for Wired {
+    type Inbound = WiredIn;
+    type Outbound = WiredOut;
+
+    fn split(self) -> (WiredIn, WiredOut) {
+        (
+            WiredIn(self.from_test),
+            WiredOut(self.to_test, self.refuse_calls),
+        )
+    }
+}
+
+impl Inbound for WiredIn {
+    async fn recv(&mut self) -> Received {
+        // `mpsc::UnboundedReceiver::recv` is cancel-safe, as the trait requires.
+        self.0.recv().await.unwrap_or(Received::Closed(None))
+    }
+}
+
+impl Outbound for WiredOut {
+    async fn send(&mut self, envelope: Envelope<Value>) -> io::Result<()> {
+        if self.1 && envelope.message_type == MessageType::Call {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        // The test may have stopped listening; the write still "succeeds", as a socket would.
+        let _ = self.0.send(envelope);
+        Ok(())
+    }
+}
+
+/// The test's side of a [`Wired`] connection: a stand-in Backend.
+struct Backend {
+    to_daemon: Option<tokio::sync::mpsc::UnboundedSender<Received>>,
+    from_daemon: tokio::sync::mpsc::UnboundedReceiver<Envelope<Value>>,
+}
+
+impl Backend {
+    fn send(&self, received: Received) {
+        self.to_daemon
+            .as_ref()
+            .expect("still connected")
+            .send(received)
+            .unwrap();
+    }
+
+    fn reply(&self, id: CorrelationId, message_type: MessageType, payload: Value) {
+        self.send(Received::Message(Envelope::new(id, message_type, payload)));
+    }
+
+    /// The next envelope the Daemon writes.
+    async fn next(&mut self) -> Envelope<Value> {
+        tokio::time::timeout(Duration::from_secs(10), self.from_daemon.recv())
+            .await
+            .expect("the Daemon wrote nothing within 10s")
+            .expect("the connection is still open")
+    }
+
+    /// The next envelope, which must be a `Call`: its id, name and arguments.
+    async fn call(&mut self) -> (CorrelationId, String, Vec<Value>) {
+        let call = self.next().await;
+        assert_eq!(call.message_type, MessageType::Call, "{call:?}");
+        let Value::Map(fields) = call.payload else {
+            panic!("a Call payload is a map");
+        };
+        assert_eq!(
+            fields.len(),
+            2,
+            "exactly `name` and `arguments`: {fields:?}"
+        );
+        assert_eq!(fields[0].0.as_str(), Some("name"));
+        assert_eq!(fields[1].0.as_str(), Some("arguments"));
+        let name = fields[0].1.as_str().expect("a string name").to_owned();
+        let Value::Array(arguments) = fields[1].1.clone() else {
+            panic!("`arguments` is an array");
+        };
+        (call.id.expect("a Call has an id"), name, arguments)
+    }
+
+    /// The peer closes the connection.
+    fn close(&mut self) {
+        self.to_daemon = None;
+    }
+}
+
+/// Serve one wired connection on `runtime` while `drive` plays the Backend. `drive` gets the
+/// Client ID's init reply already read; `registered` is what the init registered.
+fn hosted<F, Fut>(
+    runtime: &tokio::runtime::Runtime,
+    registered: &[&str],
+    refuse_calls: bool,
+    drive: F,
+) -> Arc<Sessions>
+where
+    F: FnOnce(Backend) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (to_daemon, from_test) = tokio::sync::mpsc::unbounded_channel();
+    let (to_test, from_daemon) = tokio::sync::mpsc::unbounded_channel();
+    let port = Wired {
+        from_test,
+        to_test,
+        refuse_calls,
+    };
+    let sessions = Arc::new(Sessions::new());
+    let dispatch = discarding_dispatch();
+    let registry = Arc::clone(&sessions);
+    let init_payload = init_payload(registered);
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let serving = tokio::spawn(hexput_connection::serve(port, registry));
+            let mut backend = Backend {
+                to_daemon: Some(to_daemon),
+                from_daemon,
+            };
+            backend.reply(CorrelationId(0), MessageType::Init, init_payload);
+            let reply = backend.next().await;
+            client_id_of(&reply);
+            drive(backend).await;
+            tokio::time::timeout(Duration::from_secs(10), serving)
+                .await
+                .expect("serve returned once the Backend left")
+                .unwrap();
+        });
+    });
+    sessions
+}
+
+fn wired_runtime() -> tokio::runtime::Runtime {
+    let dispatch = discarding_dispatch();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .on_thread_start(move || {
+            std::mem::forget(tracing::dispatcher::set_default(&dispatch));
+        })
+        .build()
+        .unwrap()
+}
+
+fn value_of(response: &Envelope<Value>) -> Value {
+    assert_eq!(
+        response.message_type,
+        MessageType::Result,
+        "{:?}",
+        response.payload
+    );
+    let Value::Map(fields) = &response.payload else {
+        panic!("a Result payload is a map");
+    };
+    assert_eq!(fields.len(), 1, "exactly `value`");
+    fields[0].1.clone()
+}
+
+#[test]
+fn a_host_call_round_trips_and_the_script_resumes_with_the_backend_value() {
+    let sessions = hosted(
+        &wired_runtime(),
+        &["getOrder"],
+        false,
+        |mut backend| async move {
+            // The Backend's own ids and the Daemon's call ids are separate spaces: this execution's
+            // id is the same number as the Daemon's first call id, and nothing is confused.
+            backend.send(execution(0, "return getOrder(7).total;"));
+            let (id, name, arguments) = backend.call().await;
+            assert_eq!(id, CorrelationId(0));
+            assert_eq!(name, "getOrder");
+            assert_eq!(arguments, [Value::from(7)]);
+            backend.reply(
+                id,
+                MessageType::Result,
+                Value::Map(vec![(
+                    string("value"),
+                    Value::Map(vec![(string("total"), Value::from(3))]),
+                )]),
+            );
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(0)));
+            assert_eq!(value_of(&reply), Value::from(3));
+            backend.close();
+        },
+    );
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_backend_error_fails_only_its_script() {
+    hosted(
+        &wired_runtime(),
+        &["getOrder"],
+        false,
+        |mut backend| async move {
+            backend.send(execution(1, "let x = 7;\nreturn getOrder(x);"));
+            let (id, _, _) = backend.call().await;
+            backend.reply(
+                id,
+                MessageType::Error,
+                Value::Map(vec![(string("message"), string("no such order"))]),
+            );
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "host.function_failed");
+            assert!(message_of(&reply).contains("no such order"));
+            // The connection, and the next execution, are unaffected.
+            backend.send(execution(2, "return 2;"));
+            let reply = backend.next().await;
+            assert_eq!(value_of(&reply), Value::from(2));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn an_unregistered_or_shadowed_call_sends_nothing() {
+    hosted(
+        &wired_runtime(),
+        &["getOrder"],
+        false,
+        |mut backend| async move {
+            backend.send(execution(1, "return nope(1);"));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "capability.unknown_function");
+            backend.send(execution(
+                2,
+                "fn getOrder(x) { return x; }; return getOrder(1);",
+            ));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(value_of(&reply), Value::from(1));
+            backend.send(execution(3, "return getOrder(fn() {});"));
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "type.function_argument");
+            backend.close();
+            // Nothing else was written: no `Call` at any point.
+            assert!(backend.from_daemon.recv().await.is_none());
+        },
+    );
+}
+
+#[test]
+fn concurrent_calls_are_routed_by_id_whatever_order_the_replies_come_in() {
+    hosted(
+        &wired_runtime(),
+        &["echo"],
+        false,
+        |mut backend| async move {
+            backend.send(execution(10, "return echo(\"first\");"));
+            let first = backend.call().await;
+            backend.send(execution(20, "return echo(\"second\");"));
+            let second = backend.call().await;
+            assert_ne!(first.0, second.0, "each call has its own id");
+            // Answer the later call first.
+            for (id, _, arguments) in [second, first] {
+                backend.reply(
+                    id,
+                    MessageType::Result,
+                    Value::Map(vec![(string("value"), arguments[0].clone())]),
+                );
+            }
+            let mut replies = [backend.next().await, backend.next().await];
+            replies.sort_by_key(|r| r.id.unwrap().get());
+            assert_eq!(value_of(&replies[0]), string("first"));
+            assert_eq!(value_of(&replies[1]), string("second"));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_peer_that_closes_mid_call_fails_the_call_with_no_reply_and_is_answered_then_detached() {
+    let sessions = hosted(
+        &wired_runtime(),
+        &["getOrder"],
+        false,
+        |mut backend| async move {
+            backend.send(execution(5, "return getOrder(1);"));
+            let _ = backend.call().await;
+            backend.close();
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(5)));
+            assert_eq!(code_of(&reply), "host.no_reply");
+        },
+    );
+    assert!(sessions.is_empty(), "the connection detached");
+}
+
+#[test]
+fn a_stray_reply_after_init_is_an_unexpected_message() {
+    hosted(
+        &wired_runtime(),
+        &["getOrder"],
+        false,
+        |mut backend| async move {
+            backend.reply(CorrelationId(42), MessageType::Result, Value::Nil);
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(42)));
+            assert_eq!(code_of(&reply), "protocol.unexpected_message");
+            // A reply to a call already answered is stray too.
+            backend.send(execution(1, "return getOrder(1);"));
+            let (id, _, _) = backend.call().await;
+            let answer = Value::Map(vec![(string("value"), Value::from(1))]);
+            backend.reply(id, MessageType::Result, answer.clone());
+            assert_eq!(value_of(&backend.next().await), Value::from(1));
+            backend.reply(id, MessageType::Result, answer);
+            assert_eq!(
+                code_of(&backend.next().await),
+                "protocol.unexpected_message"
+            );
+            // And a Backend never sends a `Call` of its own.
+            backend.reply(CorrelationId(7), MessageType::Call, Value::Nil);
+            assert_eq!(
+                code_of(&backend.next().await),
+                "protocol.unexpected_message"
+            );
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_call_that_cannot_be_framed_fails_only_its_script() {
+    hosted(
+        &wired_runtime(),
+        &["getOrder"],
+        true,
+        |mut backend| async move {
+            backend.send(execution(1, "return getOrder(1);"));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "host.function_failed");
+            backend.send(execution(2, "return 2;"));
+            assert_eq!(value_of(&backend.next().await), Value::from(2));
+            backend.close();
+        },
+    );
+}
+
+/// The acceptance criterion: an execution waiting on a reply holds no blocking-pool thread. With
+/// a pool of exactly one thread, a second execution can only finish while the first waits if the
+/// first holds none.
+#[test]
+fn an_execution_waiting_on_a_reply_holds_no_thread_and_another_completes_meanwhile() {
+    let dispatch = discarding_dispatch();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .on_thread_start(move || {
+            std::mem::forget(tracing::dispatcher::set_default(&dispatch));
+        })
+        .build()
+        .unwrap();
+    hosted(&runtime, &["getOrder"], false, |mut backend| async move {
+        backend.send(execution(1, "return getOrder(1) + 1;"));
+        let (id, _, _) = backend.call().await;
+        // The call is outstanding; a second execution runs to completion meanwhile.
+        backend.send(execution(
+            2,
+            "let i = 0; while (i < 1000) { i = i + 1; }; return i;",
+        ));
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&reply), Value::from(1000));
+        backend.reply(
+            id,
+            MessageType::Result,
+            Value::Map(vec![(string("value"), Value::from(41))]),
+        );
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(1)));
+        assert_eq!(value_of(&reply), Value::from(42));
+        backend.close();
+    });
+}

@@ -274,6 +274,14 @@ fn reading_a_name_nobody_supplied_is_the_interpreters_own_reference_error() {
         .reported("reference.undeclared_identifier");
 }
 
+#[test]
+fn a_host_call_has_no_host_under_eval_and_is_a_capability_error() {
+    // Story 3.1: a call to an undeclared name is a host call; `hexput eval` has no host.
+    eval("return getOrder(1);")
+        .exit(1)
+        .reported("capability.unknown_function");
+}
+
 // --- starting variables ---
 
 #[test]

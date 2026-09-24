@@ -1,18 +1,20 @@
-//! Hexput values to and from the wire's MessagePack values.
+//! Hexput values to and from the wire's MessagePack values — for every value that crosses the
+//! boundary: a starting variable and a Script result (Story 2.6), a host call's arguments and the
+//! Backend's reply (Story 3.1). Moved here from `hexput-script` in Story 3.1, because the Executor
+//! converts a host call's values itself; Direct Execution uses the same functions from here.
 //!
-//! Inbound, a starting variable's value becomes a Hexput value **losslessly or not at all**:
-//! every MessagePack shape with no exact Hexput counterpart is refused with the path to it, never
-//! rounded, truncated or dropped. Outbound, a Script result is walked iteratively first, so a
-//! result the Daemon could not send — nested past what its own decoder accepts, or certain to
-//! exceed a frame — is refused before the recursive conversion and the recursive encoder ever see
-//! it.
+//! Inbound, a wire value becomes a Hexput value **losslessly or not at all**: every MessagePack
+//! shape with no exact Hexput counterpart is refused with the path to it, never rounded, truncated
+//! or dropped. Outbound, a value is walked iteratively first ([`measure`]), so one the Daemon could
+//! not send — nested past a limit, or certain to exceed a frame — is refused before the recursive
+//! conversion and the recursive encoder ever see it.
 
 use core::fmt::Write as _;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use hexput_interpreter::{Array, Object, Value as Hexput};
-use hexput_port::{MAX_FRAME_LEN, MAX_NESTING_DEPTH, ProtocolCode, ProtocolError, Value as Wire};
+use hexput_rpc::{MAX_FRAME_LEN, MAX_NESTING_DEPTH, Value as Wire};
 
 /// The deepest container nesting a Script result may have. The Daemon's decoder accepts
 /// [`MAX_NESTING_DEPTH`] levels per frame and the envelope map and the `{value}` payload map take
@@ -36,22 +38,34 @@ enum Segment<'a> {
     Index(usize),
 }
 
-/// Where a value sits inside the `ExecutionStart` payload, rendered only on failure.
-pub(crate) struct Path<'a> {
+/// Where a value sits inside the payload it arrived in, rendered only on failure.
+pub struct Path<'a> {
+    root: &'static str,
     segments: Vec<Segment<'a>>,
 }
 
 impl<'a> Path<'a> {
     /// The path of one starting variable, `variables.<name>`.
-    pub(crate) fn variable(name: &'a str) -> Self {
+    #[must_use]
+    pub fn variable(name: &'a str) -> Self {
         Self {
+            root: "variables",
             segments: vec![Segment::Key(name)],
+        }
+    }
+
+    /// The path of a host call's reply value, `value`.
+    #[must_use]
+    pub const fn reply() -> Self {
+        Self {
+            root: "value",
+            segments: Vec::new(),
         }
     }
 
     /// `variables.user.tags[2]`, with non-identifier keys quoted and every part bounded.
     fn render(&self) -> String {
-        let mut out = String::from("`variables");
+        let mut out = format!("`{}", self.root);
         for segment in &self.segments {
             match segment {
                 Segment::Key(key) if is_plain_key(key) => {
@@ -83,7 +97,8 @@ fn is_plain_key(key: &str) -> bool {
 }
 
 /// `text` cut to [`SEGMENT_LIMIT`] characters, with an ellipsis when anything was cut.
-pub(crate) fn bounded(text: &str) -> String {
+#[must_use]
+pub fn bounded(text: &str) -> String {
     bounded_to(text, SEGMENT_LIMIT)
 }
 
@@ -94,16 +109,15 @@ fn bounded_to(text: &str, limit: usize) -> String {
     }
 }
 
-/// Convert one starting variable's wire value into a Hexput value.
+/// Convert a wire value — a starting variable's, or a host call's reply — into a Hexput value.
 ///
 /// Recursive, and bounded: a payload the Daemon decoded is at most [`MAX_NESTING_DEPTH`] levels
 /// deep, and a value handed in directly deeper than that is refused rather than followed.
 ///
 /// # Errors
 ///
-/// The message for `protocol.invalid_payload`, naming the path to the first value with no
-/// lossless Hexput representation.
-pub(crate) fn to_hexput<'a>(value: &'a Wire, path: &mut Path<'a>) -> Result<Hexput, String> {
+/// A message naming the path to the first value with no lossless Hexput representation.
+pub fn to_hexput<'a>(value: &'a Wire, path: &mut Path<'a>) -> Result<Hexput, String> {
     if path.segments.len() > MAX_NESTING_DEPTH {
         return Err(format!(
             "{} nests deeper than {MAX_NESTING_DEPTH} levels",
@@ -191,45 +205,43 @@ fn finite(number: f64, path: &Path<'_>) -> Result<Hexput, String> {
     }
 }
 
-/// Why a Script result cannot be sent.
-pub(crate) enum Unsendable {
-    /// Refused with this protocol error.
-    Protocol(ProtocolError),
-    /// The result holds a value kind this crate does not know how to put on the wire.
+/// Why a value cannot be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsendable {
+    /// It nests more containers deep than the limit it was measured against.
+    TooDeep,
+    /// It is certain to encode past [`MAX_FRAME_LEN`] (together with whatever else was measured
+    /// against the same budget).
+    TooLarge,
+    /// It holds a value kind this crate does not know how to put on the wire.
     Unrepresentable,
 }
 
-/// Walk a Script result without recursion and refuse it if it is nested deeper than
-/// [`MAX_RESULT_DEPTH`], or certain to encode past [`MAX_FRAME_LEN`].
+/// Walk a value without recursion and refuse it if it nests more than `max_depth` arrays or
+/// objects deep, or if its encoding is certain to take more than the `budget` bytes left — which
+/// is then reduced by what the value takes, so several values can share one frame's budget.
 ///
 /// The size check is a lower bound — every value encodes to at least one byte, and a string or
-/// key to at least its own bytes — so it never refuses a result that would have fit. It also
-/// bounds the walk itself: a result that shares one collection many times over (`[x, x]` nested
+/// key to at least its own bytes — so it never refuses a value that would have fit. It also
+/// bounds the walk itself: a value that shares one collection many times over (`[x, x]` nested
 /// repeatedly) is small in the execution but exponential on the wire, and the walk stops as soon
 /// as the bound is passed instead of expanding it.
-pub(crate) fn check_result(result: &Hexput) -> Result<(), Unsendable> {
-    let too_large = || {
-        Unsendable::Protocol(ProtocolError::new(
-            ProtocolCode::ResponseTooLarge,
-            format!(
-                "the Script's result encodes to more than the maximum frame of {MAX_FRAME_LEN} \
-                 bytes"
-            ),
-        ))
-    };
-    let mut bytes: usize = 0;
-    let mut pending: Vec<(&Hexput, usize)> = vec![(result, 0)];
+///
+/// # Errors
+/// Which limit the value breaks.
+pub fn measure(value: &Hexput, max_depth: usize, budget: &mut usize) -> Result<(), Unsendable> {
+    let mut pending: Vec<(&Hexput, usize)> = vec![(value, 0)];
     while let Some((value, depth)) = pending.pop() {
-        bytes = bytes.saturating_add(1);
+        let mut bytes: usize = 1;
         match value {
             Hexput::Null | Hexput::Bool(_) | Hexput::Number(_) => {}
             Hexput::String(text) => bytes = bytes.saturating_add(text.len()),
             Hexput::Array(array) => {
-                let depth = nested(depth)?;
+                let depth = nested(depth, max_depth)?;
                 pending.extend(array.iter().map(|item| (item, depth)));
             }
             Hexput::Object(object) => {
-                let depth = nested(depth)?;
+                let depth = nested(depth, max_depth)?;
                 for (key, item) in object.iter() {
                     bytes = bytes.saturating_add(key.len());
                     pending.push((item, depth));
@@ -237,31 +249,34 @@ pub(crate) fn check_result(result: &Hexput) -> Result<(), Unsendable> {
             }
             _ => return Err(Unsendable::Unrepresentable),
         }
-        if bytes > MAX_FRAME_LEN {
-            return Err(too_large());
-        }
+        *budget = budget.checked_sub(bytes).ok_or(Unsendable::TooLarge)?;
     }
     Ok(())
 }
 
-/// One container level deeper, refused past [`MAX_RESULT_DEPTH`].
-fn nested(depth: usize) -> Result<usize, Unsendable> {
+/// Walk a Script result: refused when it nests deeper than [`MAX_RESULT_DEPTH`], or is certain to
+/// encode past [`MAX_FRAME_LEN`] (see [`measure`]).
+///
+/// # Errors
+/// Which limit the result breaks.
+pub fn check_result(result: &Hexput) -> Result<(), Unsendable> {
+    let mut budget = MAX_FRAME_LEN;
+    measure(result, MAX_RESULT_DEPTH, &mut budget)
+}
+
+/// One container level deeper, refused past `max_depth`.
+const fn nested(depth: usize, max_depth: usize) -> Result<usize, Unsendable> {
     let depth = depth + 1;
-    if depth > MAX_RESULT_DEPTH {
-        return Err(Unsendable::Protocol(ProtocolError::new(
-            ProtocolCode::ResultTooDeep,
-            format!(
-                "the Script's result nests more than {MAX_RESULT_DEPTH} arrays or objects deep, \
-                 past what a frame may carry"
-            ),
-        )));
+    if depth > max_depth {
+        return Err(Unsendable::TooDeep);
     }
     Ok(depth)
 }
 
-/// Convert a result [`check_result`] accepted. Recursive, which the check has bounded to
-/// [`MAX_RESULT_DEPTH`] levels.
-pub(crate) fn to_wire(value: &Hexput) -> Wire {
+/// Convert a value [`measure`] accepted. Recursive, which the walk has bounded to the depth it
+/// was measured against.
+#[must_use]
+pub fn to_wire(value: &Hexput) -> Wire {
     match value {
         Hexput::Null => Wire::Nil,
         Hexput::Bool(b) => Wire::Boolean(*b),
@@ -274,7 +289,7 @@ pub(crate) fn to_wire(value: &Hexput) -> Wire {
                 .map(|(key, item)| (Wire::from(key), to_wire(item)))
                 .collect(),
         ),
-        // `check_result` refuses every kind it does not know, so this is never reached.
+        // `measure` refuses every kind it does not know, so this is never reached.
         _ => Wire::Nil,
     }
 }

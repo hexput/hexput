@@ -27,6 +27,21 @@
 //! Recursion is bounded by [`CALL_DEPTH_LIMIT`] rather than by the host stack; exceeding it is a
 //! `depth` error (`depth.call_depth_exceeded`).
 //!
+//! # Host calls
+//!
+//! A call whose callee is a bare name that no scope declares is a **host call** (§8, Story 3.1):
+//! a call to a Registered Function. A local binding of the name shadows it, and naming one
+//! without calling it stays `reference.undeclared_identifier` — a host function is not a value.
+//! This crate knows nothing about the host: an [`Execution`] stops at a host call with a
+//! [`HostCall`] holding the name and the detached arguments, and whoever drives it — the one
+//! Executor, `hexput-exec` — decides whether the call is allowed, makes it, and either resumes the
+//! Script with the returned value or ends it. A function or a cyclic value cannot be an argument
+//! (`type.function_argument`, `type.cyclic_argument`, spanned on that argument), for the same
+//! reason neither can be a Script result.
+//!
+//! [`evaluate`] and [`evaluate_with_variables`] run with no host at all, so every host call is
+//! refused there as `capability.unknown_function` — which is what `hexput eval` reports.
+//!
 //! # Starting variables
 //!
 //! [`evaluate`] runs a Script with nothing but what its own source declares. [`evaluate_with_variables`]
@@ -48,8 +63,11 @@ mod heap;
 mod machine;
 mod value;
 
+use std::sync::Arc;
+
 use hexput_ast::StatementKind;
 
+pub use machine::Argument;
 pub use value::{Array, Object, Value};
 
 /// The diagnostics shape and its rendering, re-exported so a consumer of the evaluator — the CLI
@@ -85,7 +103,7 @@ pub const CALL_DEPTH_LIMIT: usize = 1024;
 /// not return are fine. Returning a function, or a value containing one, is a `type` error
 /// (`type.function_result`) spanned the same way.
 pub fn evaluate(program: &Program) -> Result<Value, Diagnostic> {
-    machine::Machine::new(program).run()
+    evaluate_with_variables(program, Vec::<(&str, Value)>::new())
 }
 
 /// Evaluate a parsed Script whose root scope already binds `variables` — the Script's **starting
@@ -111,7 +129,8 @@ pub fn evaluate(program: &Program) -> Result<Value, Diagnostic> {
 /// reporting it is what keeps a supplied value from being silently discarded by source the caller
 /// may not have written.
 ///
-/// Otherwise the same failures as [`evaluate`].
+/// Otherwise the same failures as [`evaluate`]. There is no host, so a host call is a
+/// `capability` error (`capability.unknown_function`) spanned on the call.
 ///
 /// # Caller obligations
 /// Neither is checked here, and neither can be detected later:
@@ -128,6 +147,30 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
     variables: impl IntoIterator<Item = (N, Value)>,
 ) -> Result<Value, Diagnostic> {
     let variables: Vec<(N, Value)> = variables.into_iter().collect();
+    check_starting_variables(program, &variables)?;
+    let mut machine = machine::Machine::with_variables(program, variables);
+    // Consuming the machine on every path is the memory contract: the heap is dropped here and
+    // only the detached result escapes.
+    match machine.execute()? {
+        machine::Stop::Finished(result) => Ok(result),
+        machine::Stop::HostCall(call) => Err(Diagnostic::new(
+            Category::Capability,
+            Code::UNKNOWN_FUNCTION,
+            format!(
+                "`{}` is not declared, and there is no host here to call it on: a Script run on \
+                 its own can call only the functions it declares",
+                call.name
+            ),
+            call.span,
+        )),
+    }
+}
+
+/// Reject a starting variable whose name the Script's own top level also declares.
+fn check_starting_variables<N: AsRef<str>>(
+    program: &Program,
+    variables: &[(N, Value)],
+) -> Result<(), Diagnostic> {
     for statement in &program.statements {
         let (StatementKind::Let { name, .. } | StatementKind::Function { name, .. }) =
             &statement.kind
@@ -150,7 +193,108 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
             ));
         }
     }
-    machine::Machine::with_variables(program, variables).run()
+    Ok(())
+}
+
+/// A resumable run of one Script: what the one Executor drives, a segment at a time, so the
+/// Script can wait for a host call's value without holding a thread (Story 3.1).
+///
+/// An `Execution` owns its Program (shared through [`Arc`]) and its heap, and is `Send + 'static`,
+/// so it can move between threads while suspended. [`Execution::run`] consumes it: the Script
+/// either finishes, fails — and the heap is dropped with it — or stops at a host call, which hands
+/// the `Execution` back inside the [`HostCall`].
+pub struct Execution {
+    machine: Box<machine::Machine<Arc<Program>>>,
+}
+
+impl Execution {
+    /// An execution of `program` whose root scope binds `variables`, exactly as
+    /// [`evaluate_with_variables`] binds them — with the same caller obligations. Nothing runs
+    /// until [`Execution::run`].
+    ///
+    /// # Errors
+    /// A supplied name that the Script's own top level also declares, as
+    /// `syntax.duplicate_declaration` (see [`evaluate_with_variables`]).
+    pub fn with_variables<N: AsRef<str>>(
+        program: Arc<Program>,
+        variables: impl IntoIterator<Item = (N, Value)>,
+    ) -> Result<Self, Diagnostic> {
+        let variables: Vec<(N, Value)> = variables.into_iter().collect();
+        check_starting_variables(&program, &variables)?;
+        Ok(Self {
+            machine: Box::new(machine::Machine::with_variables(program, variables)),
+        })
+    }
+
+    /// Run until the Script ends or calls the host.
+    ///
+    /// # Errors
+    /// The Script's first runtime failure, as [`evaluate`] reports it — including a host call's
+    /// argument that is, or contains, a function or a cycle.
+    pub fn run(self) -> Result<Outcome, Diagnostic> {
+        let mut machine = self.machine;
+        match machine.execute()? {
+            machine::Stop::Finished(result) => Ok(Outcome::Finished(result)),
+            machine::Stop::HostCall(call) => Ok(Outcome::HostCall(HostCall {
+                name: call.name,
+                arguments: call.arguments,
+                span: call.span,
+                execution: Self { machine },
+            })),
+        }
+    }
+}
+
+/// Where an [`Execution::run`] stopped.
+pub enum Outcome {
+    /// The Script ended with this result, detached from the execution.
+    Finished(Value),
+    /// The Script called the host and waits for the value.
+    HostCall(HostCall),
+}
+
+/// A host call an [`Execution`] is suspended on: a call to a bare name no scope declares (§8).
+///
+/// Dropping it ends the execution. [`HostCall::resume`] hands the execution back with the call's
+/// value in place.
+pub struct HostCall {
+    name: String,
+    arguments: Vec<Argument>,
+    span: Span,
+    execution: Execution,
+}
+
+impl HostCall {
+    /// The name the Script called.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The arguments, in order, each detached and with the span of its expression.
+    #[must_use]
+    pub fn arguments(&self) -> &[Argument] {
+        &self.arguments
+    }
+
+    /// The call, from the callee's name through its closing parenthesis — where an error about
+    /// the call as a whole points.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+
+    /// Give the call `value` as its result and hand back the execution, ready to
+    /// [`run`](Execution::run) on from the call. The value is copied into the execution, like a
+    /// starting variable, and carries on exactly as an ordinary call's returned value would.
+    ///
+    /// The caller obligation of [`evaluate_with_variables`] applies: every number must be finite.
+    #[must_use]
+    pub fn resume(self, value: &Value) -> Execution {
+        let mut execution = self.execution;
+        execution.machine.resume(value);
+        execution
+    }
 }
 
 /// Format a number the way the language does (§4.3): shortest round-tripping digits, plain

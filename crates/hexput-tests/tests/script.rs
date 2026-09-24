@@ -5,8 +5,22 @@ use hexput_port::{
     CorrelationId, Envelope, ErrorBody, MAX_FRAME_LEN, MAX_NESTING_DEPTH, MessageType, Value,
     decode, encode, encode_frame,
 };
-use hexput_script::{MAX_RESULT_DEPTH, direct_execution};
+use hexput_script::MAX_RESULT_DEPTH;
 use rmpv::Integer;
+
+/// Serve one Direct Execution with no Registered Functions, on a runtime of its own.
+fn direct_execution(payload: &Value) -> Result<Value, Box<ErrorBody>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    // A call table nobody serves: nothing is registered, so no call is ever made on it.
+    let (_calls, caller) = hexput_rpc::Calls::new();
+    runtime.block_on(hexput_script::direct_execution(
+        payload.clone(),
+        Vec::new(),
+        caller,
+    ))
+}
 
 fn s(text: &str) -> Value {
     Value::from(text)

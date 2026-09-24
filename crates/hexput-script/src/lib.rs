@@ -6,26 +6,32 @@
 //! # What exists today
 //!
 //! [`direct_execution`] serves one `ExecutionStart` payload (FR-4): decode it, parse the source
-//! with no AST Cache involved, run it through [`hexput_exec::execute`] — never the interpreter's
-//! `evaluate*` directly (AD-3) — and turn the result into the `Result` payload `{value}`, or the
-//! failure into the one [`ErrorBody`] shape. The connection only routes; everything about the
-//! payload, the wire↔value conversion and the error lives here.
+//! with no AST Cache involved, run it through [`hexput_exec::execute`] — never the interpreter
+//! directly (AD-3) — and turn the result into the `Result` payload `{value}`, or the failure into
+//! the one [`ErrorBody`] shape. The connection only routes; everything about the payload and the
+//! error lives here, and the wire↔value conversion is the Executor's (`hexput_exec::wire`), which
+//! converts a host call's values the same way.
 //!
-//! Not yet: the static check (no check mode exists in Config until Epic 3), the AST Cache and
-//! Cached Execution (Epic 4), Registered Function calls, Capabilities and Resource Budgets
-//! (Epic 3, behind the same Executor).
+//! The Script may call its Session's Registered Functions (Story 3.1): the connection passes the
+//! registration names, read once per execution, and the [`Caller`] its calls travel through, and
+//! the Executor decides and makes every call. Decoding, parsing and converting the result run on
+//! the blocking pool, like the Script itself, so a large payload never occupies a runtime worker.
+//!
+//! Not yet: the static check (no check mode exists in Config until Story 3.10), the AST Cache
+//! and Cached Execution (Epic 4), grants and Resource Budgets (Epic 3, behind the same
+//! Executor).
 //!
 //! Binds: AD-3, AD-6, AD-8.
-
-mod wire;
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use hexput_interpreter::{Category, Code, Diagnostic, Span, Value as Hexput};
-use hexput_port::{ErrorBody, ProtocolCode, ProtocolError, Value};
+use hexput_exec::wire;
+use hexput_exec::{Caller, Host};
+use hexput_interpreter::{Category, Code, Diagnostic, Program, Span, Value as Hexput};
+use hexput_port::{ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, Value};
 
-pub use wire::MAX_RESULT_DEPTH;
+pub use hexput_exec::wire::MAX_RESULT_DEPTH;
 
 const SOURCE: &str = "source";
 const VARIABLES: &str = "variables";
@@ -33,11 +39,14 @@ const VALUE: &str = "value";
 
 /// Serve one Direct Execution: `payload` is an `ExecutionStart` payload, a map with exactly
 /// `source` (the Script, a string) and `variables` (its starting variables, a map from §2
-/// identifier to value).
+/// identifier to value). The Script may call the Registered Functions named in `registrations`,
+/// through `caller` (Story 3.1).
 ///
 /// Returns the `Result` payload `{value: <the Script's result>}`. A number that is whole and
 /// within ±2^53 is sent as a MessagePack integer (`-0` as `0`), every other number as a
 /// float64; object keys keep their order.
+///
+/// Must run inside a Tokio runtime: the work runs on its blocking pool.
 ///
 /// # Errors
 ///
@@ -47,31 +56,81 @@ const VALUE: &str = "value";
 ///   or appears twice, or a value has no lossless Hexput representation (an integer outside
 ///   ±2^53, a NaN or infinity, binary data, an extension, a non-string or repeated object key,
 ///   invalid UTF-8). The message names the key or path; nothing is parsed or run.
-/// * The parser's or interpreter's [`Diagnostic`] — category, code, severity, message and span —
-///   including `syntax.duplicate_declaration` for a starting variable the Script also declares.
+/// * The parser's, interpreter's or Executor's [`Diagnostic`] — category, code, severity, message
+///   and span — including `syntax.duplicate_declaration` for a starting variable the Script also
+///   declares, and every `capability`, `host` and argument error of a host call.
 /// * `protocol.result_too_deep` — the result nests past [`MAX_RESULT_DEPTH`].
 /// * `protocol.response_too_large` — the result is certain to encode past the maximum frame.
 ///
 /// The error is boxed: it is the reply's payload, built once per failed execution, and a large
 /// `Err` would make every `Result` this returns as large as it.
-pub fn direct_execution(payload: &Value) -> Result<Value, Box<ErrorBody>> {
-    let refused = |body: ErrorBody| Box::new(body);
+///
+/// # Panics
+///
+/// If the work on the blocking pool panics, the panic continues here.
+pub async fn direct_execution(
+    payload: Value,
+    registrations: Vec<String>,
+    caller: Caller,
+) -> Result<Value, Box<ErrorBody>> {
+    let (program, variables) = blocking(move || prepare(&payload)).await?;
+    let result = hexput_exec::execute(program, variables, Host::new(registrations, caller))
+        .await
+        .map_err(|d| Box::new(ErrorBody::from(&d)))?;
+    blocking(move || reply(&result)).await
+}
+
+/// Run `work` on the blocking pool and wait for it.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(done) => done,
+        Err(error) => match error.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // Only a runtime shutting down cancels a blocking task, and it is dropping this
+            // future too.
+            Err(error) => panic!("a Direct Execution step was cancelled: {error}"),
+        },
+    }
+}
+
+/// A parsed Script and its starting variables, ready for the Executor.
+type Prepared = (Arc<Program>, Vec<(Arc<str>, Hexput)>);
+
+/// Decode the payload and parse its source.
+fn prepare(payload: &Value) -> Result<Prepared, Box<ErrorBody>> {
     let (source, variables) = decode(payload).map_err(|message| {
-        refused(ErrorBody::from(&ProtocolError::new(
+        Box::new(ErrorBody::from(&ProtocolError::new(
             ProtocolCode::InvalidPayload,
             message,
         )))
     })?;
-    let program = hexput_parser::parse(source).map_err(|d| refused(ErrorBody::from(&d)))?;
-    let result =
-        hexput_exec::execute(&program, variables).map_err(|d| refused(ErrorBody::from(&d)))?;
-    match wire::check_result(&result) {
+    let program = hexput_parser::parse(source).map_err(|d| Box::new(ErrorBody::from(&d)))?;
+    Ok((Arc::new(program), variables))
+}
+
+/// The `Result` payload for a Script's result, or why it cannot be sent.
+fn reply(result: &Hexput) -> Result<Value, Box<ErrorBody>> {
+    let refused = |error: ProtocolError| Box::new(ErrorBody::from(&error));
+    match wire::check_result(result) {
         Ok(()) => Ok(Value::Map(vec![(
             Value::from(VALUE),
-            wire::to_wire(&result),
+            wire::to_wire(result),
         )])),
-        Err(wire::Unsendable::Protocol(error)) => Err(refused(ErrorBody::from(&error))),
-        Err(wire::Unsendable::Unrepresentable) => Err(refused(ErrorBody::from(&Diagnostic::new(
+        Err(wire::Unsendable::TooDeep) => Err(refused(ProtocolError::new(
+            ProtocolCode::ResultTooDeep,
+            format!(
+                "the Script's result nests more than {MAX_RESULT_DEPTH} arrays or objects deep, \
+                 past what a frame may carry"
+            ),
+        ))),
+        Err(wire::Unsendable::TooLarge) => Err(refused(ProtocolError::new(
+            ProtocolCode::ResponseTooLarge,
+            format!(
+                "the Script's result encodes to more than the maximum frame of {MAX_FRAME_LEN} \
+                 bytes"
+            ),
+        ))),
+        Err(wire::Unsendable::Unrepresentable) => Err(Box::new(ErrorBody::from(&Diagnostic::new(
             Category::Type,
             Code::FUNCTION_RESULT,
             "the Script's result holds a value with no wire representation",

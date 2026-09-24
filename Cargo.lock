@@ -234,6 +234,7 @@ name = "hexput-connection"
 version = "0.1.0"
 dependencies = [
  "hexput-port",
+ "hexput-rpc",
  "hexput-script",
  "hexput-session",
  "tokio",
@@ -272,6 +273,7 @@ dependencies = [
  "hexput-globalvar",
  "hexput-interpreter",
  "hexput-rpc",
+ "tokio",
 ]
 
 [[package]]
@@ -342,6 +344,7 @@ name = "hexput-rpc"
 version = "0.1.0"
 dependencies = [
  "hexput-port",
+ "tokio",
 ]
 
 [[package]]
@@ -353,6 +356,7 @@ dependencies = [
  "hexput-interpreter",
  "hexput-parser",
  "hexput-port",
+ "tokio",
 ]
 
 [[package]]
@@ -388,6 +392,7 @@ dependencies = [
  "hexput-lexer",
  "hexput-parser",
  "hexput-port",
+ "hexput-rpc",
  "hexput-script",
  "hexput-session",
  "hexput-shared",

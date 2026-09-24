@@ -39,6 +39,7 @@ fn category_wire_strings_are_stable() {
         (Category::Arithmetic, "arithmetic"),
         (Category::Depth, "depth"),
         (Category::Capability, "capability"),
+        (Category::Host, "host"),
         (Category::Budget, "budget"),
         (Category::Policy, "policy"),
     ] {

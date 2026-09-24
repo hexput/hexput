@@ -7,11 +7,15 @@ rust-version.workspace = true
 
 [lib]
 
+# `scripts/check-crate-graph.py` pins this set. `tokio` is an external crate: the Executor runs
+# every Script segment on the blocking pool and waits for a host call's reply between segments
+# (Story 3.1).
 [dependencies]
 hexput-enforce = { path = "../hexput-enforce" }
 hexput-interpreter = { path = "../hexput-interpreter" }
 hexput-rpc = { path = "../hexput-rpc" }
 hexput-globalvar = { path = "../hexput-globalvar" }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

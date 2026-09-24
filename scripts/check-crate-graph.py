@@ -84,8 +84,15 @@ EXACT_DEPENDENCIES = {
     # Story 2.3: the connection actor drives a Port (the `conn --> port` edge is the Spine's
     # 2026-09-23 amendment) and attaches to a Session; it never reaches a transport (AD-1).
     # Story 2.6: it routes `ExecutionStart` to `hexput-script` (`conn --> script`, amended
-    # 2026-09-23) and executes nothing itself.
-    "hexput-connection": {"hexput-session", "hexput-port", "hexput-script"},
+    # 2026-09-23) and executes nothing itself. Story 3.1: it holds one `hexput-rpc` call table,
+    # writing its executions' host calls and routing their replies (`conn --> rpc`, amended
+    # 2026-09-24) — still never `hexput-enforce` (AD-3).
+    "hexput-connection": {"hexput-session", "hexput-port", "hexput-script", "hexput-rpc"},
+    # Story 3.1: host-call correlation reaches the wire codec alone — never `hexput-enforce`
+    # (AD-3), `hexput-exec` (which depends on it, not the reverse) or `hexput-globalvar` (AD-4).
+    "hexput-rpc": {"hexput-port"},
+    # Story 3.1: capability (and later budget) enforcement reaches the shared vocabulary alone.
+    "hexput-enforce": {"hexput-shared"},
     # Story 2.6: Direct Execution reaches the parser, the interpreter's value types, the static
     # check (unused until Epic 3's check mode), the one Executor, and the wire value and error
     # shape (`script --> port`, amended 2026-09-23) — never a transport, never `hexput-enforce`

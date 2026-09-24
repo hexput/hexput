@@ -5,7 +5,10 @@
 //!
 //! * `id` — the request's [`CorrelationId`] (a uint64). A response carries its request's id
 //!   verbatim; the Daemon treats ids as opaque and never reorders or deduplicates them, so a
-//!   Backend matches responses to requests by id and may receive them in any order. `id` is nil
+//!   Backend matches responses to requests by id and may receive them in any order. Ids are per
+//!   direction (Story 3.1): a Backend's `Result`/`Error` always answers a Daemon `Call`, whose id
+//!   the Daemon issued, and the Daemon's `Result`/`Error` always answers a Backend request, so the
+//!   two id spaces never meet. `id` is nil
 //!   only on an [`MessageType::Error`] response whose request id could not be read.
 //! * `type` — the [`MessageType`], as its PascalCase name.
 //! * `payload` — any value. An absent `payload` reads as nil.
@@ -55,13 +58,23 @@ pub enum MessageType {
     ExecutionStart,
     /// Response: a request succeeded; the payload is its result.
     Result,
+    /// Request, from the Daemon to the Backend: a Script called a Registered Function (Story
+    /// 3.1). The payload is `{name, arguments}`; a later Registered Method call adds `receiver`.
+    /// The Backend answers with `Result {value}` or `Error` under the call's id.
+    Call,
     /// Response: a request failed; the payload is the one wire error shape.
     Error,
 }
 
 impl MessageType {
     /// Every message type, in declaration order.
-    pub const ALL: &'static [Self] = &[Self::Init, Self::ExecutionStart, Self::Result, Self::Error];
+    pub const ALL: &'static [Self] = &[
+        Self::Init,
+        Self::ExecutionStart,
+        Self::Result,
+        Self::Call,
+        Self::Error,
+    ];
 
     /// The type's wire spelling.
     #[must_use]
@@ -70,6 +83,7 @@ impl MessageType {
             Self::Init => "Init",
             Self::ExecutionStart => "ExecutionStart",
             Self::Result => "Result",
+            Self::Call => "Call",
             Self::Error => "Error",
         }
     }

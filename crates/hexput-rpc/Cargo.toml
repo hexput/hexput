@@ -7,8 +7,13 @@ rust-version.workspace = true
 
 [lib]
 
+# `hexput-port` alone among workspace crates (pinned by `scripts/check-crate-graph.py`): a host
+# call is an envelope on the wire, and nothing here reaches `hexput-enforce` (AD-3). `tokio` is an
+# external crate, for the channels that carry a call from its execution to the connection's
+# single writer and its reply back (Story 3.1).
 [dependencies]
 hexput-port = { path = "../hexput-port" }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

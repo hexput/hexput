@@ -19,8 +19,10 @@
 //!   runs the Script through the one Executor, and the connection answers `Result { value }` or
 //!   the `Error` it returns — a parse or runtime diagnostic, or a `protocol.*` refusal. A failing
 //!   Script ends nothing but itself.
-//! * `Result` or `Error` from the Backend — `protocol.unexpected_message`: the Daemon asked
-//!   nothing it could answer.
+//! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
+//!   connection, when its id names one still pending (see "Host calls"); otherwise
+//!   `protocol.unexpected_message`: the Daemon asked nothing it could answer.
+//! * `Call` from the Backend — `protocol.unexpected_message`: only the Daemon calls.
 //!
 //! A frame the codec rejects gets its `protocol.*` error response; the connection keeps
 //! reading unless the error is fatal (an oversized frame), after which it closes.
@@ -31,29 +33,46 @@
 //!
 //! # Concurrency
 //!
-//! Every initialized `ExecutionStart` is dispatched as its own task, owned by the connection, on
-//! the shared runtime's blocking pool (`spawn_blocking`): runtime workers never run Script code, so
-//! a slow Script delays neither this connection's reads nor any other connection, even when slow
-//! Scripts outnumber the cores (AD-6, FR-16). A connection may have any number of executions in
-//! flight, and there is no per-connection serial queue: up to the size of Tokio's blocking pool
-//! (512 threads by default), none waits on another. Past it, executions queue Daemon-wide for a
-//! free thread; a cap on in-flight executions is deferred to Epic 3. Everything else — `Init`, the
-//! gate's refusals, malformed-frame answers — is answered inline, at once.
+//! Every initialized `ExecutionStart` is dispatched as its own task, owned by the connection. The
+//! task runs [`hexput_script::direct_execution`], which runs every piece of Script work on the
+//! shared runtime's blocking pool: runtime workers never run Script code, so a slow Script delays
+//! neither this connection's reads nor any other connection, even when slow Scripts outnumber the
+//! cores (AD-6, FR-16). A connection may have any number of executions in flight, and there is no
+//! per-connection serial queue: up to the size of Tokio's blocking pool (512 threads by default),
+//! none waits on another. Past it, executions queue Daemon-wide for a free thread; a cap on
+//! in-flight executions is deferred to Epic 3. Everything else — `Init`, the gate's refusals,
+//! malformed-frame answers, routing a host call's reply — is handled inline, at once.
 //!
-//! The loop races reading the next message against the next finished execution and is the only
-//! writer of the `Outbound` half, so no lock guards it. Each execution's reply is written, with
-//! its request id, as soon as it finishes — in completion order, not submission order. A write is
-//! always driven to completion (`Outbound::send` is not cancel-safe); only `Inbound::recv` and
-//! `JoinSet::join_next`, both cancel-safe, are raced. While one reply is being written the loop
-//! neither reads nor collects finished executions, and `send` has no timeout: a peer that stops
-//! reading stalls this connection's reads and replies until it reads again — this connection
-//! alone, never another. A write timeout is deferred (Epic 3).
+//! The loop races reading the next message, the next host call an execution submits, and the next
+//! finished execution, and is the only writer of the `Outbound` half, so no lock guards it. Each
+//! execution's reply is written, with its request id, as soon as it finishes — in completion
+//! order, not submission order. A write is always driven to completion (`Outbound::send` is not
+//! cancel-safe); only `Inbound::recv`, the call queue and `JoinSet::join_next`, all cancel-safe,
+//! are raced. While one envelope is being written the loop neither reads nor collects anything,
+//! and `send` has no timeout: a peer that stops reading stalls this connection's reads and
+//! replies until it reads again — this connection alone, never another. A write timeout is
+//! deferred (Epic 3).
 //!
 //! When the peer stops sending — a clean close, possibly of its write side only, or a fatal
 //! frame — the connection stops reading, waits for its in-flight executions, writes each reply,
 //! and only then closes. A lost stream or a failed write abandons them at once: nothing more can
-//! be written. An abandoned execution already running finishes on its blocking thread and its
+//! be written. An abandoned execution already running finishes its blocking segment and its
 //! result is discarded; nothing can cancel a running Script until Story 3.5's Resource Budget.
+//!
+//! # Host calls
+//!
+//! A Script calls its Session's Registered Functions through this connection (Story 3.1). The
+//! connection holds one [`hexput_rpc::Calls`] table and hands each execution a
+//! [`hexput_rpc::Caller`], together with the Session's registration names, read once when the
+//! execution is dispatched. When an execution makes a call, the loop writes the `Call` envelope
+//! under a Daemon-issued id — a per-connection counter, independent of the Backend's ids — and
+//! routes the Backend's `Result` or `Error` naming that id back to the waiting execution, which
+//! holds no thread while it waits. A `Call` the adapter cannot frame fails only that call. A
+//! Backend's `Error` is the Script's failure, never the Daemon's, and is logged at `debug`.
+//!
+//! When the connection stops reading, or is lost, every pending call fails with `host.no_reply` at
+//! once, as does every call made after: no execution the connection is still waiting for can wait
+//! on a reply that cannot arrive.
 //!
 //! However the connection ends — the peer closing, a lost stream, a failed write, a fatal frame —
 //! [`serve`] detaches it from its Session, and detaching the last Connection tears the Session
@@ -68,7 +87,7 @@
 //! attachment — and `client_id`, which is `"none"` until init completes: the field is marked,
 //! never omitted. Each well-formed request (and each malformed frame whose id is readable) is
 //! handled inside a child `request` span carrying its correlation `id` as a string (`"none"` when
-//! a request has none). That span is carried onto the blocking thread that runs a Direct Execution, and
+//! a request has none). That span instruments the task that runs a Direct Execution, and is
 //! entered again while the execution's reply is written, so every event about a request —
 //! wherever it is emitted — names both the Client ID and the request.
 //!
@@ -88,6 +107,7 @@ use hexput_port::{
     CorrelationId, Envelope, ErrorBody, Inbound, MessageType, Outbound, Port, ProtocolCode,
     ProtocolError, Received, Value, error_response,
 };
+use hexput_rpc::{Call, Caller, Calls};
 use hexput_session::{ClientId, ConnectionId, InitRequest, Sessions};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{Instrument, Span};
@@ -157,6 +177,8 @@ enum Event {
     Received(Received),
     /// An execution task ended, with its reply or its failure.
     Finished(Result<Envelope<Value>, JoinError>),
+    /// An execution made a host call, to be written.
+    Call(Call),
 }
 
 /// Read, answer and write until the connection ends. Returning drops `running`, which abandons
@@ -167,15 +189,19 @@ enum Event {
 async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
     let (mut inbound, mut outbound) = port.split();
     let mut running: JoinSet<Envelope<Value>> = JoinSet::new();
+    // This connection's host calls. The loop keeps a `Caller` itself, so the queue stays open
+    // while it reads, and clones it for each execution.
+    let (mut calls, caller) = Calls::new();
     // Whether the peer may still send; once it cannot, only in-flight executions are awaited.
     let mut reading = true;
     loop {
         let event = if reading {
-            // Both futures are cancel-safe: the branch that loses loses nothing.
+            // All three futures are cancel-safe: a branch that loses loses nothing.
             tokio::select! {
                 received = inbound.recv().instrument(connection.span.clone()) => {
                     Event::Received(received)
                 }
+                Some(call) = calls.submitted() => Event::Call(call),
                 Some(finished) = running.join_next() => Event::Finished(finished),
             }
         } else {
@@ -192,6 +218,12 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
         // frame whose id is unreadable).
         let (reply, span) = match event {
             Event::Received(Received::Message(request)) => {
+                // A Backend `Result`/`Error` is a reply to one of this connection's host calls
+                // when its id names one still pending; anything else is answered below.
+                let request = match route_reply(&mut calls, request, &connection.span) {
+                    Some(request) => request,
+                    None => continue,
+                };
                 let span = request_span(&connection.span, request.id);
                 match span.in_scope(|| answer(request, connection)) {
                     Answer::Reply(reply) => (reply, span),
@@ -205,10 +237,16 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         (reply, span)
                     }
                     Answer::Execute(id, payload) => {
-                        // The blocking thread does not inherit the caller's span; carry the
-                        // request's, so everything the execution logs names its connection,
-                        // its Client ID and its request.
-                        running.spawn_blocking(move || span.in_scope(|| execute(id, payload)));
+                        // The Session's registrations as they are now, read once per execution.
+                        let registrations = connection
+                            .attached
+                            .and_then(|client_id| connection.sessions.registration_names(client_id))
+                            .unwrap_or_default();
+                        // The task carries the request's span, so everything the execution logs
+                        // names its connection, its Client ID and its request.
+                        running.spawn(
+                            execute(id, payload, registrations, caller.clone()).instrument(span),
+                        );
                         continue;
                     }
                 }
@@ -227,6 +265,10 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         reading = false;
                     }
                 });
+                if !reading {
+                    // Nothing more is read, so no host call can be answered.
+                    calls.close();
+                }
                 (failure.to_response(), span)
             }
             Event::Received(Received::Closed(None)) => {
@@ -234,6 +276,8 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                     .span
                     .in_scope(|| tracing::debug!("connection closed by the peer"));
                 reading = false;
+                // Nothing more is read, so no host call can be answered.
+                calls.close();
                 continue;
             }
             Event::Received(Received::Closed(Some(error))) => {
@@ -249,6 +293,16 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                 let span = request_span(&connection.span, reply.id);
                 (reply, span)
             }
+            Event::Call(call) => {
+                let call = calls.issue(call);
+                if !send_call(&mut outbound, &mut calls, call)
+                    .instrument(connection.span.clone())
+                    .await
+                {
+                    return;
+                }
+                continue;
+            }
             Event::Finished(Err(error)) => {
                 // A task that panicked has no id left to answer with. It ends only itself.
                 connection.span.in_scope(|| {
@@ -261,6 +315,55 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
         // `.await`, and it is driven to completion, never raced.
         if !deliver(&mut outbound, reply).instrument(span).await {
             return;
+        }
+    }
+}
+
+/// Hand a Backend `Result`/`Error` that answers a pending host call to the execution waiting on
+/// it. Returns the message when it answers none, for the caller to answer.
+fn route_reply(
+    calls: &mut Calls,
+    message: Envelope<Value>,
+    span: &Span,
+) -> Option<Envelope<Value>> {
+    let (id, failed) = (message.id, message.message_type == MessageType::Error);
+    match calls.complete(message) {
+        Ok(()) => {
+            if failed {
+                // The Script's failure, not the Daemon's: the execution reports it.
+                span.in_scope(|| {
+                    tracing::debug!(
+                        call = id.map(CorrelationId::get),
+                        "a host call failed on the Backend"
+                    );
+                });
+            }
+            None
+        }
+        Err(message) => Some(message),
+    }
+}
+
+/// Write one host call. A call that cannot be framed fails alone, with nothing written; any other
+/// failure means the connection is unusable. Returns whether it is still usable.
+async fn send_call<O: Outbound>(
+    outbound: &mut O,
+    calls: &mut Calls,
+    call: Envelope<Value>,
+) -> bool {
+    let Some(id) = call.id else {
+        return true;
+    };
+    match outbound.send(call).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            tracing::debug!(%error, call = id.get(), "a host call was too large to send");
+            calls.unsendable(id, format!("its frame would be too large: {error}"));
+            true
+        }
+        Err(error) => {
+            tracing::debug!(%error, "cannot write to the connection; closing it");
+            false
         }
     }
 }
@@ -342,9 +445,15 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
     Answer::Execute(request.id, request.payload)
 }
 
-/// Run one Direct Execution to its reply. Runs on a blocking-pool thread, never a runtime worker.
-fn execute(id: Option<CorrelationId>, payload: Value) -> Envelope<Value> {
-    match hexput_script::direct_execution(&payload) {
+/// Run one Direct Execution to its reply. The Script's own work runs on the blocking pool; this
+/// task only waits, including for its host calls' replies.
+async fn execute(
+    id: Option<CorrelationId>,
+    payload: Value,
+    registrations: Vec<String>,
+    caller: Caller,
+) -> Envelope<Value> {
+    match hexput_script::direct_execution(payload, registrations, caller).await {
         Ok(payload) => Envelope {
             id,
             message_type: MessageType::Result,

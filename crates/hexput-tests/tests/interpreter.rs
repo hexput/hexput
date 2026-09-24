@@ -808,11 +808,19 @@ fn calls_bind_parameters_per_invocation() {
         Code::UNDECLARED_IDENTIFIER,
         "x1",
     );
+    // Story 3.1: calling an undeclared name is a host call, whose arguments are evaluated before
+    // anything is decided about the call itself.
     assert_error(
         "return missingFn(x1);",
         Category::Reference,
         Code::UNDECLARED_IDENTIFIER,
-        "missingFn",
+        "x1",
+    );
+    assert_error(
+        "return missingFn(1);",
+        Category::Capability,
+        Code::UNKNOWN_FUNCTION,
+        "missingFn(1)",
     );
 }
 
@@ -1332,7 +1340,7 @@ fn many_blocks_evaluate() {
 #[test]
 fn every_runtime_code_spans_the_offending_source() {
     let deep = countdown(hexput_interpreter::CALL_DEPTH_LIMIT);
-    let cases: [(&str, Category, Code, &str); 15] = [
+    let cases: [(&str, Category, Code, &str); 18] = [
         (
             r#"return "abc" * 2;"#,
             Category::Type,
@@ -1417,6 +1425,25 @@ fn every_runtime_code_spans_the_offending_source() {
             Category::Depth,
             Code::CALL_DEPTH_EXCEEDED,
             "(n - 1)",
+        ),
+        // Story 3.1: a host call's arguments, and — with no host — the call itself.
+        (
+            "return send(1, [fn() {}]);",
+            Category::Type,
+            Code::FUNCTION_ARGUMENT,
+            "[fn() {}]",
+        ),
+        (
+            "let a = [1]; a[1] = a; return send(a);",
+            Category::Type,
+            Code::CYCLIC_ARGUMENT,
+            "a",
+        ),
+        (
+            "let x = 1;\nreturn getOrder(x).total;",
+            Category::Capability,
+            Code::UNKNOWN_FUNCTION,
+            "getOrder(x)",
         ),
     ];
     for (source, category, code, offending) in cases {
@@ -1648,4 +1675,133 @@ fn an_adversarially_nested_starting_variable_does_not_overflow_the_host_stack() 
         }
     }
     assert_eq!(depth, 20_000);
+}
+
+// --- Story 3.1: host calls suspend a resumable execution ---
+
+mod host_calls {
+    use std::sync::Arc;
+
+    use hexput_interpreter::{Execution, Outcome, Value};
+
+    fn start(source: &str, variables: Vec<(&str, Value)>) -> Execution {
+        let program = Arc::new(hexput_parser::parse(source).unwrap());
+        Execution::with_variables(program, variables).unwrap()
+    }
+
+    /// Run `execution`, answering each host call with `answer(name, arguments)`; the calls made,
+    /// in order, and the result.
+    fn drive(
+        execution: Execution,
+        answer: impl Fn(&str, &[Value]) -> Value,
+    ) -> (Vec<(String, Vec<Value>)>, Value) {
+        let mut calls = Vec::new();
+        let mut execution = execution;
+        loop {
+            match execution.run().unwrap() {
+                Outcome::Finished(result) => return (calls, result),
+                Outcome::HostCall(call) => {
+                    let arguments: Vec<Value> =
+                        call.arguments().iter().map(|a| a.value.clone()).collect();
+                    let value = answer(call.name(), &arguments);
+                    calls.push((call.name().to_owned(), arguments));
+                    execution = call.resume(&value);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_execution_is_send_and_static() {
+        fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<Execution>();
+        assert_send_static::<hexput_interpreter::HostCall>();
+    }
+
+    #[test]
+    fn a_host_call_suspends_and_resumes_with_the_value_given() {
+        let source = "let x = 7;\nreturn getOrder(x, \"a\").total + 1;";
+        let execution = start(source, vec![]);
+        let Outcome::HostCall(call) = execution.run().unwrap() else {
+            panic!("the Script calls the host");
+        };
+        assert_eq!(call.name(), "getOrder");
+        let arguments = call.arguments();
+        assert_eq!(arguments.len(), 2);
+        assert_eq!(arguments[0].value.as_number(), Some(7.0));
+        assert_eq!(&source[arguments[0].span.range()], "x");
+        assert_eq!(arguments[1].value.as_str(), Some("a"));
+        assert_eq!(&source[call.span().range()], "getOrder(x, \"a\")");
+        let order = Value::Object(hexput_interpreter::Object::from_entries([(
+            "total",
+            Value::Number(3.0),
+        )]));
+        let Outcome::Finished(result) = call.resume(&order).run().unwrap() else {
+            panic!("one call only");
+        };
+        assert_eq!(result.as_number(), Some(4.0));
+    }
+
+    #[test]
+    fn calls_inside_functions_loops_and_assignment_targets_resume_in_place() {
+        let source = "
+            fn twice(n) { return double(n) + double(n); };
+            let total = 0;
+            for (i in [1, 2]) { total = total + twice(i); };
+            let seen = getBox();
+            getBox().n = 5;
+            return [total, seen.n];
+        ";
+        let boxed = Value::Object(hexput_interpreter::Object::from_entries([(
+            "n",
+            Value::Number(1.0),
+        )]));
+        let (calls, result) = drive(start(source, vec![]), |name, arguments| match name {
+            "double" => Value::Number(arguments[0].as_number().unwrap() * 2.0),
+            _ => boxed.clone(),
+        });
+        let names: Vec<&str> = calls.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["double", "double", "double", "double", "getBox", "getBox"]
+        );
+        let items: Vec<f64> = result
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_number().unwrap())
+            .collect();
+        // Each `getBox()` value is its own copy, so writing the second leaves the first alone.
+        assert_eq!(items, [12.0, 1.0]);
+    }
+
+    #[test]
+    fn a_local_binding_shadows_the_host_and_a_host_name_is_not_a_value() {
+        let (calls, result) = drive(
+            start("fn f(x) { return x; }; return f(1);", vec![]),
+            |_, _| Value::Null,
+        );
+        assert!(calls.is_empty());
+        assert_eq!(result.as_number(), Some(1.0));
+        let (calls, result) = drive(
+            start("return f;", vec![("f", Value::Number(2.0))]),
+            |_, _| Value::Null,
+        );
+        assert!(calls.is_empty());
+        assert_eq!(result.as_number(), Some(2.0));
+        let error = start("let g = f; return g;", vec![])
+            .run()
+            .err()
+            .expect("a host name is not a value");
+        assert_eq!(error.code.as_str(), "reference.undeclared_identifier");
+    }
+
+    #[test]
+    fn with_variables_rejects_a_starting_variable_the_script_declares() {
+        let program = Arc::new(hexput_parser::parse("let a = 1; return a;").unwrap());
+        let error = Execution::with_variables(program, [("a", Value::Null)])
+            .err()
+            .expect("a duplicate declaration");
+        assert_eq!(error.code.as_str(), "syntax.duplicate_declaration");
+    }
 }

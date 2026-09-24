@@ -1,21 +1,33 @@
 //! The evaluator: one loop over an explicit stack of continuation frames plus a value stack,
 //! mirroring the parser's driver. Nothing here recurses on input nesting, and every frame boundary
-//! is a point where a future Executor could suspend the evaluation (Story 3.1).
+//! is a point where the evaluation can stop and later carry on.
 //!
 //! The `Machine` owns the execution's heap. Every collection and scope the Script creates lives
 //! there, so dropping the `Machine` — after a result or an error — frees all of it, cycles
 //! included. Only the detached result outlives it.
 //!
-//! The `Machine` (heap and value stack included) must stay `Send`, so a future Executor can hold
-//! a suspended evaluation across an `.await` (Story 3.1); a test asserts it.
+//! # Suspension (Story 3.1)
+//!
+//! A call whose callee is a bare name no scope declares is a host call (LANGUAGE-REFERENCE §8).
+//! The machine evaluates its arguments, detaches them, and stops with a [`Stop::HostCall`]; the
+//! caller answers it with [`Machine::resume`] and runs the machine again, which carries on as if an
+//! ordinary call had returned that value. Nothing about the host is known here: which names are
+//! registered, how the call travels and what it may cost are the Executor's.
+//!
+//! A suspended machine moves between threads, so it must be `Send` and must not borrow the
+//! Program. Frames therefore address the syntax tree by index (an [`ExprId`], a [`BlockId`], a
+//! statement's position), never by reference, and the machine holds the Program through `P` —
+//! `Arc<Program>` for a resumable execution, `&Program` for a run-to-completion one. A test
+//! asserts `Machine<Arc<Program>>` is `Send + 'static`.
 
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use hexput_ast::{
-    AccessKind, AccessLink, BinaryOperator, Block, BlockId, Category, Code, ConditionalBranch,
-    Diagnostic, ElseBranch, ExprId, ExpressionKind, Function, Identifier, Literal, ObjectEntry,
-    Program, Span, Spanned, Statement, StatementKind, UnaryOperator,
+    AccessKind, AccessLink, BinaryOperator, BlockId, Category, Code, Diagnostic, ExprId,
+    ExpressionKind, Function, Identifier, Literal, Program, Span, Spanned, Statement,
+    StatementKind, UnaryOperator,
 };
 use indexmap::IndexMap;
 
@@ -23,18 +35,42 @@ use crate::convert::{number_to_string, to_number, to_string};
 use crate::heap::{DetachFailure, Heap, RtValue, SlotId};
 use crate::{CALL_DEPTH_LIMIT, Value};
 
+/// Where a statement sits: at the Program's top level (`block: None`) or in a block, by position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StmtAt {
+    block: Option<BlockId>,
+    index: usize,
+}
+
+/// Where a `Function` sits: a named declaration statement, or a function literal expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FnAt {
+    Declared(StmtAt),
+    Literal(ExprId),
+}
+
+/// One access chain, or its first `end` links: an assignment target's receiver chain is every
+/// link but the assigned one.
+#[derive(Debug, Clone, Copy)]
+struct Chain {
+    /// The `Access` expression the chain belongs to.
+    access: ExprId,
+    /// How many of its links the chain covers.
+    end: usize,
+}
+
 /// A pending unit of work. Frames that consume values document the value-stack shape they
 /// expect on entry, top last.
-enum Frame<'p> {
-    Statement(&'p Statement),
+enum Frame {
+    Statement(StmtAt),
     /// Reclaim the block's scope and restore the one that was current before it was entered.
     ExitScope(SlotId),
     /// Evaluate an expression and push its value.
     Eval(ExprId),
     /// `[value]` → `[]`.
     Discard,
-    /// `[value]` → `[]`, binding `name` in the current scope.
-    Declare(&'p Identifier),
+    /// `[value]` → `[]`, binding the name of the `let` statement at this position.
+    Declare(StmtAt),
     /// `[value]` → the Script result, detached from the heap. The id is the returned
     /// expression, which a cyclic result's diagnostic points at.
     Return(ExprId),
@@ -57,55 +93,43 @@ enum Frame<'p> {
     },
     /// `[e0 … eN-1]` → `[array]`.
     BuildArray(usize),
-    /// `[v0 … vN-1]` → `[object]`.
-    BuildObject(&'p [ObjectEntry]),
-    /// `[receiver]` → applies `links[index]` onward. `base` names the chain's first receiver.
-    /// `in_target` marks an assignment target's receiver chain, where `?.` is not allowed.
+    /// `[v0 … vN-1]` → `[object]`, keyed by the entries of the object literal with this id.
+    BuildObject(ExprId),
+    /// `[receiver]` → applies the chain's `links[index]` onward. `in_target` marks an assignment
+    /// target's receiver chain, where `?.` is not allowed.
     Link {
-        base: ExprId,
-        links: &'p [AccessLink],
+        chain: Chain,
         index: usize,
         in_target: bool,
     },
     /// `[receiver, key]` → `[element]`, then continues with `links[index + 1]`.
     IndexRead {
-        base: ExprId,
-        links: &'p [AccessLink],
+        chain: Chain,
         index: usize,
         in_target: bool,
     },
-    /// `[value]` → `[]`.
-    AssignName(&'p Identifier),
-    /// `[receiver, value]` or `[receiver, key, value]` → `[]`. `prefix` is the chain before the
-    /// assigned link, used to name a `null` receiver.
-    AssignMember {
-        base: ExprId,
-        prefix: &'p [AccessLink],
-        link: &'p AccessLink,
-    },
-    /// `[condition]` → runs `branches[index]`'s body, tests the next branch, or takes the
-    /// `else`. Only the taken branch's body is ever scheduled.
+    /// `[value]` → `[]`, assigning the identifier expression with this id.
+    AssignName(ExprId),
+    /// `[receiver, value]` or `[receiver, key, value]` → `[]`, for the assignment whose target is
+    /// the access expression with this id. Its last link is the one assigned; the links before it
+    /// name a `null` receiver.
+    AssignMember(ExprId),
+    /// `[condition]` → runs the `if` statement's `branches[index]` body, tests the next branch,
+    /// or takes the `else`. Only the taken branch's body is ever scheduled.
     Branch {
-        branches: &'p [ConditionalBranch],
+        at: StmtAt,
         index: usize,
-        else_branch: &'p Option<ElseBranch>,
     },
     /// A loop's control boundary: it sits directly below the running body for the whole loop, so
     /// `break` and `continue` can unwind to it. Popping it advances the loop by one iteration.
-    Loop(Box<LoopFrame<'p>>),
+    Loop(Box<LoopFrame>),
     /// `[condition]` → runs one `while` iteration or ends the loop.
-    LoopTest(Box<LoopFrame<'p>>),
-    /// `[iterable]` → opens a `for` loop over it.
-    ForStart {
-        keyword: Span,
-        binding: &'p Identifier,
-        iterable: ExprId,
-        body: BlockId,
-    },
+    LoopTest(Box<LoopFrame>),
+    /// `[iterable]` → opens the `for` loop at this position over it.
+    ForStart(StmtAt),
     /// `[callee, a0 … aN-1]` → binds a fresh call scope and runs the body.
     Invoke {
-        base: ExprId,
-        links: &'p [AccessLink],
+        chain: Chain,
         index: usize,
         in_target: bool,
         arguments: usize,
@@ -116,35 +140,42 @@ enum Frame<'p> {
     CallEnd {
         outer_scope: SlotId,
         values: usize,
-        base: ExprId,
-        links: &'p [AccessLink],
+        chain: Chain,
         index: usize,
+        in_target: bool,
+    },
+    /// `[a0 … aN-1]` → stops the machine with a host call: the chain's base is a bare name no
+    /// scope declares and its first link is the call (§8). [`Machine::resume`] continues the
+    /// chain from its second link.
+    HostCall {
+        chain: Chain,
         in_target: bool,
     },
 }
 
 /// What a loop needs to run and to be unwound to. Boxed inside [`Frame`] so one loop's state
 /// does not widen every frame.
-struct LoopFrame<'p> {
+struct LoopFrame {
     /// The scope in effect outside the loop; each iteration's scope hangs off it.
     outer_scope: SlotId,
     /// The value-stack depth outside the loop, restored by `break` and `continue`.
     values: usize,
-    kind: LoopKind<'p>,
+    kind: LoopKind,
 }
 
-enum LoopKind<'p> {
+enum LoopKind {
     While {
         condition: ExprId,
-        body: &'p Block,
+        body: BlockId,
     },
     /// The collection is snapshotted by handle at the loop's start, together with its mutation
     /// counter: each iteration re-checks the counter, so mutating the iterated collection is an
-    /// error rather than undefined behaviour (§5). `keys` is `None` for an array.
+    /// error rather than undefined behaviour (§5). `keys` is `None` for an array. `at` is the
+    /// `for` statement, which names the binding.
     For {
         keyword: Span,
-        binding: &'p Identifier,
-        body: &'p Block,
+        at: StmtAt,
+        body: BlockId,
         collection: SlotId,
         version: u64,
         index: usize,
@@ -152,31 +183,60 @@ enum LoopKind<'p> {
     },
 }
 
-impl<'p> LoopKind<'p> {
-    const fn body(&self) -> &'p Block {
+impl LoopKind {
+    const fn body(&self) -> BlockId {
         match self {
-            Self::While { body, .. } | Self::For { body, .. } => body,
+            Self::While { body, .. } | Self::For { body, .. } => *body,
         }
     }
 }
 
-pub(crate) struct Machine<'p> {
-    program: &'p Program,
-    frames: Vec<Frame<'p>>,
+/// One argument of a host call: its detached value and the span of the expression that
+/// produced it, which an error about that argument points at.
+#[derive(Debug, Clone)]
+pub struct Argument {
+    /// The argument, detached from the execution like a Script result.
+    pub value: Value,
+    /// The argument expression's span.
+    pub span: Span,
+}
+
+/// Why the machine stopped.
+pub(crate) enum Stop {
+    /// The Script ended with this result.
+    Finished(Value),
+    /// The Script called a host function and waits for its value.
+    HostCall(PendingCall),
+}
+
+/// A host call the machine is suspended on.
+pub(crate) struct PendingCall {
+    pub(crate) name: String,
+    pub(crate) arguments: Vec<Argument>,
+    /// From the callee's name through the call's closing parenthesis.
+    pub(crate) span: Span,
+}
+
+pub(crate) struct Machine<P> {
+    program: P,
+    frames: Vec<Frame>,
     values: Vec<RtValue>,
     heap: Heap,
     scope: SlotId,
     /// Every `Function` a function value points at, addressed by index so the heap never carries
-    /// the program's lifetime. `definitions` maps a `Function`'s address back to its index, so a
-    /// closure created in a loop reuses one entry instead of adding one per iteration.
-    functions: Vec<&'p Function>,
-    definitions: HashMap<usize, usize>,
+    /// the program. `definitions` maps a `Function`'s position back to its index, so a closure
+    /// created in a loop reuses one entry instead of adding one per iteration.
+    functions: Vec<FnAt>,
+    definitions: HashMap<FnAt, usize>,
     /// Number of calls currently on the frame stack; bounded by [`CALL_DEPTH_LIMIT`].
     depth: usize,
+    /// The chain a host call suspended, to carry on with once its value arrives.
+    suspended: Option<(Chain, bool)>,
 }
 
-impl<'p> Machine<'p> {
-    pub(crate) fn new(program: &'p Program) -> Self {
+impl<P: Deref<Target = Program> + Clone> Machine<P> {
+    #[cfg(test)]
+    pub(crate) fn new(program: P) -> Self {
         Self::with_variables(program, Vec::<(&str, Value)>::new())
     }
 
@@ -188,11 +248,12 @@ impl<'p> Machine<'p> {
     /// top-level `fn`, and binding before means the `fn` wins, exactly as a redeclaration in
     /// source would be rejected outright.
     pub(crate) fn with_variables<N: AsRef<str>>(
-        program: &'p Program,
+        program: P,
         variables: impl IntoIterator<Item = (N, Value)>,
     ) -> Self {
         let mut heap = Heap::default();
         let scope = heap.push_scope(None);
+        let tree = program.clone();
         let mut machine = Self {
             program,
             frames: Vec::new(),
@@ -202,36 +263,71 @@ impl<'p> Machine<'p> {
             functions: Vec::new(),
             definitions: HashMap::new(),
             depth: 0,
+            suspended: None,
         };
         for (name, value) in variables {
             let attached = machine.heap.attach(&value);
             machine.heap.declare(scope, name.as_ref(), attached);
         }
-        machine.open(&program.statements);
+        machine.open(&tree, None);
         machine
     }
 
-    /// Schedule `statements` in the current scope, after hoisting the named functions they
-    /// declare (decision 3: every `fn name` in a block is bound before the block runs, so mutual
-    /// recursion works in any declaration order).
-    fn open(&mut self, statements: &'p [Statement]) {
-        for statement in statements {
-            if let StatementKind::Function { name, function } = &statement.kind {
-                let value = self.make_function(function);
+    /// Run until the Script ends or calls the host. After an error, or after
+    /// [`Stop::Finished`], the machine must be dropped; after [`Stop::HostCall`], it continues
+    /// only through [`Machine::resume`].
+    pub(crate) fn execute(&mut self) -> Result<Stop, Diagnostic> {
+        // One handle for the whole run, so every step borrows the tree apart from `self`.
+        let program = self.program.clone();
+        let tree: &Program = &program;
+        while let Some(frame) = self.frames.pop() {
+            if let Some(stop) = self.step(tree, frame)? {
+                return Ok(stop);
+            }
+        }
+        Ok(Stop::Finished(Value::Null))
+    }
+
+    /// Answer the host call the machine stopped on with `value`, which becomes the call's value
+    /// exactly as if an ordinary call had returned it. Without a pending host call, does
+    /// nothing.
+    pub(crate) fn resume(&mut self, value: &Value) {
+        if let Some((chain, in_target)) = self.suspended.take() {
+            let value = self.heap.attach(value);
+            self.values.push(value);
+            self.frames.push(Frame::Link {
+                chain,
+                index: 1,
+                in_target,
+            });
+        }
+    }
+
+    /// Schedule the statements of `block` (the top level for `None`) in the current scope, after
+    /// hoisting the named functions they declare (decision 3: every `fn name` in a block is bound
+    /// before the block runs, so mutual recursion works in any declaration order).
+    fn open(&mut self, tree: &Program, block: Option<BlockId>) {
+        let statements = statements(tree, block);
+        for (index, statement) in statements.iter().enumerate() {
+            if let StatementKind::Function { name, .. } = &statement.kind {
+                let value = self.make_function(FnAt::Declared(StmtAt { block, index }));
                 self.heap.declare(self.scope, &name.name, value);
             }
         }
-        self.frames
-            .extend(statements.iter().rev().map(Frame::Statement));
+        self.frames.extend(
+            (0..statements.len())
+                .rev()
+                .map(|index| Frame::Statement(StmtAt { block, index })),
+        );
     }
 
     /// Enter `block` in a fresh scope nested in the current one, arranging for that scope to be
     /// reclaimed when the block's statements are done.
-    fn enter(&mut self, block: &'p Block) {
+    fn enter(&mut self, tree: &Program, block: BlockId) {
         let inner = self.heap.push_scope(Some(self.scope));
         let outer = core::mem::replace(&mut self.scope, inner);
         self.frames.push(Frame::ExitScope(outer));
-        self.open(&block.statements);
+        self.open(tree, Some(block));
     }
 
     /// Reclaim the current scope (unless a closure captured it) and restore `outer`.
@@ -242,14 +338,13 @@ impl<'p> Machine<'p> {
 
     /// A function value closing over the current scope, which is marked captured so the scope —
     /// and its ancestors, which lookups walk — outlive the block that created it.
-    fn make_function(&mut self, function: &'p Function) -> RtValue {
-        let key = core::ptr::from_ref(function) as usize;
-        let definition = match self.definitions.get(&key) {
+    fn make_function(&mut self, at: FnAt) -> RtValue {
+        let definition = match self.definitions.get(&at) {
             Some(index) => *index,
             None => {
                 let index = self.functions.len();
-                self.functions.push(function);
-                self.definitions.insert(key, index);
+                self.functions.push(at);
+                self.definitions.insert(at, index);
                 index
             }
         };
@@ -257,35 +352,25 @@ impl<'p> Machine<'p> {
         self.heap.new_function(definition, self.scope)
     }
 
-    /// Run to completion. Consuming `self` is the memory contract: the heap is dropped here, on
-    /// every path, and only the detached result escapes.
-    pub(crate) fn run(mut self) -> Result<Value, Diagnostic> {
-        self.execute()
-    }
-
-    fn execute(&mut self) -> Result<Value, Diagnostic> {
-        while let Some(frame) = self.frames.pop() {
-            if let Some(result) = self.step(frame)? {
-                return Ok(result);
-            }
-        }
-        Ok(Value::Null)
-    }
-
-    /// Execute one frame. `Some` is the Script result from a `return`.
-    fn step(&mut self, frame: Frame<'p>) -> Result<Option<Value>, Diagnostic> {
+    /// Execute one frame. `Some` means the machine stops: the Script result from a `return`, or
+    /// a host call.
+    fn step(&mut self, tree: &Program, frame: Frame) -> Result<Option<Stop>, Diagnostic> {
         match frame {
-            Frame::Statement(statement) => return self.statement(statement),
+            Frame::Statement(at) => {
+                return Ok(self.statement(tree, at)?.map(Stop::Finished));
+            }
             // A scope a closure captured is skipped here and lives until the execution ends,
             // like any other heap garbage; see `environment.rs`.
             Frame::ExitScope(outer) => self.exit(outer),
-            Frame::Eval(id) => self.expression(id)?,
+            Frame::Eval(id) => self.expression(tree, id)?,
             Frame::Discard => {
                 self.pop();
             }
-            Frame::Declare(name) => {
+            Frame::Declare(at) => {
                 let value = self.pop();
-                self.heap.declare(self.scope, &name.name, value);
+                if let StatementKind::Let { name, .. } = &statement(tree, at).kind {
+                    self.heap.declare(self.scope, &name.name, value);
+                }
             }
             Frame::Return(expression) => {
                 let value = self.pop();
@@ -294,11 +379,13 @@ impl<'p> Machine<'p> {
                     self.return_from_call(value);
                     return Ok(None);
                 }
-                return self.script_result(&value, expression).map(Some);
+                return self
+                    .script_result(tree, &value, expression)
+                    .map(|result| Some(Stop::Finished(result)));
             }
             Frame::Unary { operator, operand } => {
                 let value = self.pop();
-                let result = self.unary(operator, operand, &value)?;
+                let result = self.unary(tree, operator, operand, &value)?;
                 self.values.push(result);
             }
             Frame::BinaryRight {
@@ -313,7 +400,7 @@ impl<'p> Machine<'p> {
             } => {
                 let right_value = self.pop();
                 let left_value = self.pop();
-                let result = self.binary(left, operator, right, &left_value, &right_value)?;
+                let result = self.binary(tree, left, operator, right, &left_value, &right_value)?;
                 self.values.push(result);
             }
             Frame::BuildArray(count) => {
@@ -321,7 +408,11 @@ impl<'p> Machine<'p> {
                 let array = self.heap.new_array(items);
                 self.values.push(array);
             }
-            Frame::BuildObject(entries) => {
+            Frame::BuildObject(id) => {
+                let expression = tree.expression(id);
+                let ExpressionKind::Object { entries, .. } = &expression.kind else {
+                    return Err(internal(expression.span));
+                };
                 let values = self.pop_many(entries.len());
                 let map: IndexMap<Arc<str>, RtValue> = entries
                     .iter()
@@ -332,33 +423,38 @@ impl<'p> Machine<'p> {
                 self.values.push(object);
             }
             Frame::Link {
-                base,
-                links,
+                chain,
                 index,
                 in_target,
-            } => self.link(base, links, index, in_target)?,
+            } => self.link(tree, chain, index, in_target)?,
             Frame::IndexRead {
-                base,
-                links,
+                chain,
                 index,
                 in_target,
             } => {
                 let key = self.pop();
                 let receiver = self.pop();
-                let AccessKind::Index { expression, .. } = &links[index].kind else {
-                    return Err(internal(links[index].span));
+                let (_, links) = chain_links(tree, chain);
+                let Some(link) = links.get(index) else {
+                    return Err(internal(tree.expression(chain.access).span));
                 };
-                let element = self.read_index(&receiver, &key, &links[index], *expression)?;
+                let AccessKind::Index { expression, .. } = &link.kind else {
+                    return Err(internal(link.span));
+                };
+                let element = self.read_index(tree, &receiver, &key, link, *expression)?;
                 self.values.push(element);
                 self.frames.push(Frame::Link {
-                    base,
-                    links,
+                    chain,
                     index: index + 1,
                     in_target,
                 });
             }
-            Frame::AssignName(name) => {
+            Frame::AssignName(target) => {
                 let value = self.pop();
+                let expression = tree.expression(target);
+                let ExpressionKind::Identifier(name) = &expression.kind else {
+                    return Err(internal(expression.span));
+                };
                 if self.heap.assign(self.scope, &name.name, value).is_err() {
                     return Err(Diagnostic::new(
                         Category::Reference,
@@ -371,47 +467,39 @@ impl<'p> Machine<'p> {
                     ));
                 }
             }
-            Frame::AssignMember { base, prefix, link } => self.assign_member(base, prefix, link)?,
-            Frame::Branch {
-                branches,
-                index,
-                else_branch,
-            } => {
+            Frame::AssignMember(target) => self.assign_member(tree, target)?,
+            Frame::Branch { at, index } => {
                 let taken = self.pop();
                 if self.heap.is_truthy(&taken) {
-                    let body = self.program.block(branches[index].body);
-                    self.enter(body);
+                    if let StatementKind::If { branches, .. } = &statement(tree, at).kind
+                        && let Some(branch) = branches.get(index)
+                    {
+                        self.enter(tree, branch.body);
+                    }
                 } else {
-                    self.next_branch(branches, index + 1, else_branch);
+                    self.next_branch(tree, at, index + 1);
                 }
             }
-            Frame::Loop(state) => self.advance(state)?,
+            Frame::Loop(state) => self.advance(tree, state)?,
             Frame::LoopTest(state) => {
                 let condition = self.pop();
                 if self.heap.is_truthy(&condition) {
                     let body = state.kind.body();
                     self.frames.push(Frame::Loop(state));
-                    self.enter(body);
+                    self.enter(tree, body);
                 }
             }
-            Frame::ForStart {
-                keyword,
-                binding,
-                iterable,
-                body,
-            } => self.for_start(keyword, binding, iterable, body)?,
+            Frame::ForStart(at) => self.for_start(tree, at)?,
             Frame::Invoke {
-                base,
-                links,
+                chain,
                 index,
                 in_target,
                 arguments,
-            } => self.invoke(base, links, index, in_target, arguments)?,
+            } => self.invoke(tree, chain, index, in_target, arguments)?,
             Frame::CallEnd {
                 outer_scope,
                 values,
-                base,
-                links,
+                chain,
                 index,
                 in_target,
             } => {
@@ -421,19 +509,26 @@ impl<'p> Machine<'p> {
                 self.depth -= 1;
                 self.values.push(RtValue::Null);
                 self.frames.push(Frame::Link {
-                    base,
-                    links,
+                    chain,
                     index: index + 1,
                     in_target,
                 });
+            }
+            Frame::HostCall { chain, in_target } => {
+                return self.host_call(tree, chain, in_target).map(Some);
             }
         }
         Ok(None)
     }
 
     /// Detach the top-level `return`'s value into the Script result.
-    fn script_result(&self, value: &RtValue, expression: ExprId) -> Result<Value, Diagnostic> {
-        let span = self.program.expression(expression).span;
+    fn script_result(
+        &self,
+        tree: &Program,
+        value: &RtValue,
+        expression: ExprId,
+    ) -> Result<Value, Diagnostic> {
+        let span = tree.expression(expression).span;
         match self.heap.detach(value) {
             Ok(result) => Ok(result),
             Err(DetachFailure::Cycle) => Err(Diagnostic::new(
@@ -467,35 +562,95 @@ impl<'p> Machine<'p> {
         }
     }
 
-    /// Test `branches[index]`, or fall through to the `else` body when there is none left.
-    fn next_branch(
+    /// Suspend on the host call whose arguments are on the value stack: detach each one, as a
+    /// Script result is detached, and remember where to carry on.
+    fn host_call(
         &mut self,
-        branches: &'p [ConditionalBranch],
-        index: usize,
-        else_branch: &'p Option<ElseBranch>,
-    ) {
+        tree: &Program,
+        chain: Chain,
+        in_target: bool,
+    ) -> Result<Stop, Diagnostic> {
+        let (base, links) = chain_links(tree, chain);
+        let base = tree.expression(base);
+        let (Some(link), ExpressionKind::Identifier(name)) = (links.first(), &base.kind) else {
+            return Err(internal(base.span));
+        };
+        let AccessKind::Call { arguments, .. } = &link.kind else {
+            return Err(internal(link.span));
+        };
+        let values = self.pop_many(arguments.len());
+        let mut detached = Vec::with_capacity(values.len());
+        for (value, argument) in values.iter().zip(arguments) {
+            let span = tree.expression(*argument).span;
+            let (code, reason) = match self.heap.detach(value) {
+                Ok(value) => {
+                    detached.push(Argument { value, span });
+                    continue;
+                }
+                Err(DetachFailure::Cycle) => (
+                    Code::CYCLIC_ARGUMENT,
+                    "it contains a value that refers back to itself",
+                ),
+                Err(DetachFailure::Function) if matches!(value, RtValue::Function(_)) => (
+                    Code::FUNCTION_ARGUMENT,
+                    "a function has no wire representation",
+                ),
+                Err(DetachFailure::Function) => (
+                    Code::FUNCTION_ARGUMENT,
+                    "it contains a function, which has no wire representation",
+                ),
+            };
+            return Err(Diagnostic::new(
+                Category::Type,
+                code,
+                format!(
+                    "cannot pass this {} to `{}`: {reason}, and a host call's arguments must be \
+                     data the Backend can receive",
+                    value.type_name(),
+                    name.name
+                ),
+                span,
+            ));
+        }
+        self.suspended = Some((chain, in_target));
+        Ok(Stop::HostCall(PendingCall {
+            name: name.name.clone(),
+            arguments: detached,
+            span: through(name.span, link.span),
+        }))
+    }
+
+    /// Test the `if` statement's `branches[index]`, or fall through to its `else` body when there
+    /// is none left.
+    fn next_branch(&mut self, tree: &Program, at: StmtAt, index: usize) {
+        let StatementKind::If {
+            branches,
+            else_branch,
+        } = &statement(tree, at).kind
+        else {
+            return;
+        };
         if let Some(branch) = branches.get(index) {
-            self.frames.push(Frame::Branch {
-                branches,
-                index,
-                else_branch,
-            });
+            self.frames.push(Frame::Branch { at, index });
             self.frames.push(Frame::Eval(branch.condition.expression));
         } else if let Some(otherwise) = else_branch {
-            let body = self.program.block(otherwise.body);
-            self.enter(body);
+            self.enter(tree, otherwise.body);
         }
     }
 
-    /// Open a `for` loop over the iterable on top of the value stack.
-    fn for_start(
-        &mut self,
-        keyword: Span,
-        binding: &'p Identifier,
-        iterable: ExprId,
-        body: BlockId,
-    ) -> Result<(), Diagnostic> {
+    /// Open the `for` loop at `at` over the iterable on top of the value stack.
+    fn for_start(&mut self, tree: &Program, at: StmtAt) -> Result<(), Diagnostic> {
         let value = self.pop();
+        let statement = statement(tree, at);
+        let StatementKind::For {
+            keyword,
+            iterable,
+            body,
+            ..
+        } = &statement.kind
+        else {
+            return Err(internal(statement.span));
+        };
         let (collection, keys) = match value {
             RtValue::Array(id) => (id, None),
             RtValue::Object(id) => (id, Some(self.heap.object_keys(id))),
@@ -507,7 +662,7 @@ impl<'p> Machine<'p> {
                         "cannot iterate {}: `for … in` needs an array or an object",
                         article(&other)
                     ),
-                    self.program.expression(iterable).span,
+                    tree.expression(*iterable).span,
                 ));
             }
         };
@@ -515,9 +670,9 @@ impl<'p> Machine<'p> {
             outer_scope: self.scope,
             values: self.values.len(),
             kind: LoopKind::For {
-                keyword,
-                binding,
-                body: self.program.block(body),
+                keyword: *keyword,
+                at,
+                body: *body,
                 collection,
                 version: self.heap.version(collection),
                 index: 0,
@@ -528,7 +683,7 @@ impl<'p> Machine<'p> {
     }
 
     /// Advance a loop by one iteration, or let it end by not re-scheduling itself.
-    fn advance(&mut self, mut state: Box<LoopFrame<'p>>) -> Result<(), Diagnostic> {
+    fn advance(&mut self, tree: &Program, mut state: Box<LoopFrame>) -> Result<(), Diagnostic> {
         match &mut state.kind {
             LoopKind::While { condition, .. } => {
                 let condition = *condition;
@@ -537,7 +692,7 @@ impl<'p> Machine<'p> {
             }
             LoopKind::For {
                 keyword,
-                binding,
+                at,
                 body,
                 collection,
                 version,
@@ -561,15 +716,17 @@ impl<'p> Machine<'p> {
                     return Ok(()); // exhausted: the loop frame is not re-scheduled
                 };
                 *index += 1;
-                let (binding, body) = (*binding, *body);
+                let (at, body) = (*at, *body);
                 // Decision 4: the binding and the body share one scope, fresh per iteration, so
                 // a closure created in iteration i captures that iteration's value.
                 let inner = self.heap.push_scope(Some(state.outer_scope));
                 let outer = core::mem::replace(&mut self.scope, inner);
-                self.heap.declare(inner, &binding.name, item);
+                if let StatementKind::For { binding, .. } = &statement(tree, at).kind {
+                    self.heap.declare(inner, &binding.name, item);
+                }
                 self.frames.push(Frame::Loop(state));
                 self.frames.push(Frame::ExitScope(outer));
-                self.open(&body.statements);
+                self.open(tree, Some(body));
             }
         }
         Ok(())
@@ -611,8 +768,7 @@ impl<'p> Machine<'p> {
                 Frame::CallEnd {
                     outer_scope,
                     values,
-                    base,
-                    links,
+                    chain,
                     index,
                     in_target,
                 } => {
@@ -621,8 +777,7 @@ impl<'p> Machine<'p> {
                     self.depth -= 1;
                     self.values.push(value);
                     self.frames.push(Frame::Link {
-                        base,
-                        links,
+                        chain,
                         index: index + 1,
                         in_target,
                     });
@@ -636,13 +791,16 @@ impl<'p> Machine<'p> {
     /// Call the function under its arguments on the value stack.
     fn invoke(
         &mut self,
-        base: ExprId,
-        links: &'p [AccessLink],
+        tree: &Program,
+        chain: Chain,
         index: usize,
         in_target: bool,
         arguments: usize,
     ) -> Result<(), Diagnostic> {
-        let link = &links[index];
+        let (_, links) = chain_links(tree, chain);
+        let Some(link) = links.get(index) else {
+            return Err(internal(tree.expression(chain.access).span));
+        };
         let values = self.pop_many(arguments);
         let callee = self.pop();
         let RtValue::Function(slot) = callee else {
@@ -659,7 +817,13 @@ impl<'p> Machine<'p> {
         let Some((definition, captured)) = self.heap.function(slot) else {
             return Err(internal(link.span));
         };
-        let function = self.functions[definition];
+        let Some(function) = self
+            .functions
+            .get(definition)
+            .and_then(|at| function(tree, *at))
+        else {
+            return Err(internal(link.span));
+        };
         if values.len() != function.parameters.len() {
             return Err(Diagnostic::new(
                 Category::Arity,
@@ -688,24 +852,21 @@ impl<'p> Machine<'p> {
         self.frames.push(Frame::CallEnd {
             outer_scope: outer,
             values: self.values.len(),
-            base,
-            links,
+            chain,
             index,
             in_target,
         });
         for (parameter, value) in function.parameters.iter().zip(values) {
             self.heap.declare(inner, &parameter.name, value);
         }
-        self.open(&self.program.block(function.body).statements);
+        self.open(tree, Some(function.body));
         Ok(())
     }
 
-    fn statement(&mut self, statement: &'p Statement) -> Result<Option<Value>, Diagnostic> {
-        match &statement.kind {
-            StatementKind::Let {
-                name, initializer, ..
-            } => {
-                self.frames.push(Frame::Declare(name));
+    fn statement(&mut self, tree: &Program, at: StmtAt) -> Result<Option<Value>, Diagnostic> {
+        match &statement(tree, at).kind {
+            StatementKind::Let { initializer, .. } => {
+                self.frames.push(Frame::Declare(at));
                 self.frames.push(Frame::Eval(*initializer));
             }
             StatementKind::Expression(id) => {
@@ -722,16 +883,13 @@ impl<'p> Machine<'p> {
                 None if self.depth > 0 => self.return_from_call(RtValue::Null),
                 None => return Ok(Some(Value::Null)),
             },
-            StatementKind::Block(id) => self.enter(self.program.block(*id)),
+            StatementKind::Block(id) => self.enter(tree, *id),
             StatementKind::Assignment { target, value, .. } => {
-                self.assignment(*target, *value)?;
+                self.assignment(tree, *target, *value)?;
             }
             // Already bound by `open` before this block's statements ran (decision 3).
             StatementKind::Function { .. } => {}
-            StatementKind::If {
-                branches,
-                else_branch,
-            } => self.next_branch(branches, 0, else_branch),
+            StatementKind::If { .. } => self.next_branch(tree, at, 0),
             StatementKind::While {
                 condition, body, ..
             } => {
@@ -740,23 +898,12 @@ impl<'p> Machine<'p> {
                     values: self.values.len(),
                     kind: LoopKind::While {
                         condition: condition.expression,
-                        body: self.program.block(*body),
+                        body: *body,
                     },
                 })));
             }
-            StatementKind::For {
-                keyword,
-                binding,
-                iterable,
-                body,
-                ..
-            } => {
-                self.frames.push(Frame::ForStart {
-                    keyword: *keyword,
-                    binding,
-                    iterable: *iterable,
-                    body: *body,
-                });
+            StatementKind::For { iterable, .. } => {
+                self.frames.push(Frame::ForStart(at));
                 self.frames.push(Frame::Eval(*iterable));
             }
             StatementKind::Break { .. } => self.unwind_to_loop(true),
@@ -765,14 +912,19 @@ impl<'p> Machine<'p> {
         Ok(None)
     }
 
-    fn assignment(&mut self, target: ExprId, value: ExprId) -> Result<(), Diagnostic> {
-        let target_expression = self.program.expression(target);
+    fn assignment(
+        &mut self,
+        tree: &Program,
+        target: ExprId,
+        value: ExprId,
+    ) -> Result<(), Diagnostic> {
+        let target_expression = tree.expression(target);
         match &target_expression.kind {
-            ExpressionKind::Identifier(name) => {
-                self.frames.push(Frame::AssignName(name));
+            ExpressionKind::Identifier(_) => {
+                self.frames.push(Frame::AssignName(target));
                 self.frames.push(Frame::Eval(value));
             }
-            ExpressionKind::Access { base, links } => {
+            ExpressionKind::Access { links, .. } => {
                 let Some((link, prefix)) = links.split_last() else {
                     return Err(invalid_target(target_expression.span));
                 };
@@ -780,11 +932,7 @@ impl<'p> Machine<'p> {
                     return Err(invalid_target(target_expression.span));
                 }
                 // Order: receiver, then index key, then the assigned value.
-                self.frames.push(Frame::AssignMember {
-                    base: *base,
-                    prefix,
-                    link,
-                });
+                self.frames.push(Frame::AssignMember(target));
                 self.frames.push(Frame::Eval(value));
                 match &link.kind {
                     AccessKind::Property(_) => {}
@@ -793,21 +941,15 @@ impl<'p> Machine<'p> {
                     }
                     AccessKind::Call { .. } => return Err(invalid_target(target_expression.span)),
                 }
-                self.frames.push(Frame::Link {
-                    base: *base,
-                    links: prefix,
-                    index: 0,
-                    in_target: true,
-                });
-                self.frames.push(Frame::Eval(*base));
+                self.open_chain(tree, target, prefix.len(), true)?;
             }
             _ => return Err(invalid_target(target_expression.span)),
         }
         Ok(())
     }
 
-    fn expression(&mut self, id: ExprId) -> Result<(), Diagnostic> {
-        let expression = self.program.expression(id);
+    fn expression(&mut self, tree: &Program, id: ExprId) -> Result<(), Diagnostic> {
+        let expression = tree.expression(id);
         match &expression.kind {
             ExpressionKind::Literal(literal) => self.values.push(match literal {
                 Literal::Null => RtValue::Null,
@@ -816,6 +958,8 @@ impl<'p> Machine<'p> {
                 Literal::String(s) => RtValue::String(Arc::from(s.as_str())),
             }),
             ExpressionKind::Identifier(name) => {
+                // A host function is not a value (§8): only calling a bare undeclared name
+                // reaches the host, so naming one without calling it is still undeclared.
                 let Some(value) = self.heap.lookup(self.scope, &name.name) else {
                     return Err(Diagnostic::new(
                         Category::Reference,
@@ -852,35 +996,69 @@ impl<'p> Machine<'p> {
                     .extend(elements.iter().rev().map(|e| Frame::Eval(*e)));
             }
             ExpressionKind::Object { entries, .. } => {
-                self.frames.push(Frame::BuildObject(entries));
+                self.frames.push(Frame::BuildObject(id));
                 self.frames
                     .extend(entries.iter().rev().map(|e| Frame::Eval(e.value)));
             }
-            ExpressionKind::Access { base, links } => {
-                self.frames.push(Frame::Link {
-                    base: *base,
-                    links,
-                    index: 0,
-                    in_target: false,
-                });
-                self.frames.push(Frame::Eval(*base));
+            ExpressionKind::Access { links, .. } => {
+                self.open_chain(tree, id, links.len(), false)?;
             }
-            ExpressionKind::Function(function) => {
-                let value = self.make_function(function);
+            ExpressionKind::Function(_) => {
+                let value = self.make_function(FnAt::Literal(id));
                 self.values.push(value);
             }
         }
         Ok(())
     }
 
-    /// Apply `links[index]` to the receiver on top of the value stack.
+    /// Schedule the first `end` links of the access chain `access`, starting with its base.
+    ///
+    /// When the base is a bare name that no scope declares and the first link calls it, the chain
+    /// starts with a host call instead (§8): its arguments are evaluated and the machine stops.
+    /// A local binding of the name — `let`, parameter, named `fn`, starting variable — makes it an
+    /// ordinary call.
+    fn open_chain(
+        &mut self,
+        tree: &Program,
+        access: ExprId,
+        end: usize,
+        in_target: bool,
+    ) -> Result<(), Diagnostic> {
+        let expression = tree.expression(access);
+        let ExpressionKind::Access { base, links } = &expression.kind else {
+            return Err(internal(expression.span));
+        };
+        let chain = Chain { access, end };
+        if let Some(AccessLink {
+            kind: AccessKind::Call { arguments, .. },
+            ..
+        }) = links.get(..end).and_then(<[AccessLink]>::first)
+            && let ExpressionKind::Identifier(name) = &tree.expression(*base).kind
+            && self.heap.lookup(self.scope, &name.name).is_none()
+        {
+            self.frames.push(Frame::HostCall { chain, in_target });
+            self.frames
+                .extend(arguments.iter().rev().map(|a| Frame::Eval(*a)));
+            return Ok(());
+        }
+        self.frames.push(Frame::Link {
+            chain,
+            index: 0,
+            in_target,
+        });
+        self.frames.push(Frame::Eval(*base));
+        Ok(())
+    }
+
+    /// Apply the chain's `links[index]` to the receiver on top of the value stack.
     fn link(
         &mut self,
-        base: ExprId,
-        links: &'p [AccessLink],
+        tree: &Program,
+        chain: Chain,
         index: usize,
         in_target: bool,
     ) -> Result<(), Diagnostic> {
+        let (base, links) = chain_links(tree, chain);
         let Some(link) = links.get(index) else {
             return Ok(()); // chain complete; its value is on the stack
         };
@@ -894,8 +1072,7 @@ impl<'p> Machine<'p> {
             // Calls are handled before the null check: calling `null` is `type.not_callable`,
             // not a null access, and there is no optional call form to suppress it (§4.4).
             self.frames.push(Frame::Invoke {
-                base,
-                links,
+                chain,
                 index,
                 in_target,
                 arguments: arguments.len(),
@@ -906,7 +1083,14 @@ impl<'p> Machine<'p> {
         }
         if receiver_is_null {
             // `?.` is not allowed in an assignment target, so only suggest it for plain reads.
-            return Err(self.null_access(base, &links[..index], link, "read", !in_target));
+            return Err(null_access(
+                tree,
+                base,
+                &links[..index],
+                link,
+                "read",
+                !in_target,
+            ));
         }
         match &link.kind {
             AccessKind::Property(name) => {
@@ -914,16 +1098,14 @@ impl<'p> Machine<'p> {
                 let value = self.read_property(&receiver, name, link)?;
                 self.values.push(value);
                 self.frames.push(Frame::Link {
-                    base,
-                    links,
+                    chain,
                     index: index + 1,
                     in_target,
                 });
             }
             AccessKind::Index { expression, .. } => {
                 self.frames.push(Frame::IndexRead {
-                    base,
-                    links,
+                    chain,
                     index,
                     in_target,
                 });
@@ -937,12 +1119,13 @@ impl<'p> Machine<'p> {
 
     fn read_index(
         &self,
+        tree: &Program,
         receiver: &RtValue,
         key: &RtValue,
         link: &AccessLink,
         key_expression: ExprId,
     ) -> Result<RtValue, Diagnostic> {
-        let key_span = self.program.expression(key_expression).span;
+        let key_span = tree.expression(key_expression).span;
         match (receiver, key) {
             (RtValue::Array(array), RtValue::Number(n)) => {
                 // §7: anything that is not an in-range whole index reads as absent.
@@ -958,13 +1141,16 @@ impl<'p> Machine<'p> {
         }
     }
 
-    fn assign_member(
-        &mut self,
-        base: ExprId,
-        prefix: &'p [AccessLink],
-        link: &'p AccessLink,
-    ) -> Result<(), Diagnostic> {
+    /// Store the assigned value through the last link of the access expression `target`.
+    fn assign_member(&mut self, tree: &Program, target: ExprId) -> Result<(), Diagnostic> {
         let value = self.pop();
+        let expression = tree.expression(target);
+        let ExpressionKind::Access { base, links } = &expression.kind else {
+            return Err(internal(expression.span));
+        };
+        let Some((link, prefix)) = links.split_last() else {
+            return Err(internal(expression.span));
+        };
         match &link.kind {
             AccessKind::Property(name) => {
                 let receiver = self.pop();
@@ -973,17 +1159,17 @@ impl<'p> Machine<'p> {
                         self.heap.object_store(*object, &name.name, value);
                         Ok(())
                     }
-                    RtValue::Null => Err(self.null_access(base, prefix, link, "assign", false)),
+                    RtValue::Null => Err(null_access(tree, *base, prefix, link, "assign", false)),
                     other => Err(no_properties(other, name, link.span)),
                 }
             }
             AccessKind::Index { expression, .. } => {
                 let key = self.pop();
                 let receiver = self.pop();
-                let key_span = self.program.expression(*expression).span;
+                let key_span = tree.expression(*expression).span;
                 match (&receiver, &key) {
                     (RtValue::Null, _) => {
-                        Err(self.null_access(base, prefix, link, "assign", false))
+                        Err(null_access(tree, *base, prefix, link, "assign", false))
                     }
                     (RtValue::Array(array), RtValue::Number(n)) => {
                         if array_slot(*n).is_some_and(|i| self.heap.array_store(*array, i, value)) {
@@ -1016,45 +1202,6 @@ impl<'p> Machine<'p> {
         }
     }
 
-    /// A `reference` error for applying `link` to `null`, naming what produced the null: the
-    /// last of `before` (the chain's earlier links), or the chain's base.
-    fn null_access(
-        &self,
-        base: ExprId,
-        before: &[AccessLink],
-        link: &AccessLink,
-        verb: &str,
-        suggest_optional: bool,
-    ) -> Diagnostic {
-        let subject = match before.last() {
-            None => match &self.program.expression(base).kind {
-                ExpressionKind::Identifier(name) => format!("`{}`", name.name),
-                ExpressionKind::Literal(Literal::Null) => "`null`".to_owned(),
-                _ => "the value".to_owned(),
-            },
-            Some(previous) => match &previous.kind {
-                AccessKind::Property(name) => format!("`{}`", name.name),
-                AccessKind::Index { .. } => "the indexed element".to_owned(),
-                AccessKind::Call { .. } => "the call result".to_owned(),
-            },
-        };
-        let what = match &link.kind {
-            AccessKind::Property(name) => format!("property `{}`", name.name),
-            _ => "an index".to_owned(),
-        };
-        let hint = if suggest_optional {
-            "; use `?.` to read it as null instead"
-        } else {
-            ""
-        };
-        Diagnostic::new(
-            Category::Reference,
-            Code::NULL_ACCESS,
-            format!("cannot {verb} {what}: {subject} is null{hint}"),
-            link.span,
-        )
-    }
-
     fn binary_right(&mut self, left: ExprId, operator: Spanned<BinaryOperator>, right: ExprId) {
         match operator.kind {
             // §4.1: `||` keeps a truthy left, `&&` keeps a falsy left; otherwise the result is
@@ -1080,6 +1227,7 @@ impl<'p> Machine<'p> {
 
     fn unary(
         &self,
+        tree: &Program,
         operator: Spanned<UnaryOperator>,
         operand: ExprId,
         value: &RtValue,
@@ -1096,7 +1244,7 @@ impl<'p> Machine<'p> {
                         article(value),
                         not_a_number_reason(value)
                     ),
-                    self.program.expression(operand).span,
+                    tree.expression(operand).span,
                 )),
             },
         }
@@ -1104,6 +1252,7 @@ impl<'p> Machine<'p> {
 
     fn binary(
         &self,
+        tree: &Program,
         left: ExprId,
         operator: Spanned<BinaryOperator>,
         right: ExprId,
@@ -1111,8 +1260,8 @@ impl<'p> Machine<'p> {
         r: &RtValue,
     ) -> Result<RtValue, Diagnostic> {
         use BinaryOperator as Op;
-        let left_span = self.program.expression(left).span;
-        let right_span = self.program.expression(right).span;
+        let left_span = tree.expression(left).span;
+        let right_span = tree.expression(right).span;
         let symbol = binary_symbol(operator.kind);
         let mismatch = |span: Span, reason: String| {
             Diagnostic::new(
@@ -1228,6 +1377,92 @@ impl<'p> Machine<'p> {
             other => Err(no_properties(other, name, link.span)),
         }
     }
+}
+
+/// A `reference` error for applying `link` to `null`, naming what produced the null: the last of
+/// `before` (the chain's earlier links), or the chain's base.
+fn null_access(
+    tree: &Program,
+    base: ExprId,
+    before: &[AccessLink],
+    link: &AccessLink,
+    verb: &str,
+    suggest_optional: bool,
+) -> Diagnostic {
+    let subject = match before.last() {
+        None => match &tree.expression(base).kind {
+            ExpressionKind::Identifier(name) => format!("`{}`", name.name),
+            ExpressionKind::Literal(Literal::Null) => "`null`".to_owned(),
+            _ => "the value".to_owned(),
+        },
+        Some(previous) => match &previous.kind {
+            AccessKind::Property(name) => format!("`{}`", name.name),
+            AccessKind::Index { .. } => "the indexed element".to_owned(),
+            AccessKind::Call { .. } => "the call result".to_owned(),
+        },
+    };
+    let what = match &link.kind {
+        AccessKind::Property(name) => format!("property `{}`", name.name),
+        _ => "an index".to_owned(),
+    };
+    let hint = if suggest_optional {
+        "; use `?.` to read it as null instead"
+    } else {
+        ""
+    };
+    Diagnostic::new(
+        Category::Reference,
+        Code::NULL_ACCESS,
+        format!("cannot {verb} {what}: {subject} is null{hint}"),
+        link.span,
+    )
+}
+
+/// The statements of `block`, or the Program's top level for `None`.
+fn statements(tree: &Program, block: Option<BlockId>) -> &[Statement] {
+    match block {
+        None => &tree.statements,
+        Some(id) => &tree.block(id).statements,
+    }
+}
+
+/// The statement at `at`. Positions are only ever made from the statements they name.
+fn statement(tree: &Program, at: StmtAt) -> &Statement {
+    &statements(tree, at.block)[at.index]
+}
+
+/// The `Function` at `at`; `None` only if `at` names something else, which the machine never
+/// records.
+fn function(tree: &Program, at: FnAt) -> Option<&Function> {
+    match at {
+        FnAt::Declared(at) => match &statement(tree, at).kind {
+            StatementKind::Function { function, .. } => Some(function),
+            _ => None,
+        },
+        FnAt::Literal(id) => match &tree.expression(id).kind {
+            ExpressionKind::Function(function) => Some(function),
+            _ => None,
+        },
+    }
+}
+
+/// The chain's base and its links. A chain is only ever made from an `Access` expression; were
+/// it not one, the chain would have no links and end at once.
+fn chain_links(tree: &Program, chain: Chain) -> (ExprId, &[AccessLink]) {
+    match &tree.expression(chain.access).kind {
+        ExpressionKind::Access { base, links } => (*base, links.get(..chain.end).unwrap_or(links)),
+        _ => (chain.access, &[]),
+    }
+}
+
+/// The span from the start of `first` through the end of `last`, both on the same source.
+const fn through(first: Span, last: Span) -> Span {
+    Span::new(
+        first.offset,
+        last.end().saturating_sub(first.offset),
+        first.line,
+        first.column,
+    )
 }
 
 /// A whole, non-negative number as an array position.
@@ -1502,7 +1737,15 @@ mod tests {
         }
     }
 
-    fn marker(machine: &Machine<'_>) -> Arc<str> {
+    /// Run `machine` to its result; these trees make no host call.
+    fn finish(machine: &mut Machine<&Program>) -> Result<Value, Diagnostic> {
+        match machine.execute()? {
+            Stop::Finished(value) => Ok(value),
+            Stop::HostCall(call) => panic!("unexpected host call to `{}`", call.name),
+        }
+    }
+
+    fn marker(machine: &Machine<&Program>) -> Arc<str> {
         let strings = machine.heap.strings();
         let found = strings.iter().find(|s| s.as_ref() == "marker");
         Arc::clone(found.expect("the marker string is in the heap"))
@@ -1511,7 +1754,10 @@ mod tests {
     #[test]
     fn machine_is_send() {
         fn assert_send<T: Send>() {}
-        assert_send::<Machine<'static>>();
+        fn assert_static<T: 'static>() {}
+        // A suspended execution moves between blocking-pool threads (Story 3.1).
+        assert_send::<Machine<Arc<Program>>>();
+        assert_static::<Machine<Arc<Program>>>();
     }
 
     #[test]
@@ -1527,7 +1773,7 @@ mod tests {
         let program = build.0;
 
         let mut machine = Machine::new(&program);
-        let result = machine.execute().expect("evaluates");
+        let result = finish(&mut machine).expect("evaluates");
         assert_eq!(result.as_number(), Some(1.0));
         assert!(machine.heap.has_self_containing_array());
         let marker = marker(&machine);
@@ -1546,7 +1792,7 @@ mod tests {
         let program = build.0;
 
         let mut machine = Machine::new(&program);
-        let error = machine.execute().expect_err("fails");
+        let error = finish(&mut machine).expect_err("fails");
         assert_eq!(error.code, Code::UNDECLARED_IDENTIFIER);
         assert!(machine.heap.has_self_containing_array());
         let marker = marker(&machine);
@@ -1571,7 +1817,7 @@ mod tests {
         let program = build.0;
 
         let mut machine = Machine::new(&program);
-        let result = machine.execute().expect("evaluates");
+        let result = finish(&mut machine).expect("evaluates");
         let marker = marker(&machine);
         drop(machine);
         assert_eq!(Arc::strong_count(&marker), 2, "held by the result alone");
@@ -1602,7 +1848,7 @@ mod tests {
         let program = build.0;
 
         let mut machine = Machine::new(&program);
-        let value = machine.execute().expect("evaluates");
+        let value = finish(&mut machine).expect("evaluates");
         assert_eq!(value.as_number(), Some(7.0), "the capture is intact");
         // Root scope, the retained (captured) block scope, and the function value itself. The
         // call's own scope captured nothing, so it was reclaimed.
@@ -1620,7 +1866,7 @@ mod tests {
         let program = build.0;
 
         let mut machine = Machine::new(&program);
-        machine.execute().expect("evaluates");
+        finish(&mut machine).expect("evaluates");
         assert_eq!(machine.heap.live(), 1, "only the root scope is live");
     }
 
@@ -1648,7 +1894,7 @@ mod tests {
         let program = build.0;
 
         let mut machine = Machine::new(&program);
-        machine.execute().expect("evaluates");
+        finish(&mut machine).expect("evaluates");
         // Root scope plus the one function value; the single call scope is on the free list.
         assert_eq!(machine.heap.live(), 2);
         assert_eq!(
@@ -1716,7 +1962,7 @@ mod tests {
         let program = build.0;
 
         let mut machine = Machine::new(&program);
-        let value = machine.execute().expect("evaluates");
+        let value = finish(&mut machine).expect("evaluates");
         assert_eq!(value.as_number(), Some(0.0));
         assert_eq!(machine.heap.live(), 2, "every call scope was reclaimed");
     }
@@ -1749,7 +1995,7 @@ mod tests {
         let program = build.0;
 
         let mut machine = Machine::new(&program);
-        machine.execute().expect("evaluates");
+        finish(&mut machine).expect("evaluates");
         assert_eq!(machine.heap.live(), 1, "only the root scope is live");
         assert_eq!(
             machine.heap.capacity(),

@@ -2,7 +2,7 @@
 title: 'Story 3.1: Call a registered host function from a script'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'in-review'
 baseline_commit: '5779a10024530d838b449bb3bb5e3d82d433f4b1'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -64,13 +64,13 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hexput-interpreter/src/{machine.rs,lib.rs}` -- owned program, resumable step API, host-call suspension -- AC1/AC3.
-- [ ] `crates/hexput-shared/src/{diagnostics.rs,wire.rs}` -- codes, message type.
-- [ ] `crates/hexput-enforce`, `crates/hexput-rpc` -- capability check; call correlation.
-- [ ] `crates/hexput-exec`, `crates/hexput-script` -- async driver, moved conversions.
-- [ ] `crates/hexput-connection/src/lib.rs` -- routing, outbound branch, fail-pending on close.
-- [ ] `scripts/check-crate-graph.py`, Spine (conn→rpc amendment), LANGUAGE-REFERENCE (`host` category, host-call semantics in §7/§8), `CLAUDE.md` status.
-- [ ] `crates/hexput-tests/tests/*` -- every matrix row; `hexput eval` host call → `capability`.
+- [x] `crates/hexput-interpreter/src/{machine.rs,lib.rs}` -- owned program, resumable step API, host-call suspension -- AC1/AC3.
+- [x] `crates/hexput-shared/src/{diagnostics.rs,wire.rs}` -- codes, message type.
+- [x] `crates/hexput-enforce`, `crates/hexput-rpc` -- capability check; call correlation.
+- [x] `crates/hexput-exec`, `crates/hexput-script` -- async driver, moved conversions.
+- [x] `crates/hexput-connection/src/lib.rs` -- routing, outbound branch, fail-pending on close.
+- [x] `scripts/check-crate-graph.py`, Spine (conn→rpc amendment), LANGUAGE-REFERENCE (`host` category, host-call semantics in §7/§8), `CLAUDE.md` status.
+- [x] `crates/hexput-tests/tests/*` -- every matrix row; `hexput eval` host call → `capability`.
 
 **Acceptance Criteria:**
 - Given an execution waiting on a reply, when the runtime is inspected, then no blocking-pool thread is held for it and a second execution on the same connection completes meanwhile.

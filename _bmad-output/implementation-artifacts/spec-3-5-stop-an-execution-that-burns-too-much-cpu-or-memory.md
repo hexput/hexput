@@ -21,6 +21,10 @@ context:
 
 **Always:** The decision and the error live in `hexput-enforce`, reached only through `hexput-exec` (the graph check already pins it). The six dimensions are one `#[non_exhaustive]` enum in `hexput-shared::budget` (CPU time, memory, allocations, RPC calls, output size, side effects); only CPU time and memory are enforced here. Each dimension has its own stable code (`budget.cpu_time_exceeded`, `budget.memory_exceeded`) in `Code::ALL`, category `budget`, distinct from `capability`/`policy`/`host`. The error is spanned on the construct running when the limit was crossed. Waiting for a host call's reply or a per-call handler's answer is never charged as CPU time. The interpreter is checked often enough that a runaway loop stops within a small fraction of its CPU limit, and memory is checked at allocation so one step cannot overshoot by more than that step's own allocation. A terminated execution never panics the Daemon and never disturbs other in-flight executions; RPC calls it already made stand.
 
+**Decisions (2026-09-24, Erdem):**
+1. *Default limits* — CPU time 1 second and memory 64 MiB per execution, documented constants in `hexput-enforce` until Story 3.7 makes them Config values.
+2. *What CPU time measures* — the monotonic time (`Instant`) the execution spends running Script code on its blocking thread, summed across slices and segments, excluding every wait on the Backend. No OS thread-CPU API, no `unsafe`; the doc says an oversubscribed host inflates it.
+
 **Never:** No Config keys or per-execution overrides (Story 3.7 — limits are documented constants here), no allocation/RPC/output/side-effect counting (Story 3.6), no metrics or budget log events beyond one `debug` event (Epic 7), no OS-level limits, threads killed, or `unsafe`.
 
 ## I/O & Edge-Case Matrix
@@ -36,11 +40,6 @@ context:
 | Shutdown | Daemon shut down while a runaway runs | exits once the runaway hits its CPU limit (no indefinite hang) | N/A |
 
 </frozen-after-approval>
-
-## Open Questions
-
-1. **Default limits (until Story 3.7 makes them Config values)** — options: (A, recommended) CPU time 1 second, memory 64 MiB per execution — rule-engine scripts are short; 64 MiB leaves room for large inputs / (B) CPU 5 s, memory 256 MiB — more permissive for report-style scripts / (C) values you name.
-2. **What "CPU time" measures** — options: (A, recommended) the monotonic time the execution spends running Script code on its blocking thread, summed across segments and excluding every wait on the Backend — portable, no `unsafe`, but a heavily oversubscribed host inflates it / (B) true per-thread CPU time from the OS (`CLOCK_THREAD_CPUTIME_ID`) — exact under contention, but needs a platform API (an external crate wrapping `unsafe`) and differs on Windows.
 
 ## Code Map
 

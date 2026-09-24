@@ -138,3 +138,10 @@ development_status:
   9-4-see-syntax-errors-where-they-are: backlog
   9-5-get-basic-completion-while-writing: backlog
   epic-9-retrospective: optional
+
+  epic-10: backlog
+  10-1-build-the-playground-as-its-own-package: backlog
+  10-2-serve-the-playground-from-the-daemon-by-default: backlog
+  10-3-try-host-calls-with-demo-functions: backlog
+  10-4-get-language-server-help-in-the-playground: backlog
+  epic-10-retrospective: optional

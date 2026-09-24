@@ -8,7 +8,7 @@ scope: 'Hexput v2 daemon — the whole system covered by the v2 PRD'
 status: final
 created: '2026-09-18'
 updated: '2026-09-24'
-amended: '2026-09-18 — AD-8 and the check/ module added for FR-26 (optional static check); later the same day, Structural Seed rewritten from a single-crate module tree into a Cargo workspace, one crate per module plus language/tooling crates, all lib crates funneling into one hexput-bin crate for binaries. Both after this spine was first marked final. 2026-09-24 — edge hexput-connection → hexput-rpc and the Call/Value Secret wire contract added for FR-27/FR-28 (course correction); the same day, the Authorize question for the per-call handler (Story 3.3). See .memlog.md.'
+amended: '2026-09-18 — AD-8 and the check/ module added for FR-26 (optional static check); later the same day, Structural Seed rewritten from a single-crate module tree into a Cargo workspace, one crate per module plus language/tooling crates, all lib crates funneling into one hexput-bin crate for binaries. Both after this spine was first marked final. 2026-09-24 — edge hexput-connection → hexput-rpc and the Call/Value Secret wire contract added for FR-27/FR-28 (course correction); the same day, the Authorize question for the per-call handler (Story 3.3); later, crate hexput-playground (FR-30), fixed default ports (FR-9/FR-29) and the loopback playground listener as the one exception to OQ-1. See .memlog.md.'
 binds: [FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-7, FR-8, FR-9, FR-11, FR-12, FR-13, FR-16, FR-17, FR-18, FR-19, FR-20, FR-21, FR-22, FR-23, FR-24, FR-25, FR-26, FR-27, FR-28]
 sources: ['_bmad-output/planning-artifacts/prds/prd-hexput-2026-09-18/prd.md', '_bmad-output/planning-artifacts/briefs/brief-hexput-2026-09-18/brief.md']
 companions: []
@@ -189,12 +189,14 @@ crates/
   # — developer tooling (FR-14, FR-15), independent of the daemon —
   hexput-grammar/               # tree-sitter grammar
   hexput-lsp-core/               # language server logic — depends on lexer/parser/check only, never interpreter or any daemon crate
+  hexput-playground/             # local browser playground (FR-30): a loopback HTTP page acting as a Backend over the wire protocol
 
   hexput-bin/                    # the ONLY crate that produces binaries
     src/bin/
       hexput-daemon.rs          # thin main() -> hexput_daemon::run()
       hexput.rs                 # thin main() -> hexput_cli_core::run() (eval + check)
       hexput-lsp.rs              # thin main() -> hexput_lsp_core::run_server()
+      hexput-playground.rs       # thin main() -> hexput_playground::run() (standalone, against a running Daemon)
 ```
 
 ### Crate dependency graph
@@ -260,6 +262,11 @@ graph TD
   bin[hexput-bin] --> daemon
   bin --> clicore
   bin --> lspcore
+  playground[hexput-playground] --> port
+  playground --> shared
+  playground --> lspcore
+  daemon --> playground
+  bin --> playground
 ```
 
 What this graph makes a compile error rather than a review comment:
@@ -283,6 +290,8 @@ What this graph makes a compile error rather than a review comment:
 **[Amended 2026-09-24, Epic 3 Story 3.3]** A call of a function registered without a blanket grant is preceded by a separate question, `Authorize {name, arguments}` (the same payload the `Call` would carry), under a Daemon-issued id from the same per-connection counter as `Call` and answered like one, `Result {value: <bool>}` or `Error`. Only `value: true` lets the Daemon send the `Call` — two round trips, keeping the Backend's guard apart from the implementation it guards (FR-6). The Daemon waits at most `hexput_exec::AUTHORIZATION_TIMEOUT` (5 s; Story 3.7 makes it a Config default); a later answer is dropped. The decision is `hexput-enforce`'s, asked only by `hexput-exec` (AD-3); `hexput-rpc` builds and correlates the question, and `check-crate-graph.py` restricts `MessageType::Authorize` and `Caller::ask_authorization` like `MessageType::Call` and `dispatch_authorized`. Every denial is the Script-visible `capability.unknown_function`; the Daemon logs its `reason` (`refused`, `handler_invalid`, `handler_failed`, `handler_timeout`, `handler_no_reply`, `unregistered`) at `debug`.
 
 **[Amended 2026-09-24, Epic 3 Story 3.3 follow-up — Erdem]** Every `Call` and `Authorize` the Daemon sends for a Direct Execution also carries `execution`: the correlation id of the `ExecutionStart` that started the execution making it. The Backend can have several executions in flight on one connection; without it, it could not tell which one is asking, and so could not decide a call by who the Script acts for (Story 3.3's purpose). The key is additive — a request made for no named execution omits it — and it is set where the connection hands each execution its `Caller` (`hexput_rpc::Caller::for_execution`).
+
+**[Amended 2026-09-24, course correction — FR-29/FR-30, Erdem]** A crate `hexput-playground` is added, with the edges `hexput-playground --> hexput-port`, `hexput-playground --> hexput-shared`, `hexput-playground --> hexput-lsp-core` (Story 10.4), `hexput-daemon --> hexput-playground` and `hexput-bin --> hexput-playground` (a fourth binary, `src/bin/hexput-playground.rs`). The playground is a **Backend**, not part of the runtime: it speaks the ordinary wire protocol (`Init`, `ExecutionStart`, answering `Call`s for its blanket-granted demo functions) over a byte stream, framed by `hexput-port`'s codec. Embedded, the Daemon hands it one end of an in-process duplex stream and serves the other end through `hexput-connection::serve` like any accepted connection, so every playground Script goes through the same init gate, Session and Executor (AD-3) — the playground can reach neither `hexput-exec` nor `hexput-enforce`, and `check-crate-graph.py` pins its exact set. Standalone, it connects to a running Daemon's socket as a client (client-side sockets need no `hexput-transport` adapter, so AD-1 is untouched). Its browser-facing side is a minimal HTTP/1.1 listener bound to loopback only (default `127.0.0.1:7477`), serving one self-contained page and a JSON run endpoint; it is **the one HTTP listener** the Daemon may open (OQ-1 amendment in `epics.md`), is not a Transport and carries no health or metrics. System Config gains `[playground] enabled` (default `true`) and `port` (default `7477`); a non-loopback bind is a start-up error. The fixed default ports are **7476** for TCP+TLS and **7478** for WebSocket (Epic 5), recorded here so the installer (FR-29), the SDKs and the docs agree.
 
 `[workspace.dependencies]` in the root `Cargo.toml` pins every version from the Stack table above exactly once; member crates inherit with `workspace = true` rather than re-pinning.
 

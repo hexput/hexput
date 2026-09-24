@@ -3,7 +3,7 @@ title: Hexput v2 PRD
 created: 2026-09-18
 updated: 2026-09-24
 status: final
-amended: '2026-09-18 — FR-26 (optional static check) added during sprint planning, after this document was first marked final. 2026-09-24 — FR-27 (Registered Methods on keyed objects) and FR-28 (Value Secret, Reference IDs, host-side modifications) added by course correction during Story 3.1 planning. See .memlog.md.'
+amended: '2026-09-18 — FR-26 (optional static check) added during sprint planning, after this document was first marked final. 2026-09-24 — FR-27 (Registered Methods on keyed objects) and FR-28 (Value Secret, Reference IDs, host-side modifications) added by course correction during Story 3.1 planning; later the same day FR-29 (one-line install as a system service, fixed default ports) and FR-30 (local playground). See .memlog.md.'
 ---
 
 # PRD: Hexput v2
@@ -231,6 +231,7 @@ A Backend can connect via Unix Domain Socket, Named Pipe, TCP+TLS, or WebSocket,
 - The same script/RPC request produces the same result whether submitted over UDS/Named Pipe or over TCP+TLS/WebSocket, modulo network latency.
 - TLS is enforced (not optional) for any remote connection — that is, anything other than UDS or Named Pipe.
 - Named Pipe is the Windows-native equivalent of UDS for local, same-machine connections — a Backend on Windows is not required to use TCP for local IPC.
+- Hexput has fixed default ports, used whenever System Config names a transport without a port: **7476** for TCP+TLS and **7478** for WebSocket (7477 is the local playground, FR-30). **[Added 2026-09-24.]**
 
 ### 4.6 Client SDKs
 
@@ -396,6 +397,27 @@ A handler annotated `@Event(<name>, async = true)` runs concurrently, without wa
 - With `async = true`, the handler's default Global Variable mutation strategy is unsafe/lock-free (FR-20), independent of the Backend's otherwise-configured default — unless the Backend explicitly configures async handlers to use the safe/mutex strategy too.
 - `priority` and `async = true` on the same handler binding is a defined combination, not undefined behavior: async takes precedence, since a handler that doesn't wait its turn has no ordering to apply priority to. [ASSUMPTION: precedence rule, not separately confirmed.]
 
+### 4.10 Installation and local playground
+
+**Description:** Getting from nothing to a running, supervised Daemon is one command, and trying the language needs nothing but a browser on the same machine. **[Added 2026-09-24 by course correction.]**
+
+#### FR-29: One-line install as a system service
+An operator can install and start the Daemon as a supervised system service with a single command published in the README.
+
+**Consequences (testable):**
+- On Linux (systemd) and macOS (launchd), `curl -fsSL <release>/install.sh | sh` installs the binaries, writes a default System Config at the default path (AD-7) if none exists, registers the service and starts it; on Windows, a one-line PowerShell `install.ps1` does the same as a Windows service.
+- Re-running the installer updates the binaries in place and restarts the service, never overwriting an existing System Config.
+- The default System Config uses the fixed default ports (FR-9) and enables the playground (FR-30).
+
+#### FR-30: Local playground
+The Daemon serves a local web playground for trying Hexput — an editor, a run button, the result or error with its span, and a few demo host functions — reachable only from the same machine.
+
+**Consequences (testable):**
+- The playground listens on **7477**, bound to loopback only (`127.0.0.1`/`::1`); it is on by default and can be switched off in System Config.
+- It is its own package: embedded in the Daemon by default, and also runnable as a standalone executable that connects to a Daemon.
+- It reaches the runtime exactly as a Backend does — init, registrations, Direct Execution — so every capability and budget rule applies; its demo host functions are registered with a blanket grant and do nothing outside the playground.
+- Once the language server exists (FR-15), the playground's editor shows its diagnostics and completion.
+
 ## 5. Non-goals (explicit)
 
 The three non-user boundaries in §2.2 (no OS-level sandboxing, no transactional RPC effects, no built-in horizontal scaling) apply here too and aren't repeated. Additionally:
@@ -416,6 +438,7 @@ The three non-user boundaries in §2.2 (no OS-level sandboxing, no transactional
 - Tree-sitter grammar and basic LSP (FR-14, FR-15)
 - Plugin Registration & Events: registration as a distinct mode, reserved `BackendRegisteredInit`, upfront-declared Backend-defined events, priority/async handler ordering, Global Variable state/locking/behavior, Session-tied lifecycle with disconnect handling (FR-17…FR-25)
 - MessagePack wire protocol
+- One-line install as a system service with fixed default ports (FR-29), and a local playground (FR-30)
 
 ### 6.2 Out of scope for MVP
 - Client SDKs, Phase 2: Node.js, Rust, Go — deferred, tracked separately, not a launch blocker

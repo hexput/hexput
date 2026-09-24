@@ -43,6 +43,8 @@ FR-6: A Backend can register a function as callable independently of the logic d
 FR-7: A script cannot reach the filesystem, network, or host process memory except through an explicitly granted Registered Function; any other capability reference fails with a defined capability-denied error, not a host-level exception.
 FR-27: A Backend can register a function as a method bound to an object key (`registerMethod(objKey, fn)`); a script calls it as `value.name(args)` on a value whose Value Secret carries that key, the call reaching the Backend as the same generic `Call` message with the receiver itself attached; a registered method wins over an own property of the same name, an unregistered method name is a capability denial, and argument/receiver nesting is capped by a Config limit (default 12). **[Added 2026-09-24 by course correction — sprint-change-proposal-2026-09-24.md.]**
 FR-28: Every value crossing to the Backend carries a hidden Value Secret (`__secret`: Reference ID `ref`, optional `key`, further Backend fields) that the Backend can read and edit and a script can never observe or change — reading yields `null`, writing is silently ignored, iteration skips it; modifications flow both ways by Reference ID — changes the Backend makes during a call are reported in the call's reply and applied before the script resumes, and referenced locations the script writes are reported in the execution's result; a Reference ID names a collection itself or the location a scalar or string arrived in, never a copy; a script can never override a Registered Method (`capability.method_override`, also a static-check finding). **[Added 2026-09-24 by course correction.]**
+FR-29: An operator installs and starts the Daemon as a supervised system service with one command from the README (`install.sh` for Linux/systemd and macOS/launchd, `install.ps1` for a Windows service); the default System Config uses Hexput's fixed default ports — 7476 TCP+TLS, 7478 WebSocket. **[Added 2026-09-24.]**
+FR-30: The Daemon serves a local playground on 7477, loopback only, on by default and switchable off in System Config; it is its own package, embedded by default and also runnable standalone, reaches the runtime as a Backend with demo host functions, and gains the language server's diagnostics and completion once FR-15 exists. **[Added 2026-09-24.]**
 
 **Resource budgeting (PRD §4.4)**
 
@@ -115,7 +117,7 @@ NFR7 (Operability): The daemon runs as standard infrastructure (systemd unit or 
 
 *PRD §9 left these open. Resolved here with user authority — OQ-1 decided by the user directly, OQ-2/OQ-3/OQ-11 delegated to the PM role ("solve it yourself"). These are binding on story acceptance criteria; the PRD's [ASSUMPTION] tags on FR-22/FR-23 are now settled, not assumed.*
 
-- **OQ-1 → RESOLVED (user): health and metrics are RPC message types, not an HTTP endpoint.** `HealthCheck` and `MetricsScrape` are ordinary `hexput-port` message types served pre-init-gate (no completed handshake, no authenticated Backend required), consistent with AD-1's prohibition on a structurally separate listener. `MetricsScrape` returns a Prometheus text-exposition-format payload as its response body so standard tooling can consume it through a thin bridge; the daemon itself never opens an HTTP listener. Per-budget-dimension violation counters are separate series (FR-8, FR-11).
+- **OQ-1 → RESOLVED (user): health and metrics are RPC message types, not an HTTP endpoint.** `HealthCheck` and `MetricsScrape` are ordinary `hexput-port` message types served pre-init-gate (no completed handshake, no authenticated Backend required), consistent with AD-1's prohibition on a structurally separate listener. `MetricsScrape` returns a Prometheus text-exposition-format payload as its response body so standard tooling can consume it through a thin bridge; the daemon itself never opens an HTTP listener. *[Amended 2026-09-24 (Erdem): one exception — the local playground (FR-30) is served over HTTP on loopback only (7477), is off-switchable in System Config, and is not a Transport or a health/metrics surface; health and metrics stay RPC messages.]* Per-budget-dimension violation counters are separate series (FR-8, FR-11).
 - **OQ-2 → RESOLVED (PM): reconnect protection is a daemon-issued reconnect secret paired with the Client ID.** On first init the daemon generates a high-entropy (>=256-bit) secret from a CSPRNG and returns it alongside the Client ID exactly once; it persists only a salted hash of that secret in the `Session`, never the secret itself. A reconnect message carries Client ID + secret; `hexput-session` verifies it in constant time and rejects mismatches with a defined reconnect-denied error that is indistinguishable between "unknown Client ID" and "wrong secret". The secret lives for the Session's lifetime; rotation is out of scope for v2. Validation happens once in `hexput-session` for all four Transports (AD-2) — no adapter validates anything.
 - **OQ-3 → RESOLVED (PM): the execution-policy feature toggles are a fixed, closed set.** Togglable constructs (each independently on/off, all defaulting to on, settable in Config and overridable per execution per FR-3): `loops` (for/while), `conditionals` (if/else), `callbacks` (user-defined and anonymous function definition and invocation), `object_literals`, `array_literals`, and `rpc_calls` (a blanket switch disabling all Registered Function invocation regardless of Capability grants). Always-on and never togglable: variable declaration and assignment, scalar literals, arithmetic/comparison/logical operators, property and index access on existing values, `return`, and Plugin Global Variable access — disabling any of these would leave the language unable to express or report anything. Using a disabled construct raises the FR-3 "construct disabled by policy" error naming the toggle, distinct from a budget violation (FR-8) or capability denial (FR-6/FR-7).
 - **OQ-11 → RESOLVED (PM): ordering conventions confirmed as the PRD's assumed defaults.** `priority` is ascending — lower value runs first. Absent `priority`, handlers for one Event run in source-declaration order within the Plugin. `async = true` combined with `priority` resolves in favor of `async`: the handler is dispatched concurrently and its `priority` value is ignored (not rejected), since a handler that never waits its turn has no ordering position to occupy.
@@ -137,6 +139,8 @@ FR-6: Epic 3 - Function registration separate from per-call allow decision (cont
 FR-7: Epic 3 - No ambient host access; every reach outside the script is a granted Registered Function
 FR-27: Epic 3 (Daemon side) and Epic 8 (SDK `registerMethod`) - Registered Methods on keyed objects over the generic `Call` message
 FR-28: Epic 3 (Daemon side) and Epic 8 (SDK handling of Value Secrets and modifications) - Value Secret, Reference IDs, host-side modifications
+FR-29: Epic 7 (Story 7.6) and Epic 5 (default ports) - One-line install as a system service; fixed default ports
+FR-30: Epic 10 - Local playground, embedded in the Daemon by default
 FR-8: Epic 3 - Six-dimension Resource Budget, independently enforced, configurable and overridable
 FR-9: Epic 5 - UDS, Named Pipe, TCP+TLS, WebSocket adapters with identical protocol semantics
 FR-10: Epic 8 - Phase 1 client SDKs: JavaScript and Python
@@ -157,7 +161,7 @@ FR-24: Epic 2 - File-based System Config with CLI > env > default-path discovery
 FR-25: Epic 6 - Global Variable behavior strategies: forever, ttl, separate_each_trigger, keyed
 FR-26: Epic 1 (the check pass itself) and Epic 3 (its Config mode and per-execution override)
 
-**Coverage check:** all 28 FRs (FR-1...FR-28) are mapped to an owning epic; FR-26, FR-27 and FR-28 are split across two, since the check pass and its policy surface belong to different layers, and the Daemon and SDK sides of a wire feature ship in different epics. Epic 1 owns no FR directly — it is the enabling substrate the PRD assumes but never states as a requirement (the Hexput language itself), and is consumed by FR-4, FR-5, FR-14, FR-15, and FR-19.
+**Coverage check:** all 30 FRs (FR-1...FR-30) are mapped to an owning epic; FR-26, FR-27 and FR-28 are split across two, since the check pass and its policy surface belong to different layers, and the Daemon and SDK sides of a wire feature ship in different epics. Epic 1 owns no FR directly — it is the enabling substrate the PRD assumes but never states as a requirement (the Hexput language itself), and is consumed by FR-4, FR-5, FR-14, FR-15, and FR-19.
 
 
 ## Epic List
@@ -208,6 +212,11 @@ A backend engineer working in JavaScript or Python can install a thin client SDK
 
 A script author — often not the backend engineer running the daemon — gets syntax highlighting and folding from a tree-sitter grammar, and syntax-error diagnostics plus basic completion from a language server, in any LSP-compatible editor. Both reuse Epic 1's parser rather than reimplementing the grammar.
 **FRs covered:** FR-14, FR-15
+
+### Epic 10: Try Hexput in a local playground
+
+**[Added 2026-09-24 by course correction.]** Anyone on the Daemon's machine opens `http://127.0.0.1:7477`, writes a Script, runs it against demo host functions, and sees the result or the error at its span — the fastest way to learn the language and the capability/budget rules. Once Epic 9's language server exists, the editor gets its diagnostics and completion.
+**FRs covered:** FR-30
 
 
 ---
@@ -1146,6 +1155,10 @@ So that my scripts and my host data never cross the network in the clear.
 **When** the daemon starts
 **Then** it listens on that address and accepts only TLS connections via rustls (FR-9, FR-24)
 
+**Given** a System Config enabling TCP without a port
+**When** the daemon starts
+**Then** it listens on Hexput's fixed default port **7476** (FR-9, FR-29) **[Added 2026-09-24]**
+
 **Given** a client attempting a plaintext TCP connection to that port
 **When** the handshake is attempted
 **Then** it is refused — TLS is not negotiable or optional for any non-local transport (FR-9)
@@ -1169,6 +1182,10 @@ So that proxies and gateways between me and the daemon don't block my connection
 **Given** a System Config enabling the WebSocket transport
 **When** a client opens a WebSocket connection via tokio-tungstenite and sends a framed message
 **Then** the daemon handles it through the same `Port` with the same MessagePack envelope as every other transport (FR-9, AD-1)
+
+**Given** a System Config enabling WebSocket without a port
+**When** the daemon starts
+**Then** it listens on Hexput's fixed default port **7478** (FR-9, FR-29) **[Added 2026-09-24]**
 
 **Given** a remote WebSocket connection
 **When** it is established
@@ -1787,6 +1804,10 @@ So that I can install and run Hexput the way I run Redis or Postgres, which is t
 **When** it is installed and started on a host with a System Config at the default path
 **Then** the daemon starts, is supervised, restarts on failure, and reports readiness — and the unit points at the config via the environment variable or the default path, never by changing discovery logic (AD-7)
 
+**Given** the README
+**When** an operator runs its one-line install command — `curl -fsSL <release>/install.sh | sh` on Linux (systemd) or macOS (launchd), or the one-line PowerShell `install.ps1` on Windows
+**Then** the binaries are installed, a default System Config is written at the default path if none exists (fixed default ports 7476 TCP+TLS / 7478 WebSocket, playground on 7477), the service is registered and started, and re-running it updates in place without overwriting an existing System Config (FR-29) **[Added 2026-09-24]**
+
 **Given** the container image
 **When** it is run with a System Config bind-mounted at the default path
 **Then** the daemon starts identically to the systemd deployment, resolving its config through the same precedence (AD-7)
@@ -2086,3 +2107,82 @@ So that I can recall the language's own constructs without leaving my editor.
 **Given** the completion surface
 **When** its scope is reviewed
 **Then** it deliberately excludes go-to-definition across Registered Functions and capability-aware autocomplete, which are out of scope for v2 (PRD §4.8 Out of Scope)
+
+---
+
+## Epic 10: Try Hexput in a local playground
+
+*[Added 2026-09-24 by course correction — see sprint-change-proposal-2026-09-24.md, second change.]* Anyone on the Daemon's machine can try Hexput in a browser: write a Script, run it against demo host functions, see the result or the error at its span. The playground is its own package, embedded in the Daemon by default and runnable standalone.
+
+### Story 10.1: Build the playground as its own package
+
+As a developer trying Hexput,
+I want a playground I can run on its own against a Daemon,
+So that I can learn the language without writing a Backend first.
+
+**Acceptance Criteria:**
+
+**Given** the `hexput-playground` crate
+**When** it is built
+**Then** it is a library the Daemon can embed and also a standalone executable (`hexput-playground`, produced by `hexput-bin`) that connects to a running Daemon over the wire protocol like any Backend (FR-30)
+
+**Given** the standalone executable started against a Daemon
+**When** a browser opens its page
+**Then** it serves one self-contained HTML page (no external assets) with an editor, starting-variable inputs and a run button, and shows the result in Hexput literal form or the error with its code, message and highlighted span
+
+**Given** its listener
+**When** it binds
+**Then** it binds loopback only (`127.0.0.1`/`::1`) on **7477** by default and refuses a non-loopback address
+
+### Story 10.2: Serve the playground from the Daemon by default
+
+As an operator who just installed Hexput,
+I want the playground to be there when the service starts,
+So that trying Hexput needs nothing beyond the one-line install.
+
+**Acceptance Criteria:**
+
+**Given** a default System Config
+**When** the Daemon starts
+**Then** it embeds the playground and serves it on `127.0.0.1:7477`, reaching the runtime through an in-process connection that goes through the same init, Session and Executor path as any Backend — no second execution path (AD-3) (FR-30)
+
+**Given** System Config `[playground] enabled = false` (or a different loopback `port`)
+**When** the Daemon starts
+**Then** no playground listener opens (or it opens on that port); a non-loopback address is a start-up error naming the field
+
+**Given** the OQ-1 amendment
+**When** a reviewer checks the Daemon's listeners
+**Then** the playground is the only HTTP listener, loopback-only and off-switchable, and health/metrics remain RPC messages
+
+### Story 10.3: Try host calls with demo functions
+
+As a developer trying Hexput,
+I want a few host functions to call from the playground,
+So that I can see host calls, capability refusals and budget errors, not just pure Scripts.
+
+**Acceptance Criteria:**
+
+**Given** the playground's Session
+**When** it initializes
+**Then** it registers a small set of demo functions (for example `echo(x)`, `now()`, `sleep(ms)` capped well under the CPU budget) with a blanket grant, implemented inside the playground and touching nothing outside it (FR-30, FR-7)
+
+**Given** a Script calling a name the playground did not register, or exceeding a budget
+**When** it runs
+**Then** the page shows the same `capability`/`budget` error a real Backend would receive
+
+### Story 10.4: Get language-server help in the playground
+
+As a developer trying Hexput,
+I want the playground's editor to show diagnostics and completion as I type,
+So that the playground teaches the language the way an editor with the language server does.
+
+**Acceptance Criteria:**
+
+**Given** Epic 9's language server (FR-15)
+**When** the playground page is open
+**Then** its editor shows syntax diagnostics and static-check findings at their spans, and offers basic completion, served by the same language-server logic (`hexput-lsp-core`) rather than a second implementation (FR-30)
+
+**Given** the playground's known demo functions
+**When** static-check findings are computed
+**Then** they are the callable-name list, so a typo'd demo call is a finding before running
+

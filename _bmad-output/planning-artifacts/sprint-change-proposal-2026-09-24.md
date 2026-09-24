@@ -110,3 +110,13 @@ All edits below are applied in place. Each carries a dated `[Added 2026-09-24]` 
   - The Backend sees and edits the Value Secret while the script never can.
   - Backend modifications are visible to the script after the call.
   - Each of these is pinned by tests in `hexput-tests`.
+
+## 6. Addendum — second change (2026-09-24): installer, default ports, local playground
+
+**Trigger.** Erdem asked for a one-line README install that sets Hexput up as a system service, fixed default ports, and a local browser playground with demo host functions and language-server help.
+
+**Decisions (Erdem).** Ports: 7476 TCP+TLS, 7478 WebSocket, 7477 playground. The playground is its own package (`hexput-playground`), embedded in and served by the Daemon by default, off-switchable in System Config, and also a standalone executable.
+
+**Applied.** PRD: FR-9 default-port bullet, new §4.10 with FR-29 and FR-30, MVP §6.1. Epics: FR inventory and coverage map (30 FRs), OQ-1 amendment (the playground is the one HTTP listener, loopback only), Story 5.1/5.2 default-port criteria, Story 7.6 installer criterion, new Epic 10 (Stories 10.1–10.4). Spine: `hexput-playground` crate and edges, the playground as an in-process Backend through `hexput-connection::serve`, `[playground]` System Config, default ports. Sprint status: `epic-10` and its four stories in the backlog.
+
+**Scope.** Minor-to-moderate: additive; no existing story's intent changes. Epic 10 is sequenced after Epic 9 for its language-server story, but Stories 10.1–10.3 need only Epics 2–3.

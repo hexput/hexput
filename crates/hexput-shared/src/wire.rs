@@ -59,12 +59,14 @@ pub enum MessageType {
     /// Response: a request succeeded; the payload is its result.
     Result,
     /// Request, from the Daemon to the Backend: a Script called a Registered Function (Story
-    /// 3.1). The payload is `{name, arguments}`; a later Registered Method call adds `receiver`.
+    /// 3.1). The payload is `{name, arguments}`, plus `execution` — the id of the request that
+    /// started the execution making the call — when that execution is named; a later Registered
+    /// Method call adds `receiver`.
     /// The Backend answers with `Result {value}` or `Error` under the call's id.
     Call,
     /// Request, from the Daemon to the Backend: may a Script make this call of a Registered
     /// Function granted per call rather than blanket (Story 3.3)? The payload is
-    /// `{name, arguments}`, exactly what the `Call` would carry; the Backend's per-call handler
+    /// `{name, arguments}` (with `execution`), exactly what the `Call` would carry; the Backend's per-call handler
     /// answers `Result {value: <bool>}` or `Error` under the question's id. Only `value: true`
     /// lets the Daemon send the `Call`. Its id comes from the same per-connection counter as a
     /// `Call`'s.

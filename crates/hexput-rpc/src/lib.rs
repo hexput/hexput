@@ -9,9 +9,10 @@
 //! # Host-call correlation (Story 3.1)
 //!
 //! A host call is a request the Daemon originates: one generic `Call` envelope, payload
-//! `{name, arguments}`, written on the connection that submitted the execution and answered by
-//! the Backend with `Result {value}` or `Error` under the same id. This crate owns everything
-//! about that exchange except writing and reading the bytes:
+//! `{name, arguments}` (plus `execution`, naming the request that started the execution — see
+//! [`Caller::for_execution`]), written on the connection that submitted the execution and
+//! answered by the Backend with `Result {value}` or `Error` under the same id. This crate owns
+//! everything about that exchange except writing and reading the bytes:
 //!
 //! * [`Calls`] belongs to one connection's loop — its single writer. It hands out the Daemon's
 //!   call ids (a per-connection counter, independent of the Backend's own request ids: a
@@ -68,6 +69,20 @@ const NAME: &str = "name";
 const ARGUMENTS: &str = "arguments";
 const VALUE: &str = "value";
 const MESSAGE: &str = "message";
+const EXECUTION: &str = "execution";
+
+/// A `Call` or `Authorize` payload: `{name, arguments}`, plus `execution` — the id of the request
+/// that started the execution making it — when the execution is named.
+fn payload(execution: Option<CorrelationId>, name: String, arguments: Vec<Value>) -> Value {
+    let mut fields = vec![
+        (Value::from(NAME), Value::from(name)),
+        (Value::from(ARGUMENTS), Value::Array(arguments)),
+    ];
+    if let Some(execution) = execution {
+        fields.push((Value::from(EXECUTION), Value::from(execution.get())));
+    }
+    Value::Map(fields)
+}
 
 /// Why a host call produced no value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +111,7 @@ enum Request {
 #[derive(Debug)]
 pub struct Call {
     request: Request,
+    execution: Option<CorrelationId>,
     name: String,
     arguments: Vec<Value>,
     reply: oneshot::Sender<Result<Value, CallFailure>>,
@@ -103,12 +119,28 @@ pub struct Call {
 
 /// An execution's handle for making host calls on the connection that submitted it. Cheap to
 /// clone; every clone reaches the same connection.
+///
+/// A `Caller` may name the execution it serves ([`Caller::for_execution`]): the id of the request
+/// that started it. Every `Call` and `Authorize` it sends then carries that id as `execution`, so
+/// a Backend with several executions in flight on one connection knows which one is asking — and
+/// so who the Script acts for.
 #[derive(Debug, Clone)]
 pub struct Caller {
     calls: mpsc::UnboundedSender<Call>,
+    execution: Option<CorrelationId>,
 }
 
 impl Caller {
+    /// This handle, naming `execution` — the id of the request that started the execution it
+    /// serves — in every `Call` and `Authorize` it sends. `None` names none.
+    #[must_use]
+    pub fn for_execution(&self, execution: Option<CorrelationId>) -> Self {
+        Self {
+            calls: self.calls.clone(),
+            execution,
+        }
+    }
+
     /// Call the Registered Function `name` with `arguments`, and wait for the Backend's answer:
     /// the reply's `value`, or why there is none.
     ///
@@ -161,6 +193,7 @@ impl Caller {
         let (reply, answer) = oneshot::channel();
         let call = Call {
             request,
+            execution: self.execution,
             name,
             arguments,
             reply,
@@ -194,7 +227,10 @@ impl Calls {
                 pending: HashMap::new(),
                 next: 0,
             },
-            Caller { calls: sender },
+            Caller {
+                calls: sender,
+                execution: None,
+            },
         )
     }
 
@@ -208,7 +244,7 @@ impl Calls {
 
     /// Give `call` the next Daemon-issued id, record it as pending, and return the envelope to
     /// write: a `Call`, or an `Authorize` for a question, either with the payload
-    /// `{name, arguments}`.
+    /// `{name, arguments}`, plus `execution` when the execution is named.
     ///
     /// `None` when its execution already stopped waiting — a question whose timeout elapsed while
     /// it was still queued: nothing is written and nothing is left pending, so the Backend is
@@ -228,10 +264,7 @@ impl Calls {
         Some(Envelope::new(
             id,
             message_type,
-            Value::Map(vec![
-                (Value::from(NAME), Value::from(call.name)),
-                (Value::from(ARGUMENTS), Value::Array(call.arguments)),
-            ]),
+            payload(call.execution, call.name, call.arguments),
         ))
     }
 

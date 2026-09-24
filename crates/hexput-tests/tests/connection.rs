@@ -1157,8 +1157,19 @@ impl Backend {
     }
 
     /// The next envelope, which must be a `message_type` request from the Daemon with the payload
-    /// `{name, arguments}`: its id, name and arguments.
+    /// `{name, arguments, execution}`: its id, name and arguments.
     async fn request(&mut self, message_type: MessageType) -> (CorrelationId, String, Vec<Value>) {
+        let (id, name, arguments, _) = self.request_from(message_type).await;
+        (id, name, arguments)
+    }
+
+    /// The next envelope, which must be a `message_type` request from the Daemon with the payload
+    /// `{name, arguments, execution}`: its id, name, arguments, and the id of the `ExecutionStart`
+    /// that made it.
+    async fn request_from(
+        &mut self,
+        message_type: MessageType,
+    ) -> (CorrelationId, String, Vec<Value>, u64) {
         let call = self.next().await;
         assert_eq!(call.message_type, message_type, "{call:?}");
         let Value::Map(fields) = call.payload else {
@@ -1166,19 +1177,22 @@ impl Backend {
         };
         assert_eq!(
             fields.len(),
-            2,
-            "exactly `name` and `arguments`: {fields:?}"
+            3,
+            "exactly `name`, `arguments` and `execution`: {fields:?}"
         );
         assert_eq!(fields[0].0.as_str(), Some("name"));
         assert_eq!(fields[1].0.as_str(), Some("arguments"));
+        assert_eq!(fields[2].0.as_str(), Some("execution"));
         let name = fields[0].1.as_str().expect("a string name").to_owned();
         let Value::Array(arguments) = fields[1].1.clone() else {
             panic!("`arguments` is an array");
         };
+        let execution = fields[2].1.as_u64().expect("`execution` is a request id");
         (
             call.id.expect("a Daemon request has an id"),
             name,
             arguments,
+            execution,
         )
     }
 
@@ -1383,6 +1397,38 @@ fn concurrent_calls_are_routed_by_id_whatever_order_the_replies_come_in() {
             replies.sort_by_key(|r| r.id.unwrap().get());
             assert_eq!(value_of(&replies[0]), string("first"));
             assert_eq!(value_of(&replies[1]), string("second"));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn every_call_and_question_names_the_execution_that_made_it() {
+    hosted(
+        &wired_runtime(),
+        &[("echo", true), ("guarded", false)],
+        false,
+        |mut backend| async move {
+            // Two executions in flight on one connection: each request says which is asking.
+            backend.send(execution(10, "return echo(1);"));
+            let (first, _, _, from_first) = backend.request_from(MessageType::Call).await;
+            backend.send(execution(20, "return guarded(2);"));
+            let (question, _, _, from_second) = backend.request_from(MessageType::Authorize).await;
+            assert_eq!((from_first, from_second), (10, 20));
+            backend.allow(question, Value::Boolean(true));
+            let (second, _, _, from_second) = backend.request_from(MessageType::Call).await;
+            assert_eq!(
+                from_second, 20,
+                "the Call after the question names the same execution"
+            );
+            for id in [first, second] {
+                backend.reply(
+                    id,
+                    MessageType::Result,
+                    Value::Map(vec![(string("value"), Value::Nil)]),
+                );
+            }
+            let _ = [backend.next().await, backend.next().await];
             backend.close();
         },
     );

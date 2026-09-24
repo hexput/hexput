@@ -263,7 +263,8 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         // The task carries the request's span, so everything the execution logs
                         // names its connection, its Client ID and its request.
                         running.spawn(
-                            execute(id, payload, registrations, caller.clone()).instrument(span),
+                            execute(id, payload, registrations, caller.for_execution(id))
+                                .instrument(span),
                         );
                         continue;
                     }

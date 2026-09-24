@@ -60,7 +60,7 @@ Let a Backend expose its host to scripts on its own terms, and bound what any on
 - **`hexput-rpc` owns host-call correlation.** That means Daemon-issued call ids, the pending-call table, the `Call` payload and decoding of the reply. `hexput-connection` gains a `hexput-rpc` edge and holds one per connection. It writes the `Call`s as the connection's single writer and routes each Backend `Result`/`Error` that names a pending call back to it. `hexput-rpc` never reaches `hexput-enforce`. `check-crate-graph.py` pins the exact dependency sets of `hexput-rpc` and `hexput-enforce`, and adds `hexput-rpc` to `hexput-connection`'s set.
 - **Fixed wire contract.**
   - An `Init` registration is `{name, blanket}`, `blanket` an optional boolean: absent means no blanket grant, anything but a boolean is refused (Story 3.2). Without a blanket grant a call is decided per call (Story 3.3).
-  - Every host call is one generic `Call {name, arguments}`, plus `receiver` for a method.
+  - Every host call is one generic `Call {name, arguments, execution}` (`execution`: the id of the `ExecutionStart` that started the execution asking), plus `receiver` for a method; a per-call question is `Authorize` with the same payload.
   - The Backend replies with `Result {value, modifications?}` or `Error` under the call's id.
   - Ids are per direction: a Backend `Result`/`Error` always answers a Daemon `Call`, and a Daemon `Result`/`Error` always answers a Backend request. This changes Epic 2's rule, where a Backend `Result`/`Error` was always `protocol.unexpected_message`.
   - A value with a Value Secret travels as a holder map with exactly the keys `__secret` and `value` (`ValueHolder { key: Option<String>, ref: String, value, rest }`). A value without one travels plain.

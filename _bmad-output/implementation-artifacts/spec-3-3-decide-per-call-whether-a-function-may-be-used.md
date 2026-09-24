@@ -75,6 +75,8 @@ context:
 - A timed-out question stays in the connection's pending table until its answer arrives (then consumed and dropped silently) or the connection closes. A Backend that never answers therefore grows its own connection's table by one entry per timed-out question; bounded per connection, never shared.
 - `execute`/`direct_execution` now need a runtime with timers enabled when a question may be asked; the Daemon's runtime uses `enable_all`.
 
+- Post-review follow-up (Erdem, 2026-09-24, triage row 1 answered A): `Call` and `Authorize` payloads gain `execution`, the originating `ExecutionStart`'s correlation id, set per execution through `hexput_rpc::Caller::for_execution`; additive, omitted when no execution is named. Test: `every_call_and_question_names_the_execution_that_made_it`.
+
 ## Spec Change Log
 
 ## Review Triage Log

@@ -2,7 +2,7 @@
 title: 'Story 3.1: Call a registered host function from a script'
 type: 'feature'
 created: '2026-09-24'
-status: 'draft'
+status: 'ready-for-dev'
 route: 'dispatch'
 review_loop_iteration: 0
 context:

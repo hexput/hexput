@@ -28,6 +28,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 pub use hexput_shared::ids::ClientId;
 
+pub use hexput_port::{Setting, Settings};
 pub use init::{Config, InitError, InitRequest, RegisteredFunction};
 
 /// A Connection's identity for this Daemon run, issued by [`Sessions::connect`] when it opens —
@@ -171,6 +172,29 @@ impl Sessions {
         self.sessions
             .get(&client_id)
             .map(|session| session.registrations.clone())
+    }
+
+    /// The execution limits the Session's Config sets, as they are now; `None` when it does not
+    /// exist. A copy for one execution — read afresh per execution, never cached (AD-5).
+    #[must_use]
+    pub fn settings(&self, client_id: ClientId) -> Option<Settings> {
+        self.sessions
+            .get(&client_id)
+            .map(|session| session.config.settings())
+    }
+
+    /// What one execution is dispatched with, read together under one lock: the Session's
+    /// Registered Functions ([`registrations`](Self::registrations)) and its Config's execution
+    /// limits ([`settings`](Self::settings)), as they are now; `None` when the Session does not
+    /// exist.
+    #[must_use]
+    pub fn for_execution(
+        &self,
+        client_id: ClientId,
+    ) -> Option<(Vec<RegisteredFunction>, Settings)> {
+        self.sessions
+            .get(&client_id)
+            .map(|session| (session.registrations.clone(), session.config.settings()))
     }
 
     /// How many Sessions are live.

@@ -18,7 +18,8 @@
 //! runs on the blocking pool (`spawn_blocking`), never on a runtime worker. When the Script calls
 //! a bare name no scope declares, the segment ends at that host call, and the Executor:
 //!
-//! 1. measures each argument: one nested deeper than [`ARGUMENT_DEPTH_LIMIT`] is
+//! 1. measures each argument: one nested deeper than the argument depth limit
+//!    ([`Limits::argument_depth`], by default [`ARGUMENT_DEPTH_LIMIT`]) is
 //!    `depth.argument_too_deep`, spanned on that argument; arguments that together are certain to
 //!    exceed a frame cannot be sent, `host.function_failed` on the call. (A function or cyclic
 //!    argument was already refused by the interpreter, as a `type` error on that argument.)
@@ -27,7 +28,8 @@
 //!    blanket grant proceeds at once (Story 3.2). A name registered without one is decided by the
 //!    Backend's per-call handler (Story 3.3): the Executor asks it through the [`Caller`] — an
 //!    `Authorize` question carrying the call's name and arguments, before any `Call` — and waits
-//!    at most [`AUTHORIZATION_TIMEOUT`], holding no thread and no lock. `hexput-enforce` turns
+//!    at most [`Limits::authorization_timeout`] (by default [`AUTHORIZATION_TIMEOUT`]), holding no
+//!    thread and no lock. `hexput-enforce` turns
 //!    what came back into the decision: only an explicit `true` lets the call proceed. Nothing is
 //!    cached; every call asks anew. An unregistered name, a refusal (`false`), an answer that is
 //!    not a boolean, an `Error`, no answer in time, or a connection that ends first are all the
@@ -83,6 +85,14 @@
 //!   result payload ([`wire::payload_size`]) is charged, and one past the limit is
 //!   `budget.output_size_exceeded`, spanned on the whole Script.
 //!
+//! # Tunable limits (Story 3.7)
+//!
+//! [`execute_with_limits`] runs under the [`Limits`] its caller computed from the Session's Config
+//! and the execution's overrides ([`Limits::from_settings`]); [`execute`] under the defaults.
+//! Besides the six budget limits, the limits carry the argument depth limit and the per-call
+//! handler's timeout, and the Executor applies both from there — an error naming the depth limit
+//! names the one in force.
+//!
 //! Binds: AD-3, AD-6.
 
 pub mod wire;
@@ -105,18 +115,22 @@ pub use hexput_interpreter::{Diagnostic, Program, Value};
 /// it, depends on `hexput-rpc` itself.
 pub use hexput_rpc::Caller;
 
-/// How many arrays or objects deep a host call's argument may nest: 12. An argument nested
-/// deeper is `depth.argument_too_deep`, and nothing is sent.
+/// How many arrays or objects deep a host call's argument may nest by default: 12. An argument
+/// nested deeper than the limit in force ([`Limits::argument_depth`]) is
+/// `depth.argument_too_deep`, and nothing is sent.
 ///
-/// A documented constant today; Story 3.7 makes it the default of a Backend-configurable limit.
-pub const ARGUMENT_DEPTH_LIMIT: usize = 12;
+/// The default of the `argument_depth` setting (Story 3.7), which Config or an override may set
+/// from 1 to 64; an alias of `hexput-enforce`'s `DEFAULT_ARGUMENT_DEPTH`.
+pub const ARGUMENT_DEPTH_LIMIT: usize = hexput_enforce::DEFAULT_ARGUMENT_DEPTH;
 
 /// How long the Executor waits for the Backend's per-call handler to answer an `Authorize`
-/// question: 5 seconds. No answer by then denies the call (`reason = handler_timeout`), and an
-/// answer arriving later is dropped.
+/// question by default: 5 seconds. No answer within the timeout in force
+/// ([`Limits::authorization_timeout`]) denies the call (`reason = handler_timeout`), and an answer
+/// arriving later is dropped.
 ///
-/// A documented constant today; Story 3.7 makes it the default of a Config value.
-pub const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// The default of the `authorization_timeout_ms` setting (Story 3.7), which Config or an override
+/// may set from 1 ms to 60 s; an alias of `hexput-enforce`'s `DEFAULT_AUTHORIZATION_TIMEOUT`.
+pub const AUTHORIZATION_TIMEOUT: Duration = hexput_enforce::DEFAULT_AUTHORIZATION_TIMEOUT;
 
 /// How much work a Script does between two CPU time charges: 10 000 units — one per evaluation
 /// step, plus one per 256 bytes a string operation reads or writes. A slice takes around a
@@ -204,7 +218,7 @@ enum Step {
 ///
 /// Must run inside a Tokio runtime: every segment of the Script runs on its blocking pool. The
 /// runtime must have timers enabled when a Script may call a function granted per call, since the
-/// handler's answer is awaited under [`AUTHORIZATION_TIMEOUT`].
+/// handler's answer is awaited under a timeout ([`Limits::authorization_timeout`]).
 ///
 /// # Errors
 ///
@@ -226,9 +240,8 @@ pub async fn execute(
 /// [`execute`], under a Resource Budget with `limits` rather than the documented defaults.
 ///
 /// Every limit is still enforced by `hexput-enforce`, exactly as under [`execute`]; only the
-/// numbers differ. No execution path sets them yet — Story 3.7 feeds them from the Session's
-/// Config and per-execution overrides — so today this is what lets a test cross one dimension
-/// alone without first crossing another.
+/// numbers differ. Direct Execution computes them from the Session's Config overlaid with the
+/// execution's overrides (Story 3.7), through [`Limits::from_settings`].
 ///
 /// # Errors
 /// As [`execute`].
@@ -247,6 +260,7 @@ pub async fn execute_with_limits(
     } = host;
     let capabilities = Arc::new(capabilities);
     let budget = Budget::with_limits(limits);
+    let authorization_timeout = limits.authorization_timeout();
     let meter = Meter {
         slice: Some(SLICE),
         memory_ceiling: Some(budget.memory_ceiling()),
@@ -274,7 +288,13 @@ pub async fn execute_with_limits(
             Step::Refused(function, refusal) => return Err(refused(&function, refusal)),
         };
         if let Some(question) = question {
-            let answer = ask(caller.as_ref(), &question, arguments.clone()).await;
+            let answer = ask(
+                caller.as_ref(),
+                &question,
+                arguments.clone(),
+                authorization_timeout,
+            )
+            .await;
             if let Err(refusal) = question.decide(answer) {
                 return Err(refused(call.name(), refusal));
             }
@@ -371,19 +391,20 @@ fn refused(function: &str, refusal: Refusal) -> Diagnostic {
     refusal.into_diagnostic()
 }
 
-/// Put `question` to the Backend's per-call handler, waiting at most [`AUTHORIZATION_TIMEOUT`],
-/// and report what came back. Holds no thread and no lock while it waits.
+/// Put `question` to the Backend's per-call handler, waiting at most `timeout`, and report what
+/// came back. Holds no thread and no lock while it waits.
 async fn ask(
     caller: Option<&Caller>,
     question: &Question,
     arguments: Vec<hexput_rpc::Value>,
+    timeout: Duration,
 ) -> HandlerAnswer {
     // Unreachable in practice, like a dispatch without a caller: nothing is registered.
     let Some(caller) = caller else {
         return HandlerAnswer::NoReply;
     };
     let answer = caller.ask_authorization(question.name(), arguments);
-    match tokio::time::timeout(AUTHORIZATION_TIMEOUT, answer).await {
+    match tokio::time::timeout(timeout, answer).await {
         Err(_elapsed) => HandlerAnswer::TimedOut,
         Ok(Ok(hexput_rpc::Value::Boolean(allowed))) => HandlerAnswer::Boolean(allowed),
         // Any other value, or a `Result` that is not a well-formed `{value}`.
@@ -414,7 +435,7 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 /// before the capability decision, so a refused or denied call counts; a call whose arguments
 /// cannot be sent never became a host call and is not charged.
 fn advance(call: HostCall, capabilities: &Capabilities, budget: &mut Budget) -> Result<Step, Halt> {
-    let arguments = arguments(&call)?;
+    let arguments = arguments(&call, budget.limits().argument_depth())?;
     budget
         .charge_rpc_call(call.span())
         .map_err(Halt::Exceeded)?;
@@ -425,20 +446,21 @@ fn advance(call: HostCall, capabilities: &Capabilities, budget: &mut Budget) -> 
     }
 }
 
-/// A host call's arguments as wire values, each measured first.
-fn arguments(call: &HostCall) -> Result<Vec<hexput_rpc::Value>, Diagnostic> {
+/// A host call's arguments as wire values, each measured first against the argument depth limit
+/// `depth`.
+fn arguments(call: &HostCall, depth: usize) -> Result<Vec<hexput_rpc::Value>, Diagnostic> {
     // One frame carries every argument; the envelope and payload maps' own bytes are small
     // enough that a lower bound over the arguments alone is the useful check.
     let mut budget = hexput_rpc::MAX_FRAME_LEN;
     for argument in call.arguments() {
-        match wire::measure(&argument.value, ARGUMENT_DEPTH_LIMIT, &mut budget) {
+        match wire::measure(&argument.value, depth, &mut budget) {
             Ok(()) => {}
             Err(wire::Unsendable::TooDeep) => {
                 return Err(Diagnostic::new(
                     Category::Depth,
                     Code::ARGUMENT_TOO_DEEP,
                     format!(
-                        "cannot pass this {} to `{}`: it nests more than {ARGUMENT_DEPTH_LIMIT} \
+                        "cannot pass this {} to `{}`: it nests more than {depth} \
                          arrays or objects deep",
                         argument.value.type_name(),
                         call.name()

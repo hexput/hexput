@@ -296,3 +296,110 @@ fn typed_envelope_encodes_as_a_named_map() {
         ])
     );
 }
+
+// --- Story 3.7: the setting table and `Settings` ---
+
+mod settings {
+    use hexput_shared::budget::{Setting, Settings};
+
+    #[test]
+    fn the_table_pins_every_path_range_and_default() {
+        let table: Vec<_> = Setting::ALL
+            .iter()
+            .map(|s| (s.path(), s.min(), s.max(), s.default()))
+            .collect();
+        assert_eq!(
+            table,
+            [
+                ("budget.cpu_time_ms", 1, 60_000, 1_000),
+                ("budget.memory_bytes", 1024, 1 << 30, 64 << 20),
+                ("budget.allocations", 0, 100_000_000, 1_000_000),
+                ("budget.rpc_calls", 0, 100_000, 100),
+                ("budget.output_size_bytes", 1, 16 << 20, 1 << 20),
+                ("budget.side_effects", 0, 100_000, 100),
+                ("argument_depth", 1, 64, 12),
+                ("authorization_timeout_ms", 1, 60_000, 5_000),
+            ]
+        );
+        for setting in Setting::ALL {
+            assert!((setting.min()..=setting.max()).contains(&setting.default()));
+            assert_eq!(setting.to_string(), setting.path());
+        }
+    }
+
+    #[test]
+    fn nothing_set_means_every_default_is_in_force() {
+        let settings = Settings::default();
+        assert_eq!(settings, Settings::new());
+        for &setting in Setting::ALL {
+            assert_eq!(settings.get(setting), None);
+            assert_eq!(settings.effective(setting), setting.default());
+        }
+    }
+
+    #[test]
+    fn set_accepts_both_ends_of_the_range_and_refuses_one_past_either() {
+        for &setting in Setting::ALL {
+            let mut settings = Settings::new();
+            settings.set(setting, setting.min()).unwrap();
+            assert_eq!(settings.get(setting), Some(setting.min()));
+            settings.set(setting, setting.max()).unwrap();
+            assert_eq!(settings.effective(setting), setting.max());
+
+            let refused = settings.set(setting, setting.max() + 1).unwrap_err();
+            assert_eq!(refused.setting(), setting);
+            assert_eq!(refused.found(), setting.max() + 1);
+            // Refused, never clamped: the value set before stands.
+            assert_eq!(settings.get(setting), Some(setting.max()));
+            if let Some(below) = setting.min().checked_sub(1) {
+                assert!(settings.set(setting, below).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_value_names_the_setting_and_its_range() {
+        let refused = Settings::new().set(Setting::RpcCalls, 200_000).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "`budget.rpc_calls` must be an integer from 0 to 100000; found 200000"
+        );
+    }
+
+    #[test]
+    fn zero_is_allowed_only_for_the_counted_dimensions() {
+        let zero: Vec<_> = Setting::ALL
+            .iter()
+            .filter(|s| Settings::new().set(**s, 0).is_ok())
+            .copied()
+            .collect();
+        assert_eq!(
+            zero,
+            [
+                Setting::Allocations,
+                Setting::RpcCalls,
+                Setting::SideEffects
+            ]
+        );
+    }
+
+    #[test]
+    fn an_overlay_takes_what_it_sets_and_changes_neither_side() {
+        let mut config = Settings::new();
+        config.set(Setting::RpcCalls, 2).unwrap();
+        config.set(Setting::ArgumentDepth, 3).unwrap();
+        let mut overrides = Settings::new();
+        overrides.set(Setting::RpcCalls, 5).unwrap();
+        overrides.set(Setting::CpuTimeMs, 50).unwrap();
+        let (config_before, overrides_before) = (config, overrides);
+
+        let effective = config.overlay(&overrides);
+        assert_eq!(effective.get(Setting::RpcCalls), Some(5));
+        assert_eq!(effective.get(Setting::ArgumentDepth), Some(3));
+        assert_eq!(effective.get(Setting::CpuTimeMs), Some(50));
+        assert_eq!(effective.get(Setting::MemoryBytes), None);
+        assert_eq!(config, config_before);
+        assert_eq!(overrides, overrides_before);
+        assert_eq!(config.overlay(&Settings::new()), config);
+    }
+}

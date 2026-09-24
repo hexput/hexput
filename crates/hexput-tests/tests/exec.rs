@@ -487,12 +487,18 @@ fn a_question_that_cannot_be_framed_is_denied_as_handler_failed() {
 /// Run `return getOrder(x);` with `getOrder` registered without a grant, its handler answering as
 /// `authorize` does: the Script's error, and the logged refusal's reason. Nothing may be called.
 fn denied(authorize: Handler) -> (Diagnostic, String, usize) {
-    let run = run_full(
+    denied_under(authorize, Limits::default())
+}
+
+/// [`denied`] under `limits`.
+fn denied_under(authorize: Handler, limits: Limits) -> (Diagnostic, String, usize) {
+    let run = run_limited(
         "let x = 1;\nreturn getOrder(x);",
         vec![],
         &[("getOrder", false)],
         authorize,
         Box::new(|_, _| value(Wire::Nil)),
+        limits,
     );
     assert!(run.calls.is_empty(), "a denied call is never sent");
     let refusals: Vec<_> = run
@@ -569,9 +575,20 @@ fn a_handler_that_never_answers_is_denied_after_the_timeout() {
         hexput_exec::AUTHORIZATION_TIMEOUT,
         std::time::Duration::from_secs(5)
     );
+    assert_eq!(
+        Limits::default().authorization_timeout(),
+        hexput_exec::AUTHORIZATION_TIMEOUT
+    );
+    // Story 3.7: the timeout in force is the limits', here far below the default.
+    let timeout = std::time::Duration::from_millis(100);
     let started = std::time::Instant::now();
-    let (denial, reason, asked) = denied(Box::new(|_, _| Reply::Silent));
-    assert!(started.elapsed() >= hexput_exec::AUTHORIZATION_TIMEOUT);
+    let (denial, reason, asked) = denied_under(
+        Box::new(|_, _| Reply::Silent),
+        Limits::default().with_authorization_timeout(timeout),
+    );
+    let elapsed = started.elapsed();
+    assert!(elapsed >= timeout, "{elapsed:?}");
+    assert!(elapsed < hexput_exec::AUTHORIZATION_TIMEOUT, "{elapsed:?}");
     assert_eq!(reason, "handler_timeout");
     assert_eq!(asked, 1);
     assert_eq!(denial.code.as_str(), "capability.unknown_function");
@@ -1716,4 +1733,46 @@ fn each_dimension_crossed_alone_names_only_itself() {
         crossed(at_limits.with_cpu_time(std::time::Duration::ZERO)),
         "budget.cpu_time_exceeded"
     );
+}
+
+// --- Story 3.7: the argument depth limit in force ---
+
+#[test]
+fn the_argument_depth_limit_is_the_one_in_force() {
+    let source = format!("return send({});", nested(3));
+    for (depth, sent) in [(2, false), (3, true)] {
+        let run = run_limited(
+            &source,
+            vec![],
+            &[("send", true)],
+            refusing(),
+            Box::new(|_, _| value(Wire::from(1))),
+            Limits::default().with_argument_depth(depth),
+        );
+        if sent {
+            assert_eq!(run.result.unwrap().as_number(), Some(1.0));
+            assert_eq!(run.calls.len(), 1);
+        } else {
+            let error = run.result.unwrap_err();
+            assert_eq!(error.code.as_str(), "depth.argument_too_deep");
+            // The message names the limit in force, not the default.
+            assert!(
+                error.message.contains("more than 2 arrays"),
+                "{}",
+                error.message
+            );
+            assert!(run.calls.is_empty());
+        }
+    }
+    // Past the default, allowed by a raised limit.
+    let deep = format!("return send({});", nested(ARGUMENT_DEPTH_LIMIT + 1));
+    let run = run_limited(
+        &deep,
+        vec![],
+        &[("send", true)],
+        refusing(),
+        Box::new(|_, _| value(Wire::from(1))),
+        Limits::default().with_argument_depth(ARGUMENT_DEPTH_LIMIT + 1),
+    );
+    assert_eq!(run.result.unwrap().as_number(), Some(1.0));
 }

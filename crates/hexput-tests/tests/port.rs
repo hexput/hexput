@@ -566,3 +566,187 @@ fn error_body_from_a_warning_finding_keeps_warning_severity() {
     assert_eq!(body.code, "reference.unused_variable");
     assert!(body.span.is_some());
 }
+
+// --- Story 3.7: the one settings decoder ---
+
+mod settings {
+    use hexput_port::{MAX_FRAME_LEN, Setting, Settings, Value, decode_settings};
+
+    use super::{map, s};
+
+    fn int(n: i64) -> Value {
+        Value::from(n)
+    }
+
+    fn refusal(value: &Value, prefix: &str) -> String {
+        decode_settings(value, prefix).expect_err("refused")
+    }
+
+    #[test]
+    fn an_empty_map_sets_nothing() {
+        assert_eq!(decode_settings(&map(vec![]), "config"), Ok(Settings::new()));
+        assert_eq!(
+            decode_settings(&map(vec![("budget", map(vec![]))]), "config"),
+            Ok(Settings::new())
+        );
+    }
+
+    #[test]
+    fn every_setting_decodes_at_its_path() {
+        let value = map(vec![
+            (
+                "budget",
+                map(vec![
+                    ("cpu_time_ms", int(2_000)),
+                    ("memory_bytes", int(1024)),
+                    ("allocations", int(0)),
+                    ("rpc_calls", int(2)),
+                    ("output_size_bytes", Value::from(MAX_FRAME_LEN as u64)),
+                    ("side_effects", int(7)),
+                ]),
+            ),
+            ("argument_depth", int(64)),
+            ("authorization_timeout_ms", int(100)),
+        ]);
+        let settings = decode_settings(&value, "overrides").unwrap();
+        let decoded: Vec<_> = Setting::ALL.iter().map(|s| settings.get(*s)).collect();
+        assert_eq!(
+            decoded,
+            [
+                Some(2_000),
+                Some(1024),
+                Some(0),
+                Some(2),
+                Some(MAX_FRAME_LEN as u64),
+                Some(7),
+                Some(64),
+                Some(100),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_refusal_names_the_full_path() {
+        let budget = |key: &str, value: Value| map(vec![("budget", map(vec![(key, value)]))]);
+        let cases: Vec<(Value, &str, &str)> = vec![
+            (
+                budget("rpc_calls", int(200_000)),
+                "config",
+                "`config.budget.rpc_calls` must be an integer from 0 to 100000; found 200000",
+            ),
+            (
+                budget("cpu_time_ms", int(0)),
+                "overrides",
+                "`overrides.budget.cpu_time_ms` must be an integer from 1 to 60000; found 0",
+            ),
+            (
+                budget("memory_bytes", int(1 << 40)),
+                "config",
+                "`config.budget.memory_bytes` must be an integer from 1024 to 1073741824; found \
+                 1099511627776",
+            ),
+            (
+                budget("rpc_calls", s("5")),
+                "config",
+                "`config.budget.rpc_calls` must be an integer from 0 to 100000; found a string",
+            ),
+            (
+                budget("rpc_calls", Value::F64(1.0)),
+                "config",
+                "`config.budget.rpc_calls` must be an integer from 0 to 100000; found a float",
+            ),
+            (
+                budget("rpc_calls", Value::F32(1.0)),
+                "config",
+                "`config.budget.rpc_calls` must be an integer from 0 to 100000; found a float",
+            ),
+            (
+                budget("rpc_calls", int(-1)),
+                "config",
+                "`config.budget.rpc_calls` must be an integer from 0 to 100000; found -1",
+            ),
+            (
+                budget("rpc_calls", Value::Nil),
+                "config",
+                "`config.budget.rpc_calls` must be an integer from 0 to 100000; found nil",
+            ),
+            (
+                budget("cpu", int(1)),
+                "config",
+                "`config.budget.cpu` is not a known setting",
+            ),
+            (
+                map(vec![("speed", int(1))]),
+                "config",
+                "`config.speed` is not a known setting",
+            ),
+            (
+                map(vec![("argument_depth", int(65))]),
+                "overrides",
+                "`overrides.argument_depth` must be an integer from 1 to 64; found 65",
+            ),
+            (
+                map(vec![("authorization_timeout_ms", Value::Boolean(true))]),
+                "config",
+                "`config.authorization_timeout_ms` must be an integer from 1 to 60000; found a \
+                 boolean",
+            ),
+            (
+                map(vec![("budget", int(1))]),
+                "config",
+                "`config.budget` is not a map",
+            ),
+            (
+                Value::Array(vec![]),
+                "overrides",
+                "`overrides` is not a map",
+            ),
+            (
+                map(vec![("budget", Value::Map(vec![(int(1), int(1))]))]),
+                "config",
+                "`config.budget` has a key that is not a string",
+            ),
+            (
+                map(vec![(
+                    "budget",
+                    map(vec![("rpc_calls", int(1)), ("rpc_calls", int(2))]),
+                )]),
+                "config",
+                "`config.budget` repeats the key `rpc_calls`",
+            ),
+            (
+                map(vec![("budget", map(vec![])), ("budget", map(vec![]))]),
+                "config",
+                "`config` repeats the key `budget`",
+            ),
+            // A dotted key is not a way to name a nested setting.
+            (
+                map(vec![("budget.rpc_calls", int(1))]),
+                "config",
+                "`config.budget.rpc_calls` is not a known setting",
+            ),
+            // A setting's name is not a group, nor a group's name a setting.
+            (
+                map(vec![("rpc_calls", int(1))]),
+                "config",
+                "`config.rpc_calls` is not a known setting",
+            ),
+            (
+                budget("argument_depth", int(1)),
+                "config",
+                "`config.budget.argument_depth` is not a known setting",
+            ),
+        ];
+        for (value, prefix, expected) in cases {
+            assert_eq!(refusal(&value, prefix), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_echoes_a_long_key_bounded() {
+        let long = "k".repeat(10_000);
+        let message = refusal(&map(vec![(long.as_str(), int(1))]), "config");
+        assert!(message.len() < 200, "{message}");
+        assert!(message.contains('…'), "{message}");
+    }
+}

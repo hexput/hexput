@@ -6,17 +6,30 @@
 use core::fmt;
 use std::collections::HashMap;
 
-use hexput_port::Value;
+use hexput_port::{Settings, Value, decode_settings};
 
 /// The per-backend Config a Backend hands over at init (FR-1). Never a file, and never read,
 /// written or reloaded alongside System Config (AD-5).
 ///
-/// No keys are defined until Epic 3, so a Config is empty and an `Init` whose `config` names
-/// any key is refused: a Backend must never believe a policy is in force that nothing
-/// enforces. Not `Clone`: the Session registry holds the single live copy.
+/// Its keys are the tunable execution limits (Story 3.7): the six Resource Budget limits, the
+/// argument depth and the per-call handler's timeout, decoded by `hexput-port`'s one settings
+/// decoder, so each is within the Daemon's allowed range. Any other key is refused: a Backend must
+/// never believe a policy is in force that nothing enforces. Not `Clone`: the Session registry
+/// holds the single live copy, and an execution reads a copy of its [`Settings`] when it is
+/// dispatched.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Config {}
+pub struct Config {
+    settings: Settings,
+}
+
+impl Config {
+    /// The execution limits this Config sets; each one it leaves unset is the Daemon's default.
+    #[must_use]
+    pub fn settings(&self) -> Settings {
+        self.settings
+    }
+}
 
 /// A function the Backend exposes to its Scripts, named at init (FR-1, FR-6), with its
 /// Capability grant.
@@ -143,6 +156,12 @@ impl InitRequest {
         })
     }
 
+    /// The Backend's Config.
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// The Registered Functions, in the order the Backend listed them.
     #[must_use]
     pub fn registrations(&self) -> &[RegisteredFunction] {
@@ -166,9 +185,6 @@ fn missing(keys: &[&str]) -> InitError {
 /// The most characters of Backend input a refusal echoes back, so a refusal always fits one
 /// frame however large the offending key or name.
 const ECHO_LIMIT: usize = 64;
-
-/// The most offending `config` keys a refusal lists before summarizing the rest.
-const LISTED_KEYS: usize = 3;
 
 /// `text` cut to [`ECHO_LIMIT`] characters, with an ellipsis when anything was cut.
 fn bounded(text: &str) -> String {
@@ -219,27 +235,8 @@ impl fmt::Write for Truncating<'_> {
 }
 
 fn decode_config(value: &Value) -> Result<Config, InitError> {
-    let Value::Map(fields) = value else {
-        return Err(InitError::new(format!("`{CONFIG}` is not a map")));
-    };
-    if fields.is_empty() {
-        return Ok(Config {});
-    }
-    let keys: Vec<String> = fields
-        .iter()
-        .take(LISTED_KEYS)
-        .map(|(key, _)| describe_key(key))
-        .collect();
-    let rest = fields.len().saturating_sub(LISTED_KEYS);
-    let more = if rest == 0 {
-        String::new()
-    } else {
-        format!(" and {rest} more")
-    };
-    Err(InitError::new(format!(
-        "`{CONFIG}` accepts no keys yet; found {}{more}",
-        keys.join(", ")
-    )))
+    let settings = decode_settings(value, CONFIG).map_err(InitError::new)?;
+    Ok(Config { settings })
 }
 
 fn decode_registrations(value: &Value) -> Result<Vec<RegisteredFunction>, InitError> {

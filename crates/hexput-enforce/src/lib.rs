@@ -64,35 +64,59 @@
 //! `budget.output_size_exceeded`, `budget.side_effects_exceeded` — and its own limit: no dimension
 //! ever stands in for another.
 //!
-//! The limits are the documented defaults — [`DEFAULT_CPU_TIME`], [`DEFAULT_MEMORY`],
-//! [`DEFAULT_ALLOCATIONS`], [`DEFAULT_RPC_CALLS`], [`DEFAULT_OUTPUT_SIZE`] and
-//! [`DEFAULT_SIDE_EFFECTS`] — until Story 3.7 makes them Config values.
+//! # Tunable limits (Story 3.7)
+//!
+//! Every limit — the six dimensions', plus the argument depth ([`Limits::argument_depth`]) and
+//! the per-call handler's timeout ([`Limits::authorization_timeout`]) that `hexput-exec` applies —
+//! comes from [`Limits::from_settings`]: the Session's Config overlaid with the execution's
+//! overrides, each already range-checked by the `hexput-shared` setting table. A setting neither
+//! sets is its documented default — [`DEFAULT_CPU_TIME`], [`DEFAULT_MEMORY`],
+//! [`DEFAULT_ALLOCATIONS`], [`DEFAULT_RPC_CALLS`], [`DEFAULT_OUTPUT_SIZE`],
+//! [`DEFAULT_SIDE_EFFECTS`], [`DEFAULT_ARGUMENT_DEPTH`] and [`DEFAULT_AUTHORIZATION_TIMEOUT`], all
+//! taken from that table.
 //!
 //! Binds: AD-3.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-pub use hexput_shared::budget::Dimension;
+pub use hexput_shared::budget::{Dimension, Setting, Settings};
 use hexput_shared::diagnostics::{Category, Code, Diagnostic, Span};
 
 /// The CPU time an execution may spend running Script code by default: 1 second.
-pub const DEFAULT_CPU_TIME: Duration = Duration::from_secs(1);
+pub const DEFAULT_CPU_TIME: Duration = Duration::from_millis(Setting::CpuTimeMs.default());
 
 /// The memory an execution's values may hold by default: 64 MiB.
-pub const DEFAULT_MEMORY: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MEMORY: usize = to_usize(Setting::MemoryBytes.default());
 
 /// The allocations an execution may make by default: 1 000 000.
-pub const DEFAULT_ALLOCATIONS: u64 = 1_000_000;
+pub const DEFAULT_ALLOCATIONS: u64 = Setting::Allocations.default();
 
 /// The host calls an execution may make by default: 100.
-pub const DEFAULT_RPC_CALLS: u64 = 100;
+pub const DEFAULT_RPC_CALLS: u64 = Setting::RpcCalls.default();
 
 /// The bytes a Script's result payload may encode to by default: 1 MiB.
-pub const DEFAULT_OUTPUT_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_OUTPUT_SIZE: usize = to_usize(Setting::OutputSizeBytes.default());
 
 /// The side effects an execution may perform by default: 100.
-pub const DEFAULT_SIDE_EFFECTS: u64 = 100;
+pub const DEFAULT_SIDE_EFFECTS: u64 = Setting::SideEffects.default();
+
+/// How many arrays or objects deep a host call's argument may nest by default: 12.
+pub const DEFAULT_ARGUMENT_DEPTH: usize = to_usize(Setting::ArgumentDepth.default());
+
+/// How long the Backend's per-call handler has to answer by default: 5 seconds.
+pub const DEFAULT_AUTHORIZATION_TIMEOUT: Duration =
+    Duration::from_millis(Setting::AuthorizationTimeoutMs.default());
+
+/// A setting's value as a byte count or depth. Every allowed value fits a 32-bit `usize` (the
+/// largest is 1 GiB); saturating keeps the conversion total regardless.
+const fn to_usize(value: u64) -> usize {
+    if value > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        value as usize
+    }
+}
 
 /// The limits of one execution's Resource Budget: one per dimension, each independent of the
 /// others.
@@ -104,6 +128,8 @@ pub struct Limits {
     rpc_calls: u64,
     output_size: usize,
     side_effects: u64,
+    argument_depth: usize,
+    authorization_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -115,11 +141,32 @@ impl Default for Limits {
             rpc_calls: DEFAULT_RPC_CALLS,
             output_size: DEFAULT_OUTPUT_SIZE,
             side_effects: DEFAULT_SIDE_EFFECTS,
+            argument_depth: DEFAULT_ARGUMENT_DEPTH,
+            authorization_timeout: DEFAULT_AUTHORIZATION_TIMEOUT,
         }
     }
 }
 
 impl Limits {
+    /// The limits `settings` set — a Session's Config overlaid with one execution's overrides —
+    /// with each setting they leave unset at its default. Every value is already within its
+    /// setting's range; [`Settings`] holds no other.
+    #[must_use]
+    pub const fn from_settings(settings: &Settings) -> Self {
+        Self {
+            cpu_time: Duration::from_millis(settings.effective(Setting::CpuTimeMs)),
+            memory: to_usize(settings.effective(Setting::MemoryBytes)),
+            allocations: settings.effective(Setting::Allocations),
+            rpc_calls: settings.effective(Setting::RpcCalls),
+            output_size: to_usize(settings.effective(Setting::OutputSizeBytes)),
+            side_effects: settings.effective(Setting::SideEffects),
+            argument_depth: to_usize(settings.effective(Setting::ArgumentDepth)),
+            authorization_timeout: Duration::from_millis(
+                settings.effective(Setting::AuthorizationTimeoutMs),
+            ),
+        }
+    }
+
     /// The CPU time limit.
     #[must_use]
     pub const fn cpu_time(&self) -> Duration {
@@ -154,6 +201,34 @@ impl Limits {
     #[must_use]
     pub const fn side_effects(&self) -> u64 {
         self.side_effects
+    }
+
+    /// How many arrays or objects deep a host call's argument may nest; one nested deeper is
+    /// `depth.argument_too_deep`.
+    #[must_use]
+    pub const fn argument_depth(&self) -> usize {
+        self.argument_depth
+    }
+
+    /// How long the Backend's per-call handler has to answer an `Authorize` question before the
+    /// call is denied (`handler_timeout`).
+    #[must_use]
+    pub const fn authorization_timeout(&self) -> Duration {
+        self.authorization_timeout
+    }
+
+    /// These limits with the argument depth limit set to `limit`.
+    #[must_use]
+    pub const fn with_argument_depth(mut self, limit: usize) -> Self {
+        self.argument_depth = limit;
+        self
+    }
+
+    /// These limits with the per-call handler's timeout set to `limit`.
+    #[must_use]
+    pub const fn with_authorization_timeout(mut self, limit: Duration) -> Self {
+        self.authorization_timeout = limit;
+        self
     }
 
     /// These limits with the CPU time limit set to `limit`.

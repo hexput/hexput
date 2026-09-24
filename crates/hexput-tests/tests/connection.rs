@@ -187,6 +187,11 @@ fn string(s: &str) -> Value {
 /// A well-formed `Init` payload registering `registrations`, each `(name, blanket)` stating its
 /// blanket grant explicitly.
 fn init_payload(registrations: &[(&str, bool)]) -> Value {
+    init_configured(Value::Map(vec![]), registrations)
+}
+
+/// [`init_payload`] with `config` as its Config (Story 3.7).
+fn init_configured(config: Value, registrations: &[(&str, bool)]) -> Value {
     let registrations = registrations
         .iter()
         .map(|(name, blanket)| {
@@ -197,7 +202,7 @@ fn init_payload(registrations: &[(&str, bool)]) -> Value {
         })
         .collect();
     Value::Map(vec![
-        (string("config"), Value::Map(vec![])),
+        (string("config"), config),
         (string("registrations"), Value::Array(registrations)),
     ])
 }
@@ -1104,6 +1109,13 @@ impl Outbound for WiredOut {
         if self.1 && envelope.message_type == MessageType::Call {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
+        // As a real adapter does: an envelope that cannot be framed is refused as invalid input.
+        let framable = hexput_port::encode(&envelope)
+            .ok()
+            .is_some_and(|body| hexput_port::encode_frame(&body).is_ok());
+        if !framable {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
         // The test may have stopped listening; the write still "succeeds", as a socket would.
         let _ = self.0.send(envelope);
         Ok(())
@@ -1901,16 +1913,20 @@ fn a_question_pending_when_the_peer_closes_is_denied() {
 
 #[test]
 fn a_silent_handler_is_denied_after_the_timeout_and_its_late_answer_is_dropped() {
-    hosted(
+    // Story 3.7: the Session's Config sets the timeout, here far below the 5 s default.
+    let timeout = Duration::from_millis(100);
+    configured(
         &wired_runtime(),
+        by_key(&[("authorization_timeout_ms", Value::from(100))]),
         &[("getOrder", false)],
-        false,
         |mut backend| async move {
             let started = tokio::time::Instant::now();
             backend.send(execution(1, "return getOrder(1);"));
             let (question, _, _) = backend.question().await;
             let reply = backend.next().await;
-            assert!(started.elapsed() >= hexput_exec::AUTHORIZATION_TIMEOUT);
+            let elapsed = started.elapsed();
+            assert!(elapsed >= timeout, "{elapsed:?}");
+            assert!(elapsed < hexput_exec::AUTHORIZATION_TIMEOUT, "{elapsed:?}");
             assert_eq!(reply.id, Some(CorrelationId(1)));
             assert_eq!(code_of(&reply), "capability.unknown_function");
             // The late answer reaches no one: no `Call`, and no `unexpected_message` either.
@@ -2093,4 +2109,249 @@ fn a_result_past_the_output_size_budget_is_answered_with_a_budget_error() {
     assert_eq!(sent.len(), 2);
     assert_eq!(sent[1].id, Some(CorrelationId(2)));
     assert_eq!(code_of(&sent[1]), "budget.output_size_exceeded");
+}
+
+// --- Story 3.7: limits from the Session's Config, overridden per execution ---
+
+/// A map with string keys.
+fn by_key(fields: &[(&str, Value)]) -> Value {
+    Value::Map(
+        fields
+            .iter()
+            .map(|(key, value)| (string(key), value.clone()))
+            .collect(),
+    )
+}
+
+/// A Config or override map setting `budget.<key>` alone.
+fn budget_of(key: &str, value: u64) -> Value {
+    by_key(&[("budget", by_key(&[(key, Value::from(value))]))])
+}
+
+/// An `ExecutionStart` with `overrides`.
+fn overridden(id: u64, source: &str, overrides: Value) -> Received {
+    let Value::Map(mut fields) = execution_payload(source, vec![]) else {
+        unreachable!("an execution payload is a map");
+    };
+    fields.push((string("overrides"), overrides));
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::ExecutionStart,
+        Value::Map(fields),
+    ))
+}
+
+/// [`hosted`], with the Session's init carrying `config`.
+fn configured<F, Fut>(
+    runtime: &tokio::runtime::Runtime,
+    config: Value,
+    registered: &[(&str, bool)],
+    drive: F,
+) -> Arc<Sessions>
+where
+    F: FnOnce(Backend) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let sessions = Arc::new(Sessions::new());
+    let dispatch = discarding_dispatch();
+    let registry = Arc::clone(&sessions);
+    let init_payload = init_configured(config, registered);
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let (backend, serving) = connect(&registry, init_payload, false).await;
+            drive(backend).await;
+            finished(serving).await;
+        });
+    });
+    sessions
+}
+
+/// Answer the next `count` `Call`s with `Result {value: 1}`.
+async fn answer_calls(backend: &mut Backend, count: usize) {
+    for _ in 0..count {
+        let (id, name, _) = backend.call().await;
+        assert_eq!(name, "getOrder");
+        backend.reply(
+            id,
+            MessageType::Result,
+            Value::Map(vec![(string("value"), Value::from(1))]),
+        );
+    }
+}
+
+/// A Script making `n` host calls in a row.
+fn calls(n: usize) -> String {
+    format!("let i = 0; while (i < {n}) {{ getOrder(i); i = i + 1; }}; return i;")
+}
+
+#[test]
+fn the_config_limit_applies_and_an_override_changes_it_for_one_execution_only() {
+    let sessions = configured(
+        &wired_runtime(),
+        budget_of("rpc_calls", 2),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            // Under the Config: two `Call`s, and the third is refused before it is sent.
+            backend.send(execution(1, &calls(3)));
+            answer_calls(&mut backend, 2).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "budget.rpc_calls_exceeded");
+
+            // Overridden for one execution: all five calls are made.
+            backend.send(overridden(2, &calls(5), budget_of("rpc_calls", 5)));
+            answer_calls(&mut backend, 5).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(value_of(&reply), Value::from(5));
+
+            // The next execution, with no override, is back under the Config.
+            backend.send(execution(3, &calls(3)));
+            answer_calls(&mut backend, 2).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(3)));
+            assert_eq!(code_of(&reply), "budget.rpc_calls_exceeded");
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "nothing else was sent"
+            );
+        },
+    );
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn an_override_out_of_range_is_refused_naming_its_path_and_nothing_runs() {
+    configured(
+        &wired_runtime(),
+        Value::Map(vec![]),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(overridden(
+                1,
+                "return getOrder(1);",
+                budget_of("cpu_time_ms", 0),
+            ));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "protocol.invalid_payload");
+            assert_eq!(
+                message_of(&reply),
+                "`overrides.budget.cpu_time_ms` must be an integer from 1 to 60000; found 0"
+            );
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Call` was written"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_config_out_of_range_or_mistyped_creates_no_session() {
+    let cases = [
+        (
+            budget_of("memory_bytes", 1 << 40),
+            "`config.budget.memory_bytes` must be an integer from 1024 to 1073741824; found \
+             1099511627776",
+        ),
+        (
+            by_key(&[("budget", by_key(&[("rpc_calls", string("5"))]))]),
+            "`config.budget.rpc_calls` must be an integer from 0 to 100000; found a string",
+        ),
+        (
+            by_key(&[("budget", by_key(&[("rpc_calls", Value::F64(1.0))]))]),
+            "`config.budget.rpc_calls` must be an integer from 0 to 100000; found a float",
+        ),
+        (
+            by_key(&[("budget", by_key(&[("rpc_calls", Value::from(-1))]))]),
+            "`config.budget.rpc_calls` must be an integer from 0 to 100000; found -1",
+        ),
+        (
+            by_key(&[("budget", by_key(&[("cpu", Value::from(1))]))]),
+            "`config.budget.cpu` is not a known setting",
+        ),
+        (
+            by_key(&[("speed", Value::from(1))]),
+            "`config.speed` is not a known setting",
+        ),
+    ];
+    for (config, expected) in cases {
+        let sessions = Arc::new(Sessions::new());
+        let (sent, _) = serve_with(&sessions, vec![init(3, init_configured(config, &[]))], None);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(code_of(&sent[0]), "protocol.invalid_payload");
+        assert_eq!(message_of(&sent[0]), expected);
+        assert!(sessions.is_empty(), "no Session after {expected:?}");
+    }
+}
+
+#[test]
+fn the_config_argument_depth_applies_and_an_override_raises_it() {
+    configured(
+        &wired_runtime(),
+        by_key(&[("argument_depth", Value::from(2))]),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(execution(1, "return getOrder([[[1]]]);"));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "depth.argument_too_deep");
+
+            backend.send(overridden(
+                2,
+                "return getOrder([[[1]]]);",
+                by_key(&[("argument_depth", Value::from(3))]),
+            ));
+            answer_calls(&mut backend, 1).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(value_of(&reply), Value::from(1));
+            backend.close();
+            assert!(backend.from_daemon.recv().await.is_none());
+        },
+    );
+}
+
+#[test]
+fn a_result_within_a_raised_output_budget_but_past_a_frame_is_response_too_large() {
+    // Deferred from Story 3.6: with the output size budget raised to the frame itself, a result
+    // whose `{value}` payload is exactly `MAX_FRAME_LEN` bytes passes the budget, and the
+    // envelope around it is what cannot be framed. A string of `MAX_FRAME_LEN - 12` bytes: the
+    // payload adds a 1-byte map, a 6-byte `value` key and a 5-byte string header.
+    let length = hexput_port::MAX_FRAME_LEN - 12;
+    let source = format!(
+        "let n = {length}; let piece = \"x\"; let out = \"\"; \
+         while (n > 0) {{ if (n % 2 == 1) {{ out = out + piece; }}; \
+         piece = piece + piece; n = (n - n % 2) / 2; }}; return out;"
+    );
+    let overrides = by_key(&[(
+        "budget",
+        by_key(&[
+            (
+                "output_size_bytes",
+                Value::from(hexput_port::MAX_FRAME_LEN as u64),
+            ),
+            ("memory_bytes", Value::from(1_u64 << 30)),
+            ("cpu_time_ms", Value::from(60_000)),
+        ]),
+    )]);
+    configured(
+        &wired_runtime(),
+        Value::Map(vec![]),
+        &[],
+        |mut backend| async move {
+            backend.send(overridden(1, &source, overrides));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "protocol.response_too_large");
+            // The connection keeps serving.
+            backend.send(execution(2, "return 2;"));
+            let reply = backend.next().await;
+            assert_eq!(value_of(&reply), Value::from(2));
+            backend.close();
+        },
+    );
 }

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use hexput_port::Value;
-use hexput_session::{ClientId, ConnectionId, InitRequest, Sessions};
+use hexput_session::{ClientId, ConnectionId, InitRequest, Sessions, Setting, Settings};
 
 fn s(text: &str) -> Value {
     Value::from(text)
@@ -204,7 +204,18 @@ fn a_malformed_part_names_the_offending_key_or_index() {
         ),
         (
             payload(map(vec![("timeout", Value::from(5))]), named(&[])),
-            "`config` accepts no keys yet; found `timeout`",
+            "`config.timeout` is not a known setting",
+        ),
+        (
+            payload(
+                map(vec![(
+                    "budget",
+                    map(vec![("memory_bytes", Value::from(1_u64 << 40))]),
+                )]),
+                named(&[]),
+            ),
+            "`config.budget.memory_bytes` must be an integer from 1024 to 1073741824; found \
+             1099511627776",
         ),
         (payload(empty(), empty()), "`registrations` is not an array"),
         (
@@ -389,11 +400,12 @@ fn concurrent_creates_and_detaches_leave_nothing_behind() {
 
 #[test]
 fn a_refusal_echoes_a_bounded_amount_of_backend_input() {
-    // A config with a great many keys lists a few and counts the rest.
-    let keys: Vec<(Value, Value)> = (0..100_000).map(|i| (Value::from(i), Value::Nil)).collect();
+    // A config with a great many unknown keys names the first alone (Story 3.7).
+    let keys: Vec<(Value, Value)> = (0..100_000)
+        .map(|i| (Value::from(format!("k{i}")), Value::Nil))
+        .collect();
     let message = refusal(&payload(Value::Map(keys), named(&[])));
-    assert!(message.contains("and 99997 more"), "{message}");
-    assert!(message.len() < 300, "{} bytes", message.len());
+    assert_eq!(message, "`config.k0` is not a known setting");
 
     // A huge key, string or not, is cut short.
     let long = "k".repeat(1_000_000);
@@ -403,8 +415,15 @@ fn a_refusal_echoes_a_bounded_amount_of_backend_input() {
         "{} bytes",
         message.len()
     );
+    // A huge non-string key is not echoed at all.
     let huge = Value::Array(vec![Value::from(1); 1_000_000]);
-    let message = refusal(&payload(Value::Map(vec![(huge, Value::Nil)]), named(&[])));
+    let message = refusal(&payload(
+        Value::Map(vec![(huge.clone(), Value::Nil)]),
+        named(&[]),
+    ));
+    assert_eq!(message, "`config` has a key that is not a string");
+    // One at the `Init` payload's top level is echoed, bounded.
+    let message = refusal(&Value::Map(vec![(huge, Value::Nil)]));
     assert!(
         message.contains('…') && message.len() < 300,
         "{} bytes",
@@ -425,4 +444,82 @@ fn a_refusal_echoes_a_bounded_amount_of_backend_input() {
         message.contains("`registrations[0]` and `registrations[1]`"),
         "{message}"
     );
+}
+
+// --- Story 3.7: Config holds the execution limits ---
+
+/// An `Init` whose `config` is `config`, registering `getOrder` with a blanket grant.
+fn configured(config: Value) -> InitRequest {
+    InitRequest::from_value(&payload(config, named(&[("getOrder", true)]))).unwrap()
+}
+
+#[test]
+fn an_empty_config_sets_nothing() {
+    let init = valid(&[]);
+    assert_eq!(init.config().settings(), Settings::new());
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, init);
+    assert_eq!(sessions.settings(id), Some(Settings::new()));
+}
+
+#[test]
+fn the_session_keeps_the_config_settings_and_reads_them_with_its_registrations() {
+    let init = configured(map(vec![
+        ("budget", map(vec![("rpc_calls", Value::from(2))])),
+        ("authorization_timeout_ms", Value::from(100)),
+    ]));
+    let mut expected = Settings::new();
+    expected.set(Setting::RpcCalls, 2).unwrap();
+    expected.set(Setting::AuthorizationTimeoutMs, 100).unwrap();
+    assert_eq!(init.config().settings(), expected);
+
+    let sessions = Sessions::new();
+    let (id, connection) = create(&sessions, init);
+    assert_eq!(sessions.settings(id), Some(expected));
+    let (registered, settings) = sessions.for_execution(id).unwrap();
+    assert_eq!(settings, expected);
+    let names: Vec<_> = registered.iter().map(|r| (r.name(), r.blanket())).collect();
+    assert_eq!(names, [("getOrder", true)]);
+
+    sessions.detach(id, connection);
+    assert_eq!(sessions.settings(id), None);
+    assert!(sessions.for_execution(id).is_none());
+}
+
+#[test]
+fn a_config_out_of_range_or_mistyped_is_refused_naming_its_path() {
+    let budget = |key: &str, value: Value| map(vec![("budget", map(vec![(key, value)]))]);
+    let cases = [
+        (
+            budget("rpc_calls", Value::from(200_000)),
+            "`config.budget.rpc_calls` must be an integer from 0 to 100000; found 200000",
+        ),
+        (
+            budget("rpc_calls", s("5")),
+            "`config.budget.rpc_calls` must be an integer from 0 to 100000; found a string",
+        ),
+        (
+            budget("rpc_calls", Value::F64(1.0)),
+            "`config.budget.rpc_calls` must be an integer from 0 to 100000; found a float",
+        ),
+        (
+            budget("rpc_calls", Value::from(-1)),
+            "`config.budget.rpc_calls` must be an integer from 0 to 100000; found -1",
+        ),
+        (
+            budget("cpu", Value::from(1)),
+            "`config.budget.cpu` is not a known setting",
+        ),
+        (
+            map(vec![("speed", Value::from(1))]),
+            "`config.speed` is not a known setting",
+        ),
+    ];
+    for (config, expected) in cases {
+        assert_eq!(
+            refusal(&payload(config, named(&[]))),
+            expected,
+            "a refused Init creates no Session: nothing to create from"
+        );
+    }
 }

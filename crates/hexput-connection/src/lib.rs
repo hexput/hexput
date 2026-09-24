@@ -66,8 +66,9 @@
 //!
 //! A Script calls its Session's Registered Functions through this connection (Story 3.1). The
 //! connection holds one [`hexput_rpc::Calls`] table and hands each execution a
-//! [`hexput_rpc::Caller`], together with the Session's registrations and their grants, read once
-//! when the execution is dispatched; the Executor alone decides which calls may go ahead (AD-3).
+//! [`hexput_rpc::Caller`], together with the Session's registrations and their grants and its
+//! Config's execution limits (Story 3.7), read together once when the execution is dispatched;
+//! the Executor alone decides which calls may go ahead (AD-3).
 //! This crate must neither dispatch through the `Caller` nor build a `Call` envelope itself; a
 //! source-text guard in `scripts/check-crate-graph.py` enforces that, and a sealed token the
 //! compiler enforces is still open. When an execution makes a call, the loop writes the `Call`
@@ -122,7 +123,7 @@ use hexput_port::{
     ProtocolError, Received, Value, error_response,
 };
 use hexput_rpc::{Call, Caller, Calls};
-use hexput_session::{ClientId, ConnectionId, InitRequest, Sessions};
+use hexput_session::{ClientId, ConnectionId, InitRequest, Sessions, Settings};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{Instrument, Span};
 
@@ -251,20 +252,27 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         (reply, span)
                     }
                     Answer::Execute(id, payload) => {
-                        // The Session's registrations and grants as they are now, read once per
-                        // execution.
-                        let registrations = connection
+                        // The Session's registrations, grants and Config settings as they are
+                        // now, read together once per execution and never cached (AD-5).
+                        let (registrations, settings) = connection
                             .attached
-                            .and_then(|client_id| connection.sessions.registrations(client_id))
-                            .unwrap_or_default()
+                            .and_then(|client_id| connection.sessions.for_execution(client_id))
+                            .unwrap_or_default();
+                        let registrations = registrations
                             .into_iter()
                             .map(|r| (r.name().to_owned(), r.blanket()))
                             .collect();
                         // The task carries the request's span, so everything the execution logs
                         // names its connection, its Client ID and its request.
                         running.spawn(
-                            execute(id, payload, registrations, caller.for_execution(id))
-                                .instrument(span),
+                            execute(
+                                id,
+                                payload,
+                                registrations,
+                                settings,
+                                caller.for_execution(id),
+                            )
+                            .instrument(span),
                         );
                         continue;
                     }
@@ -480,9 +488,10 @@ async fn execute(
     id: Option<CorrelationId>,
     payload: Value,
     registrations: Vec<(String, bool)>,
+    settings: Settings,
     caller: Caller,
 ) -> Envelope<Value> {
-    match hexput_script::direct_execution(payload, registrations, caller).await {
+    match hexput_script::direct_execution(payload, registrations, settings, caller).await {
         Ok(payload) => Envelope {
             id,
             message_type: MessageType::Result,

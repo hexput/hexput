@@ -2,8 +2,8 @@
 //! ways, and the result guards.
 
 use hexput_port::{
-    CorrelationId, Envelope, ErrorBody, MAX_FRAME_LEN, MAX_NESTING_DEPTH, MessageType, Value,
-    decode, encode, encode_frame,
+    CorrelationId, Envelope, ErrorBody, MAX_FRAME_LEN, MAX_NESTING_DEPTH, MessageType, Setting,
+    Settings, Value, decode, encode, encode_frame,
 };
 use hexput_script::MAX_RESULT_DEPTH;
 use rmpv::Integer;
@@ -20,6 +20,15 @@ fn direct_execution_registering(
     payload: &Value,
     registrations: Vec<(String, bool)>,
 ) -> Result<Value, Box<ErrorBody>> {
+    direct_execution_configured(payload, registrations, Settings::new())
+}
+
+/// [`direct_execution_registering`] for a Session whose Config sets `settings` (Story 3.7).
+fn direct_execution_configured(
+    payload: &Value,
+    registrations: Vec<(String, bool)>,
+    settings: Settings,
+) -> Result<Value, Box<ErrorBody>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -29,6 +38,7 @@ fn direct_execution_registering(
     runtime.block_on(hexput_script::direct_execution(
         payload.clone(),
         registrations,
+        settings,
         caller,
     ))
 }
@@ -462,4 +472,138 @@ fn a_function_registered_without_a_grant_is_a_capability_error_when_no_handler_a
     assert_eq!(body.code, "capability.unknown_function");
     let unregistered = failure(&payload(source, vec![]));
     assert_eq!(body, unregistered, "the same error as an unregistered name");
+}
+
+// --- Story 3.7: limits from the Session's Config, overridden per execution ---
+
+/// An `ExecutionStart` payload running `source` with no variables and `overrides`.
+fn overridden(source: &str, overrides: Value) -> Value {
+    map(vec![
+        ("source", s(source)),
+        ("variables", map(vec![])),
+        ("overrides", overrides),
+    ])
+}
+
+/// Settings with `setting` set to `value`.
+fn setting(setting: Setting, value: u64) -> Settings {
+    let mut settings = Settings::new();
+    settings.set(setting, value).unwrap();
+    settings
+}
+
+fn budget(key: &str, value: Value) -> Value {
+    map(vec![("budget", map(vec![(key, value)]))])
+}
+
+/// `getOrder` registered with a blanket grant; the call table is gone, so a call that is sent
+/// fails with `host.no_reply`.
+fn get_order() -> Vec<(String, bool)> {
+    vec![("getOrder".to_owned(), true)]
+}
+
+#[test]
+fn absent_or_nil_overrides_set_nothing() {
+    for payload in [
+        payload("return 1;", vec![]),
+        overridden("return 1;", Value::Nil),
+        overridden("return 1;", map(vec![])),
+    ] {
+        assert_eq!(
+            direct_execution(&payload).unwrap(),
+            map(vec![("value", int(1))])
+        );
+    }
+}
+
+#[test]
+fn the_config_limit_is_enforced_and_an_override_changes_it_for_one_execution() {
+    let config = setting(Setting::RpcCalls, 0);
+    let call = payload("return getOrder(1);", vec![]);
+    // Config: no host calls at all, so nothing is sent.
+    let body = *direct_execution_configured(&call, get_order(), config).unwrap_err();
+    assert_eq!(body.code, "budget.rpc_calls_exceeded");
+    // Overridden for this execution: the call is made (and, with no connection, unanswered).
+    let raised = overridden("return getOrder(1);", budget("rpc_calls", int(1)));
+    let body = *direct_execution_configured(&raised, get_order(), config).unwrap_err();
+    assert_eq!(body.code, "host.no_reply");
+    // The Config itself is unchanged: the next execution is back under it.
+    let body = *direct_execution_configured(&call, get_order(), config).unwrap_err();
+    assert_eq!(body.code, "budget.rpc_calls_exceeded");
+}
+
+#[test]
+fn an_override_can_lower_a_limit_too() {
+    let body = failure(&overridden(
+        "return \"a long enough result\";",
+        budget("output_size_bytes", int(8)),
+    ));
+    assert_eq!(body.code, "budget.output_size_exceeded");
+    assert!(body.message.contains("8 bytes"), "{}", body.message);
+}
+
+#[test]
+fn the_argument_depth_is_the_one_in_force_and_its_error_says_so() {
+    let source = "return getOrder([[[1]]]);";
+    let config = setting(Setting::ArgumentDepth, 2);
+    let body =
+        *direct_execution_configured(&payload(source, vec![]), get_order(), config).unwrap_err();
+    assert_eq!(body.code, "depth.argument_too_deep");
+    assert!(
+        body.message.contains("more than 2 arrays"),
+        "{}",
+        body.message
+    );
+    // An override raises it for this execution: the argument is sent.
+    let raised = overridden(source, map(vec![("argument_depth", int(3))]));
+    let body = *direct_execution_configured(&raised, get_order(), config).unwrap_err();
+    assert_eq!(body.code, "host.no_reply");
+}
+
+#[test]
+fn a_bad_override_is_refused_naming_its_path_and_nothing_runs() {
+    let cases = [
+        (
+            budget("cpu_time_ms", int(0)),
+            "`overrides.budget.cpu_time_ms` must be an integer from 1 to 60000; found 0",
+        ),
+        (
+            budget("rpc_calls", s("5")),
+            "`overrides.budget.rpc_calls` must be an integer from 0 to 100000; found a string",
+        ),
+        (
+            budget("rpc_calls", Value::F64(1.0)),
+            "`overrides.budget.rpc_calls` must be an integer from 0 to 100000; found a float",
+        ),
+        (
+            budget("cpu", int(1)),
+            "`overrides.budget.cpu` is not a known setting",
+        ),
+        (
+            map(vec![("argument_depth", int(65))]),
+            "`overrides.argument_depth` must be an integer from 1 to 64; found 65",
+        ),
+        (Value::Array(vec![]), "`overrides` is not a map"),
+    ];
+    for (overrides, expected) in cases {
+        // The Script would call the host (and fail with no reply) if it ran.
+        let body = *direct_execution_registering(
+            &overridden("return getOrder(1);", overrides),
+            get_order(),
+        )
+        .unwrap_err();
+        assert_eq!(body.code, "protocol.invalid_payload", "{expected}");
+        assert_eq!(body.message, expected);
+    }
+    let body = failure(&map(vec![
+        ("source", s("return 1;")),
+        ("variables", map(vec![])),
+        ("overrides", map(vec![])),
+        ("overrides", map(vec![])),
+    ]));
+    assert!(
+        body.message.contains("repeats the key `overrides`"),
+        "{}",
+        body.message
+    );
 }

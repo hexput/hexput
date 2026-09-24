@@ -217,10 +217,10 @@ Every failure carries a category, a stable code, a message, and a source span (E
 | `reference` | Undeclared identifier, property access on `null`, an array write outside the appendable range | Runtime |
 | `arity` | Wrong argument count | Runtime |
 | `arithmetic` | Division by zero, non-finite result | Runtime |
-| `depth` | Call-depth limit exceeded; a value sent in a `Call` nested past the configured argument depth (`depth.argument_too_deep`, §8) | Runtime |
+| `depth` | Call-depth limit exceeded; a value sent in a `Call` nested past the argument depth limit (`depth.argument_too_deep`, §8) — 12 by default, settable from 1 to 64 in the Session's Config and per execution | Runtime |
 | `capability` | Call to an unregistered or denied Registered Function or Registered Method (FR-6, FR-7, FR-27) | Runtime |
 | `host` | The Backend answered a call with an error or answered it malformed, or the call could not be sent at all (`host.function_failed`); the connection ended before it answered (`host.no_reply`) | Runtime |
-| `budget` | A Resource Budget dimension exceeded (FR-8), one code per dimension: running Script code for longer than the CPU time budget (`budget.cpu_time_exceeded`; CPU time is the time spent running Script code, measured on its thread — wall time, excluding every wait on the Backend — which an oversubscribed host inflates), or values holding more memory than the memory budget (`budget.memory_exceeded`); making more allocations than the allocation budget (`budget.allocations_exceeded`), more host calls than the RPC call budget (`budget.rpc_calls_exceeded`), more side effects than the side-effect budget (`budget.side_effects_exceeded`), or returning a result larger than the output size budget (`budget.output_size_exceeded`). Spanned on the construct running when the limit was crossed — for RPC calls and side effects the call that would cross it, which is never sent; for output size the whole Script | Runtime |
+| `budget` | A Resource Budget dimension exceeded (FR-8), one code per dimension: running Script code for longer than the CPU time budget (`budget.cpu_time_exceeded`; CPU time is the time spent running Script code, measured on its thread — wall time, excluding every wait on the Backend — which an oversubscribed host inflates), or values holding more memory than the memory budget (`budget.memory_exceeded`); making more allocations than the allocation budget (`budget.allocations_exceeded`), more host calls than the RPC call budget (`budget.rpc_calls_exceeded`), more side effects than the side-effect budget (`budget.side_effects_exceeded`), or returning a result larger than the output size budget (`budget.output_size_exceeded`). Spanned on the construct running when the limit was crossed — for RPC calls and side effects the call that would cross it, which is never sent; for output size the whole Script. Every limit is settable in the Session's Config and per execution (see below) | Runtime |
 | `policy` | A disabled language construct was used (FR-3) | Parse or runtime |
 
 **[DECISION, 2026-09-24] The four counted budget dimensions have fixed meanings** (Story 3.6), each its own limit:
@@ -231,6 +231,20 @@ Every failure carries a category, a stable code, a message, and a source span (E
 - **Output size** — the exact MessagePack byte length of the Script result's `{value}` payload.
 
 The defaults are 1 000 000 allocations, 100 RPC calls, 1 MiB of output and 100 side effects per execution. Calls made before a limit is crossed stand; nothing is rolled back.
+
+**[DECISION, 2026-09-24] The limits are set per Session and per execution** (Story 3.7). A Backend sets any of them in its Config at `Init` and may override them for one `ExecutionStart` alone; the override changes nothing stored. The limit in force is the Daemon's default, overlaid by Config, overlaid by the override. Each value is an integer within the Daemon's allowed range, and one outside it is refused before anything runs, never clamped:
+
+| Limit | Allowed range | Default |
+| --- | --- | --- |
+| CPU time | 1 ms – 60 s | 1 s |
+| Memory | 1 KiB – 1 GiB | 64 MiB |
+| Allocations | 0 – 100 000 000 | 1 000 000 |
+| RPC calls | 0 – 100 000 | 100 |
+| Output size | 1 byte – 16 MiB (the maximum frame) | 1 MiB |
+| Side effects | 0 – 100 000 | 100 |
+| Argument depth (§8) | 1 – 64 | 12 |
+
+A zero is meaningful only for the counted dimensions: an RPC call limit of 0 means the Script may make no host call at all. An error naming a limit names the one in force.
 
 **[DECISION] Reading a missing object key yields `null`, not an error** — optional fields are the common case for a rule author, and `if (input.discount)` should read as "if a discount was supplied" rather than blowing up. Writing to a missing key creates it.
 

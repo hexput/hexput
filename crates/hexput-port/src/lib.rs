@@ -21,17 +21,23 @@
 //!   will ride the same Port, exempted from the init-handshake gate rather than given a separate
 //!   listener.
 //!
+//! * [`decode_settings`] is the one decoder of the tunable execution limits (Story 3.7), shared by
+//!   an `Init`'s `config` and an `ExecutionStart`'s `overrides` so the two can never disagree on a
+//!   key, a type or a range. [`Settings`] and [`Setting`] are re-exported from `hexput-shared`.
+//!
 //! Binds: AD-1.
 
 mod codec;
 mod error;
 mod frame;
 mod port;
+mod settings;
 
 pub use codec::{EncodeError, MAX_NESTING_DEPTH, ProtocolFailure, decode, encode};
 pub use error::{ErrorBody, ProtocolCode, ProtocolError, WireSpan, error_response};
 pub use frame::{FrameDecoder, LENGTH_PREFIX_LEN, MAX_FRAME_LEN, encode_frame};
 pub use port::{Inbound, Outbound, Port, Received};
+pub use settings::{OutOfRange, Setting, Settings, decode_settings};
 
 pub use hexput_shared::wire::{CorrelationId, Envelope, MessageType};
 /// The untyped MessagePack value the Port uses as its payload type. Re-exported so consumers

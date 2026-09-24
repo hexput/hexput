@@ -240,6 +240,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-6-bound-allocations-rpc-calls-output-size-and-side-effects.md`
   summary: `protocol.response_too_large` from Direct Execution has no end-to-end test: under the 1 MiB default output budget no result can reach the frame check.
   evidence: Review finding (blind, low). Becomes reachable once Story 3.7 lets Config raise the output limit above a frame; add the test there.
+  status: RESOLVED 2026-09-24 by `spec-3-7-tune-budgets-per-backend-and-per-execution.md` — `tests/connection.rs` (`a_result_within_a_raised_output_budget_but_past_a_frame_is_response_too_large`) raises `overrides.budget.output_size_bytes` to `MAX_FRAME_LEN` and returns a string built by doubling whose `{value}` payload is exactly `MAX_FRAME_LEN` bytes: it passes the budget, and the envelope around it cannot be framed, so the connection answers `protocol.response_too_large` with the id and keeps serving. `hexput-script`'s own `check_result` size refusal stays unreachable through Direct Execution — the output size ceiling is the frame, and the check's lower bound never exceeds the exact payload size the budget already charged — so it remains a defensive guard.
 
 - source_spec: `spec-3-6-bound-allocations-rpc-calls-output-size-and-side-effects.md`
   summary: `hexput_enforce::Budget` charges side effects only together with an RPC call; committed Global Variable writes (Epic 6) need their own side-effect charge.
@@ -248,3 +249,4 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-6-bound-allocations-rpc-calls-output-size-and-side-effects.md`
   summary: AGENTS.md's Epic 3 paragraph still gives `Execution::run(self) -> Outcome::{Finished, HostCall}`; the enum also has `Paused`, `OutOfMemory` and `AllocationsExceeded`.
   evidence: Review finding (blind, low); routed to defer because the fix edits an agent-context file.
+  status: RESOLVED 2026-09-24 by `spec-3-7-tune-budgets-per-backend-and-per-execution.md` — the AGENTS.md Epic 3 paragraph now lists all five outcomes.

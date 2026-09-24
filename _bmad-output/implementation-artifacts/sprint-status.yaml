@@ -66,7 +66,7 @@ development_status:
   3-4-deny-every-path-to-the-host-that-isn-t-a-registered-function: review
   3-5-stop-an-execution-that-burns-too-much-cpu-or-memory: review
   3-6-bound-allocations-rpc-calls-output-size-and-side-effects: review
-  3-7-tune-budgets-per-backend-and-per-execution: in-progress
+  3-7-tune-budgets-per-backend-and-per-execution: review
   3-8-change-execution-policy-without-reconnecting: backlog
   3-9-switch-off-language-constructs-by-policy: backlog
   3-10-turn-the-static-check-on-or-off: backlog

@@ -338,3 +338,52 @@ mod counted {
             .unwrap();
     }
 }
+
+// --- Story 3.7: limits from settings ---
+
+mod limits {
+    use std::time::Duration;
+
+    use hexput_enforce::{Limits, Setting, Settings};
+
+    #[test]
+    fn no_setting_is_the_documented_defaults() {
+        let limits = Limits::from_settings(&Settings::new());
+        assert_eq!(limits, Limits::default());
+        assert_eq!(limits.cpu_time(), Duration::from_secs(1));
+        assert_eq!(limits.memory(), 64 * 1024 * 1024);
+        assert_eq!(limits.allocations(), 1_000_000);
+        assert_eq!(limits.rpc_calls(), 100);
+        assert_eq!(limits.output_size(), 1024 * 1024);
+        assert_eq!(limits.side_effects(), 100);
+        assert_eq!(limits.argument_depth(), 12);
+        assert_eq!(limits.authorization_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn every_setting_reaches_its_limit() {
+        let mut settings = Settings::new();
+        for (setting, value) in [
+            (Setting::CpuTimeMs, 250),
+            (Setting::MemoryBytes, 4096),
+            (Setting::Allocations, 3),
+            (Setting::RpcCalls, 0),
+            (Setting::OutputSizeBytes, 77),
+            (Setting::SideEffects, 9),
+            (Setting::ArgumentDepth, 2),
+            (Setting::AuthorizationTimeoutMs, 100),
+        ] {
+            settings.set(setting, value).unwrap();
+        }
+        let expected = Limits::default()
+            .with_cpu_time(Duration::from_millis(250))
+            .with_memory(4096)
+            .with_allocations(3)
+            .with_rpc_calls(0)
+            .with_output_size(77)
+            .with_side_effects(9)
+            .with_argument_depth(2)
+            .with_authorization_timeout(Duration::from_millis(100));
+        assert_eq!(Limits::from_settings(&settings), expected);
+    }
+}

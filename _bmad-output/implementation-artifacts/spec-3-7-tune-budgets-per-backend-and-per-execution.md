@@ -2,7 +2,7 @@
 title: 'Story 3.7: Tune budgets per backend and per execution'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'done'
 baseline_commit: '3d54919'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -114,17 +114,31 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `hexput-shared`, `hexput-port`: setting table, `Settings`, and one decoder.
-- [ ] `hexput-session`: Config holds `Settings`; read per execution.
-- [ ] `hexput-enforce`, `hexput-exec`: limits from settings; depth and timeout from limits.
-- [ ] `hexput-script`, `hexput-connection`: `overrides`; effective limits.
-- [ ] Tests for every matrix row.
-- [ ] Docs.
+- [x] `hexput-shared`, `hexput-port`: setting table, `Settings`, and one decoder.
+- [x] `hexput-session`: Config holds `Settings`; read per execution.
+- [x] `hexput-enforce`, `hexput-exec`: limits from settings; depth and timeout from limits.
+- [x] `hexput-script`, `hexput-connection`: `overrides`; effective limits.
+- [x] Tests for every matrix row.
+- [x] Docs.
 
 **Acceptance Criteria:**
 - Given a Config value, when an execution runs without overrides, then it is the enforced limit.
 - Given an override, when its execution ends, then the Session's stored settings are unchanged and the next execution uses them.
 - Given any out-of-range or mistyped value in either place, when it is decoded, then it is `protocol.invalid_payload` naming the path, never clamped.
+
+## Implementation Notes
+
+As built, 2026-09-24. No crate edge was added; `scripts/check-crate-graph.py` is unchanged.
+
+- **Setting table.** `Setting::default()` is a `const fn` taking `self`, so `hexput-enforce`'s `DEFAULT_*` constants are now *derived* from the table (`Duration::from_millis(Setting::CpuTimeMs.default())`, …) rather than duplicated. The output ceiling is written in `hexput-shared` as 16 MiB (it cannot see `hexput-port`), and `hexput-port/src/settings.rs` asserts at compile time that it equals `MAX_FRAME_LEN`. `Settings` stores its values as a private `[Option<u64>; 8]` indexed by setting, and adds `Settings::new()` (a `const` empty set) and `effective(setting)` (the value or its default) beside the specified `set`/`get`/`overlay`. `Setting` implements `Display` as its path.
+- **Decoder.** `decode_settings` walks the map generically from the table's dotted paths: a key whose relative path is a setting's is decoded as an integer, one that is a proper prefix of some path (`budget`) as a nested map, anything else — including a dotted key such as `"budget.rpc_calls"` at the root — is `` `<prefix>.<path>` is not a known setting ``. The echoed key is bounded to 64 characters; a non-string key is never echoed (`` `config.budget` has a key that is not a string ``). A wrong type reads `found a string` / `a float` / `nil` / `a boolean` / …, a negative integer `found -1`; no float is ever echoed (a float's `Display` is unbounded). A nil *inside* the settings map is refused like any other non-integer; only the `overrides` key itself may be absent or nil.
+- **Init refusal wording changed.** The old "`config` accepts no keys yet; found …, and N more" message and its three-key listing are gone: the first bad key alone is named. `tests/session.rs`'s bounded-echo test was adjusted accordingly.
+- **Session.** `InitRequest::config()` and `Config::settings()` are public. Besides `Sessions::settings(client_id)`, `Sessions::for_execution(client_id) -> Option<(Vec<RegisteredFunction>, Settings)>` reads both under one shard lock; the connection uses it. `hexput-session` re-exports `Setting`/`Settings`.
+- **Script.** `overrides` is decoded after `source` and `variables` are type-checked but before any variable is converted, so a refused override costs no conversion. `direct_execution` now always calls `execute_with_limits`.
+- **Exec.** `Limits` also gained `with_argument_depth` / `with_authorization_timeout` builders (for tests, like the other `with_*`). The `depth.argument_too_deep` message prints the limit in force.
+- **`protocol.response_too_large` (deferred from 3.6).** The reachable path is the *connection's* frame check, not `hexput-script`'s `check_result`: with `output_size_bytes` at its maximum (`MAX_FRAME_LEN`) the exact `{value}` payload is at most a frame, and `check_result`'s lower bound never exceeds that, so the result always passes it — only the envelope around it can overflow. The e2e test returns a string of `MAX_FRAME_LEN - 12` bytes (a payload of exactly `MAX_FRAME_LEN`), built by binary doubling, under raised `memory_bytes`/`cpu_time_ms` overrides. The test's in-memory `Wired` adapter now refuses an unframable envelope with `InvalidInput`, as a real adapter does. `check_result`'s size refusal remains a defensive guard.
+- **Faster timeout tests.** Both the Executor's and the connection's silent-handler tests now run under a 100 ms authorization timeout (the connection's via `config.authorization_timeout_ms`), asserting the elapsed time lies between it and the 5 s default; the default itself is still pinned by assertion.
+- **Docs.** LANGUAGE-REFERENCE §7 gained a dated decision with the language-visible limits and ranges (the authorization timeout is wire-only and lives in the Spine amendment). Tests: 593 → 619.
 
 ## Spec Change Log
 

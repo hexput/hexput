@@ -20,9 +20,14 @@
 //! enforces is still open. Decoding, parsing and converting the result run on the blocking pool,
 //! like the Script itself, so a large payload never occupies a runtime worker.
 //!
-//! Not yet: the static check (no check mode exists in Config until Story 3.10), the AST Cache
-//! and Cached Execution (Epic 4), and Config-set Resource Budget limits (Story 3.7, behind the
-//! same Executor).
+//! The execution runs under limits tuned per backend and per execution (Story 3.7): the
+//! connection passes the Session's Config settings, read once per execution, and the payload's
+//! optional `overrides` — decoded by `hexput-port`'s one settings decoder, exactly as `Init`'s
+//! `config` is — are laid over them for this execution alone. The Executor enforces the result;
+//! nothing stored changes.
+//!
+//! Not yet: the static check (no check mode exists in Config until Story 3.10), and the AST
+//! Cache and Cached Execution (Epic 4).
 //!
 //! Binds: AD-3, AD-6, AD-8.
 
@@ -30,21 +35,29 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use hexput_exec::wire;
-use hexput_exec::{Caller, Host};
+use hexput_exec::{Caller, Host, Limits};
 use hexput_interpreter::{Category, Code, Diagnostic, Program, Span, Value as Hexput};
-use hexput_port::{ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, Value};
+use hexput_port::{
+    ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, Settings, Value, decode_settings,
+};
 
 pub use hexput_exec::wire::MAX_RESULT_DEPTH;
 
 const SOURCE: &str = "source";
 const VARIABLES: &str = "variables";
+const OVERRIDES: &str = "overrides";
 const VALUE: &str = "value";
 
-/// Serve one Direct Execution: `payload` is an `ExecutionStart` payload, a map with exactly
-/// `source` (the Script, a string) and `variables` (its starting variables, a map from §2
-/// identifier to value). The Script may call the Registered Functions in `registrations` — each
-/// `(name, blanket)`, the name and whether it holds a blanket grant — as the Executor allows,
-/// through `caller` (Stories 3.1–3.3).
+/// Serve one Direct Execution: `payload` is an `ExecutionStart` payload, a map with the keys
+/// `source` (the Script, a string), `variables` (its starting variables, a map from §2
+/// identifier to value) and optionally `overrides` (execution limits for this execution alone,
+/// the shape of `Init`'s `config`; absent or nil sets none). The Script may call the Registered
+/// Functions in `registrations` — each `(name, blanket)`, the name and whether it holds a blanket
+/// grant — as the Executor allows, through `caller` (Stories 3.1–3.3).
+///
+/// It runs under `settings` — the Session's Config settings, as they were when the execution was
+/// dispatched — overlaid with the payload's `overrides` (Story 3.7). Neither is changed: the
+/// overlay is this execution's own.
 ///
 /// Returns the `Result` payload `{value: <the Script's result>}`. A number that is whole and
 /// within ±2^53 is sent as a MessagePack integer (`-0` as `0`), every other number as a
@@ -59,9 +72,11 @@ const VALUE: &str = "value";
 /// The `Error` payload, each exactly one of:
 ///
 /// * `protocol.invalid_payload` — the payload is not as described, a name is not a §2 identifier
-///   or appears twice, or a value has no lossless Hexput representation (an integer outside
+///   or appears twice, a value has no lossless Hexput representation (an integer outside
 ///   ±2^53, a NaN or infinity, binary data, an extension, a non-string or repeated object key,
-///   invalid UTF-8). The message names the key or path; nothing is parsed or run.
+///   invalid UTF-8), or an override is unknown, mistyped or out of its range (never clamped).
+///   The message names the key or path — and for an override out of range, the range; nothing
+///   is parsed or run.
 /// * The parser's, interpreter's or Executor's [`Diagnostic`] — category, code, severity, message
 ///   and span — including `syntax.duplicate_declaration` for a starting variable the Script also
 ///   declares, every `capability`, `host` and argument error of a host call, and every `budget`
@@ -69,7 +84,8 @@ const VALUE: &str = "value";
 /// * `protocol.result_too_deep` — the result nests past [`MAX_RESULT_DEPTH`].
 /// * `protocol.response_too_large` — the result is certain to encode past the maximum frame.
 ///   Under the default Resource Budget the Executor refuses any such result first, as
-///   `budget.output_size_exceeded` (Story 3.6): the output size budget is far below a frame.
+///   `budget.output_size_exceeded` (Story 3.6): the output size budget is far below a frame. Only
+///   an output size limit raised to the frame itself lets one reach this check.
 ///
 /// The error is boxed: it is the reply's payload, built once per failed execution, and a large
 /// `Err` would make every `Result` this returns as large as it.
@@ -80,12 +96,19 @@ const VALUE: &str = "value";
 pub async fn direct_execution(
     payload: Value,
     registrations: Vec<(String, bool)>,
+    settings: Settings,
     caller: Caller,
 ) -> Result<Value, Box<ErrorBody>> {
-    let (program, variables) = blocking(move || prepare(&payload)).await?;
-    let result = hexput_exec::execute(program, variables, Host::new(registrations, caller))
-        .await
-        .map_err(|d| Box::new(ErrorBody::from(&d)))?;
+    let (program, variables, overrides) = blocking(move || prepare(&payload)).await?;
+    let limits = Limits::from_settings(&settings.overlay(&overrides));
+    let result = hexput_exec::execute_with_limits(
+        program,
+        variables,
+        Host::new(registrations, caller),
+        limits,
+    )
+    .await
+    .map_err(|d| Box::new(ErrorBody::from(&d)))?;
     blocking(move || reply(&result)).await
 }
 
@@ -102,19 +125,19 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
     }
 }
 
-/// A parsed Script and its starting variables, ready for the Executor.
-type Prepared = (Arc<Program>, Vec<(Arc<str>, Hexput)>);
+/// A parsed Script, its starting variables and its overrides, ready for the Executor.
+type Prepared = (Arc<Program>, Vec<(Arc<str>, Hexput)>, Settings);
 
 /// Decode the payload and parse its source.
 fn prepare(payload: &Value) -> Result<Prepared, Box<ErrorBody>> {
-    let (source, variables) = decode(payload).map_err(|message| {
+    let (source, variables, overrides) = decode(payload).map_err(|message| {
         Box::new(ErrorBody::from(&ProtocolError::new(
             ProtocolCode::InvalidPayload,
             message,
         )))
     })?;
     let program = hexput_parser::parse(source).map_err(|d| Box::new(ErrorBody::from(&d)))?;
-    Ok((Arc::new(program), variables))
+    Ok((Arc::new(program), variables, overrides))
 }
 
 /// The `Result` payload for a Script's result, or why it cannot be sent.
@@ -148,8 +171,9 @@ fn reply(result: &Hexput) -> Result<Value, Box<ErrorBody>> {
     }
 }
 
-/// A decoded `ExecutionStart`: the source, and the starting variables in the order given.
-type Decoded<'a> = (&'a str, Vec<(Arc<str>, Hexput)>);
+/// A decoded `ExecutionStart`: the source, the starting variables in the order given, and the
+/// overrides (none set when the payload has none).
+type Decoded<'a> = (&'a str, Vec<(Arc<str>, Hexput)>, Settings);
 
 /// Decode an `ExecutionStart` payload by hand, like `Init`'s: a Backend is owed the exact key,
 /// name or path that was wrong.
@@ -166,10 +190,12 @@ fn decode(payload: &Value) -> Result<Decoded<'_>, String> {
 
     let mut source = None;
     let mut variables = None;
+    let mut overrides = None;
     for (key, value) in fields {
         let slot = match key.as_str() {
             Some(SOURCE) => &mut source,
             Some(VARIABLES) => &mut variables,
+            Some(OVERRIDES) => &mut overrides,
             Some(other) => {
                 return Err(format!(
                     "the `ExecutionStart` payload has an unknown key `{}`",
@@ -205,6 +231,12 @@ fn decode(payload: &Value) -> Result<Decoded<'_>, String> {
     let Value::Map(entries) = variables else {
         return Err(format!("`{VARIABLES}` is not a map"));
     };
+    // Checked before any variable is converted: a refused override runs nothing, and costs
+    // nothing more.
+    let overrides = match present(overrides) {
+        None => Settings::new(),
+        Some(overrides) => decode_settings(overrides, OVERRIDES)?,
+    };
 
     let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
     let mut bound = Vec::with_capacity(entries.len());
@@ -228,7 +260,7 @@ fn decode(payload: &Value) -> Result<Decoded<'_>, String> {
         let value = wire::to_hexput(value, &mut wire::Path::variable(name))?;
         bound.push((Arc::from(name), value));
     }
-    Ok((source, bound))
+    Ok((source, bound, overrides))
 }
 
 /// A key that is absent or nil is missing.

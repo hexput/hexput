@@ -56,6 +56,11 @@ pub enum MessageType {
     Init,
     /// Request: run a Script (Story 2.6).
     ExecutionStart,
+    /// Request: replace the Session's Config with a new one, without reconnecting (Story 3.8).
+    /// The payload is `{config}`, a complete Config in exactly `Init.config`'s shape: a setting it
+    /// leaves out goes back to the Daemon default. Answered `Result {}` (an empty map); every
+    /// attached Connection's later executions run under the new Config.
+    ConfigUpdate,
     /// Response: a request succeeded; the payload is its result.
     Result,
     /// Request, from the Daemon to the Backend: a Script called a Registered Function (Story
@@ -80,6 +85,7 @@ impl MessageType {
     pub const ALL: &'static [Self] = &[
         Self::Init,
         Self::ExecutionStart,
+        Self::ConfigUpdate,
         Self::Result,
         Self::Call,
         Self::Authorize,
@@ -92,6 +98,7 @@ impl MessageType {
         match self {
             Self::Init => "Init",
             Self::ExecutionStart => "ExecutionStart",
+            Self::ConfigUpdate => "ConfigUpdate",
             Self::Result => "Result",
             Self::Call => "Call",
             Self::Authorize => "Authorize",

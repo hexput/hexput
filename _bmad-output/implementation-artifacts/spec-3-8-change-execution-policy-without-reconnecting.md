@@ -2,7 +2,7 @@
 title: 'Story 3.8: Change execution policy without reconnecting'
 type: 'feature'
 created: '2026-09-25'
-status: 'in-progress'
+status: 'done'
 baseline_commit: '36293932d6987c337925af2cdf3b2f038c7a595a'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -85,11 +85,11 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `hexput-shared`: message type.
-- [ ] `hexput-session`: decode the payload; `update_config`.
-- [ ] `hexput-connection`: route and answer inline.
-- [ ] Tests for every matrix row.
-- [ ] Spine and AGENTS.md.
+- [x] `hexput-shared`: message type.
+- [x] `hexput-session`: decode the payload; `update_config`.
+- [x] `hexput-connection`: route and answer inline.
+- [x] Tests for every matrix row.
+- [x] Spine and AGENTS.md.
 
 **Acceptance Criteria:**
 - Given an initialized connection, when it sends a valid `ConfigUpdate`, then the reply is `Result {}` and later executions on any attached Connection run under the new Config.
@@ -97,6 +97,28 @@ context:
 - Given `hexput-script` and `hexput-exec`, when a reviewer reads them, then neither holds settings beyond one dispatch.
 
 ## Spec Change Log
+
+## Review Triage Log
+
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | verification-gap | A `ConfigUpdate` pipelined right before an `ExecutionStart` (no await of `Result {}`) is untested; every test awaits the reply first | low | Pre-verified gap; the guarantee is stated in decision 2. **patch** (test) |
+| 2 | blind | `an_update_before_init_is_refused_and_creates_no_session` checks `sessions.is_empty()` after `serve` returned, true even had a Session been created | low | Real: detach on exit empties the registry. **patch**: assert no reply carries `client_id` |
+| 3 | blind | Unreachable `update_config == false` branch answers "send `Init` first" to an attached connection and logs nothing | low | Real wording defect; direct. **patch**: `error` log, message naming the missing Session |
+| 4 | blind | `hexput-port` docs name only `Init`/`ExecutionStart` as users of the settings decoder and sources of `invalid_payload` | low | Real; direct. **patch** |
+| 5 | blind | Replace semantics give concurrent updaters last-writer-wins, and a budget-only update will reset Story 3.9/3.10 keys | medium | Real consequence of frozen decision 1 (agent-chosen under Erdem's delegation); kept as decided. **patch** (documented as a known limitation in the Spine amendment) + **defer** (revisit echoing the effective Config or a patch form when 3.9/3.10 add keys) |
+| 6 | blind | Spine 2026-09-25 amendment sits between two 2026-09-24 amendments | low | Real; direct. **patch**: moved after the FR-29/FR-30 paragraph |
+| 7 | blind | epic-3-context still says the runtime update message is undefined | low | Real; direct. **patch** |
+| 8 | blind | `tests/connection.rs` header over 100 columns and omits Story 2.8 | low | Real; direct. **patch** |
+| 9 | blind | Session test comment "An update through the second Connection" describes what `update_config(client_id, …)` cannot express | low | Real; direct. **patch** |
+| 10 | blind | Multi-Connection criterion checked only on the registry, no second served Connection | low | Rejected: nothing on the wire attaches a second Connection before Epic 5 (reconnect); `for_execution` is what every connection reads at dispatch |
+| 11 | blind | Connection-level malformed-payload test misses repeated key, `{config: nil}`, non-map and the unchanged-Config check | low | Rejected: the session tests cover every shape and unchanged settings; the "Invalid update" connection test checks the next execution uses the old limits |
+| 12 | blind | `ConfigUpdate` errors reuse the type name `InitError` | low | Rejected: naming only; renaming a public type for one extra caller is more than a direct correction |
+| 13 | blind | New log events untested inside the request span | low | Rejected: logged from `answer`, which already runs in the request span Story 2.8's tests pin; a log test adds a subscriber harness for one event |
+| 14 | blind | epic-3-context lost "whether a Value Secret counts as an allocation" | low | Real planning gap for Stories 3.11–3.13, not caused by code. **defer** |
+| 15 | blind | Sprint status `in-progress` vs spec `in-review` | false | Step 5 syncs the sprint status |
+| 16 | blind | Code Map mentions `tests/port.rs` though it iterates `ALL` | — | Rejected: fix edits this build's spec |
+| 17 | edge-case | (no findings) | — | — |
 
 ## Verification
 

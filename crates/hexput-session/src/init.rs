@@ -29,6 +29,50 @@ impl Config {
     pub fn settings(&self) -> Settings {
         self.settings
     }
+
+    /// Decode a `ConfigUpdate` payload (Story 3.8): a map with exactly the key `config`, a
+    /// complete Config in exactly `Init.config`'s shape, decoded by the same decoder.
+    ///
+    /// The result *replaces* the Session's Config: a setting it leaves out goes back to the
+    /// Daemon default, so `config: {}` resets every one. There are no patch semantics.
+    ///
+    /// # Errors
+    ///
+    /// An [`InitError`] naming what was wrong: a payload that is not a map, a `config` that is
+    /// absent or nil (missing), an unknown or repeated key, or a bad setting (its full path and
+    /// range, as for `Init`).
+    pub fn from_update_payload(payload: &Value) -> Result<Self, InitError> {
+        const MESSAGE: &str = "ConfigUpdate";
+        let fields: &[(Value, Value)] = match payload {
+            Value::Nil => &[],
+            Value::Map(fields) => fields,
+            _ => {
+                return Err(InitError::new(format!(
+                    "the `{MESSAGE}` payload must be a map with `{CONFIG}`"
+                )));
+            }
+        };
+        let mut config = None;
+        for (key, value) in fields {
+            if key.as_str() != Some(CONFIG) {
+                return Err(InitError::new(format!(
+                    "the `{MESSAGE}` payload has an unknown key {}",
+                    describe_key(key)
+                )));
+            }
+            if config.is_some() {
+                return Err(InitError::new(format!(
+                    "the `{MESSAGE}` payload repeats the key {}",
+                    describe_key(key)
+                )));
+            }
+            config = Some(value);
+        }
+        match present(config) {
+            Some(config) => decode_config(config),
+            None => Err(missing(MESSAGE, &[CONFIG])),
+        }
+    }
 }
 
 /// A function the Backend exposes to its Scripts, named at init (FR-1, FR-6), with its
@@ -66,8 +110,8 @@ pub struct InitRequest {
     pub(crate) registrations: Vec<RegisteredFunction>,
 }
 
-/// Why an `Init` payload was refused, naming the offending key or index. No Session is ever
-/// created from a refused payload.
+/// Why an `Init` (or `ConfigUpdate`) payload was refused, naming the offending key or index. No
+/// Session is ever created from a refused `Init`, and a refused `ConfigUpdate` changes nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitError {
     message: String,
@@ -145,9 +189,9 @@ impl InitRequest {
 
         let (config, registrations) = match (present(config), present(registrations)) {
             (Some(config), Some(registrations)) => (config, registrations),
-            (None, Some(_)) => return Err(missing(&[CONFIG])),
-            (Some(_), None) => return Err(missing(&[REGISTRATIONS])),
-            (None, None) => return Err(missing(&[CONFIG, REGISTRATIONS])),
+            (None, Some(_)) => return Err(missing("Init", &[CONFIG])),
+            (Some(_), None) => return Err(missing("Init", &[REGISTRATIONS])),
+            (None, None) => return Err(missing("Init", &[CONFIG, REGISTRATIONS])),
         };
 
         Ok(Self {
@@ -174,10 +218,11 @@ fn present(value: Option<&Value>) -> Option<&Value> {
     value.filter(|v| !v.is_nil())
 }
 
-fn missing(keys: &[&str]) -> InitError {
+/// `message`'s payload lacks `keys`.
+fn missing(message: &str, keys: &[&str]) -> InitError {
     let names: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
     InitError::new(format!(
-        "the `Init` payload is missing {}",
+        "the `{message}` payload is missing {}",
         names.join(" and ")
     ))
 }

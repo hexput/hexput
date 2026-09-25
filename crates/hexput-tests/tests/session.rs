@@ -1,9 +1,10 @@
 //! Stories 2.4 + 2.5: decoding an `Init` payload, and the Session registry it creates into.
+//! Stories 3.7 + 3.8: the Config's execution limits, and replacing the Config at runtime.
 
 use std::collections::HashSet;
 
 use hexput_port::Value;
-use hexput_session::{ClientId, ConnectionId, InitRequest, Sessions, Setting, Settings};
+use hexput_session::{ClientId, Config, ConnectionId, InitRequest, Sessions, Setting, Settings};
 
 fn s(text: &str) -> Value {
     Value::from(text)
@@ -522,4 +523,138 @@ fn a_config_out_of_range_or_mistyped_is_refused_naming_its_path() {
             "a refused Init creates no Session: nothing to create from"
         );
     }
+}
+
+// --- Story 3.8: replacing the Config at runtime ---
+
+/// A `ConfigUpdate` payload carrying `config`.
+fn update(config: Value) -> Value {
+    map(vec![("config", config)])
+}
+
+/// The Config a valid `ConfigUpdate` payload decodes to.
+fn updated(config: Value) -> Config {
+    Config::from_update_payload(&update(config)).unwrap()
+}
+
+/// The refusal message for a `ConfigUpdate` payload, which must be refused.
+fn update_refusal(payload: &Value) -> String {
+    Config::from_update_payload(payload)
+        .expect_err("the payload is refused")
+        .to_string()
+}
+
+fn rpc_calls(value: u64) -> Value {
+    map(vec![(
+        "budget",
+        map(vec![("rpc_calls", Value::from(value))]),
+    )])
+}
+
+#[test]
+fn an_update_replaces_the_config_whole_and_a_left_out_setting_is_back_to_its_default() {
+    let sessions = Sessions::new();
+    let (id, _) = create(
+        &sessions,
+        configured(map(vec![
+            ("budget", map(vec![("rpc_calls", Value::from(1))])),
+            ("argument_depth", Value::from(2)),
+        ])),
+    );
+    assert!(sessions.update_config(id, updated(rpc_calls(3))));
+
+    let settings = sessions.settings(id).unwrap();
+    let mut expected = Settings::new();
+    expected.set(Setting::RpcCalls, 3).unwrap();
+    assert_eq!(settings, expected, "replace, never patch");
+    assert_eq!(settings.get(Setting::ArgumentDepth), None);
+    assert_eq!(settings.effective(Setting::ArgumentDepth), 12);
+
+    // `config: {}` resets every setting.
+    assert!(sessions.update_config(id, updated(Value::Map(vec![]))));
+    assert_eq!(sessions.settings(id), Some(Settings::new()));
+    // The registrations are untouched.
+    assert_eq!(
+        registrations(&sessions, id),
+        Some(vec![("getOrder".to_owned(), true)])
+    );
+}
+
+#[test]
+fn an_update_of_no_session_changes_nothing() {
+    let sessions = Sessions::new();
+    let (id, connection) = create(&sessions, valid(&[]));
+    sessions.detach(id, connection);
+    assert!(!sessions.update_config(id, updated(rpc_calls(3))));
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_refused_update_leaves_the_stored_config_as_it_was() {
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, configured(rpc_calls(1)));
+    let before = sessions.settings(id);
+
+    let cases = [
+        (
+            update(map(vec![(
+                "budget",
+                map(vec![("rpc_calls", Value::from(-1))]),
+            )])),
+            "`config.budget.rpc_calls` must be an integer from 0 to 100000; found -1",
+        ),
+        (Value::Nil, "the `ConfigUpdate` payload is missing `config`"),
+        (
+            Value::Map(vec![]),
+            "the `ConfigUpdate` payload is missing `config`",
+        ),
+        (
+            map(vec![("config", Value::Nil)]),
+            "the `ConfigUpdate` payload is missing `config`",
+        ),
+        (update(Value::from(1)), "`config` is not a map"),
+        (
+            map(vec![("config", Value::Map(vec![])), ("x", Value::from(1))]),
+            "the `ConfigUpdate` payload has an unknown key `x`",
+        ),
+        (
+            map(vec![
+                ("config", Value::Map(vec![])),
+                ("config", Value::Map(vec![])),
+            ]),
+            "the `ConfigUpdate` payload repeats the key `config`",
+        ),
+        (
+            Value::from(1),
+            "the `ConfigUpdate` payload must be a map with `config`",
+        ),
+    ];
+    for (payload, expected) in cases {
+        assert_eq!(update_refusal(&payload), expected);
+    }
+    // Nothing refused ever reached the registry.
+    assert_eq!(sessions.settings(id), before);
+}
+
+#[test]
+fn an_update_is_seen_by_every_attached_connection() {
+    let sessions = Sessions::new();
+    let (id, first) = create(&sessions, configured(rpc_calls(1)));
+    let second = sessions.connect();
+    assert!(sessions.attach(id, second));
+
+    // The update is made on the Session, and both attached Connections read it.
+    assert!(sessions.update_config(id, updated(rpc_calls(3))));
+    let mut expected = Settings::new();
+    expected.set(Setting::RpcCalls, 3).unwrap();
+    // One Session, one Config: whichever Connection dispatches next reads the new one.
+    let (_, settings) = sessions.for_execution(id).unwrap();
+    assert_eq!(settings, expected);
+
+    // Still there after the updating Connection detaches.
+    sessions.detach(id, second);
+    let (_, settings) = sessions.for_execution(id).unwrap();
+    assert_eq!(settings, expected);
+    sessions.detach(id, first);
+    assert!(sessions.is_empty());
 }

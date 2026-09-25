@@ -19,6 +19,12 @@
 //!   runs the Script through the one Executor, and the connection answers `Result { value }` or
 //!   the `Error` it returns — a parse or runtime diagnostic, or a `protocol.*` refusal. A failing
 //!   Script ends nothing but itself.
+//! * `ConfigUpdate` — `protocol.init_not_completed` before init. After init, the payload's
+//!   `config` — a complete Config, decoded like `Init.config` — replaces the Session's Config
+//!   (Story 3.8) and is answered `Result {}`; an invalid one is `protocol.invalid_payload` and
+//!   changes nothing. Handled inline, so it is in force for every execution this connection sends
+//!   after it, and for every later execution on any Connection attached to the Session. An
+//!   execution already dispatched keeps the settings it started with.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
@@ -43,8 +49,9 @@
 //! cores (AD-6, FR-16). A connection may have any number of executions in flight, and there is no
 //! per-connection serial queue: up to the size of Tokio's blocking pool (512 threads by default),
 //! none waits on another. Past it, executions queue Daemon-wide for a free thread; a cap on
-//! in-flight executions is deferred to Epic 3. Everything else — `Init`, the gate's refusals,
-//! malformed-frame answers, routing a host call's reply — is handled inline, at once.
+//! in-flight executions is deferred to Epic 3. Everything else — `Init`, `ConfigUpdate`, the
+//! gate's refusals, malformed-frame answers, routing a host call's reply — is handled inline, at
+//! once.
 //!
 //! The loop races reading the next message, the next host call an execution submits, and the next
 //! finished execution, and is the only writer of the `Outbound` half, so no lock guards it. Each
@@ -123,7 +130,7 @@ use hexput_port::{
     ProtocolError, Received, Value, error_response,
 };
 use hexput_rpc::{Call, Caller, Calls};
-use hexput_session::{ClientId, ConnectionId, InitRequest, Sessions, Settings};
+use hexput_session::{ClientId, Config, ConnectionId, InitRequest, Sessions, Settings};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{Instrument, Span};
 
@@ -449,7 +456,7 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
     // Messages that need no Session.
     match request.message_type {
         MessageType::Init => return init(&request, connection),
-        MessageType::ExecutionStart => {}
+        MessageType::ExecutionStart | MessageType::ConfigUpdate => {}
         other => {
             // A stray reply's id is the Daemon's call id, not a Backend request id: echoing it
             // would fail whatever Backend request shares the number. Nil is allowed on `Error`.
@@ -478,8 +485,44 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
         ));
     }
 
-    // Past the gate, `ExecutionStart` is the only message left: a Direct Execution.
+    // Past the gate: a `ConfigUpdate`, answered inline, or a Direct Execution.
+    if request.message_type == MessageType::ConfigUpdate {
+        return Answer::Reply(config_update(&request, connection));
+    }
     Answer::Execute(request.id, request.payload)
+}
+
+/// Serve `ConfigUpdate` (Story 3.8): decode the complete new Config and replace the Session's
+/// single live copy with it, answering `Result {}`. Inline and synchronous — the registry's shard
+/// lock is taken and released here — so an `ExecutionStart` this connection sends after it is
+/// always dispatched under the new Config. A refused update changes nothing.
+fn config_update(request: &Envelope<Value>, connection: &Connection<'_>) -> Envelope<Value> {
+    let config = match Config::from_update_payload(&request.payload) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::debug!(%error, "refused an invalid config update");
+            return refuse(request.id, ProtocolCode::InvalidPayload, error.to_string());
+        }
+    };
+    let updated = connection
+        .attached
+        .is_some_and(|client_id| connection.sessions.update_config(client_id, config));
+    if !updated {
+        // Unreachable while the connection is attached: its Session outlives it. No better code
+        // exists than `init_not_completed`; the message says what actually happened.
+        tracing::error!("an attached connection's Session no longer exists; config not updated");
+        return refuse(
+            request.id,
+            ProtocolCode::InitNotCompleted,
+            "this connection's Session no longer exists; the Config was not updated".to_owned(),
+        );
+    }
+    tracing::debug!("config updated");
+    Envelope {
+        id: request.id,
+        message_type: MessageType::Result,
+        payload: Value::Map(Vec::new()),
+    }
 }
 
 /// Run one Direct Execution to its reply. The Script's own work runs on the blocking pool; this

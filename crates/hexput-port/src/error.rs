@@ -34,10 +34,11 @@ pub enum ProtocolCode {
     /// A well-formed message the Daemon never accepts from a Backend on its own initiative, such
     /// as a `Result` or `Error` answering nothing the Daemon asked.
     UnexpectedMessage,
-    /// A request payload the Daemon cannot accept: an `Init` or `ExecutionStart` with a missing,
-    /// mistyped, unknown or repeated key, a malformed or duplicate registration, a starting
-    /// variable that is not a §2 identifier, or a value with no lossless Hexput representation.
-    /// The message names the offending key, index or path. Nothing runs.
+    /// A request payload the Daemon cannot accept: an `Init`, `ConfigUpdate` or `ExecutionStart`
+    /// with a missing, mistyped, unknown or repeated key, a malformed or duplicate registration, a
+    /// starting variable that is not a §2 identifier, or a value with no lossless Hexput
+    /// representation. The message names the offending key, index or path. Nothing runs, and a
+    /// refused `ConfigUpdate` changes nothing.
     InvalidPayload,
     /// An `Init` on a connection already attached to a Session; that Session is untouched.
     AlreadyInitialized,

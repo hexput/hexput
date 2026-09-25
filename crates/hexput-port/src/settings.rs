@@ -1,6 +1,6 @@
 //! Decoding the tunable execution limits (Story 3.7) from the wire: one decoder for a Session's
-//! `Init.config` and an `ExecutionStart`'s `overrides`, so the two can never disagree on a key, a
-//! type or a range.
+//! `Init.config`, a `ConfigUpdate`'s `config` (Story 3.8) and an `ExecutionStart`'s `overrides`,
+//! so they can never disagree on a key, a type or a range.
 //!
 //! The shape is the [`Setting`] table's dotted paths as nested maps:
 //!
@@ -29,8 +29,8 @@ const _: () = assert!(Setting::OutputSizeBytes.max() == MAX_FRAME_LEN as u64);
 /// frame however large the key.
 const ECHO_LIMIT: usize = 64;
 
-/// Decode a settings map found at `prefix` — `config` for an `Init`'s Config, `overrides` for an
-/// `ExecutionStart`'s — into the [`Settings`] it sets.
+/// Decode a settings map found at `prefix` — `config` for an `Init`'s or a `ConfigUpdate`'s
+/// Config, `overrides` for an `ExecutionStart`'s — into the [`Settings`] it sets.
 ///
 /// # Errors
 ///

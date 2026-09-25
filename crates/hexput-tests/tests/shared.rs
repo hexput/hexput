@@ -255,6 +255,7 @@ fn message_types_spell_pascal_case_and_parse_exactly() {
         [
             "Init",
             "ExecutionStart",
+            "ConfigUpdate",
             "Result",
             "Call",
             "Authorize",

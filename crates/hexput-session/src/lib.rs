@@ -14,8 +14,17 @@
 //! A Session holds a *set* of attached Connections — zero or more, never "exactly one" (AD-2).
 //! [`Sessions::detach`] removes one; detaching the last removes the Session from the registry in
 //! the same step and then tears it down through the one explicit teardown path, which Story 5.8
-//! will delay behind a TTL rather than relocate. Nothing here is `async`, so no lock of this
-//! crate's can be held across an `.await`; nothing here writes to disk.
+//! will delay behind a TTL rather than relocate.
+//!
+//! # What Story 3.8 adds
+//!
+//! [`Sessions::update_config`] replaces a live Session's Config with a whole new one, decoded from
+//! a `ConfigUpdate` payload by [`Config::from_update_payload`]. It is still the single live copy
+//! (AD-5): every attached Connection's later executions read it afresh when dispatched, and an
+//! execution already dispatched keeps what it read. A refused update never reaches the registry.
+//!
+//! Nothing here is `async`, so no lock of this crate's can be held across an `.await`; nothing
+//! here writes to disk.
 //!
 //! Binds: AD-2, AD-4, AD-5.
 
@@ -156,6 +165,23 @@ impl Sessions {
     #[must_use]
     pub fn contains(&self, client_id: ClientId) -> bool {
         self.sessions.contains_key(&client_id)
+    }
+
+    /// Replace the Session's Config with `config` — the whole of it, not a patch: a setting
+    /// `config` leaves unset is the Daemon default from now on (Story 3.8). The replacement
+    /// happens under the Session's shard lock, so an execution dispatched on any attached
+    /// Connection sees either the old Config or the new one, never a mix; one already dispatched
+    /// keeps the settings it read. Returns whether a Session has this Client ID; when none does,
+    /// nothing changes.
+    #[must_use]
+    pub fn update_config(&self, client_id: ClientId, config: Config) -> bool {
+        match self.sessions.get_mut(&client_id) {
+            Some(mut session) => {
+                session.config = config;
+                true
+            }
+            None => false,
+        }
     }
 
     /// How many Connections the Session has attached; `None` when it does not exist.

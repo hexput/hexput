@@ -1,4 +1,5 @@
-//! Stories 2.3–2.7: the core's side of a connection, driven through an in-memory `Port`.
+//! Stories 2.3–2.8 and Epic 3's wire-facing stories: the core's side of a connection, driven
+//! through an in-memory `Port`.
 //!
 //! No socket is involved anywhere in this file. That is the point: `hexput_connection::serve`
 //! is generic over the Port, so exercising it with an adapter that is not a transport at all is
@@ -13,7 +14,7 @@ use hexput_port::{
     CorrelationId, Envelope, Inbound, MessageType, Outbound, Port, ProtocolCode, ProtocolError,
     ProtocolFailure, Received, Value,
 };
-use hexput_session::{ClientId, Sessions};
+use hexput_session::{ClientId, Sessions, Setting, Settings};
 
 /// Everything the core wrote.
 #[derive(Clone, Default)]
@@ -1249,6 +1250,16 @@ async fn connect(
     init_payload: Value,
     refuse_calls: bool,
 ) -> (Backend, tokio::task::JoinHandle<()>) {
+    let (backend, serving, _) = connect_as(sessions, init_payload, refuse_calls).await;
+    (backend, serving)
+}
+
+/// [`connect`], also returning the Client ID the init issued.
+async fn connect_as(
+    sessions: &Arc<Sessions>,
+    init_payload: Value,
+    refuse_calls: bool,
+) -> (Backend, tokio::task::JoinHandle<()>, ClientId) {
     let (to_daemon, from_test) = tokio::sync::mpsc::unbounded_channel();
     let (to_test, from_daemon) = tokio::sync::mpsc::unbounded_channel();
     let port = Wired {
@@ -1263,8 +1274,8 @@ async fn connect(
     };
     backend.reply(CorrelationId(0), MessageType::Init, init_payload);
     let reply = backend.next().await;
-    client_id_of(&reply);
-    (backend, serving)
+    let client_id = client_id_of(&reply);
+    (backend, serving, client_id)
 }
 
 /// Wait for a connection's `serve` to return once its Backend left.
@@ -2354,4 +2365,296 @@ fn a_result_within_a_raised_output_budget_but_past_a_frame_is_response_too_large
             backend.close();
         },
     );
+}
+
+// --- Story 3.8: replacing the Config without reconnecting ---
+
+/// A `ConfigUpdate` with `payload` as its whole payload.
+fn config_update_raw(id: u64, payload: Value) -> Received {
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::ConfigUpdate,
+        payload,
+    ))
+}
+
+/// A `ConfigUpdate` carrying `config`.
+fn config_update(id: u64, config: Value) -> Received {
+    config_update_raw(id, by_key(&[("config", config)]))
+}
+
+/// Assert `reply` is the `Result {}` answering the `ConfigUpdate` `id`.
+fn assert_updated(reply: &Envelope<Value>, id: u64) {
+    assert_eq!(reply.id, Some(CorrelationId(id)));
+    assert_eq!(
+        reply.message_type,
+        MessageType::Result,
+        "{:?}",
+        reply.payload
+    );
+    assert_eq!(reply.payload, Value::Map(vec![]), "exactly `Result {{}}`");
+}
+
+#[test]
+fn an_update_applies_to_the_next_execution_without_reconnecting() {
+    configured(
+        &wired_runtime(),
+        budget_of("rpc_calls", 1),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(config_update(1, budget_of("rpc_calls", 3)));
+            assert_updated(&backend.next().await, 1);
+            backend.send(execution(2, &calls(3)));
+            answer_calls(&mut backend, 3).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(value_of(&reply), Value::from(3));
+            backend.close();
+            assert!(backend.from_daemon.recv().await.is_none());
+        },
+    );
+}
+
+#[test]
+fn an_update_replaces_the_config_and_a_left_out_setting_is_back_to_its_default() {
+    configured(
+        &wired_runtime(),
+        by_key(&[
+            ("budget", by_key(&[("rpc_calls", Value::from(1))])),
+            ("argument_depth", Value::from(2)),
+        ]),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(execution(1, "return getOrder([[[1]]]);"));
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "depth.argument_too_deep");
+
+            backend.send(config_update(2, budget_of("rpc_calls", 3)));
+            assert_updated(&backend.next().await, 2);
+            // `argument_depth` is back to its default of 12: a depth of 3 is sent.
+            backend.send(execution(3, "return getOrder([[[1]]]);"));
+            answer_calls(&mut backend, 1).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(3)));
+            assert_eq!(value_of(&reply), Value::from(1));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_refused_update_changes_nothing_and_the_next_execution_uses_the_old_limits() {
+    configured(
+        &wired_runtime(),
+        budget_of("rpc_calls", 1),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(config_update(
+                1,
+                by_key(&[("budget", by_key(&[("rpc_calls", Value::from(-1))]))]),
+            ));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "protocol.invalid_payload");
+            assert_eq!(
+                message_of(&reply),
+                "`config.budget.rpc_calls` must be an integer from 0 to 100000; found -1"
+            );
+            // Still one call, as the Config said before the refused update.
+            backend.send(execution(2, &calls(2)));
+            answer_calls(&mut backend, 1).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(code_of(&reply), "budget.rpc_calls_exceeded");
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_malformed_update_payload_is_refused_naming_what_is_wrong() {
+    let cases = [
+        (Value::Nil, "the `ConfigUpdate` payload is missing `config`"),
+        (
+            Value::Map(vec![]),
+            "the `ConfigUpdate` payload is missing `config`",
+        ),
+        (
+            by_key(&[("config", Value::from(1))]),
+            "`config` is not a map",
+        ),
+        (
+            by_key(&[("config", Value::Map(vec![])), ("x", Value::from(1))]),
+            "the `ConfigUpdate` payload has an unknown key `x`",
+        ),
+    ];
+    for (payload, expected) in cases {
+        let sessions = Arc::new(Sessions::new());
+        let (sent, _) = serve_with(
+            &sessions,
+            vec![
+                init(1, init_configured(budget_of("rpc_calls", 1), &[])),
+                config_update_raw(2, payload),
+            ],
+            None,
+        );
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].id, Some(CorrelationId(2)));
+        assert_eq!(code_of(&sent[1]), "protocol.invalid_payload");
+        assert_eq!(message_of(&sent[1]), expected);
+    }
+}
+
+#[test]
+fn an_update_before_init_is_refused_and_creates_no_session() {
+    let sessions = Arc::new(Sessions::new());
+    let (sent, _) = serve_with(
+        &sessions,
+        vec![config_update(1, budget_of("rpc_calls", 3))],
+        None,
+    );
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].id, Some(CorrelationId(1)));
+    assert_eq!(code_of(&sent[0]), "protocol.init_not_completed");
+    // The refusal is the only reply: no `client_id` was ever issued. (`sessions.is_empty()` alone
+    // would hold even then, since `serve` detaches on exit.)
+    assert!(
+        sent.iter()
+            .all(|reply| reply.message_type == MessageType::Error),
+        "{sent:?}"
+    );
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_pipelined_update_is_in_force_for_the_execution_queued_right_behind_it() {
+    let sessions = Arc::new(Sessions::new());
+    let (sent, _) = serve_with(
+        &sessions,
+        vec![
+            // An output size budget of one byte: `{value: "hello"}` cannot fit it.
+            init(1, init_configured(budget_of("output_size_bytes", 1), &[])),
+            // Not awaited: the execution is queued right behind the update.
+            config_update(2, Value::Map(vec![])),
+            execution(3, "return \"hello\";"),
+        ],
+        None,
+    );
+    assert_eq!(sent.len(), 3);
+    client_id_of(&sent[0]);
+    assert_updated(&sent[1], 2);
+    assert_eq!(sent[2].id, Some(CorrelationId(3)));
+    assert_eq!(value_of(&sent[2]), string("hello"));
+}
+
+#[test]
+fn an_update_through_one_connection_is_seen_by_every_attached_connection() {
+    let runtime = wired_runtime();
+    let sessions = Arc::new(Sessions::new());
+    let dispatch = discarding_dispatch();
+    let registry = Arc::clone(&sessions);
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let (mut backend, serving, client_id) = connect_as(
+                &registry,
+                init_configured(budget_of("rpc_calls", 1), &[("getOrder", true)]),
+                false,
+            )
+            .await;
+            // A second Connection on the same Session, as reconnect (Epic 5) will attach one.
+            let other = registry.connect();
+            assert!(registry.attach(client_id, other));
+
+            backend.send(config_update(1, budget_of("rpc_calls", 3)));
+            assert_updated(&backend.next().await, 1);
+            let mut expected = Settings::new();
+            expected.set(Setting::RpcCalls, 3).unwrap();
+            // Whichever Connection dispatches next reads the one live Config.
+            let (_, settings) = registry.for_execution(client_id).unwrap();
+            assert_eq!(settings, expected);
+
+            // The updating Connection leaves; the other still sees the update.
+            backend.close();
+            finished(serving).await;
+            let (_, settings) = registry.for_execution(client_id).unwrap();
+            assert_eq!(settings, expected);
+            registry.detach(client_id, other);
+        });
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn an_execution_in_flight_keeps_its_limits_and_the_next_one_gets_the_update() {
+    configured(
+        &wired_runtime(),
+        budget_of("rpc_calls", 2),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(execution(1, &calls(3)));
+            // The execution is waiting on its first call when the update arrives.
+            let (first, name, _) = backend.call().await;
+            assert_eq!(name, "getOrder");
+            backend.send(config_update(2, budget_of("rpc_calls", 5)));
+            assert_updated(&backend.next().await, 2);
+            backend.reply(
+                first,
+                MessageType::Result,
+                Value::Map(vec![(string("value"), Value::from(1))]),
+            );
+            // Its second call is its last: it still runs under `rpc_calls = 2`.
+            answer_calls(&mut backend, 1).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "budget.rpc_calls_exceeded");
+
+            // The next execution runs under the update.
+            backend.send(execution(3, &calls(3)));
+            answer_calls(&mut backend, 3).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(3)));
+            assert_eq!(value_of(&reply), Value::from(3));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn an_override_still_wins_over_an_updated_config_and_changes_nothing_stored() {
+    let runtime = wired_runtime();
+    let sessions = Arc::new(Sessions::new());
+    let dispatch = discarding_dispatch();
+    let registry = Arc::clone(&sessions);
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let (mut backend, serving, client_id) = connect_as(
+                &registry,
+                init_configured(budget_of("rpc_calls", 1), &[("getOrder", true)]),
+                false,
+            )
+            .await;
+            backend.send(config_update(1, budget_of("rpc_calls", 3)));
+            assert_updated(&backend.next().await, 1);
+
+            backend.send(overridden(2, &calls(5), budget_of("rpc_calls", 5)));
+            answer_calls(&mut backend, 5).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(2)));
+            assert_eq!(value_of(&reply), Value::from(5));
+
+            let mut expected = Settings::new();
+            expected.set(Setting::RpcCalls, 3).unwrap();
+            assert_eq!(registry.settings(client_id), Some(expected));
+
+            // Without an override, the updated Config's three calls again.
+            backend.send(execution(3, &calls(4)));
+            answer_calls(&mut backend, 3).await;
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(3)));
+            assert_eq!(code_of(&reply), "budget.rpc_calls_exceeded");
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    assert!(sessions.is_empty());
 }

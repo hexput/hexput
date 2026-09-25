@@ -250,3 +250,11 @@ Append-only. Each entry is work identified during a build but deliberately not d
   summary: AGENTS.md's Epic 3 paragraph still gives `Execution::run(self) -> Outcome::{Finished, HostCall}`; the enum also has `Paused`, `OutOfMemory` and `AllocationsExceeded`.
   evidence: Review finding (blind, low); routed to defer because the fix edits an agent-context file.
   status: RESOLVED 2026-09-24 by `spec-3-7-tune-budgets-per-backend-and-per-execution.md` — the AGENTS.md Epic 3 paragraph now lists all five outcomes.
+
+- source_spec: `spec-3-8-change-execution-policy-without-reconnecting.md`
+  summary: `ConfigUpdate` replaces the whole Config, so concurrent updaters on one Session get last-writer-wins and a partial change must resend every setting; once Stories 3.9/3.10 add `features` and `check`, a budget-only update silently resets them.
+  evidence: Review finding (blind, medium). Decision 1 chose replace (no way to express "unset" in the decoder); documented in the Spine's Story 3.8 amendment. Settle with Story 3.9/3.10: echo the effective Config in the `Result`, or add a patch form with an explicit reset.
+
+- source_spec: `spec-3-8-change-execution-policy-without-reconnecting.md`
+  summary: Whether a Value Secret's hidden metadata counts toward the allocation (or memory) budget is unstated; the recompiled epic-3-context dropped the old open note.
+  evidence: Review finding (blind, low). LANGUAGE-REFERENCE §7 defines allocations without Value Secrets, which do not exist yet. Decide in Story 3.11's spec.

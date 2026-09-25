@@ -22,8 +22,8 @@
 //!   listener.
 //!
 //! * [`decode_settings`] is the one decoder of the tunable execution limits (Story 3.7), shared by
-//!   an `Init`'s `config` and an `ExecutionStart`'s `overrides` so the two can never disagree on a
-//!   key, a type or a range. [`Settings`] and [`Setting`] are re-exported from `hexput-shared`.
+//!   an `Init`'s `config`, a `ConfigUpdate`'s `config` (Story 3.8) and an `ExecutionStart`'s
+//!   `overrides` so they can never disagree on a key, a type or a range. [`Settings`] and [`Setting`] are re-exported from `hexput-shared`.
 //!
 //! Binds: AD-1.
 

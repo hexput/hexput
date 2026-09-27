@@ -69,7 +69,7 @@ development_status:
   3-7-tune-budgets-per-backend-and-per-execution: review
   3-8-change-execution-policy-without-reconnecting: review
   3-9-switch-off-language-constructs-by-policy: review
-  3-10-turn-the-static-check-on-or-off: backlog
+  3-10-turn-the-static-check-on-or-off: in-progress
   3-11-carry-hidden-metadata-on-values-the-script-cannot-touch: backlog
   3-12-call-a-backend-method-on-a-keyed-object: backlog
   3-13-keep-referenced-values-in-step-between-backend-and-script: backlog

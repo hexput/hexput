@@ -2,7 +2,7 @@
 title: 'Story 3.10: Turn the static check on or off'
 type: 'feature'
 created: '2026-09-27'
-status: 'in-progress'
+status: 'done'
 baseline_commit: '48393cd9af945a44a0876c0438a57e37c387326f'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -96,11 +96,11 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `hexput-shared`, `hexput-port`: `CheckMode`, the `Settings` field, the decoder, and `ErrorBody.findings`.
-- [ ] `hexput-check`: `Policy::from_features`; aligned policy findings.
-- [ ] `hexput-script`: run the pass per mode; reject or attach.
-- [ ] Tests for every matrix row.
-- [ ] Docs.
+- [x] `hexput-shared`, `hexput-port`: `CheckMode`, the `Settings` field, the decoder, and `ErrorBody.findings`.
+- [x] `hexput-check`: `Policy::from_features`; aligned policy findings.
+- [x] `hexput-script`: run the pass per mode; reject or attach.
+- [x] Tests for every matrix row.
+- [x] Docs.
 
 **Acceptance Criteria:**
 - Given mode `error` and an error finding, when the Script is submitted, then the Backend receives the findings and no statement runs and no host call is sent.
@@ -108,6 +108,21 @@ context:
 - Given mode `off` (default), when a Script is submitted, then `hexput_check::check` is never called and the reply is exactly `{value}` or the runtime error.
 
 ## Spec Change Log
+
+## Review Triage Log
+
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | blind + edge-case + verification-gap | Findings from `warn` (or `error` with warnings only) are dropped when the Script then fails at runtime | medium | Real: only the success `reply` attached them. Decision 2 was silent on failures; the one reading that serves the Backend is to always return findings once the pass ran. **patch** |
+| 2 | blind + edge-case | `findings` is unbounded: a success or rejection reply can pass a frame and be replaced by `protocol.response_too_large`, losing the result | medium | Real. **patch**: at most `MAX_FINDINGS` (100), dropped entirely if the reply still would not fit |
+| 3 | blind | `findings` sits outside the output-size budget, and docs call that budget the exact payload length | low | Real; bounded by #2. **patch** (docs) |
+| 4 | blind | An `error`-mode rejection is not logged | low | Real; direct. **patch** (`debug` log) |
+| 5 | blind | The pass runs with no time bound before any `Budget` exists | low | Real; linear in a source bounded by one frame. **defer** |
+| 6 | blind + verification-gap | Untested: bad `check` in `ConfigUpdate`, no `Authorize` on rejection, `warn` override over `error`, `rpc_calls` disabled for a registered name under `error`, non-UTF-8 `check` message | low | Pre-verified / real; cheap. **patch** (tests) |
+| 7 | blind | `ErrorBody.findings` is recursive, and a rejection's top body is duplicated in `findings` | low | Design is intentional (one error shape); nested findings are never produced. **patch** (doc) |
+| 8 | blind | Edited doc comment in `hexput-session/src/init.rs` runs past 100 columns | low | Real; direct. **patch** |
+| 9 | blind + edge-case | Under `error`, a disabled construct on an untaken path rejects, though the runtime would not; only the 3.10 decision text implies it | low | Intended (the check reports anywhere in the source); undocumented. **patch** (LANGUAGE-REFERENCE) |
+| 10 | blind + verification-gap | Sprint status `in-progress` vs spec `in-review` | false | Step 5 syncs the sprint status |
 
 ## Verification
 

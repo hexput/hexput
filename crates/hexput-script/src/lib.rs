@@ -26,19 +26,36 @@
 //! `config` is — are laid over them for this execution alone. The Executor enforces the result;
 //! nothing stored changes. The same overlay carries the language feature toggles (Story 3.9).
 //!
-//! Not yet: the static check (no check mode exists in Config until Story 3.10), and the AST
-//! Cache and Cached Execution (Epic 4).
+//! The static check (FR-26, Story 3.10) runs here, and only here on the Direct Execution path
+//! (AD-8), when the effective `check` mode — the Session's Config overlaid with the payload's
+//! `overrides` — is not `off`. It runs on the blocking pool right after parsing, before the
+//! Executor, with the starting-variable names, every registration name as the callable list
+//! (blanket or not: a per-call function is still callable) and the policy the effective feature
+//! toggles describe. Under `error` a Script with any error-severity finding is rejected before
+//! anything runs: the `Error` payload is the first error finding's body with every finding under
+//! `findings`, logged at `debug`. Otherwise the Script runs and its reply — a successful
+//! `Result`'s `{value}`, or an `Error` body when it then fails — carries `findings` when there
+//! are any. At most [`MAX_FINDINGS`] are kept, in source order, and a reply whose findings would
+//! not fit a frame is sent without them: the value, or the error, always wins. Under `off` no pass
+//! runs at all. The check grants nothing and
+//! charges nothing — it is not Script code, so it is not charged to the CPU budget — and its
+//! findings are never cached.
+//!
+//! Not yet: the AST Cache and Cached Execution (Epic 4), which will run the check once at
+//! `CodeRegister`.
 //!
 //! Binds: AD-3, AD-6, AD-8.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use hexput_check::{Environment, Policy, Severity};
 use hexput_exec::wire;
 use hexput_exec::{Caller, Host, Limits};
 use hexput_interpreter::{Category, Code, Diagnostic, Program, Span, Value as Hexput};
 use hexput_port::{
-    ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, Settings, Value, decode_settings,
+    CheckMode, ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, Settings, Value,
+    decode_settings, findings_value,
 };
 
 pub use hexput_exec::wire::MAX_RESULT_DEPTH;
@@ -47,7 +64,16 @@ const SOURCE: &str = "source";
 const VARIABLES: &str = "variables";
 const OVERRIDES: &str = "overrides";
 const VALUE: &str = "value";
+const FINDINGS: &str = "findings";
 
+/// The most static check findings one reply carries, in source order (Story 3.10). A Script with
+/// more has the rest dropped — except that a rejection's first error is always kept, in place of
+/// the last one, so the rejection's own body is always among its `findings`.
+pub const MAX_FINDINGS: usize = 100;
+
+/// Room left in a frame for everything around a reply's payload: the envelope map, its `id`,
+/// `type` and `payload` keys, the largest id and the longest type name, with margin.
+const ENVELOPE_ROOM: usize = 64;
 /// Serve one Direct Execution: `payload` is an `ExecutionStart` payload, a map with the keys
 /// `source` (the Script, a string), `variables` (its starting variables, a map from §2
 /// identifier to value) and optionally `overrides` (execution limits for this execution alone,
@@ -61,7 +87,11 @@ const VALUE: &str = "value";
 ///
 /// Returns the `Result` payload `{value: <the Script's result>}`. A number that is whole and
 /// within ±2^53 is sent as a MessagePack integer (`-0` as `0`), every other number as a
-/// float64; object keys keep their order.
+/// float64; object keys keep their order. When the effective `check` mode ran the static check
+/// (Story 3.10) and it found anything, the payload is `{value, findings: [ … ]}`, each finding
+/// in the [`ErrorBody`] shape, in source order, at most [`MAX_FINDINGS`] of them — and every
+/// `Error` below that follows a pass carries them too. Findings that would not fit a frame are
+/// left out.
 ///
 /// Must run inside a Tokio runtime: the work runs on its blocking pool. Its timers must be enabled
 /// when a registration lacks a blanket grant, since the Executor waits for a per-call handler's
@@ -82,6 +112,9 @@ const VALUE: &str = "value";
 ///   declares, every `capability`, `host` and argument error of a host call, every `budget`
 ///   error, and `policy.construct_disabled` for a construct the effective `features` toggles
 ///   switch off (Story 3.9).
+/// * Under check mode `error`, the first error-severity static check finding's body, with every
+///   finding (warnings included, [`MAX_FINDINGS`] at most, the rejection's own among them) under
+///   `findings`; nothing runs and no host call is made. Logged at `debug`.
 /// * `protocol.result_too_deep` — the result nests past [`MAX_RESULT_DEPTH`].
 /// * `protocol.response_too_large` — the result is certain to encode past the maximum frame.
 ///   Under the default Resource Budget the Executor refuses any such result first, as
@@ -100,17 +133,118 @@ pub async fn direct_execution(
     settings: Settings,
     caller: Caller,
 ) -> Result<Value, Box<ErrorBody>> {
-    let (program, variables, overrides) = blocking(move || prepare(&payload)).await?;
-    let limits = Limits::from_settings(&settings.overlay(&overrides));
+    let names: Vec<String> = registrations.iter().map(|(name, _)| name.clone()).collect();
+    let (program, variables, effective, checked) = blocking(move || {
+        let (program, variables, overrides) = prepare(&payload)?;
+        let effective = settings.overlay(&overrides);
+        let checked = static_check(&program, &variables, names, &effective);
+        Ok::<_, Box<ErrorBody>>((program, variables, effective, checked))
+    })
+    .await?;
+    let findings = match checked {
+        Ok(findings) => findings,
+        Err(Rejection { body, found }) => {
+            // Logged here, not on the blocking pool, so the event carries the request span.
+            tracing::debug!(
+                code = %body.code,
+                findings = found,
+                "rejected by the static check"
+            );
+            return Err(fitted(body));
+        }
+    };
+    let limits = Limits::from_settings(&effective);
     let result = hexput_exec::execute_with_limits(
         program,
         variables,
         Host::new(registrations, caller),
         limits,
     )
+    .await;
+    blocking(move || match result {
+        Ok(result) => reply(&result, findings),
+        // The findings accompany a runtime failure too: the pass ran, so the Backend is owed them.
+        Err(diagnostic) => Err(with_findings(ErrorBody::from(&diagnostic), findings)),
+    })
     .await
-    .map_err(|d| Box::new(ErrorBody::from(&d)))?;
-    blocking(move || reply(&result)).await
+}
+
+/// A Script the static check rejected: the reply's body, and how many findings the pass made
+/// (before [`MAX_FINDINGS`] applied).
+struct Rejection {
+    body: Box<ErrorBody>,
+    found: usize,
+}
+
+/// `body` carrying `findings`, fitted to a frame.
+fn with_findings(mut body: ErrorBody, findings: Vec<ErrorBody>) -> Box<ErrorBody> {
+    body.findings = findings;
+    fitted(Box::new(body))
+}
+
+/// `body` as it can be sent: without its `findings` when with them it would not fit a frame.
+fn fitted(mut body: Box<ErrorBody>) -> Box<ErrorBody> {
+    if !body.findings.is_empty() && encoded_len(&body.to_value()) > MAX_FRAME_LEN - ENVELOPE_ROOM {
+        body.findings.clear();
+    }
+    body
+}
+
+/// The MessagePack length of `value`.
+fn encoded_len(value: &Value) -> usize {
+    let mut bytes = Vec::new();
+    // Writing to a `Vec` cannot fail.
+    let _ = hexput_port::rmpv::encode::write_value(&mut bytes, value);
+    bytes.len()
+}
+
+/// Run the static check the effective `check` mode asks for (Story 3.10) and return its findings
+/// as wire bodies — none at all under `off`, where no pass runs.
+///
+/// # Errors
+///
+/// Under `error`, a Script with an error-severity finding: the first one's body, with every
+/// finding under `findings`.
+fn static_check(
+    program: &Program,
+    variables: &[(Arc<str>, Hexput)],
+    callables: Vec<String>,
+    effective: &Settings,
+) -> Result<Vec<ErrorBody>, Rejection> {
+    let mode = effective.check();
+    if mode == CheckMode::Off {
+        return Ok(Vec::new());
+    }
+    let environment = Environment::new()
+        .with_variables(variables.iter().map(|(name, _)| name.to_string()))
+        .with_callables(callables);
+    let findings = hexput_check::check(
+        program,
+        &environment,
+        &Policy::from_features(effective.features()),
+    );
+    let all = findings.diagnostics();
+    let mut bodies: Vec<ErrorBody> = all.iter().take(MAX_FINDINGS).map(ErrorBody::from).collect();
+    if mode == CheckMode::Error
+        && let Some(at) = all
+            .iter()
+            .position(|finding| finding.severity == Severity::Error)
+    {
+        let first = ErrorBody::from(&all[at]);
+        if at >= MAX_FINDINGS {
+            // Every finding before it was kept up to the cap; it replaces the last, so source
+            // order holds and the rejection is among its own findings.
+            bodies.pop();
+            bodies.push(first.clone());
+        }
+        let mut body = first;
+        body.findings = bodies;
+        return Err(Rejection {
+            body: Box::new(body),
+            found: all.len(),
+        });
+    }
+    Ok(bodies)
 }
 
 /// Run `work` on the blocking pool and wait for it.
@@ -141,14 +275,28 @@ fn prepare(payload: &Value) -> Result<Prepared, Box<ErrorBody>> {
     Ok((Arc::new(program), variables, overrides))
 }
 
-/// The `Result` payload for a Script's result, or why it cannot be sent.
-fn reply(result: &Hexput) -> Result<Value, Box<ErrorBody>> {
-    let refused = |error: ProtocolError| Box::new(ErrorBody::from(&error));
+/// The `Result` payload for a Script's result and its static check findings (`findings` only
+/// when there are any), or why it cannot be sent.
+///
+/// The findings are left out when with them the reply would not fit a frame, and they go with the
+/// refusal when the result cannot be sent.
+fn reply(result: &Hexput, findings: Vec<ErrorBody>) -> Result<Value, Box<ErrorBody>> {
+    let refused = |error: ProtocolError| with_findings(ErrorBody::from(&error), findings.clone());
     match wire::check_result(result) {
-        Ok(()) => Ok(Value::Map(vec![(
-            Value::from(VALUE),
-            wire::to_wire(result),
-        )])),
+        Ok(()) => {
+            let mut fields = vec![(Value::from(VALUE), wire::to_wire(result))];
+            if !findings.is_empty() {
+                let listed = findings_value(&findings);
+                // The `findings` key and value, beside the `{value}` payload.
+                let size = wire::payload_size(result, MAX_FRAME_LEN)
+                    .saturating_add(FINDINGS.len() + 1)
+                    .saturating_add(encoded_len(&listed));
+                if size <= MAX_FRAME_LEN - ENVELOPE_ROOM {
+                    fields.push((Value::from(FINDINGS), listed));
+                }
+            }
+            Ok(Value::Map(fields))
+        }
         Err(wire::Unsendable::TooDeep) => Err(refused(ProtocolError::new(
             ProtocolCode::ResultTooDeep,
             format!(
@@ -163,12 +311,15 @@ fn reply(result: &Hexput) -> Result<Value, Box<ErrorBody>> {
                  bytes"
             ),
         ))),
-        Err(wire::Unsendable::Unrepresentable) => Err(Box::new(ErrorBody::from(&Diagnostic::new(
-            Category::Type,
-            Code::FUNCTION_RESULT,
-            "the Script's result holds a value with no wire representation",
-            Span::new(0, 0, 1, 1),
-        )))),
+        Err(wire::Unsendable::Unrepresentable) => Err(with_findings(
+            ErrorBody::from(&Diagnostic::new(
+                Category::Type,
+                Code::FUNCTION_RESULT,
+                "the Script's result holds a value with no wire representation",
+                Span::new(0, 0, 1, 1),
+            )),
+            findings,
+        )),
     }
 }
 

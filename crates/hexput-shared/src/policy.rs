@@ -117,3 +117,46 @@ impl Default for Features {
         Self::ALL_ENABLED
     }
 }
+
+/// The static check mode (FR-26, Story 3.10): whether Direct Execution runs `hexput-check`'s pass
+/// over a Script before running it, and what a finding does.
+///
+/// Set in a Session's Config under the root key `check`, and overridable per execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CheckMode {
+    /// No pass at all: the default.
+    #[default]
+    Off,
+    /// Run the pass, run the Script whatever it finds, and return the findings with the result.
+    Warn,
+    /// Run the pass and reject a Script with any error-severity finding before anything runs;
+    /// otherwise run it and return the remaining findings (warnings) with the result.
+    Error,
+}
+
+impl CheckMode {
+    /// Every mode, in the order the wire shape lists them.
+    pub const ALL: &'static [Self] = &[Self::Off, Self::Warn, Self::Error];
+
+    /// The mode's wire spelling: `off`, `warn` or `error`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    /// The mode spelled `name` on the wire, if there is one.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|m| m.as_str() == name)
+    }
+}
+
+impl fmt::Display for CheckMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}

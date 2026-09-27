@@ -607,3 +607,215 @@ fn a_bad_override_is_refused_naming_its_path_and_nothing_runs() {
         body.message
     );
 }
+
+// --- Story 3.10: the static check mode ---
+
+/// Settings with the check mode `mode`.
+fn checked(mode: hexput_port::CheckMode) -> Settings {
+    let mut settings = Settings::new();
+    settings.set_check(mode);
+    settings
+}
+
+fn codes(findings: &[ErrorBody]) -> Vec<&str> {
+    findings.iter().map(|f| f.code.as_str()).collect()
+}
+
+#[test]
+fn under_error_an_error_finding_rejects_before_anything_runs() {
+    use hexput_port::CheckMode;
+    // Were `getOrder(1)` reached, the gone call table would make it `host.no_reply`.
+    let body = *direct_execution_configured(
+        &payload("getOrder(1); let unused = 1; return x;", vec![]),
+        get_order(),
+        checked(CheckMode::Error),
+    )
+    .expect_err("rejected");
+    assert_eq!(body.code, "reference.undeclared_identifier");
+    assert_eq!(body.severity, "error");
+    assert_eq!(
+        codes(&body.findings),
+        [
+            "reference.unused_variable",
+            "reference.undeclared_identifier"
+        ]
+    );
+    // Off (the default): the Script runs and reaches the host call.
+    let body = *direct_execution_configured(
+        &payload("getOrder(1); let unused = 1; return x;", vec![]),
+        get_order(),
+        Settings::new(),
+    )
+    .expect_err("the host call fails");
+    assert_eq!(body.code, "host.no_reply");
+    assert!(body.findings.is_empty());
+}
+
+#[test]
+fn under_warn_the_result_carries_value_then_findings() {
+    use hexput_port::CheckMode;
+    let reply = direct_execution_configured(
+        &payload("let unused = 1; return 2;", vec![]),
+        Vec::new(),
+        checked(CheckMode::Warn),
+    )
+    .unwrap();
+    let Value::Map(fields) = reply else {
+        panic!("a map")
+    };
+    assert_eq!(fields[0], (s("value"), int(2)));
+    assert_eq!(fields[1].0, s("findings"));
+    let findings: Vec<ErrorBody> = rmpv::ext::from_value(fields[1].1.clone()).unwrap();
+    assert_eq!(codes(&findings), ["reference.unused_variable"]);
+    assert_eq!(fields.len(), 2);
+}
+
+#[test]
+fn an_override_sets_the_mode_for_one_execution() {
+    let source = "if (false) { return x; }; return 1;";
+    let body = *direct_execution(&overridden(source, map(vec![("check", s("error"))])))
+        .expect_err("checked");
+    assert_eq!(body.code, "reference.undeclared_identifier");
+    // An override of `off` lifts a Config's `error`.
+    let reply = direct_execution_configured(
+        &overridden(source, map(vec![("check", s("off"))])),
+        Vec::new(),
+        checked(hexput_port::CheckMode::Error),
+    )
+    .unwrap();
+    assert_eq!(reply, map(vec![("value", int(1))]));
+}
+
+#[test]
+fn the_check_sees_starting_variables_registrations_and_toggles() {
+    use hexput_port::CheckMode;
+    // Starting variables and every registration name, blanket or not, are known.
+    let reply = direct_execution_configured(
+        &payload("return n;", vec![("n", int(3))]),
+        vec![("askFirst".to_owned(), false)],
+        checked(CheckMode::Error),
+    )
+    .unwrap();
+    assert_eq!(reply, map(vec![("value", int(3))]));
+    let body = *direct_execution_configured(
+        &payload("if (false) { askFirst(1); other(2); }; return 1;", vec![]),
+        vec![("askFirst".to_owned(), false)],
+        checked(CheckMode::Error),
+    )
+    .expect_err("an unregistered call");
+    assert_eq!(body.code, "capability.unknown_function");
+    assert_eq!(body.findings.len(), 1);
+    // The effective toggles become the policy.
+    let body = *direct_execution(&overridden(
+        "if (false) { return [1]; }; return 1;",
+        map(vec![
+            ("check", s("error")),
+            (
+                "features",
+                map(vec![("array_literals", Value::Boolean(false))]),
+            ),
+        ]),
+    ))
+    .expect_err("a disabled construct");
+    assert_eq!(body.code, "policy.construct_disabled");
+    assert_eq!(
+        body.message,
+        "`[ … ]` is disabled by policy (`features.array_literals`)"
+    );
+}
+
+#[test]
+fn under_warn_a_runtime_failure_carries_the_findings_too() {
+    use hexput_port::CheckMode;
+    let body = *direct_execution_configured(
+        &payload("let unused = 1; return x;", vec![]),
+        Vec::new(),
+        checked(CheckMode::Warn),
+    )
+    .expect_err("the runtime fails");
+    assert_eq!(body.code, "reference.undeclared_identifier");
+    assert_eq!(
+        codes(&body.findings),
+        [
+            "reference.unused_variable",
+            "reference.undeclared_identifier"
+        ]
+    );
+    // Off: the same failure, no findings.
+    let body = *direct_execution(&payload("let unused = 1; return x;", vec![])).unwrap_err();
+    assert!(body.findings.is_empty());
+}
+
+/// A Script declaring `n` unused locals, then `tail`.
+fn unused_locals(n: usize, tail: &str) -> String {
+    let mut source: String = (0..n).map(|i| format!("let u{i} = 1; ")).collect();
+    source.push_str(tail);
+    source
+}
+
+#[test]
+fn at_most_max_findings_are_kept_in_source_order() {
+    use hexput_port::CheckMode;
+    use hexput_script::MAX_FINDINGS;
+    assert_eq!(MAX_FINDINGS, 100);
+    let reply = direct_execution_configured(
+        &payload(&unused_locals(150, "return 1;"), vec![]),
+        Vec::new(),
+        checked(CheckMode::Warn),
+    )
+    .unwrap();
+    let Value::Map(fields) = reply else {
+        panic!("a map")
+    };
+    let findings: Vec<ErrorBody> = rmpv::ext::from_value(fields[1].1.clone()).unwrap();
+    assert_eq!(findings.len(), MAX_FINDINGS);
+    let offsets: Vec<u64> = findings.iter().map(|f| f.span.unwrap().offset).collect();
+    assert!(offsets.windows(2).all(|w| w[0] < w[1]), "source order");
+
+    // A rejection whose first error lies past the cap keeps it, as the last finding.
+    let body = *direct_execution_configured(
+        &payload(&unused_locals(150, "return x;"), vec![]),
+        Vec::new(),
+        checked(CheckMode::Error),
+    )
+    .expect_err("rejected");
+    assert_eq!(body.code, "reference.undeclared_identifier");
+    assert_eq!(body.findings.len(), MAX_FINDINGS);
+    let last = body.findings.last().unwrap();
+    assert_eq!(
+        (&last.code, &last.message, last.span),
+        (&body.code, &body.message, body.span)
+    );
+    assert!(
+        body.findings[..MAX_FINDINGS - 1]
+            .iter()
+            .all(|f| f.code == "reference.unused_variable")
+    );
+}
+
+#[test]
+fn findings_that_would_not_fit_a_frame_are_left_out_and_the_value_wins() {
+    use hexput_port::CheckMode;
+    let mut settings = checked(CheckMode::Warn);
+    settings
+        .set(Setting::OutputSizeBytes, MAX_FRAME_LEN as u64)
+        .unwrap();
+    let run = |len: usize| {
+        let text = "x".repeat(len);
+        direct_execution_configured(
+            &payload("let unused = 1; return t;", vec![("t", s(&text))]),
+            Vec::new(),
+            settings,
+        )
+        .unwrap()
+    };
+    let Value::Map(fields) = run(MAX_FRAME_LEN - 4096) else {
+        panic!("a map")
+    };
+    assert_eq!(fields.len(), 2, "room for the findings");
+    let Value::Map(fields) = run(MAX_FRAME_LEN - 100) else {
+        panic!("a map")
+    };
+    assert_eq!(fields.len(), 1, "exactly `{{value}}`");
+    assert_eq!(fields[0].0, s("value"));
+}

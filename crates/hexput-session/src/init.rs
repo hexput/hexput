@@ -13,11 +13,11 @@ use hexput_port::{Settings, Value, decode_settings};
 ///
 /// Its keys are the tunable execution limits (Story 3.7): the six Resource Budget limits, the
 /// argument depth and the per-call handler's timeout — plus the language feature toggles under
-/// `features` (Story 3.9) — decoded by `hexput-port`'s one settings decoder, so each is within
-/// the Daemon's allowed range. Any other key is refused: a Backend must
-/// never believe a policy is in force that nothing enforces. Not `Clone`: the Session registry
-/// holds the single live copy, and an execution reads a copy of its [`Settings`] when it is
-/// dispatched.
+/// `features` (Story 3.9) and the static check mode under `check` (Story 3.10) — decoded by
+/// `hexput-port`'s one settings decoder, so each is within the Daemon's allowed range. Any other
+/// key is refused: a Backend must never believe a policy is in force that nothing enforces. Not
+/// `Clone`: the Session registry holds the single live copy, and an execution reads a copy of
+/// its [`Settings`] when it is dispatched.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Config {

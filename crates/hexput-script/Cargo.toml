@@ -17,6 +17,8 @@ hexput-check = { path = "../hexput-check" }
 hexput-exec = { path = "../hexput-exec" }
 # External: decoding, parsing and converting the result run on the blocking pool (Story 3.1).
 tokio = { workspace = true }
+# External: an `error`-mode static check rejection is logged at `debug` (Story 3.10).
+tracing = { workspace = true }
 
 [lints]
 workspace = true

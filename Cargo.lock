@@ -359,6 +359,7 @@ dependencies = [
  "hexput-parser",
  "hexput-port",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

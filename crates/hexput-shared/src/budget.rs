@@ -13,10 +13,13 @@
 //! Story 3.9 adds the language feature toggles ([`Feature`]) beside them: [`Settings`] also holds
 //! some toggles, each set one enabled or disabled, and overlays them per toggle exactly as it
 //! overlays a limit. An unset toggle is enabled.
+//!
+//! Story 3.10 adds the static check mode ([`CheckMode`]): [`Settings`] holds it too, overlaid
+//! like a limit. Unset means [`CheckMode::Off`].
 
 use core::fmt;
 
-use crate::policy::{Feature, Features};
+use crate::policy::{CheckMode, Feature, Features};
 
 /// One Resource Budget dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -204,6 +207,7 @@ impl fmt::Display for Setting {
 pub struct Settings {
     values: [Option<u64>; Setting::ALL.len()],
     features: [Option<bool>; Feature::ALL.len()],
+    check: Option<CheckMode>,
 }
 
 impl Settings {
@@ -213,6 +217,7 @@ impl Settings {
         Self {
             values: [None; Setting::ALL.len()],
             features: [None; Feature::ALL.len()],
+            check: None,
         }
     }
 
@@ -250,7 +255,7 @@ impl Settings {
     /// other keeps this one's. Neither input changes — an override never touches the Config
     /// beneath it.
     ///
-    /// Feature toggles overlay the same way, one toggle at a time.
+    /// Feature toggles overlay the same way, one toggle at a time, and so does the check mode.
     #[must_use]
     pub fn overlay(&self, over: &Self) -> Self {
         let mut values = self.values;
@@ -265,7 +270,31 @@ impl Settings {
                 *toggle = over;
             }
         }
-        Self { values, features }
+        Self {
+            values,
+            features,
+            check: over.check.or(self.check),
+        }
+    }
+
+    /// Set the static check mode. Every mode is valid, so this cannot fail.
+    pub const fn set_check(&mut self, mode: CheckMode) {
+        self.check = Some(mode);
+    }
+
+    /// The check mode set, if any.
+    #[must_use]
+    pub const fn check_setting(&self) -> Option<CheckMode> {
+        self.check
+    }
+
+    /// The check mode in force: the one set, or else [`CheckMode::Off`].
+    #[must_use]
+    pub const fn check(&self) -> CheckMode {
+        match self.check {
+            Some(mode) => mode,
+            None => CheckMode::Off,
+        }
     }
 
     /// Set the toggle `feature` to `enabled`. Every boolean is valid, so this cannot fail.

@@ -7,7 +7,8 @@
 //! ```text
 //! { budget: { cpu_time_ms, memory_bytes, allocations, rpc_calls, output_size_bytes, side_effects },
 //!   argument_depth, authorization_timeout_ms,
-//!   features: { loops, conditionals, callbacks, object_literals, array_literals, rpc_calls } }
+//!   features: { loops, conditionals, callbacks, object_literals, array_literals, rpc_calls },
+//!   check: "off" | "warn" | "error" }
 //! ```
 //!
 //! Every key is optional, and `{}` sets nothing. Each value is a MessagePack integer within its
@@ -18,13 +19,16 @@
 //! The `features` map (Story 3.9) holds the language feature toggles: each key optional, each
 //! value a MessagePack boolean. A key outside the closed set is refused as an unknown toggle, and
 //! any value but a boolean — `0`, `"no"`, nil — as not a boolean.
+//!
+//! The root `check` key (Story 3.10) holds the static check mode as a string: `"off"`, `"warn"`
+//! or `"error"`. Any other string is refused, echoed bounded; any other type is named by its type.
 
 use core::fmt;
 
 use rmpv::Value;
 
 pub use hexput_shared::budget::{OutOfRange, Setting, Settings};
-pub use hexput_shared::policy::{Feature, Features};
+pub use hexput_shared::policy::{CheckMode, Feature, Features};
 
 use crate::MAX_FRAME_LEN;
 
@@ -50,6 +54,9 @@ pub fn decode_settings(value: &Value, prefix: &str) -> Result<Settings, String> 
 
 /// The key under which the feature toggles sit, at the root of a settings map.
 const FEATURES: &str = "features";
+
+/// The key under which the static check mode sits, at the root of a settings map.
+const CHECK: &str = "check";
 
 /// Decode the map at `relative` (a dotted path within the settings, `""` for the root) into
 /// `settings`.
@@ -78,6 +85,21 @@ fn decode_map(
                 &Path {
                     prefix,
                     relative: FEATURES,
+                },
+                settings,
+            )?;
+            continue;
+        }
+        if relative.is_empty() && key == CHECK {
+            if seen.contains(&key) {
+                return Err(format!("`{}` repeats the key `{key}`", at()));
+            }
+            seen.push(key);
+            decode_check(
+                value,
+                &Path {
+                    prefix,
+                    relative: CHECK,
                 },
                 settings,
             )?;
@@ -160,6 +182,29 @@ fn decode_features(value: &Value, path: &Path<'_>, settings: &mut Settings) -> R
         }
     }
     Ok(())
+}
+
+/// Decode the static check mode found at `path` into `settings`.
+fn decode_check(value: &Value, path: &Path<'_>, settings: &mut Settings) -> Result<(), String> {
+    if let Some(mode) = value.as_str().and_then(CheckMode::from_name) {
+        settings.set_check(mode);
+        return Ok(());
+    }
+    let found = match value {
+        Value::String(text) => match text.as_str() {
+            Some(text) => format!("\"{}\"", bounded(text)),
+            None => "a string that is not valid UTF-8".to_owned(),
+        },
+        other => describe(other),
+    };
+    let modes: Vec<String> = CheckMode::ALL
+        .iter()
+        .map(|m| format!("\"{}\"", m.as_str()))
+        .collect();
+    Err(format!(
+        "`{path}` must be one of {}; found {found}",
+        modes.join(", ")
+    ))
 }
 
 /// How a refusal names a value it found.

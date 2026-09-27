@@ -2862,3 +2862,477 @@ fn a_config_update_with_an_unknown_toggle_is_refused_and_the_stored_toggles_stan
         },
     );
 }
+
+// --- Story 3.10: the static check mode from the Config, overridden per execution ---
+
+/// A Config or override map setting `check` alone.
+fn check_of(mode: Value) -> Value {
+    by_key(&[("check", mode)])
+}
+
+/// The field `key` of a reply's payload map, if present.
+fn field_of(response: &Envelope<Value>, key: &str) -> Option<Value> {
+    let Value::Map(fields) = &response.payload else {
+        panic!("a payload is a map: {:?}", response.payload);
+    };
+    fields
+        .iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v.clone())
+}
+
+/// The `findings` a reply carries, decoded back into bodies.
+fn findings_of(response: &Envelope<Value>) -> Vec<hexput_port::ErrorBody> {
+    let findings = field_of(response, "findings").expect("a `findings` field");
+    hexput_port::rmpv::ext::from_value(findings).expect("findings decode as error bodies")
+}
+
+/// A successful reply's `value`, asserting its payload is exactly `{value, findings}`.
+fn value_with_findings(response: &Envelope<Value>) -> Value {
+    assert_eq!(
+        response.message_type,
+        MessageType::Result,
+        "{:?}",
+        response.payload
+    );
+    let Value::Map(fields) = &response.payload else {
+        panic!("a Result payload is a map");
+    };
+    let keys: Vec<_> = fields.iter().map(|(k, _)| k.as_str().unwrap()).collect();
+    assert_eq!(keys, ["value", "findings"]);
+    fields[0].1.clone()
+}
+
+/// An `ExecutionStart` with starting variables and optional `overrides`.
+fn execution_with(
+    id: u64,
+    source: &str,
+    variables: Vec<(&str, Value)>,
+    overrides: Option<Value>,
+) -> Received {
+    let Value::Map(mut fields) = execution_payload(source, variables) else {
+        unreachable!("an execution payload is a map");
+    };
+    if let Some(overrides) = overrides {
+        fields.push((string("overrides"), overrides));
+    }
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::ExecutionStart,
+        Value::Map(fields),
+    ))
+}
+
+#[test]
+fn with_the_check_off_by_default_a_script_runs_unchecked() {
+    configured(
+        &wired_runtime(),
+        Value::Map(vec![]),
+        &[],
+        |mut backend| async move {
+            // An undeclared read on a path never taken: the runtime never reaches it, and no
+            // pass reports it.
+            backend.send(execution(
+                1,
+                "if (false) { return x; }; let unused = 1; return 1;",
+            ));
+            let reply = backend.next().await;
+            assert_eq!(value_of(&reply), Value::from(1), "exactly `{{value}}`");
+            // The explicit `off` is the same.
+            backend.send(overridden(
+                2,
+                "if (false) { return x; }; return 2;",
+                check_of(string("off")),
+            ));
+            assert_eq!(value_of(&backend.next().await), Value::from(2));
+            // A runtime error is still exactly the runtime error.
+            backend.send(execution(3, "return x;"));
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "reference.undeclared_identifier");
+            assert_eq!(field_of(&reply, "findings"), None);
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn under_error_a_script_with_an_error_finding_is_rejected_and_no_call_is_sent() {
+    configured(
+        &wired_runtime(),
+        check_of(string("error")),
+        &[("f", true)],
+        |mut backend| async move {
+            backend.send(execution(1, "let unused = 1; f(1); return x;"));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "reference.undeclared_identifier");
+            assert_eq!(message_of(&reply), "`x` is not declared");
+            let findings = findings_of(&reply);
+            let codes: Vec<&str> = findings.iter().map(|f| f.code.as_str()).collect();
+            // Every finding, warnings included, in source order.
+            assert_eq!(
+                codes,
+                [
+                    "reference.unused_variable",
+                    "reference.undeclared_identifier"
+                ]
+            );
+            assert_eq!(findings[0].severity, "warning");
+            assert_eq!(findings[1].severity, "error");
+            // The rejection's own fields are the first error finding's.
+            assert_eq!(findings[1].message, message_of(&reply));
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Call` was written"
+            );
+        },
+    );
+}
+
+#[test]
+fn under_error_an_unregistered_call_is_a_finding_at_submission() {
+    configured(
+        &wired_runtime(),
+        check_of(string("error")),
+        &[("getOrder", true), ("askFirst", false)],
+        |mut backend| async move {
+            backend.send(execution(1, "getOrder(1); return g(1);"));
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "capability.unknown_function");
+            let findings = findings_of(&reply);
+            assert_eq!(findings.len(), 1);
+            let span = findings[0].span.expect("a spanned finding");
+            let source = "getOrder(1); return g(1);";
+            assert_eq!(
+                &source[span.offset as usize..(span.offset + span.len) as usize],
+                "g(1)"
+            );
+            backend.send(execution(2, "return 5;"));
+            assert_eq!(value_of(&backend.next().await), Value::from(5));
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Call` was written"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_per_call_registration_is_on_the_callable_list() {
+    configured(
+        &wired_runtime(),
+        check_of(string("error")),
+        &[("askFirst", false)],
+        |mut backend| async move {
+            backend.send(execution(1, "return askFirst(1);"));
+            // Not rejected by the check: the Daemon asks the handler before the call.
+            let (id, name, _) = backend.question().await;
+            assert_eq!(name, "askFirst");
+            backend.allow(id, Value::Boolean(false));
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "capability.unknown_function");
+            assert_eq!(field_of(&reply, "findings"), None, "a runtime refusal");
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn under_warn_the_script_runs_and_its_findings_come_with_the_result() {
+    configured(
+        &wired_runtime(),
+        check_of(string("warn")),
+        &[],
+        |mut backend| async move {
+            backend.send(execution(1, "let unused = 1; return 2;"));
+            let reply = backend.next().await;
+            assert_eq!(value_with_findings(&reply), Value::from(2));
+            let findings = findings_of(&reply);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, "warning");
+            assert_eq!(findings[0].code, "reference.unused_variable");
+
+            // Under `warn` an error finding does not reject: the Script runs and fails (or not)
+            // on its own.
+            backend.send(execution(2, "if (false) { return x; }; return 3;"));
+            let reply = backend.next().await;
+            assert_eq!(value_with_findings(&reply), Value::from(3));
+            assert_eq!(
+                findings_of(&reply)[0].code,
+                "reference.undeclared_identifier"
+            );
+
+            // No findings: exactly `{value}`.
+            backend.send(execution(3, "return 4;"));
+            assert_eq!(value_of(&backend.next().await), Value::from(4));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn under_error_warnings_alone_run_and_come_with_the_result() {
+    configured(
+        &wired_runtime(),
+        check_of(string("error")),
+        &[],
+        |mut backend| async move {
+            backend.send(execution(1, "let unused = 1; return 2;"));
+            let reply = backend.next().await;
+            assert_eq!(value_with_findings(&reply), Value::from(2));
+            let findings = findings_of(&reply);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, "warning");
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_disabled_toggle_is_a_finding_with_the_runtime_message_and_span() {
+    let config = by_key(&[
+        ("check", string("error")),
+        ("features", by_key(&[("loops", Value::Boolean(false))])),
+    ]);
+    configured(&wired_runtime(), config, &[], |mut backend| async move {
+        // On a path never taken: rejected at submission all the same.
+        backend.send(execution(1, "if (false) { while (true) { }; }; return 1;"));
+        let reply = backend.next().await;
+        assert_eq!(code_of(&reply), "policy.construct_disabled");
+        assert_eq!(
+            message_of(&reply),
+            "`while` is disabled by policy (`features.loops`)"
+        );
+
+        // On a path taken, the check's body and the runtime's (check off) are the same.
+        backend.send(execution(2, LOOPING));
+        let checked = backend.next().await;
+        backend.send(overridden(3, LOOPING, check_of(string("off"))));
+        let ran = backend.next().await;
+        assert_eq!(code_of(&ran), "policy.construct_disabled");
+        assert_eq!(field_of(&ran, "findings"), None);
+        let without_findings = |reply: &Envelope<Value>| {
+            let Value::Map(fields) = &reply.payload else {
+                unreachable!()
+            };
+            fields
+                .iter()
+                .filter(|(k, _)| k.as_str() != Some("findings"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(without_findings(&checked), without_findings(&ran));
+        backend.close();
+    });
+}
+
+#[test]
+fn an_override_checks_one_execution_and_the_stored_mode_stays_off() {
+    let runtime = wired_runtime();
+    let sessions = Arc::new(Sessions::new());
+    let dispatch = discarding_dispatch();
+    let registry = Arc::clone(&sessions);
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let (mut backend, serving, client_id) =
+                connect_as(&registry, init_configured(Value::Map(vec![]), &[]), false).await;
+            let unchecked = "if (false) { return x; }; return 1;";
+            backend.send(overridden(1, unchecked, check_of(string("error"))));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "reference.undeclared_identifier"
+            );
+            assert_eq!(registry.settings(client_id), Some(Settings::new()));
+            backend.send(execution(2, unchecked));
+            assert_eq!(value_of(&backend.next().await), Value::from(1));
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_config_update_without_check_turns_it_off_again() {
+    configured(
+        &wired_runtime(),
+        check_of(string("error")),
+        &[],
+        |mut backend| async move {
+            let unchecked = "if (false) { return x; }; return 1;";
+            backend.send(execution(1, unchecked));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "reference.undeclared_identifier"
+            );
+            backend.send(config_update(2, Value::Map(vec![])));
+            assert_updated(&backend.next().await, 2);
+            backend.send(execution(3, unchecked));
+            assert_eq!(value_of(&backend.next().await), Value::from(1));
+            backend.send(config_update(4, check_of(string("warn"))));
+            assert_updated(&backend.next().await, 4);
+            backend.send(execution(5, unchecked));
+            assert_eq!(value_with_findings(&backend.next().await), Value::from(1));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_bad_check_mode_is_refused_naming_its_path() {
+    let cases = [
+        (
+            string("strict"),
+            r#"`config.check` must be one of "off", "warn", "error"; found "strict""#,
+        ),
+        (
+            Value::from(1),
+            r#"`config.check` must be one of "off", "warn", "error"; found 1"#,
+        ),
+        (
+            Value::Boolean(true),
+            r#"`config.check` must be one of "off", "warn", "error"; found a boolean"#,
+        ),
+    ];
+    for (mode, expected) in cases {
+        let sessions = Arc::new(Sessions::new());
+        let (sent, _) = serve_with(
+            &sessions,
+            vec![init(3, init_configured(check_of(mode), &[]))],
+            None,
+        );
+        assert_eq!(code_of(&sent[0]), "protocol.invalid_payload");
+        assert_eq!(message_of(&sent[0]), expected);
+        assert!(sessions.is_empty());
+    }
+    configured(
+        &wired_runtime(),
+        Value::Map(vec![]),
+        &[],
+        |mut backend| async move {
+            backend.send(overridden(1, "return 1;", check_of(string("strict"))));
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "protocol.invalid_payload");
+            assert!(
+                message_of(&reply).starts_with("`overrides.check` must be one of"),
+                "{}",
+                message_of(&reply)
+            );
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_starting_variable_is_never_a_finding() {
+    configured(
+        &wired_runtime(),
+        check_of(string("error")),
+        &[],
+        |mut backend| async move {
+            backend.send(execution_with(
+                1,
+                "return total + 1;",
+                vec![("total", Value::from(4))],
+                None,
+            ));
+            assert_eq!(value_of(&backend.next().await), Value::from(5));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_config_update_with_a_bad_check_is_refused_and_the_stored_mode_stands() {
+    configured(
+        &wired_runtime(),
+        check_of(string("error")),
+        &[],
+        |mut backend| async move {
+            backend.send(config_update(1, check_of(string("strict"))));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "protocol.invalid_payload");
+            assert_eq!(
+                message_of(&reply),
+                r#"`config.check` must be one of "off", "warn", "error"; found "strict""#
+            );
+            // Still `error`: an untaken undeclared read is rejected.
+            backend.send(execution(2, "if (false) { return x; }; return 1;"));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "reference.undeclared_identifier"
+            );
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn an_error_mode_rejection_asks_no_per_call_handler() {
+    configured(
+        &wired_runtime(),
+        check_of(string("error")),
+        &[("askFirst", false)],
+        |mut backend| async move {
+            backend.send(execution(1, "askFirst(1); return x;"));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "reference.undeclared_identifier");
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Authorize` and no `Call` was written"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_warn_override_over_an_error_config_runs_a_script_with_an_error_finding() {
+    configured(
+        &wired_runtime(),
+        check_of(string("error")),
+        &[],
+        |mut backend| async move {
+            let source = "if (false) { return x; }; return 1;";
+            backend.send(overridden(1, source, check_of(string("warn"))));
+            let reply = backend.next().await;
+            assert_eq!(value_with_findings(&reply), Value::from(1));
+            let findings = findings_of(&reply);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].code, "reference.undeclared_identifier");
+            assert_eq!(findings[0].severity, "error");
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn rpc_calls_disabled_under_error_rejects_a_registered_call_and_sends_nothing() {
+    let config = by_key(&[
+        ("check", string("error")),
+        ("features", by_key(&[("rpc_calls", Value::Boolean(false))])),
+    ]);
+    configured(
+        &wired_runtime(),
+        config,
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(execution(1, "if (false) { getOrder(1); }; return 1;"));
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "policy.construct_disabled");
+            assert_eq!(
+                message_of(&reply),
+                "a host call to `getOrder` is disabled by policy (`features.rpc_calls`)"
+            );
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Call` was written"
+            );
+        },
+    );
+}

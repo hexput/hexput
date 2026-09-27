@@ -464,3 +464,39 @@ mod policy {
         assert_eq!(config.feature(Feature::Loops), Some(false));
     }
 }
+
+// --- Story 3.10: the static check mode ---
+
+mod check_mode {
+    use hexput_shared::budget::Settings;
+    use hexput_shared::policy::CheckMode;
+
+    #[test]
+    fn the_modes_are_spelled_for_the_wire_and_default_to_off() {
+        let names: Vec<&str> = CheckMode::ALL.iter().map(|m| m.as_str()).collect();
+        assert_eq!(names, ["off", "warn", "error"]);
+        for mode in CheckMode::ALL {
+            assert_eq!(mode.to_string(), mode.as_str());
+            assert_eq!(CheckMode::from_name(mode.as_str()), Some(*mode));
+        }
+        for name in ["strict", "Off", "ERROR", ""] {
+            assert_eq!(CheckMode::from_name(name), None);
+        }
+        assert_eq!(CheckMode::default(), CheckMode::Off);
+        assert_eq!(Settings::new().check(), CheckMode::Off);
+        assert_eq!(Settings::new().check_setting(), None);
+    }
+
+    #[test]
+    fn settings_overlay_the_mode_and_leave_the_config_alone() {
+        let mut config = Settings::new();
+        config.set_check(CheckMode::Warn);
+        assert_eq!(config.overlay(&Settings::new()).check(), CheckMode::Warn);
+        let mut over = Settings::new();
+        over.set_check(CheckMode::Error);
+        let effective = config.overlay(&over);
+        assert_eq!(effective.check(), CheckMode::Error);
+        assert_eq!(config.check(), CheckMode::Warn);
+        assert_eq!(Settings::new().overlay(&over).check(), CheckMode::Error);
+    }
+}

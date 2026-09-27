@@ -37,7 +37,7 @@
 mod operands;
 mod pass;
 
-use hexput_ast::Program;
+use hexput_ast::{Feature, Features, Program};
 
 /// The diagnostics shape and its rendering, re-exported so a consumer of the check pass can
 /// report findings without a `hexput-shared` edge the Spine's crate graph does not list.
@@ -79,6 +79,24 @@ impl Policy {
             object_literals: true,
             array_literals: true,
             rpc_calls: true,
+        }
+    }
+}
+
+impl Policy {
+    /// The policy a set of language feature toggles describes (Story 3.10): each construct
+    /// enabled exactly when its toggle is. This is how the Daemon checks a Script against the
+    /// toggles in force for its execution, so a construct the runtime would refuse is reported
+    /// under the same `policy` code, message and span.
+    #[must_use]
+    pub const fn from_features(features: Features) -> Self {
+        Self {
+            loops: features.is_enabled(Feature::Loops),
+            conditionals: features.is_enabled(Feature::Conditionals),
+            callbacks: features.is_enabled(Feature::Callbacks),
+            object_literals: features.is_enabled(Feature::ObjectLiterals),
+            array_literals: features.is_enabled(Feature::ArrayLiterals),
+            rpc_calls: features.is_enabled(Feature::RpcCalls),
         }
     }
 }

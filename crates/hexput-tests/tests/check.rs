@@ -868,3 +868,117 @@ fn an_unknown_call_is_spanned_like_the_runtime_capability_error() {
     assert_eq!(runtime.code, finding.code);
     assert_eq!(runtime.span, finding.span);
 }
+
+// --- Story 3.10: the policy from the feature toggles, aligned with the runtime ---
+
+mod from_features {
+    use std::sync::Arc;
+
+    use hexput_ast::{Diagnostic, Feature, Features};
+    use hexput_check::{Environment, Policy, check};
+    use hexput_interpreter::{Execution, Outcome, Value};
+    use hexput_parser::parse;
+
+    #[test]
+    fn every_toggle_maps_to_its_policy_field() {
+        assert_eq!(
+            Policy::from_features(Features::ALL_ENABLED),
+            Policy::new(),
+            "the toggles' default is the CLI's all-enabled policy"
+        );
+        let fields = |p: Policy| {
+            [
+                p.loops,
+                p.conditionals,
+                p.callbacks,
+                p.object_literals,
+                p.array_literals,
+                p.rpc_calls,
+            ]
+        };
+        for (at, feature) in Feature::ALL.iter().enumerate() {
+            let policy = Policy::from_features(Features::ALL_ENABLED.with(*feature, false));
+            let expected: Vec<bool> = (0..Feature::ALL.len()).map(|i| i != at).collect();
+            assert_eq!(fields(policy).to_vec(), expected, "{feature}");
+        }
+    }
+
+    /// The runtime's refusal of `source` under `features`, answering every host call with null.
+    fn runtime_refusal(source: &str, features: Features) -> Diagnostic {
+        let program = Arc::new(parse(source).unwrap());
+        let mut execution = Execution::with_variables(program, Vec::<(&str, Value)>::new())
+            .unwrap()
+            .with_features(features);
+        loop {
+            match execution.run() {
+                Err(error) => return error,
+                Ok(Outcome::HostCall(call)) => execution = call.resume(&Value::Null),
+                Ok(Outcome::Paused(paused)) => execution = paused.resume(),
+                Ok(_) => panic!("`{source}` was not refused"),
+            }
+        }
+    }
+
+    /// Each disabled construct is reported with the very category, code, message and span the
+    /// interpreter refuses it with (Story 3.9's wording).
+    #[test]
+    fn a_disabled_construct_finding_is_the_runtime_refusal() {
+        let cases = [
+            (
+                Feature::Loops,
+                "let n = 0; while (n < 1) { n = n + 1; }; return n;",
+            ),
+            (
+                Feature::Loops,
+                "let t = 0; for (k in {}) { t = 1; }; return t;",
+            ),
+            (
+                Feature::Conditionals,
+                "if (true) { return 1; } else { return 2; };",
+            ),
+            (Feature::Callbacks, "fn f() { return 1; }; return f();"),
+            (
+                Feature::Callbacks,
+                "let f = fn() { return 1; }; return f();",
+            ),
+            (Feature::ObjectLiterals, "return { a: 1 };"),
+            (Feature::ArrayLiterals, "return [1];"),
+            (Feature::RpcCalls, "return log(1, 2);"),
+        ];
+        for (feature, source) in cases {
+            let features = Features::ALL_ENABLED.with(feature, false);
+            let program = parse(source).unwrap();
+            let found = check(
+                &program,
+                &Environment::new(),
+                &Policy::from_features(features),
+            );
+            let finding = found
+                .diagnostics()
+                .iter()
+                .find(|f| f.code.as_str() == "policy.construct_disabled")
+                .unwrap_or_else(|| panic!("no policy finding for {source}"));
+            let refusal = runtime_refusal(source, features);
+            assert_eq!(finding.category, refusal.category, "{source}");
+            assert_eq!(finding.code, refusal.code, "{source}");
+            assert_eq!(finding.severity, refusal.severity, "{source}");
+            assert_eq!(finding.message, refusal.message, "{source}");
+            assert_eq!(finding.span, refusal.span, "{source}");
+        }
+    }
+
+    #[test]
+    fn the_all_enabled_policy_produces_no_policy_finding() {
+        let source = "fn f() { return [1]; }; let t = 0; while (t < 1) { t = t + 1; }; \
+                      for (k in { a: 1 }) { if (k == \"a\") { t = t + 1; }; }; log(f()); return t;";
+        let found = check(&parse(source).unwrap(), &Environment::new(), &Policy::new());
+        assert!(
+            found
+                .diagnostics()
+                .iter()
+                .all(|f| f.code.as_str() != "policy.construct_disabled"),
+            "{:?}",
+            found.diagnostics()
+        );
+    }
+}

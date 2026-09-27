@@ -162,6 +162,11 @@ impl From<Span> for WireSpan {
 /// `protocol`, severity `error`, no span). Owned strings, so it round-trips: an SDK or a test can
 /// decode it back with `rmpv::ext::from_value`. `span` is always present on the wire, nil when
 /// absent.
+///
+/// The same shape carries a static check finding (Story 3.10). A rejection under check mode
+/// `error` is the first error-severity finding's body with every finding listed under
+/// `findings`; `findings` is on the wire only when non-empty, so every other body is exactly the
+/// five fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     /// `error` or `warning`.
@@ -174,6 +179,13 @@ pub struct ErrorBody {
     pub message: String,
     /// Where in the Script the failure is; absent for a protocol failure.
     pub span: Option<WireSpan>,
+    /// The static check's findings (Story 3.10), in source order. Only a reply to an execution
+    /// whose check mode ran the pass carries any — a rejection under `error`, or the `Error` of a
+    /// Script that ran after the pass and then failed; every other body has none, and it is then
+    /// absent on the wire. A finding never carries findings of its own. A rejection's top-level
+    /// body is also the first error among its `findings`, so count errors from `findings` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<ErrorBody>,
 }
 
 impl ErrorBody {
@@ -191,14 +203,25 @@ impl ErrorBody {
                 (text("column"), Value::from(s.column)),
             ])
         });
-        Value::Map(vec![
+        let mut fields = vec![
             (text("severity"), text(&self.severity)),
             (text("category"), text(&self.category)),
             (text("code"), text(&self.code)),
             (text("message"), text(&self.message)),
             (text("span"), span),
-        ])
+        ];
+        if !self.findings.is_empty() {
+            fields.push((text("findings"), findings_value(&self.findings)));
+        }
+        Value::Map(fields)
     }
+}
+
+/// A list of finding bodies as one wire array, in the order given: the `findings` of a
+/// rejection, or of a successful `Result` under check mode `warn` or `error`.
+#[must_use]
+pub fn findings_value(findings: &[ErrorBody]) -> Value {
+    Value::Array(findings.iter().map(ErrorBody::to_value).collect())
 }
 
 impl From<&Diagnostic> for ErrorBody {
@@ -209,6 +232,7 @@ impl From<&Diagnostic> for ErrorBody {
             code: diagnostic.code.as_str().to_owned(),
             message: diagnostic.message.clone(),
             span: Some(diagnostic.span.into()),
+            findings: Vec::new(),
         }
     }
 }
@@ -221,6 +245,7 @@ impl From<&ProtocolError> for ErrorBody {
             code: error.code.as_str().to_owned(),
             message: error.message.clone(),
             span: None,
+            findings: Vec::new(),
         }
     }
 }

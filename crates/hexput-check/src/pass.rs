@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use hexput_ast::{
     AccessKind, AccessLink, Block, BlockId, Category, Code, Diagnostic, ExprId, Expression,
-    ExpressionKind, Function, Identifier, Program, Span, Statement, StatementKind,
+    ExpressionKind, Feature, Function, Identifier, Program, Span, Statement, StatementKind,
 };
 
 use crate::operands;
@@ -364,8 +364,16 @@ impl<'p> Walk<'p> {
                 });
                 jobs.push(Job::Expression(*initializer));
             }
-            StatementKind::Function { function, .. } => {
-                // Already hoisted by `open`; the body waits for the rest of this block.
+            StatementKind::Function { name, function } => {
+                // Already hoisted by `open`; the body waits for the rest of this block. The
+                // runtime refuses a disabled one where its block hoists, spanned `fn name`.
+                if !self.policy.callbacks {
+                    self.disabled(
+                        Feature::Callbacks,
+                        "`fn`",
+                        through(function.keyword, name.span),
+                    );
+                }
                 self.defer(function);
             }
             StatementKind::Assignment {
@@ -391,7 +399,7 @@ impl<'p> Walk<'p> {
                     let span = branches
                         .first()
                         .map_or(statement.span, |first| first.keyword);
-                    self.disabled("if", "conditionals", span);
+                    self.disabled(Feature::Conditionals, "`if`", span);
                 }
                 if let Some(branch) = else_branch {
                     self.enter(branch.body, jobs);
@@ -407,7 +415,7 @@ impl<'p> Walk<'p> {
                 body,
             } => {
                 if !self.policy.loops {
-                    self.disabled("while", "loops", *keyword);
+                    self.disabled(Feature::Loops, "`while`", *keyword);
                 }
                 self.enter(*body, jobs);
                 jobs.push(Job::Expression(condition.expression));
@@ -420,7 +428,7 @@ impl<'p> Walk<'p> {
                 ..
             } => {
                 if !self.policy.loops {
-                    self.disabled("for", "loops", *keyword);
+                    self.disabled(Feature::Loops, "`for … in`", *keyword);
                 }
                 // The binding and the body share one scope, fresh per iteration (§5); the
                 // iterable is evaluated in the scope around the loop.
@@ -500,13 +508,13 @@ impl<'p> Walk<'p> {
             }
             ExpressionKind::Array { elements, .. } => {
                 if !self.policy.array_literals {
-                    self.disabled("array literal", "array_literals", expression.span);
+                    self.disabled(Feature::ArrayLiterals, "`[ … ]`", expression.span);
                 }
                 jobs.extend(elements.iter().rev().map(|id| Job::Expression(*id)));
             }
             ExpressionKind::Object { entries, .. } => {
                 if !self.policy.object_literals {
-                    self.disabled("object literal", "object_literals", expression.span);
+                    self.disabled(Feature::ObjectLiterals, "`{ … }`", expression.span);
                 }
                 jobs.extend(
                     entries
@@ -515,7 +523,12 @@ impl<'p> Walk<'p> {
                         .map(|entry| Job::Expression(entry.value)),
                 );
             }
-            ExpressionKind::Function(function) => self.defer(function),
+            ExpressionKind::Function(function) => {
+                if !self.policy.callbacks {
+                    self.disabled(Feature::Callbacks, "`fn`", function.keyword);
+                }
+                self.defer(function);
+            }
             ExpressionKind::Access { base, links } => self.access(*base, links, jobs),
         }
     }
@@ -572,8 +585,13 @@ impl<'p> Walk<'p> {
             return;
         }
         // No local binding, so this can only be a Registered Function — or a typo for one.
+        let whole = through(name.span, link.span);
         if !self.policy.rpc_calls {
-            self.disabled("call to a Registered Function", "rpc_calls", name.span);
+            self.disabled(
+                Feature::RpcCalls,
+                &format!("a host call to `{}`", name.name),
+                whole,
+            );
             return;
         }
         if let Some(callables) = &self.callables
@@ -588,21 +606,13 @@ impl<'p> Walk<'p> {
                 ),
                 // The whole call, name through closing parenthesis — the span the runtime's
                 // `capability.unknown_function` uses, so both underline the same range.
-                Span::new(
-                    name.span.offset,
-                    link.span.end().saturating_sub(name.span.offset),
-                    name.span.line,
-                    name.span.column,
-                ),
+                whole,
             ));
         }
     }
 
     /// Queue a function body to be walked once the scope defining it is complete.
     fn defer(&mut self, function: &'p Function) {
-        if !self.policy.callbacks {
-            self.disabled("function definition", "callbacks", function.keyword);
-        }
         if let Some(scope) = self.scopes.last_mut() {
             scope.deferred.push(function);
         }
@@ -625,12 +635,26 @@ impl<'p> Walk<'p> {
         None
     }
 
-    fn disabled(&mut self, construct: &str, toggle: &str, span: Span) {
+    /// Report `construct` as disabled by `feature`, with the very message and span the
+    /// interpreter's refusal uses (Story 3.9), so a Backend sees one finding whether the check or
+    /// the run found it.
+    fn disabled(&mut self, feature: Feature, construct: &str, span: Span) {
         self.findings.push(Diagnostic::new(
             Category::Policy,
             Code::CONSTRUCT_DISABLED,
-            format!("`{construct}` is disabled by the `{toggle}` policy toggle"),
+            format!("{construct} is disabled by policy (`features.{feature}`)"),
             span,
         ));
     }
+}
+
+/// The span from the start of `first` through the end of `last` — the interpreter's own rule for
+/// a named function's `fn name` and a call's name-through-parenthesis.
+const fn through(first: Span, last: Span) -> Span {
+    Span::new(
+        first.offset,
+        last.end().saturating_sub(first.offset),
+        first.line,
+        first.column,
+    )
 }

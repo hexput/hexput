@@ -262,7 +262,12 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-9-switch-off-language-constructs-by-policy.md`
   summary: The runtime and `hexput-check` report `policy.construct_disabled` with different messages and spans (host call: `name(args)` vs `name`; named function: `fn name` vs `fn`), and `hexput-check::Policy` still has six hand-written booleans instead of `hexput_shared::policy::Features`.
   evidence: Review finding (blind, low). Align both when Story 3.10 wires the check's `Policy` from the same Config.
+  status: RESOLVED 2026-09-27 by `spec-3-10-turn-the-static-check-on-or-off.md` — `hexput-check` now reports a disabled construct with the interpreter's exact message (`` `while` is disabled by policy (`features.loops`) ``) and span (`fn name` for a named function, `name(args)` for a host call), pinned against the runtime refusal toggle by toggle in `tests/check.rs`. `Policy` keeps its six public booleans (the CLI's all-enabled `Policy::new()` is unchanged) and gains `Policy::from_features(Features)`, which is how the Daemon builds it.
 
 - source_spec: `spec-3-9-switch-off-language-constructs-by-policy.md`
   summary: The `rpc_calls` toggle is checked only on the bare-name host-call path; Registered Method calls (`value.name(args)`, Story 3.12) must be refused by it too.
   evidence: Review finding (blind, low). LANGUAGE-REFERENCE says `rpc_calls` switches off every host call (§8), which includes methods. Add the check and a test with Story 3.12.
+
+- source_spec: `spec-3-10-turn-the-static-check-on-or-off.md`
+  summary: The Daemon-side static check pass runs on the blocking pool with no time bound or cancellation; it is not charged to the Script's CPU budget.
+  evidence: Review finding (blind, low). The pass is linear in the source, which one frame (16 MiB) bounds, so the cost is bounded but not metered. Revisit with Cached Execution (Epic 4), where the pass runs once at registration, or if profiling shows large sources dominating.

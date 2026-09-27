@@ -432,6 +432,7 @@ fn unknown_type_echoes_the_id_and_names_the_type() {
             code: "protocol.unknown_message_type".into(),
             message: failure.error.message.clone(),
             span: None,
+            findings: Vec::new(),
         }
     );
 
@@ -902,6 +903,147 @@ mod features {
                 "config"
             ),
             "`config.features.loops` is not a known setting"
+        );
+    }
+}
+
+// --- Story 3.10: the check mode in the same decoder, and findings on the error body ---
+
+mod check_mode {
+    use hexput_port::{
+        CheckMode, ErrorBody, ProtocolCode, ProtocolError, Settings, Value, WireSpan,
+        decode_settings, findings_value,
+    };
+
+    use super::{map, s};
+
+    fn refusal(value: &Value, prefix: &str) -> String {
+        decode_settings(value, prefix).expect_err("refused")
+    }
+
+    #[test]
+    fn each_mode_decodes_and_absent_is_off() {
+        assert_eq!(
+            decode_settings(&map(vec![]), "config").unwrap().check(),
+            CheckMode::Off
+        );
+        for mode in CheckMode::ALL {
+            let settings =
+                decode_settings(&map(vec![("check", s(mode.as_str()))]), "overrides").unwrap();
+            assert_eq!(settings.check_setting(), Some(*mode));
+        }
+        let mixed = decode_settings(
+            &map(vec![
+                ("check", s("warn")),
+                ("argument_depth", Value::from(3)),
+            ]),
+            "config",
+        )
+        .unwrap();
+        assert_eq!(mixed.check(), CheckMode::Warn);
+        assert_ne!(mixed, Settings::new());
+    }
+
+    #[test]
+    fn anything_but_a_mode_is_refused_naming_the_path() {
+        let expected = |prefix: &str, found: &str| {
+            format!("`{prefix}.check` must be one of \"off\", \"warn\", \"error\"; found {found}")
+        };
+        let cases = [
+            (s("strict"), "\"strict\""),
+            (s("Off"), "\"Off\""),
+            (Value::from(1), "1"),
+            (Value::Boolean(true), "a boolean"),
+            (Value::Nil, "nil"),
+            (Value::F64(1.0), "a float"),
+            (map(vec![]), "a map"),
+        ];
+        for (value, found) in cases {
+            for prefix in ["config", "overrides"] {
+                assert_eq!(
+                    refusal(&map(vec![("check", value.clone())]), prefix),
+                    expected(prefix, found)
+                );
+            }
+        }
+        // A string that is not UTF-8 is named, never echoed.
+        let invalid =
+            hexput_port::rmpv::decode::read_value(&mut &[0xa2_u8, 0xff, 0xfe][..]).unwrap();
+        assert!(matches!(&invalid, Value::String(text) if text.as_str().is_none()));
+        assert_eq!(
+            refusal(&map(vec![("check", invalid)]), "config"),
+            expected("config", "a string that is not valid UTF-8")
+        );
+        // A long string is echoed bounded.
+        let long = "x".repeat(10_000);
+        let message = refusal(&map(vec![("check", s(&long))]), "config");
+        assert!(message.len() < 200 && message.contains('…'), "{message}");
+        assert_eq!(
+            refusal(
+                &map(vec![("check", s("off")), ("check", s("off"))]),
+                "config"
+            ),
+            "`config` repeats the key `check`"
+        );
+        // Only the root holds the mode.
+        assert_eq!(
+            refusal(
+                &map(vec![("budget", map(vec![("check", s("off"))]))]),
+                "config"
+            ),
+            "`config.budget.check` is not a known setting"
+        );
+    }
+
+    fn keys(value: &Value) -> Vec<String> {
+        let Value::Map(fields) = value else {
+            panic!("a map")
+        };
+        fields
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_body_carries_findings_only_when_it_has_some() {
+        let plain = ErrorBody::from(&ProtocolError::new(ProtocolCode::InvalidPayload, "x"));
+        assert!(plain.findings.is_empty());
+        assert_eq!(
+            keys(&plain.to_value()),
+            ["severity", "category", "code", "message", "span"]
+        );
+        let decoded: ErrorBody = hexput_port::rmpv::ext::from_value(plain.to_value()).unwrap();
+        assert_eq!(decoded, plain, "an absent `findings` decodes as none");
+
+        let finding = ErrorBody {
+            severity: "warning".into(),
+            category: "reference".into(),
+            code: "reference.unused_variable".into(),
+            message: "unused".into(),
+            span: Some(WireSpan {
+                offset: 4,
+                len: 1,
+                line: 1,
+                column: 5,
+            }),
+            findings: Vec::new(),
+        };
+        let mut rejection = finding.clone();
+        rejection.severity = "error".into();
+        rejection.findings = vec![finding.clone(), finding.clone()];
+        let value = rejection.to_value();
+        assert_eq!(
+            keys(&value),
+            [
+                "severity", "category", "code", "message", "span", "findings"
+            ]
+        );
+        let decoded: ErrorBody = hexput_port::rmpv::ext::from_value(value).unwrap();
+        assert_eq!(decoded, rejection);
+        assert_eq!(
+            findings_value(&rejection.findings),
+            Value::Array(vec![finding.to_value(), finding.to_value()])
         );
     }
 }

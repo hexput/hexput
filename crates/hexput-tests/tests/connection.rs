@@ -2658,3 +2658,207 @@ fn an_override_still_wins_over_an_updated_config_and_changes_nothing_stored() {
     });
     assert!(sessions.is_empty());
 }
+
+// --- Story 3.9: feature toggles from the Config, overridden per execution ---
+
+/// A Config or override map setting `features.<toggle>` alone.
+fn feature_of(toggle: &str, enabled: bool) -> Value {
+    by_key(&[("features", by_key(&[(toggle, Value::Boolean(enabled))]))])
+}
+
+/// A Script using a `while` loop.
+const LOOPING: &str = "let n = 0; while (n < 2) { n = n + 1; }; return n;";
+
+#[test]
+fn a_config_toggle_refuses_its_construct_and_an_override_lifts_it_for_one_execution() {
+    configured(
+        &wired_runtime(),
+        feature_of("loops", false),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(execution(1, LOOPING));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "policy.construct_disabled");
+            assert_eq!(
+                message_of(&reply),
+                "`while` is disabled by policy (`features.loops`)"
+            );
+
+            backend.send(overridden(2, LOOPING, feature_of("loops", true)));
+            let reply = backend.next().await;
+            assert_eq!(value_of(&reply), Value::from(2));
+
+            backend.send(execution(3, LOOPING));
+            assert_eq!(code_of(&backend.next().await), "policy.construct_disabled");
+
+            // `rpc_calls` refuses even a blanket-granted function, and nothing is written.
+            backend.send(overridden(
+                4,
+                "return getOrder(1);",
+                feature_of("rpc_calls", false),
+            ));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(4)));
+            assert_eq!(code_of(&reply), "policy.construct_disabled");
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Call` was written"
+            );
+        },
+    );
+}
+
+#[test]
+fn with_no_toggle_set_every_construct_runs() {
+    configured(
+        &wired_runtime(),
+        Value::Map(vec![]),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(execution(
+                1,
+                "fn f(x) { return x; }; let o = { a: [1] }; let t = 0; \
+                 for (k in o) { if (k == \"a\") { t = t + f(getOrder(o.a[0])); }; }; return t;",
+            ));
+            answer_calls(&mut backend, 1).await;
+            let reply = backend.next().await;
+            assert_eq!(value_of(&reply), Value::from(1));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn an_override_disabling_a_toggle_changes_nothing_stored() {
+    let runtime = wired_runtime();
+    let sessions = Arc::new(Sessions::new());
+    let dispatch = discarding_dispatch();
+    let registry = Arc::clone(&sessions);
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let (mut backend, serving, client_id) =
+                connect_as(&registry, init_configured(Value::Map(vec![]), &[]), false).await;
+            backend.send(overridden(1, LOOPING, feature_of("loops", false)));
+            assert_eq!(code_of(&backend.next().await), "policy.construct_disabled");
+            assert_eq!(registry.settings(client_id), Some(Settings::new()));
+            backend.send(execution(2, LOOPING));
+            assert_eq!(value_of(&backend.next().await), Value::from(2));
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_config_update_toggles_later_executions_and_a_left_out_toggle_is_enabled_again() {
+    configured(
+        &wired_runtime(),
+        Value::Map(vec![]),
+        &[],
+        |mut backend| async move {
+            backend.send(execution(1, LOOPING));
+            assert_eq!(value_of(&backend.next().await), Value::from(2));
+
+            backend.send(config_update(2, feature_of("loops", false)));
+            assert_updated(&backend.next().await, 2);
+            backend.send(execution(3, LOOPING));
+            assert_eq!(code_of(&backend.next().await), "policy.construct_disabled");
+
+            // Replace, never patch: an update that leaves `loops` out enables it again.
+            backend.send(config_update(4, Value::Map(vec![])));
+            assert_updated(&backend.next().await, 4);
+            backend.send(execution(5, LOOPING));
+            assert_eq!(value_of(&backend.next().await), Value::from(2));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn an_unknown_or_non_boolean_toggle_creates_no_session() {
+    let cases = [
+        (
+            feature_of("return", false),
+            "`config.features.return` is not a known feature toggle (the toggles are loops, \
+             conditionals, callbacks, object_literals, array_literals, rpc_calls)",
+        ),
+        (
+            feature_of("variables", false),
+            "`config.features.variables` is not a known feature toggle (the toggles are loops, \
+             conditionals, callbacks, object_literals, array_literals, rpc_calls)",
+        ),
+        (
+            by_key(&[("features", by_key(&[("loops", Value::from(0))]))]),
+            "`config.features.loops` must be a boolean; found 0",
+        ),
+        (
+            by_key(&[("features", by_key(&[("loops", Value::Nil)]))]),
+            "`config.features.loops` must be a boolean; found nil",
+        ),
+    ];
+    for (config, expected) in cases {
+        let sessions = Arc::new(Sessions::new());
+        let (sent, _) = serve_with(&sessions, vec![init(3, init_configured(config, &[]))], None);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(code_of(&sent[0]), "protocol.invalid_payload");
+        assert_eq!(message_of(&sent[0]), expected);
+        assert!(sessions.is_empty(), "no Session after {expected:?}");
+    }
+}
+
+#[test]
+fn an_unknown_toggle_in_an_override_runs_nothing() {
+    configured(
+        &wired_runtime(),
+        Value::Map(vec![]),
+        &[("getOrder", true)],
+        |mut backend| async move {
+            backend.send(overridden(
+                1,
+                "return getOrder(1);",
+                feature_of("operators", false),
+            ));
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "protocol.invalid_payload");
+            assert!(
+                message_of(&reply)
+                    .starts_with("`overrides.features.operators` is not a known feature toggle"),
+                "{}",
+                message_of(&reply)
+            );
+            backend.close();
+            assert!(
+                backend.from_daemon.recv().await.is_none(),
+                "no `Call` was written"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_config_update_with_an_unknown_toggle_is_refused_and_the_stored_toggles_stand() {
+    configured(
+        &wired_runtime(),
+        feature_of("loops", false),
+        &[],
+        |mut backend| async move {
+            backend.send(config_update(1, feature_of("return", false)));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(1)));
+            assert_eq!(code_of(&reply), "protocol.invalid_payload");
+            assert!(
+                message_of(&reply)
+                    .starts_with("`config.features.return` is not a known feature toggle"),
+                "{}",
+                message_of(&reply)
+            );
+            // `loops` is still off: the refused update changed nothing stored.
+            backend.send(execution(2, LOOPING));
+            assert_eq!(code_of(&backend.next().await), "policy.construct_disabled");
+            backend.close();
+        },
+    );
+}

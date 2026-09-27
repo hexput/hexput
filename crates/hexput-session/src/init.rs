@@ -12,8 +12,9 @@ use hexput_port::{Settings, Value, decode_settings};
 /// written or reloaded alongside System Config (AD-5).
 ///
 /// Its keys are the tunable execution limits (Story 3.7): the six Resource Budget limits, the
-/// argument depth and the per-call handler's timeout, decoded by `hexput-port`'s one settings
-/// decoder, so each is within the Daemon's allowed range. Any other key is refused: a Backend must
+/// argument depth and the per-call handler's timeout — plus the language feature toggles under
+/// `features` (Story 3.9) — decoded by `hexput-port`'s one settings decoder, so each is within
+/// the Daemon's allowed range. Any other key is refused: a Backend must
 /// never believe a policy is in force that nothing enforces. Not `Clone`: the Session registry
 /// holds the single live copy, and an execution reads a copy of its [`Settings`] when it is
 /// dispatched.

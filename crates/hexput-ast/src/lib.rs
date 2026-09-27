@@ -11,6 +11,10 @@ pub use hexput_shared::diagnostics::{
     Category, Code, Diagnostic, RenderOptions, Severity, Span, render_diagnostic,
 };
 
+/// The language feature toggles (Story 3.9), re-exported for the same reason: the interpreter
+/// refuses a disabled construct and reaches the toggles through this crate alone.
+pub use hexput_shared::policy::{Feature, Features};
+
 /// An index into [`Program::expressions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExprId(pub usize);

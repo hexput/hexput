@@ -1776,3 +1776,154 @@ fn the_argument_depth_limit_is_the_one_in_force() {
     );
     assert_eq!(run.result.unwrap().as_number(), Some(1.0));
 }
+
+// --- Story 3.9: feature toggles through the Executor ---
+
+mod features {
+    use hexput_enforce::{Feature, Features};
+
+    use super::{Limits, Wire, refusing, run_limited, spanned, value};
+
+    fn without(feature: Feature) -> Limits {
+        Limits::default().with_features(Features::ALL_ENABLED.with(feature, false))
+    }
+
+    #[test]
+    fn limits_carry_every_toggle_enabled_by_default() {
+        assert_eq!(Limits::default().features(), Features::ALL_ENABLED);
+        assert_eq!(
+            Limits::from_settings(&hexput_enforce::Settings::new()).features(),
+            Features::ALL_ENABLED
+        );
+        let mut settings = hexput_enforce::Settings::new();
+        settings.set_feature(Feature::Loops, false);
+        assert!(
+            !Limits::from_settings(&settings)
+                .features()
+                .is_enabled(Feature::Loops)
+        );
+    }
+
+    #[test]
+    fn rpc_calls_refuses_a_blanket_granted_call_and_sends_nothing() {
+        let source = "let n = 1;\nreturn f(n);";
+        let run = run_limited(
+            source,
+            vec![],
+            &[("f", true)],
+            refusing(),
+            Box::new(|_, _| value(Wire::Nil)),
+            without(Feature::RpcCalls),
+        );
+        let diagnostic = run.result.unwrap_err();
+        assert_eq!(diagnostic.code.as_str(), "policy.construct_disabled");
+        assert_eq!(diagnostic.category.as_str(), "policy");
+        assert_eq!(spanned(source, &diagnostic), "f(n)");
+        assert!(diagnostic.message.contains("`features.rpc_calls`"));
+        assert!(run.calls.is_empty());
+        assert!(run.asked.is_empty());
+        assert!(run.order.is_empty());
+        let logged: Vec<_> = run
+            .events
+            .iter()
+            .filter(|event| event["fields"]["message"] == "refused a disabled construct")
+            .map(|event| event["fields"]["code"].clone())
+            .collect();
+        assert_eq!(logged, ["policy.construct_disabled"]);
+    }
+
+    #[test]
+    fn rpc_calls_is_refused_before_the_call_is_counted() {
+        // With no RPC calls left, a counted call would be `budget.rpc_calls_exceeded`: the policy
+        // error proves the refused call was never charged as an RPC call or a side effect.
+        let source = "return f(1);";
+        let budget = Limits::default().with_rpc_calls(0).with_side_effects(0);
+        let run = run_limited(
+            source,
+            vec![],
+            &[("f", true)],
+            refusing(),
+            Box::new(|_, _| value(Wire::Nil)),
+            budget.with_features(Features::ALL_ENABLED.with(Feature::RpcCalls, false)),
+        );
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "policy.construct_disabled"
+        );
+        let run = run_limited(
+            source,
+            vec![],
+            &[("f", true)],
+            refusing(),
+            Box::new(|_, _| value(Wire::Nil)),
+            budget,
+        );
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "budget.rpc_calls_exceeded"
+        );
+        assert!(run.calls.is_empty());
+    }
+
+    #[test]
+    fn rpc_calls_is_refused_before_the_capability_and_argument_checks() {
+        // Unregistered, and with a function argument: the toggle wins over both.
+        let run = run_limited(
+            "return nope(fn() {});",
+            vec![],
+            &[],
+            refusing(),
+            Box::new(|_, _| value(Wire::Nil)),
+            without(Feature::RpcCalls),
+        );
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "policy.construct_disabled"
+        );
+        assert!(run.order.is_empty());
+    }
+
+    #[test]
+    fn a_hoisted_function_fails_before_the_first_call_is_sent() {
+        let source = "f(1); fn g() { return 1; };";
+        let run = run_limited(
+            source,
+            vec![],
+            &[("f", true)],
+            refusing(),
+            Box::new(|_, _| value(Wire::Nil)),
+            without(Feature::Callbacks),
+        );
+        let diagnostic = run.result.unwrap_err();
+        assert_eq!(diagnostic.code.as_str(), "policy.construct_disabled");
+        assert_eq!(spanned(source, &diagnostic), "fn g");
+        assert!(run.order.is_empty());
+    }
+
+    #[test]
+    fn a_budget_or_capability_refusal_is_never_a_policy_error() {
+        let run = run_limited(
+            "return nope();",
+            vec![],
+            &[],
+            refusing(),
+            Box::new(|_, _| value(Wire::Nil)),
+            Limits::default(),
+        );
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "capability.unknown_function"
+        );
+        let run = run_limited(
+            "let a = [1, 2]; return a;",
+            vec![],
+            &[],
+            refusing(),
+            Box::new(|_, _| value(Wire::Nil)),
+            Limits::default().with_allocations(0),
+        );
+        let diagnostic = run.result.unwrap_err();
+        assert_eq!(diagnostic.code.as_str(), "budget.allocations_exceeded");
+        assert_eq!(diagnostic.category.as_str(), "budget");
+    }
+}

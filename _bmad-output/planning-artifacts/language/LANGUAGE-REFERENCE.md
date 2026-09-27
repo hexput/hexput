@@ -221,7 +221,7 @@ Every failure carries a category, a stable code, a message, and a source span (E
 | `capability` | Call to an unregistered or denied Registered Function or Registered Method (FR-6, FR-7, FR-27) | Runtime |
 | `host` | The Backend answered a call with an error or answered it malformed, or the call could not be sent at all (`host.function_failed`); the connection ended before it answered (`host.no_reply`) | Runtime |
 | `budget` | A Resource Budget dimension exceeded (FR-8), one code per dimension: running Script code for longer than the CPU time budget (`budget.cpu_time_exceeded`; CPU time is the time spent running Script code, measured on its thread — wall time, excluding every wait on the Backend — which an oversubscribed host inflates), or values holding more memory than the memory budget (`budget.memory_exceeded`); making more allocations than the allocation budget (`budget.allocations_exceeded`), more host calls than the RPC call budget (`budget.rpc_calls_exceeded`), more side effects than the side-effect budget (`budget.side_effects_exceeded`), or returning a result larger than the output size budget (`budget.output_size_exceeded`). Spanned on the construct running when the limit was crossed — for RPC calls and side effects the call that would cross it, which is never sent; for output size the whole Script. Every limit is settable in the Session's Config and per execution (see below) | Runtime |
-| `policy` | A disabled language construct was used (FR-3) | Parse or runtime |
+| `policy` | A disabled language construct was used (FR-3; `policy.construct_disabled`, see below) | Runtime (and the static check, §10) |
 
 **[DECISION, 2026-09-24] The four counted budget dimensions have fixed meanings** (Story 3.6), each its own limit:
 
@@ -245,6 +245,19 @@ The defaults are 1 000 000 allocations, 100 RPC calls, 1 MiB of output and 100 s
 | Argument depth (§8) | 1 – 64 | 12 |
 
 A zero is meaningful only for the counted dimensions: an RPC call limit of 0 means the Script may make no host call at all. An error naming a limit names the one in force.
+
+**[DECISION, 2026-09-27] Language constructs can be switched off by policy** (Story 3.9, FR-3). A Backend's Config — and one execution's overrides, overlaid per toggle exactly like a limit — may carry `features`, a map of booleans over a closed set of six toggles, each enabled unless set to `false`:
+
+| Toggle | What it switches off | The error is spanned on |
+| --- | --- | --- |
+| `loops` | Entering a `while` or `for … in` statement | the `while` / `for` keyword |
+| `conditionals` | An `if` statement, with every `else if` and `else` that is part of it | the `if` keyword |
+| `callbacks` | Defining a function, named or anonymous — so nothing local can be invoked | `fn name` for a named one, the `fn` keyword for an anonymous one |
+| `object_literals` | Evaluating a `{ … }` literal | the literal |
+| `array_literals` | Evaluating a `[ … ]` literal | the literal |
+| `rpc_calls` | Every host call (§8), even to a blanket-granted function | the call |
+
+Every other construct — declarations, scalar literals, operators, property and index access, `return`, Global Variables — is always on, and naming it (or anything else) under `features` is refused as an unknown toggle before anything runs, as is any value but a boolean. A disabled construct is refused **when evaluation reaches it** — there is no pre-scan, so one on a path never taken does not fail the Script — with `policy.construct_disabled`, whose message names the toggle: `` `while` is disabled by policy (`features.loops`) ``. Like every error it is uncatchable and ends the Script; it is distinct from every `budget` and `capability` error. Named functions are refused where they hoist: the Script's own top-level ones before its first statement runs, and a nested block's when that block is entered. A host call is refused before its arguments are evaluated, so before any argument check, before it counts as an RPC call or side effect, and before any capability decision: nothing is sent. `hexput eval` runs with every construct enabled. The static check (§10) is what reports a disabled construct anywhere in the source before anything runs. The toggles are syntactic, not semantic: they switch off a form of source, not the behaviour it expresses — with `callbacks` on, recursion still repeats work with `loops` off, and `&&`, `||` and `?.` still branch with `conditionals` off. Because `ConfigUpdate` replaces the whole Config, an update that omits `features` re-enables every toggle, so a Backend must resend its toggles with every update.
 
 **[DECISION] Reading a missing object key yields `null`, not an error** — optional fields are the common case for a rule author, and `if (input.discount)` should read as "if a discount was supplied" rather than blowing up. Writing to a missing key creates it.
 

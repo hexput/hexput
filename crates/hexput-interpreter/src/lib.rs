@@ -55,6 +55,14 @@
 //! of two in length (LANGUAGE-REFERENCE §7), and stops with [`Outcome::AllocationsExceeded`] once
 //! the count passes the ceiling. [`Execution::allocations`] reports the count.
 //!
+//! # Feature toggles (Story 3.9)
+//!
+//! [`Execution::with_features`] switches language constructs off (FR-3): a disabled construct is
+//! refused when evaluation reaches it, as `policy.construct_disabled` naming the toggle and
+//! spanned on the construct, and one on a path never taken does not fail the Script. `rpc_calls`
+//! refuses a host call before its arguments are evaluated. [`evaluate`] and
+//! [`evaluate_with_variables`] run with every construct enabled.
+//!
 //! # Starting variables
 //!
 //! [`evaluate`] runs a Script with nothing but what its own source declares. [`evaluate_with_variables`]
@@ -93,6 +101,10 @@ pub use hexput_ast::{
 /// The parsed Script [`evaluate`] takes, re-exported so `hexput-exec` — the one Executor, which
 /// the Spine gives no `hexput-ast` edge — can name what it runs.
 pub use hexput_ast::Program;
+
+/// The language feature toggles an [`Execution`] runs under, re-exported so its driver can name
+/// them without a `hexput-shared` edge.
+pub use hexput_ast::{Feature, Features};
 
 /// How an [`Execution`] is metered: how much work it does before pausing, how much memory its
 /// values may hold, and how many allocations it may make. All `None` in [`Meter::UNMETERED`], the
@@ -299,6 +311,18 @@ impl Execution {
     #[must_use]
     pub fn metered(mut self, meter: Meter) -> Self {
         self.machine.set_meter(meter);
+        self
+    }
+
+    /// Run this execution with the language feature toggles `features` (Story 3.9): a disabled
+    /// construct is refused when the Script reaches it. A new execution has every toggle enabled.
+    /// Set before the first [`Execution::run`]; the Script's top-level named functions are checked
+    /// against `callbacks` when it first runs, before any statement. Once the execution has run —
+    /// including one handed back by [`HostCall::resume`] or [`Paused::resume`] — this does nothing
+    /// (and panics in debug builds): the toggles cannot be changed mid-run.
+    #[must_use]
+    pub fn with_features(mut self, features: Features) -> Self {
+        self.machine.set_features(features);
         self
     }
 

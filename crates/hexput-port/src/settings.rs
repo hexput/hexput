@@ -6,19 +6,25 @@
 //!
 //! ```text
 //! { budget: { cpu_time_ms, memory_bytes, allocations, rpc_calls, output_size_bytes, side_effects },
-//!   argument_depth, authorization_timeout_ms }
+//!   argument_depth, authorization_timeout_ms,
+//!   features: { loops, conditionals, callbacks, object_literals, array_literals, rpc_calls } }
 //! ```
 //!
 //! Every key is optional, and `{}` sets nothing. Each value is a MessagePack integer within its
 //! setting's range; a float — even a whole one — a negative or out-of-range integer, or any other
 //! type is refused, as is an unknown, repeated or non-string key. Every refusal names the full
 //! path, and a value refused for its range names the range.
+//!
+//! The `features` map (Story 3.9) holds the language feature toggles: each key optional, each
+//! value a MessagePack boolean. A key outside the closed set is refused as an unknown toggle, and
+//! any value but a boolean — `0`, `"no"`, nil — as not a boolean.
 
 use core::fmt;
 
 use rmpv::Value;
 
 pub use hexput_shared::budget::{OutOfRange, Setting, Settings};
+pub use hexput_shared::policy::{Feature, Features};
 
 use crate::MAX_FRAME_LEN;
 
@@ -42,6 +48,9 @@ pub fn decode_settings(value: &Value, prefix: &str) -> Result<Settings, String> 
     Ok(settings)
 }
 
+/// The key under which the feature toggles sit, at the root of a settings map.
+const FEATURES: &str = "features";
+
 /// Decode the map at `relative` (a dotted path within the settings, `""` for the root) into
 /// `settings`.
 fn decode_map(
@@ -59,6 +68,21 @@ fn decode_map(
         let Some(key) = key.as_str() else {
             return Err(format!("`{}` has a key that is not a string", at()));
         };
+        if relative.is_empty() && key == FEATURES {
+            if seen.contains(&key) {
+                return Err(format!("`{}` repeats the key `{key}`", at()));
+            }
+            seen.push(key);
+            decode_features(
+                value,
+                &Path {
+                    prefix,
+                    relative: FEATURES,
+                },
+                settings,
+            )?;
+            continue;
+        }
         let path = if relative.is_empty() {
             key.to_owned()
         } else {
@@ -103,6 +127,59 @@ fn decode_map(
     Ok(())
 }
 
+/// Decode the feature toggles map found at `path` into `settings`.
+fn decode_features(value: &Value, path: &Path<'_>, settings: &mut Settings) -> Result<(), String> {
+    let Value::Map(fields) = value else {
+        return Err(format!("`{path}` is not a map"));
+    };
+    let mut seen: Vec<Feature> = Vec::new();
+    for (key, value) in fields {
+        let Some(key) = key.as_str() else {
+            return Err(format!("`{path}` has a key that is not a string"));
+        };
+        let Some(feature) = Feature::from_name(key) else {
+            let toggles: Vec<&str> = Feature::ALL.iter().map(|f| f.as_str()).collect();
+            return Err(format!(
+                "`{path}.{}` is not a known feature toggle (the toggles are {})",
+                bounded(key),
+                toggles.join(", ")
+            ));
+        };
+        if seen.contains(&feature) {
+            return Err(format!("`{path}` repeats the key `{key}`"));
+        }
+        seen.push(feature);
+        match value {
+            Value::Boolean(enabled) => settings.set_feature(feature, *enabled),
+            other => {
+                return Err(format!(
+                    "`{path}.{key}` must be a boolean; found {}",
+                    describe(other)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How a refusal names a value it found.
+fn describe(value: &Value) -> String {
+    match value {
+        Value::Integer(integer) => integer.as_u64().map_or_else(
+            || integer.as_i64().unwrap_or_default().to_string(),
+            |unsigned| unsigned.to_string(),
+        ),
+        Value::F32(_) | Value::F64(_) => "a float".to_owned(),
+        Value::Nil => "nil".to_owned(),
+        Value::Boolean(_) => "a boolean".to_owned(),
+        Value::String(_) => "a string".to_owned(),
+        Value::Binary(_) => "binary data".to_owned(),
+        Value::Array(_) => "an array".to_owned(),
+        Value::Map(_) => "a map".to_owned(),
+        Value::Ext(..) => "an extension".to_owned(),
+    }
+}
+
 /// Decode one setting's value, found at `path`, into `settings`.
 fn decode_value(
     value: &Value,
@@ -117,16 +194,9 @@ fn decode_value(
                 Err(out_of_range) => out_of_range.found().to_string(),
             },
             // Only a negative integer does not fit a `u64`.
-            None => integer.as_i64().unwrap_or_default().to_string(),
+            None => describe(value),
         },
-        Value::F32(_) | Value::F64(_) => "a float".to_owned(),
-        Value::Nil => "nil".to_owned(),
-        Value::Boolean(_) => "a boolean".to_owned(),
-        Value::String(_) => "a string".to_owned(),
-        Value::Binary(_) => "binary data".to_owned(),
-        Value::Array(_) => "an array".to_owned(),
-        Value::Map(_) => "a map".to_owned(),
-        Value::Ext(..) => "an extension".to_owned(),
+        other => describe(other),
     };
     Err(format!(
         "`{path}` must be an integer from {} to {}; found {found}",

@@ -750,3 +750,158 @@ mod settings {
         assert!(message.contains('…'), "{message}");
     }
 }
+
+// --- Story 3.9: feature toggles in the same decoder ---
+
+mod features {
+    use hexput_port::{Feature, Features, Settings, Value, decode_settings};
+
+    use super::{map, s};
+
+    fn features(value: Value) -> Value {
+        map(vec![("features", value)])
+    }
+
+    fn refusal(value: &Value, prefix: &str) -> String {
+        decode_settings(value, prefix).expect_err("refused")
+    }
+
+    #[test]
+    fn every_toggle_decodes_and_an_unset_one_is_enabled() {
+        let settings = decode_settings(&features(map(vec![])), "config").unwrap();
+        assert_eq!(settings, Settings::new());
+        assert_eq!(settings.features(), Features::ALL_ENABLED);
+        for feature in Feature::ALL {
+            let value = features(map(vec![(feature.as_str(), Value::Boolean(false))]));
+            let settings = decode_settings(&value, "config").unwrap();
+            assert_eq!(settings.feature(*feature), Some(false));
+            for other in Feature::ALL {
+                assert_eq!(settings.features().is_enabled(*other), other != feature);
+            }
+        }
+        let value = features(map(vec![("loops", Value::Boolean(true))]));
+        let settings = decode_settings(&value, "overrides").unwrap();
+        assert_eq!(settings.feature(Feature::Loops), Some(true));
+        assert_eq!(settings.features(), Features::ALL_ENABLED);
+    }
+
+    #[test]
+    fn toggles_decode_beside_limits() {
+        let value = map(vec![
+            ("budget", map(vec![("rpc_calls", Value::from(3))])),
+            ("features", map(vec![("rpc_calls", Value::Boolean(false))])),
+        ]);
+        let settings = decode_settings(&value, "config").unwrap();
+        assert_eq!(settings.get(hexput_port::Setting::RpcCalls), Some(3));
+        assert!(!settings.features().is_enabled(Feature::RpcCalls));
+    }
+
+    #[test]
+    fn an_override_overlays_toggle_by_toggle_and_changes_nothing_beneath() {
+        let config = decode_settings(
+            &features(map(vec![
+                ("loops", Value::Boolean(false)),
+                ("callbacks", Value::Boolean(false)),
+            ])),
+            "config",
+        )
+        .unwrap();
+        let overrides = decode_settings(
+            &features(map(vec![
+                ("loops", Value::Boolean(true)),
+                ("array_literals", Value::Boolean(false)),
+            ])),
+            "overrides",
+        )
+        .unwrap();
+        let before = config;
+        let effective = config.overlay(&overrides).features();
+        assert!(effective.is_enabled(Feature::Loops));
+        assert!(!effective.is_enabled(Feature::Callbacks));
+        assert!(!effective.is_enabled(Feature::ArrayLiterals));
+        assert!(effective.is_enabled(Feature::Conditionals));
+        assert_eq!(config, before);
+        assert!(!config.features().is_enabled(Feature::Loops));
+    }
+
+    #[test]
+    fn an_unknown_toggle_is_refused_naming_the_closed_set() {
+        for name in [
+            "variables",
+            "return",
+            "operators",
+            "global_variables",
+            "property_access",
+        ] {
+            let value = features(map(vec![(name, Value::Boolean(false))]));
+            assert_eq!(
+                refusal(&value, "config"),
+                format!(
+                    "`config.features.{name}` is not a known feature toggle (the toggles are \
+                     loops, conditionals, callbacks, object_literals, array_literals, rpc_calls)"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_boolean_is_refused_naming_the_path() {
+        let cases = [
+            (Value::from(0), "0"),
+            (s("no"), "a string"),
+            (Value::Nil, "nil"),
+            (map(vec![]), "a map"),
+        ];
+        for (value, found) in cases {
+            let value = features(map(vec![("loops", value)]));
+            assert_eq!(
+                refusal(&value, "overrides"),
+                format!("`overrides.features.loops` must be a boolean; found {found}")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_features_maps_are_refused() {
+        assert_eq!(
+            refusal(&features(Value::Boolean(false)), "config"),
+            "`config.features` is not a map"
+        );
+        assert_eq!(
+            refusal(
+                &features(Value::Map(vec![(Value::from(1), Value::Boolean(true))])),
+                "config"
+            ),
+            "`config.features` has a key that is not a string"
+        );
+        assert_eq!(
+            refusal(
+                &features(map(vec![
+                    ("loops", Value::Boolean(true)),
+                    ("loops", Value::Boolean(false)),
+                ])),
+                "config"
+            ),
+            "`config.features` repeats the key `loops`"
+        );
+        assert_eq!(
+            refusal(
+                &map(vec![("features", map(vec![])), ("features", map(vec![]))]),
+                "config"
+            ),
+            "`config` repeats the key `features`"
+        );
+        // Only the root holds toggles, and a dotted key never names one.
+        assert_eq!(
+            refusal(&map(vec![("budget", features(map(vec![])))]), "config"),
+            "`config.budget.features` is not a known setting"
+        );
+        assert_eq!(
+            refusal(
+                &map(vec![("features.loops", Value::Boolean(false))]),
+                "config"
+            ),
+            "`config.features.loops` is not a known setting"
+        );
+    }
+}

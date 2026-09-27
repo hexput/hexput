@@ -24,7 +24,7 @@
 //! connection passes the Session's Config settings, read once per execution, and the payload's
 //! optional `overrides` — decoded by `hexput-port`'s one settings decoder, exactly as `Init`'s
 //! `config` is — are laid over them for this execution alone. The Executor enforces the result;
-//! nothing stored changes.
+//! nothing stored changes. The same overlay carries the language feature toggles (Story 3.9).
 //!
 //! Not yet: the static check (no check mode exists in Config until Story 3.10), and the AST
 //! Cache and Cached Execution (Epic 4).
@@ -79,8 +79,9 @@ const VALUE: &str = "value";
 ///   is parsed or run.
 /// * The parser's, interpreter's or Executor's [`Diagnostic`] — category, code, severity, message
 ///   and span — including `syntax.duplicate_declaration` for a starting variable the Script also
-///   declares, every `capability`, `host` and argument error of a host call, and every `budget`
-///   error.
+///   declares, every `capability`, `host` and argument error of a host call, every `budget`
+///   error, and `policy.construct_disabled` for a construct the effective `features` toggles
+///   switch off (Story 3.9).
 /// * `protocol.result_too_deep` — the result nests past [`MAX_RESULT_DEPTH`].
 /// * `protocol.response_too_large` — the result is certain to encode past the maximum frame.
 ///   Under the default Resource Budget the Executor refuses any such result first, as

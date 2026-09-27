@@ -38,6 +38,17 @@
 //! non-string operand, each key a `for … in` hands out, and each array or object literal. The
 //! heap adds each growth of a collection (see `heap.rs`). With an allocation ceiling the machine
 //! stops with [`Stop::AllocationsExceeded`] after the first frame that takes the count past it.
+//!
+//! # Feature toggles (Story 3.9)
+//!
+//! A machine runs with a set of [`Features`], all enabled unless the driver says otherwise. A
+//! disabled construct is refused when evaluation reaches it — never by scanning ahead — with a
+//! `policy.construct_disabled` error spanned on the construct: entering a `while` or `for … in`
+//! (`loops`), an `if` statement (`conditionals`), hoisting a named function when its block opens
+//! or evaluating an anonymous one (`callbacks`), evaluating an array or object literal
+//! (`array_literals`, `object_literals`), and a host call, before its arguments are evaluated
+//! (`rpc_calls`). The Script's top-level functions are hoisted when the machine is built, so their
+//! check runs when it first executes, before any statement.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -45,8 +56,8 @@ use std::sync::Arc;
 
 use hexput_ast::{
     AccessKind, AccessLink, BinaryOperator, BlockId, Category, Code, Diagnostic, ExprId,
-    ExpressionKind, Function, Identifier, Literal, Program, Span, Spanned, Statement,
-    StatementKind, UnaryOperator,
+    ExpressionKind, Feature, Features, Function, Identifier, Literal, Program, Span, Spanned,
+    Statement, StatementKind, UnaryOperator,
 };
 use indexmap::IndexMap;
 
@@ -287,6 +298,11 @@ pub(crate) struct Machine<P> {
     work: u64,
     /// The last construct the machine ran, for a metering stop's span.
     site: Site,
+    /// The language feature toggles in force.
+    features: Features,
+    /// Whether the top-level functions' hoisting has been checked against [`Machine::features`]:
+    /// they are hoisted when the machine is built, before its toggles are known.
+    started: bool,
 }
 
 impl<P: Deref<Target = Program> + Clone> Machine<P> {
@@ -323,13 +339,56 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             meter: Meter::UNMETERED,
             work: 0,
             site: Site::Unknown,
+            features: Features::ALL_ENABLED,
+            started: false,
         };
         for (name, value) in variables {
             let attached = machine.heap.attach(&value);
             machine.heap.declare(scope, name.as_ref(), attached);
         }
-        machine.open(&tree, None);
+        machine.hoist(&tree, None);
         machine
+    }
+
+    /// Run the rest of the Script under the toggles `features`.
+    /// Does nothing once the machine has started running: toggles cannot change mid-run, and the
+    /// top-level hoist check has already been made against the ones in force.
+    pub(crate) fn set_features(&mut self, features: Features) {
+        debug_assert!(!self.started, "feature toggles set on a running execution");
+        if !self.started {
+            self.features = features;
+        }
+    }
+
+    /// Refuse `construct`, spanned on `span`, when `feature` is disabled.
+    fn allow(&self, feature: Feature, construct: &str, span: Span) -> Result<(), Diagnostic> {
+        if self.features.is_enabled(feature) {
+            return Ok(());
+        }
+        Err(Diagnostic::new(
+            Category::Policy,
+            Code::CONSTRUCT_DISABLED,
+            format!("{construct} is disabled by policy (`features.{feature}`)"),
+            span,
+        ))
+    }
+
+    /// Refuse the named functions `block` declares when `callbacks` is disabled, spanned on the
+    /// first one's `fn name`.
+    fn allow_hoisting(&self, tree: &Program, block: Option<BlockId>) -> Result<(), Diagnostic> {
+        if self.features.is_enabled(Feature::Callbacks) {
+            return Ok(());
+        }
+        for statement in statements(tree, block) {
+            if let StatementKind::Function { name, function } = &statement.kind {
+                self.allow(
+                    Feature::Callbacks,
+                    "`fn`",
+                    through(function.keyword, name.span),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Meter the rest of the run against `meter`.
@@ -356,6 +415,10 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         // One handle for the whole run, so every step borrows the tree apart from `self`.
         let program = self.program.clone();
         let tree: &Program = &program;
+        if !self.started {
+            self.started = true;
+            self.allow_hoisting(tree, None)?;
+        }
         // A ceiling the starting variables or a host call's value already crossed stops the
         // machine before it runs a step.
         if self.over_ceiling() {
@@ -481,7 +544,18 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// Schedule the statements of `block` (the top level for `None`) in the current scope, after
     /// hoisting the named functions they declare (decision 3: every `fn name` in a block is bound
     /// before the block runs, so mutual recursion works in any declaration order).
-    fn open(&mut self, tree: &Program, block: Option<BlockId>) {
+    ///
+    /// # Errors
+    /// `policy.construct_disabled` when the block declares a named function and `callbacks` is
+    /// disabled; nothing is scheduled.
+    fn open(&mut self, tree: &Program, block: Option<BlockId>) -> Result<(), Diagnostic> {
+        self.allow_hoisting(tree, block)?;
+        self.hoist(tree, block);
+        Ok(())
+    }
+
+    /// [`Machine::open`] without the toggle check.
+    fn hoist(&mut self, tree: &Program, block: Option<BlockId>) {
         let statements = statements(tree, block);
         for (index, statement) in statements.iter().enumerate() {
             if let StatementKind::Function { name, .. } = &statement.kind {
@@ -498,11 +572,11 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
 
     /// Enter `block` in a fresh scope nested in the current one, arranging for that scope to be
     /// reclaimed when the block's statements are done.
-    fn enter(&mut self, tree: &Program, block: BlockId) {
+    fn enter(&mut self, tree: &Program, block: BlockId) -> Result<(), Diagnostic> {
         let inner = self.heap.push_scope(Some(self.scope));
         let outer = core::mem::replace(&mut self.scope, inner);
         self.frames.push(Frame::ExitScope(outer));
-        self.open(tree, Some(block));
+        self.open(tree, Some(block))
     }
 
     /// Reclaim the current scope (unless a closure captured it) and restore `outer`.
@@ -661,10 +735,10 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     if let StatementKind::If { branches, .. } = &statement(tree, at).kind
                         && let Some(branch) = branches.get(index)
                     {
-                        self.enter(tree, branch.body);
+                        self.enter(tree, branch.body)?;
                     }
                 } else {
-                    self.next_branch(tree, at, index + 1);
+                    self.next_branch(tree, at, index + 1)?;
                 }
             }
             Frame::Loop(state) => self.advance(tree, state)?,
@@ -673,7 +747,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 if self.heap.is_truthy(&condition) {
                     let body = state.kind.body();
                     self.frames.push(Frame::Loop(state));
-                    self.enter(tree, body);
+                    self.enter(tree, body)?;
                 }
             }
             Frame::ForStart(at) => self.for_start(tree, at)?,
@@ -813,20 +887,21 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
 
     /// Test the `if` statement's `branches[index]`, or fall through to its `else` body when there
     /// is none left.
-    fn next_branch(&mut self, tree: &Program, at: StmtAt, index: usize) {
+    fn next_branch(&mut self, tree: &Program, at: StmtAt, index: usize) -> Result<(), Diagnostic> {
         let StatementKind::If {
             branches,
             else_branch,
         } = &statement(tree, at).kind
         else {
-            return;
+            return Ok(());
         };
         if let Some(branch) = branches.get(index) {
             self.frames.push(Frame::Branch { at, index });
             self.frames.push(Frame::Eval(branch.condition.expression));
         } else if let Some(otherwise) = else_branch {
-            self.enter(tree, otherwise.body);
+            self.enter(tree, otherwise.body)?;
         }
+        Ok(())
     }
 
     /// Open the `for` loop at `at` over the iterable on top of the value stack.
@@ -926,7 +1001,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 }
                 self.frames.push(Frame::Loop(state));
                 self.frames.push(Frame::ExitScope(outer));
-                self.open(tree, Some(body));
+                self.open(tree, Some(body))?;
             }
         }
         Ok(())
@@ -1059,8 +1134,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         for (parameter, value) in function.parameters.iter().zip(values) {
             self.heap.declare(inner, &parameter.name, value);
         }
-        self.open(tree, Some(function.body));
-        Ok(())
+        self.open(tree, Some(function.body))
     }
 
     fn statement(&mut self, tree: &Program, at: StmtAt) -> Result<Option<Value>, Diagnostic> {
@@ -1083,18 +1157,24 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 None if self.depth > 0 => self.return_from_call(RtValue::Null),
                 None => return Ok(Some(Value::Null)),
             },
-            StatementKind::Block(id) => self.enter(tree, *id),
+            StatementKind::Block(id) => self.enter(tree, *id)?,
             StatementKind::Assignment { target, value, .. } => {
                 self.assignment(tree, *target, *value)?;
             }
             // Already bound by `open` before this block's statements ran (decision 3).
             StatementKind::Function { .. } => {}
-            StatementKind::If { .. } => self.next_branch(tree, at, 0),
+            StatementKind::If { branches, .. } => {
+                if let Some(first) = branches.first() {
+                    self.allow(Feature::Conditionals, "`if`", first.keyword)?;
+                }
+                self.next_branch(tree, at, 0)?;
+            }
             StatementKind::While {
                 keyword,
                 condition,
                 body,
             } => {
+                self.allow(Feature::Loops, "`while`", *keyword)?;
                 self.frames.push(Frame::Loop(Box::new(LoopFrame {
                     outer_scope: self.scope,
                     values: self.values.len(),
@@ -1105,7 +1185,10 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     },
                 })));
             }
-            StatementKind::For { iterable, .. } => {
+            StatementKind::For {
+                keyword, iterable, ..
+            } => {
+                self.allow(Feature::Loops, "`for … in`", *keyword)?;
                 self.frames.push(Frame::ForStart(at));
                 self.frames.push(Frame::Eval(*iterable));
             }
@@ -1197,6 +1280,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 self.frames.push(Frame::Eval(*left));
             }
             ExpressionKind::Array { elements, .. } => {
+                self.allow(Feature::ArrayLiterals, "`[ … ]`", expression.span)?;
                 self.frames.push(Frame::BuildArray {
                     array: id,
                     count: elements.len(),
@@ -1205,6 +1289,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     .extend(elements.iter().rev().map(|e| Frame::Eval(*e)));
             }
             ExpressionKind::Object { entries, .. } => {
+                self.allow(Feature::ObjectLiterals, "`{ … }`", expression.span)?;
                 self.frames.push(Frame::BuildObject(id));
                 self.frames
                     .extend(entries.iter().rev().map(|e| Frame::Eval(e.value)));
@@ -1212,7 +1297,8 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             ExpressionKind::Access { links, .. } => {
                 self.open_chain(tree, id, links.len(), false)?;
             }
-            ExpressionKind::Function(_) => {
+            ExpressionKind::Function(function) => {
+                self.allow(Feature::Callbacks, "`fn`", function.keyword)?;
                 let value = self.make_function(FnAt::Literal(id));
                 self.values.push(value);
             }
@@ -1240,11 +1326,21 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         let chain = Chain { access, end };
         if let Some(AccessLink {
             kind: AccessKind::Call { arguments, .. },
+            span: call,
             ..
         }) = links.get(..end).and_then(<[AccessLink]>::first)
             && let ExpressionKind::Identifier(name) = &tree.expression(*base).kind
             && self.heap.lookup(self.scope, &name.name).is_none()
         {
+            // Refused before a single argument is evaluated, so before any argument check, any
+            // count and any capability decision: nothing about the call reaches the Executor.
+            if !self.features.is_enabled(Feature::RpcCalls) {
+                self.allow(
+                    Feature::RpcCalls,
+                    &format!("a host call to `{}`", name.name),
+                    through(name.span, *call),
+                )?;
+            }
             self.frames.push(Frame::HostCall { chain, in_target });
             self.frames
                 .extend(arguments.iter().rev().map(|a| Frame::Eval(*a)));

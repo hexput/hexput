@@ -2270,3 +2270,242 @@ mod allocations {
         ));
     }
 }
+
+// --- Story 3.9: switching language constructs off by policy ---
+
+mod features {
+    use std::sync::Arc;
+
+    use hexput_ast::{Category, Code, Diagnostic};
+    use hexput_interpreter::{Execution, Feature, Features, Outcome, Value};
+    use hexput_parser::parse;
+
+    /// Run `source` under `features`, answering every host call with `null`. The result, and the
+    /// names of the host calls the Script reached.
+    fn run(source: &str, features: Features) -> (Result<Value, Diagnostic>, Vec<String>) {
+        let program = Arc::new(parse(source).unwrap_or_else(|e| panic!("`{source}`: {e}")));
+        let mut execution = Execution::with_variables(program, Vec::<(&str, Value)>::new())
+            .unwrap()
+            .with_features(features);
+        let mut calls = Vec::new();
+        loop {
+            match execution.run() {
+                Err(error) => return (Err(error), calls),
+                Ok(Outcome::Finished(value)) => return (Ok(value), calls),
+                Ok(Outcome::HostCall(call)) => {
+                    calls.push(call.name().to_owned());
+                    execution = call.resume(&Value::Null);
+                }
+                Ok(Outcome::Paused(paused)) => execution = paused.resume(),
+                Ok(_) => panic!("`{source}` stopped at a ceiling it does not have"),
+            }
+        }
+    }
+
+    fn without(feature: Feature) -> Features {
+        Features::ALL_ENABLED.with(feature, false)
+    }
+
+    /// Assert `source` fails under `feature` disabled with the policy error naming it, spanned
+    /// on `spanned`, and with `message`; and that it runs with every toggle enabled.
+    fn refused(source: &str, feature: Feature, spanned: &str, message: &str) {
+        let (result, calls) = run(source, without(feature));
+        let error = result.expect_err(source);
+        assert_eq!(error.category, Category::Policy, "{source}: {error}");
+        assert_eq!(error.code, Code::CONSTRUCT_DISABLED, "{source}: {error}");
+        assert_eq!(error.code.as_str(), "policy.construct_disabled");
+        assert_eq!(&source[error.span.range()], spanned, "{source}: {error}");
+        assert_eq!(error.message, message, "{source}");
+        assert!(
+            error.message.contains(&format!("`features.{feature}`")),
+            "{source}: {error}"
+        );
+        assert!(calls.is_empty(), "{source}: {calls:?}");
+        let (result, _) = run(source, Features::ALL_ENABLED);
+        result.unwrap_or_else(|e| panic!("`{source}` should run with every toggle on: {e}"));
+    }
+
+    #[test]
+    fn each_toggle_refuses_its_construct_on_the_construct() {
+        refused(
+            "let n = 0; while (n < 3) { n = n + 1; }; return n;",
+            Feature::Loops,
+            "while",
+            "`while` is disabled by policy (`features.loops`)",
+        );
+        refused(
+            "let s = 0; for (x in [1, 2]) { s = s + x; }; return s;",
+            Feature::Loops,
+            "for",
+            "`for … in` is disabled by policy (`features.loops`)",
+        );
+        refused(
+            "if (true) { return 1; } else { return 2; };",
+            Feature::Conditionals,
+            "if",
+            "`if` is disabled by policy (`features.conditionals`)",
+        );
+        refused(
+            "let f = fn(x) { return x; }; return f(1);",
+            Feature::Callbacks,
+            "fn",
+            "`fn` is disabled by policy (`features.callbacks`)",
+        );
+        refused(
+            "fn id(x) { return x; }; return id(1);",
+            Feature::Callbacks,
+            "fn id",
+            "`fn` is disabled by policy (`features.callbacks`)",
+        );
+        refused(
+            "let o = { a: 1 }; return o.a;",
+            Feature::ObjectLiterals,
+            "{ a: 1 }",
+            "`{ … }` is disabled by policy (`features.object_literals`)",
+        );
+        refused(
+            "let a = [1, 2]; return a[0];",
+            Feature::ArrayLiterals,
+            "[1, 2]",
+            "`[ … ]` is disabled by policy (`features.array_literals`)",
+        );
+        refused(
+            "return send(1, 2);",
+            Feature::RpcCalls,
+            "send(1, 2)",
+            "a host call to `send` is disabled by policy (`features.rpc_calls`)",
+        );
+    }
+
+    #[test]
+    fn every_construct_runs_with_no_toggle_set() {
+        let source = "fn sum(xs) { let t = 0; for (x in xs) { t = t + x; }; return t; }; \
+                      let n = 0; while (n < 2) { n = n + 1; }; \
+                      let o = { v: sum([1, 2, 3]) }; host(o.v); \
+                      if (n == 2) { return o.v + n; }; return 0;";
+        let (result, calls) = run(source, Features::ALL_ENABLED);
+        assert_eq!(result.unwrap().as_number(), Some(8.0));
+        assert_eq!(calls, ["host"]);
+    }
+
+    #[test]
+    fn a_nested_block_that_declares_a_function_is_refused_when_it_opens() {
+        let source = "let r = 1; { fn g() { return 2; }; r = g(); }; return r;";
+        let (result, _) = run(source, without(Feature::Callbacks));
+        let error = result.unwrap_err();
+        assert_eq!(error.code, Code::CONSTRUCT_DISABLED);
+        assert_eq!(&source[error.span.range()], "fn g");
+    }
+
+    #[test]
+    fn a_function_declared_in_a_loop_body_is_refused_when_the_body_opens() {
+        let source =
+            "let r = 0; for (x in [1]) { r = 1; fn g() { return 2; }; r = g(); }; return r;";
+        let (result, _) = run(source, without(Feature::Callbacks));
+        let error = result.unwrap_err();
+        assert_eq!(error.code, Code::CONSTRUCT_DISABLED);
+        assert_eq!(&source[error.span.range()], "fn g");
+        // The body never ran: a host call placed first in it is never reached.
+        let source = "for (x in [1]) { seen(); fn g() {}; }; return 0;";
+        let (result, calls) = run(source, without(Feature::Callbacks));
+        assert_eq!(result.unwrap_err().code, Code::CONSTRUCT_DISABLED);
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn an_else_if_chain_is_refused_on_its_first_if() {
+        let source = "let x = 2; if (x == 1) { return 1; } else if (x == 2) { return 2; } else { return 3; };";
+        let (result, _) = run(source, without(Feature::Conditionals));
+        let error = result.unwrap_err();
+        assert_eq!(error.code, Code::CONSTRUCT_DISABLED);
+        assert_eq!(error.span.range().start, source.find("if").unwrap());
+        assert_eq!(&source[error.span.range()], "if");
+    }
+
+    #[test]
+    fn toggles_still_hold_after_a_resume() {
+        let program = Arc::new(parse("f(); while (true) {};").unwrap());
+        let execution = Execution::with_variables(program, Vec::<(&str, Value)>::new())
+            .unwrap()
+            .with_features(without(Feature::Loops));
+        let Ok(Outcome::HostCall(call)) = execution.run() else {
+            panic!("stops at the host call first");
+        };
+        let error = call.resume(&Value::Null).run().err().expect("refused");
+        assert_eq!(error.code, Code::CONSTRUCT_DISABLED);
+        assert!(error.message.contains("`features.loops`"));
+    }
+
+    #[test]
+    fn each_toggle_sits_at_its_own_index() {
+        for (i, feature) in Feature::ALL.iter().enumerate() {
+            assert_eq!(feature.index(), i, "{feature}");
+        }
+    }
+
+    #[test]
+    fn a_hoisted_top_level_function_fails_before_anything_runs() {
+        let source = "f(1); fn g() { return 1; };";
+        let (result, calls) = run(source, without(Feature::Callbacks));
+        let error = result.unwrap_err();
+        assert_eq!(error.code, Code::CONSTRUCT_DISABLED);
+        assert_eq!(&source[error.span.range()], "fn g");
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn a_construct_never_reached_does_not_fail() {
+        let (result, _) = run(
+            "if (false) { while (true) {} }; return 1;",
+            without(Feature::Loops),
+        );
+        assert_eq!(result.unwrap().as_number(), Some(1.0));
+        let (result, calls) = run(
+            "let x = null; if (x != null) { send([1], { a: fn() {} }); }; return 2;",
+            Features::ALL_ENABLED
+                .with(Feature::RpcCalls, false)
+                .with(Feature::ArrayLiterals, false)
+                .with(Feature::ObjectLiterals, false)
+                .with(Feature::Callbacks, false),
+        );
+        assert_eq!(result.unwrap().as_number(), Some(2.0));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn rpc_calls_is_refused_before_arguments_are_checked() {
+        let source = "return f(fn() {});";
+        let (result, _) = run(source, without(Feature::RpcCalls));
+        let error = result.unwrap_err();
+        assert_eq!(error.code, Code::CONSTRUCT_DISABLED);
+        assert_eq!(&source[error.span.range()], "f(fn() {})");
+        // With the toggle on, the same call fails on its argument instead.
+        let (result, _) = run(source, Features::ALL_ENABLED);
+        assert_eq!(result.unwrap_err().code, Code::FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn a_local_call_is_not_a_host_call() {
+        let (result, _) = run("let f = 1; return f;", without(Feature::RpcCalls));
+        assert_eq!(result.unwrap().as_number(), Some(1.0));
+        // Calling a function the Script declares is an ordinary call, not a host call.
+        let (result, _) = run(
+            "fn f(x) { return x + 1; }; return f(1);",
+            without(Feature::RpcCalls),
+        );
+        assert_eq!(result.unwrap().as_number(), Some(2.0));
+    }
+
+    #[test]
+    fn evaluate_runs_with_every_construct_enabled() {
+        let program = parse(
+            "fn f(xs) { let t = 0; for (x in xs) { if (x) { t = t + 1; }; }; return { t: t }; }; \
+             return f([1, 0, 1]).t;",
+        )
+        .unwrap();
+        assert_eq!(
+            hexput_interpreter::evaluate(&program).unwrap().as_number(),
+            Some(2.0)
+        );
+    }
+}

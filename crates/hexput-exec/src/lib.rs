@@ -182,11 +182,19 @@ impl From<Diagnostic> for Halt {
 }
 
 impl Halt {
-    /// The Script's error. A budget error is logged here, in the execution's own task, so the
-    /// event carries the request's span.
+    /// The Script's error. A budget error, and a construct the feature toggles disable (Story
+    /// 3.9), are logged here, in the execution's own task, so the event carries the request's span.
     fn into_diagnostic(self) -> Diagnostic {
         match self {
-            Self::Failed(diagnostic) => diagnostic,
+            Self::Failed(diagnostic) => {
+                if diagnostic.code == Code::CONSTRUCT_DISABLED {
+                    tracing::debug!(
+                        code = diagnostic.code.as_str(),
+                        "refused a disabled construct"
+                    );
+                }
+                diagnostic
+            }
             Self::Exceeded(exceeded) => {
                 tracing::debug!(
                     dimension = exceeded.dimension().as_str(),
@@ -274,7 +282,9 @@ pub async fn execute_with_limits(
             let mut budget = budget;
             // Binding the starting variables is charged with the first slice.
             let started = Instant::now();
-            let execution = Execution::with_variables(program, variables)?.metered(meter);
+            let execution = Execution::with_variables(program, variables)?
+                .metered(meter)
+                .with_features(limits.features());
             let step = segment(execution, &mut budget, &capabilities, whole, started)?;
             Ok((step, budget))
         })

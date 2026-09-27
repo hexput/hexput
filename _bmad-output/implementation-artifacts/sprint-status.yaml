@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-18-2026 11:43
-last_updated: 09-25-2026 05:40
+last_updated: 09-27-2026 08:30
 project: hexput
 project_key: NOKEY
 tracking_system: file-system
@@ -68,7 +68,7 @@ development_status:
   3-6-bound-allocations-rpc-calls-output-size-and-side-effects: review
   3-7-tune-budgets-per-backend-and-per-execution: review
   3-8-change-execution-policy-without-reconnecting: review
-  3-9-switch-off-language-constructs-by-policy: in-progress
+  3-9-switch-off-language-constructs-by-policy: review
   3-10-turn-the-static-check-on-or-off: backlog
   3-11-carry-hidden-metadata-on-values-the-script-cannot-touch: backlog
   3-12-call-a-backend-method-on-a-keyed-object: backlog

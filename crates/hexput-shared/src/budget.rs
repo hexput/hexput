@@ -9,8 +9,14 @@
 //! set in its Config and override per execution — each dimension's limit, the argument depth and
 //! the per-call handler's timeout — with each one's wire path, allowed range and default.
 //! [`Settings`] holds some of them, and can hold only values within range.
+//!
+//! Story 3.9 adds the language feature toggles ([`Feature`]) beside them: [`Settings`] also holds
+//! some toggles, each set one enabled or disabled, and overlays them per toggle exactly as it
+//! overlays a limit. An unset toggle is enabled.
 
 use core::fmt;
+
+use crate::policy::{Feature, Features};
 
 /// One Resource Budget dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -197,6 +203,7 @@ impl fmt::Display for Setting {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Settings {
     values: [Option<u64>; Setting::ALL.len()],
+    features: [Option<bool>; Feature::ALL.len()],
 }
 
 impl Settings {
@@ -205,6 +212,7 @@ impl Settings {
     pub const fn new() -> Self {
         Self {
             values: [None; Setting::ALL.len()],
+            features: [None; Feature::ALL.len()],
         }
     }
 
@@ -241,6 +249,8 @@ impl Settings {
     /// These settings with `over` laid on top: each setting `over` sets takes its value, every
     /// other keeps this one's. Neither input changes — an override never touches the Config
     /// beneath it.
+    ///
+    /// Feature toggles overlay the same way, one toggle at a time.
     #[must_use]
     pub fn overlay(&self, over: &Self) -> Self {
         let mut values = self.values;
@@ -249,7 +259,39 @@ impl Settings {
                 *value = over;
             }
         }
-        Self { values }
+        let mut features = self.features;
+        for (toggle, over) in features.iter_mut().zip(over.features) {
+            if over.is_some() {
+                *toggle = over;
+            }
+        }
+        Self { values, features }
+    }
+
+    /// Set the toggle `feature` to `enabled`. Every boolean is valid, so this cannot fail.
+    pub const fn set_feature(&mut self, feature: Feature, enabled: bool) {
+        self.features[feature.index()] = Some(enabled);
+    }
+
+    /// The value set for the toggle `feature`, if any.
+    #[must_use]
+    pub const fn feature(&self, feature: Feature) -> Option<bool> {
+        self.features[feature.index()]
+    }
+
+    /// The toggles in force: each one set takes its value, and every unset one is enabled.
+    #[must_use]
+    pub const fn features(&self) -> Features {
+        let mut features = Features::ALL_ENABLED;
+        let mut index = 0;
+        while index < Feature::ALL.len() {
+            let feature = Feature::ALL[index];
+            if let Some(false) = self.feature(feature) {
+                features = features.with(feature, false);
+            }
+            index += 1;
+        }
+        features
     }
 }
 

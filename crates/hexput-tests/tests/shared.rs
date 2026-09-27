@@ -404,3 +404,63 @@ mod settings {
         assert_eq!(config.overlay(&Settings::new()), config);
     }
 }
+
+// --- Story 3.9: the feature toggles ---
+
+mod policy {
+    use hexput_shared::budget::Settings;
+    use hexput_shared::policy::{Feature, Features};
+
+    #[test]
+    fn the_toggle_set_is_closed_and_spelled_for_the_wire() {
+        let names: Vec<&str> = Feature::ALL.iter().map(|f| f.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "loops",
+                "conditionals",
+                "callbacks",
+                "object_literals",
+                "array_literals",
+                "rpc_calls"
+            ]
+        );
+        for feature in Feature::ALL {
+            assert_eq!(feature.to_string(), feature.as_str());
+            assert_eq!(Feature::from_name(feature.as_str()), Some(*feature));
+        }
+        for name in ["return", "variables", "operators", "Loops", ""] {
+            assert_eq!(Feature::from_name(name), None);
+        }
+    }
+
+    #[test]
+    fn every_toggle_defaults_to_enabled() {
+        assert_eq!(Features::default(), Features::ALL_ENABLED);
+        assert_eq!(Settings::new().features(), Features::ALL_ENABLED);
+        for feature in Feature::ALL {
+            assert!(Features::ALL_ENABLED.is_enabled(*feature));
+            let off = Features::ALL_ENABLED.with(*feature, false);
+            for other in Feature::ALL {
+                assert_eq!(off.is_enabled(*other), other != feature);
+            }
+            assert_eq!(off.with(*feature, true), Features::ALL_ENABLED);
+        }
+    }
+
+    #[test]
+    fn settings_overlay_toggles_one_at_a_time() {
+        let mut config = Settings::new();
+        config.set_feature(Feature::Loops, false);
+        config.set_feature(Feature::RpcCalls, false);
+        let mut over = Settings::new();
+        over.set_feature(Feature::Loops, true);
+        let effective = config.overlay(&over);
+        assert_eq!(effective.feature(Feature::Loops), Some(true));
+        assert_eq!(effective.feature(Feature::RpcCalls), Some(false));
+        assert_eq!(effective.feature(Feature::Callbacks), None);
+        assert!(!effective.features().is_enabled(Feature::RpcCalls));
+        assert!(effective.features().is_enabled(Feature::Loops));
+        assert_eq!(config.feature(Feature::Loops), Some(false));
+    }
+}

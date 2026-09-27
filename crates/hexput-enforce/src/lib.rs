@@ -75,6 +75,12 @@
 //! [`DEFAULT_SIDE_EFFECTS`], [`DEFAULT_ARGUMENT_DEPTH`] and [`DEFAULT_AUTHORIZATION_TIMEOUT`], all
 //! taken from that table.
 //!
+//! # Feature toggles (Story 3.9)
+//!
+//! [`Limits`] also carries the language feature toggles in force ([`Limits::features`]), copied
+//! from the same overlaid settings; `hexput-exec` hands them to the interpreter, which refuses a
+//! disabled construct itself. Every toggle defaults to enabled.
+//!
 //! Binds: AD-3.
 
 use std::collections::HashMap;
@@ -82,6 +88,7 @@ use std::time::Duration;
 
 pub use hexput_shared::budget::{Dimension, Setting, Settings};
 use hexput_shared::diagnostics::{Category, Code, Diagnostic, Span};
+pub use hexput_shared::policy::{Feature, Features};
 
 /// The CPU time an execution may spend running Script code by default: 1 second.
 pub const DEFAULT_CPU_TIME: Duration = Duration::from_millis(Setting::CpuTimeMs.default());
@@ -130,6 +137,7 @@ pub struct Limits {
     side_effects: u64,
     argument_depth: usize,
     authorization_timeout: Duration,
+    features: Features,
 }
 
 impl Default for Limits {
@@ -143,6 +151,7 @@ impl Default for Limits {
             side_effects: DEFAULT_SIDE_EFFECTS,
             argument_depth: DEFAULT_ARGUMENT_DEPTH,
             authorization_timeout: DEFAULT_AUTHORIZATION_TIMEOUT,
+            features: Features::ALL_ENABLED,
         }
     }
 }
@@ -164,7 +173,21 @@ impl Limits {
             authorization_timeout: Duration::from_millis(
                 settings.effective(Setting::AuthorizationTimeoutMs),
             ),
+            features: settings.features(),
         }
+    }
+
+    /// The language feature toggles in force.
+    #[must_use]
+    pub const fn features(&self) -> Features {
+        self.features
+    }
+
+    /// These limits with the language feature toggles set to `features`.
+    #[must_use]
+    pub const fn with_features(mut self, features: Features) -> Self {
+        self.features = features;
+        self
     }
 
     /// The CPU time limit.

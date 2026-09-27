@@ -258,3 +258,11 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-8-change-execution-policy-without-reconnecting.md`
   summary: Whether a Value Secret's hidden metadata counts toward the allocation (or memory) budget is unstated; the recompiled epic-3-context dropped the old open note.
   evidence: Review finding (blind, low). LANGUAGE-REFERENCE §7 defines allocations without Value Secrets, which do not exist yet. Decide in Story 3.11's spec.
+
+- source_spec: `spec-3-9-switch-off-language-constructs-by-policy.md`
+  summary: The runtime and `hexput-check` report `policy.construct_disabled` with different messages and spans (host call: `name(args)` vs `name`; named function: `fn name` vs `fn`), and `hexput-check::Policy` still has six hand-written booleans instead of `hexput_shared::policy::Features`.
+  evidence: Review finding (blind, low). Align both when Story 3.10 wires the check's `Policy` from the same Config.
+
+- source_spec: `spec-3-9-switch-off-language-constructs-by-policy.md`
+  summary: The `rpc_calls` toggle is checked only on the bare-name host-call path; Registered Method calls (`value.name(args)`, Story 3.12) must be refused by it too.
+  evidence: Review finding (blind, low). LANGUAGE-REFERENCE says `rpc_calls` switches off every host call (§8), which includes methods. Add the check and a test with Story 3.12.

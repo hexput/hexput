@@ -2,7 +2,7 @@
 title: 'Story 3.9: Switch off language constructs by policy'
 type: 'feature'
 created: '2026-09-27'
-status: 'in-progress'
+status: 'done'
 baseline_commit: 'a1651f6daefc76f47f422c35a676fa83bb36b8fb'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -101,17 +101,37 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `hexput-shared`, `hexput-port`: `Feature`/`Features`, the `Settings` toggles, and the decoder.
-- [ ] `hexput-ast`, `hexput-interpreter`: re-export; runtime refusals.
-- [ ] `hexput-enforce`, `hexput-exec`: carry toggles through `Limits`.
-- [ ] Tests for every matrix row.
-- [ ] Docs.
+- [x] `hexput-shared`, `hexput-port`: `Feature`/`Features`, the `Settings` toggles, and the decoder.
+- [x] `hexput-ast`, `hexput-interpreter`: re-export; runtime refusals.
+- [x] `hexput-enforce`, `hexput-exec`: carry toggles through `Limits`.
+- [x] Tests for every matrix row.
+- [x] Docs.
 
 **Acceptance Criteria:**
 - Given any single disabled toggle, when a Script evaluates that construct, then it fails with `policy.construct_disabled` naming `features.<toggle>`, and with no toggle set every construct runs.
 - Given a name outside the closed set, when it appears under `features`, then the payload is refused and nothing runs or is created.
 
 ## Spec Change Log
+
+- 2026-09-27 (implementation): a named function is refused where **every** block hoists — the top level's on the first run, a nested block's when it is entered — rather than where a nested `fn` statement is evaluated. Nested named functions are hoisted when their block opens (§6), so a check at the statement would let the function be called earlier in the block; checking at the hoist keeps "with no function definable, nothing local can be invoked" true. The error is spanned on `fn name`.
+
+## Review Triage Log
+
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | verification-gap | Callbacks refusal at a `for … in` body's scope opening (the one block reached through `open` directly) is untested | low | Pre-verified. **patch** (test) |
+| 2 | edge-case + blind | `Execution::with_features` works after `HostCall::resume`/`Paused::resume`, loosening toggles mid-run and skipping the top-level hoist check | low | Real: `resume` returns an `Execution`; only `hexput-exec` calls it, before the first run. **patch**: ignored once started, `debug_assert!` |
+| 3 | blind | A `ConfigUpdate` omitting `features` silently re-enables every toggle (Story 3.8 replace semantics) | medium | Real consequence of Story 3.8 decision 1, already deferred there. **patch** (documented in LANGUAGE-REFERENCE) + existing deferred entry stands |
+| 4 | blind | A policy stop is never logged, unlike budget stops and capability refusals | low | Real; direct. **patch** (`debug` log) |
+| 5 | blind | Runtime and `hexput-check` word and span `policy.construct_disabled` differently; the Spine says the types are shared by `hexput-check` | low | Real; the check keeps its own `Policy` by this spec. **patch** (Spine wording) + **defer** (align in Story 3.10) |
+| 6 | blind | `rpc_calls` covers only bare-name host calls; §8 Registered Methods (Story 3.12) must check it too | low | Real future gap. **defer** to Story 3.12 |
+| 7 | blind | Docs don't say toggles are syntactic (recursion still repeats, `&&`/`||`/`?.` still branch) | low | Real; direct. **patch** |
+| 8 | blind | No test of an invalid `features` map in a `ConfigUpdate` | low | Real; cheap. **patch** (test) |
+| 9 | blind | Thin coverage: `else if` chain, toggles after a resume | low | Real; cheap. **patch** (tests) |
+| 10 | blind | `Feature::index()` duplicates `ALL`'s order with no assertion | low | Real; direct. **patch** (test) |
+| 11 | blind | Spine `updated:` not bumped | low | Real; direct. **patch** |
+| 12 | blind | Code Map still says nested `fn` is checked at statement time | — | Rejected: fix edits this build's spec; the Spec Change Log records the as-built rule |
+| 13 | blind | Sprint status `in-progress` vs spec `in-review` | false | Step 5 syncs the sprint status |
 
 ## Verification
 

@@ -11,6 +11,11 @@ use hexput_parser::parse;
 static STANDARD: std::sync::LazyLock<Environment> = std::sync::LazyLock::new(Environment::new);
 static LISTED: std::sync::LazyLock<Environment> =
     std::sync::LazyLock::new(|| Environment::new().with_callables(["warn"]));
+static KEYED: std::sync::LazyLock<Environment> = std::sync::LazyLock::new(|| {
+    Environment::new()
+        .with_variables(["u"])
+        .with_keyed("u", ["save"])
+});
 const ENABLED: Policy = Policy::new();
 const NO_LOOPS: Policy = Policy {
     loops: false,
@@ -747,7 +752,7 @@ fn a_script_the_pass_calls_clean_evaluates_without_those_failures() {
 /// slice out. `tests/shared.rs` pins the full list of code strings against `Code::ALL`.
 #[test]
 fn every_finding_code_spans_the_offending_source() {
-    let cases: [(&str, &Environment, &Policy, Code, &str); 8] = [
+    let cases: [(&str, &Environment, &Policy, Code, &str); 9] = [
         (
             "return x;",
             &STANDARD,
@@ -804,6 +809,13 @@ fn every_finding_code_spans_the_offending_source() {
             Code::CONSTRUCT_DISABLED,
             "while",
         ),
+        (
+            "u.save = 1;",
+            &KEYED,
+            &ENABLED,
+            Code::METHOD_OVERRIDE,
+            "u.save",
+        ),
     ];
     for (source, environment, policy, code, offending) in cases {
         let program = parse(source).expect("the source parses");
@@ -829,8 +841,8 @@ fn every_finding_code_spans_the_offending_source() {
             assert_ne!(code, other, "the sweep must reach each code once");
         }
     }
-    // The pass produces the eight codes above and no others. `Code::DUPLICATE_DECLARATION` is
-    // the ninth and is covered by its own test, because it needs a starting variable to reach.
+    // The pass produces the nine codes above and no others. `Code::DUPLICATE_DECLARATION` is
+    // the tenth and is covered by its own test, because it needs a starting variable to reach.
     assert!(!findings("let n = 1; return n;").has_errors());
 }
 
@@ -980,5 +992,180 @@ mod from_features {
             "{:?}",
             found.diagnostics()
         );
+    }
+}
+
+// --- Story 3.12: overriding a Registered Method ---
+
+mod method_override {
+    use hexput_check::{Code, Environment, Severity};
+
+    use super::{codes, findings_with};
+
+    /// `u` a keyed starting variable with the method `save`; `v` a plain one.
+    fn keyed() -> Environment {
+        Environment::new()
+            .with_variables(["u", "v"])
+            .with_keyed("u", ["save"])
+    }
+
+    #[test]
+    fn writing_a_method_of_a_keyed_starting_variable_is_an_error() {
+        for (source, target) in [
+            ("u.save = 1;", "u.save"),
+            ("u[\"save\"] = 1;", "u[\"save\"]"),
+            ("if (v) { u.save = fn() {}; };", "u.save"),
+            ("fn later() { u.save = 2; }; later();", "u.save"),
+        ] {
+            let found = findings_with(source, &keyed());
+            assert_eq!(codes(&found), ["capability.method_override"], "{source}");
+            let finding = &found.diagnostics()[0];
+            assert_eq!(finding.severity, Severity::Error);
+            assert_eq!(finding.code, Code::METHOD_OVERRIDE);
+            assert_eq!(&source[finding.span.range()], target, "{source}");
+        }
+    }
+
+    #[test]
+    fn the_finding_is_the_runtime_error_word_for_word() {
+        let source = "u.save = 1;";
+        let found = findings_with(source, &keyed());
+        let program = std::sync::Arc::new(hexput_parser::parse(source).unwrap());
+        let user = hexput_interpreter::Held::plain(hexput_interpreter::Value::Object(
+            hexput_interpreter::Object::from_held_entries(
+                Vec::<(&str, hexput_interpreter::Held)>::new(),
+                Some(hexput_interpreter::Secret::new(
+                    "r1",
+                    Some(std::sync::Arc::from("User")),
+                    Vec::new(),
+                )),
+            ),
+        ));
+        let runtime = hexput_interpreter::Execution::with_variables(program, [("u", user)])
+            .unwrap()
+            .with_methods([("User", "save")])
+            .run()
+            .err()
+            .expect("refused at runtime");
+        let finding = &found.diagnostics()[0];
+        assert_eq!(finding.message, runtime.message);
+        assert_eq!(finding.span, runtime.span);
+        assert_eq!(finding.code, runtime.code);
+    }
+
+    #[test]
+    fn anything_that_might_not_reach_the_keyed_value_is_silent() {
+        for source in [
+            // Another property, a computed key, a deeper write, a plain variable.
+            "u.other = 1;",
+            "let k = \"save\"; u[k] = 1;",
+            "u.inner.save = 1;",
+            "v.save = 1;",
+            // Writing `__secret` does nothing at all.
+            "u.__secret = 1;",
+            // Reassigned or shadowed anywhere, so `u` may name something else.
+            "u = {}; u.save = 1;",
+            "if (v) { let u = {}; u.save = 1; };",
+            "fn f(u) { u.save = 1; }; f({});",
+            "let g = fn(u) { u.save = 1; }; g({});",
+            "for (u in [{}]) { u.save = 1; };",
+            "if (v) { fn u() {}; u.save = 1; };",
+            // Calling a method is never a finding.
+            "u.save(); u.nope(); return u[\"save\"]();",
+        ] {
+            let found = findings_with(source, &keyed());
+            assert!(
+                !codes(&found).contains(&"capability.method_override"),
+                "{source}: {:?}",
+                found.diagnostics()
+            );
+        }
+        // Keyed but not a starting variable: nothing is known about `w`.
+        let environment = Environment::new().with_keyed("w", ["save"]);
+        let found = findings_with("let w = {}; w.save = 1;", &environment);
+        assert!(!codes(&found).contains(&"capability.method_override"));
+    }
+
+    #[test]
+    fn a_method_call_on_a_keyed_value_is_never_an_unknown_call() {
+        let environment = keyed().with_callables(Vec::<String>::new());
+        let found = findings_with("return u.save() + u.nope();", &environment);
+        assert!(found.is_empty(), "{:?}", found.diagnostics());
+    }
+}
+
+mod method_toggle {
+    use hexput_check::{Environment, Policy, check};
+
+    fn keyed() -> Environment {
+        Environment::new()
+            .with_variables(["u"])
+            .with_keyed("u", ["save"])
+    }
+
+    const NO_RPC: Policy = Policy {
+        rpc_calls: false,
+        ..Policy::new()
+    };
+
+    #[test]
+    fn a_method_call_under_disabled_rpc_calls_is_the_runtime_refusal() {
+        for (source, call) in [
+            ("return u.save(1);", "u.save(1)"),
+            ("return u[\"save\"]();", "u[\"save\"]()"),
+        ] {
+            let program = hexput_parser::parse(source).unwrap();
+            let found = check(&program, &keyed(), &NO_RPC);
+            assert_eq!(found.len(), 1, "{source}: {:?}", found.diagnostics());
+            let finding = &found.diagnostics()[0];
+            assert_eq!(&source[finding.span.range()], call);
+            // The runtime, against the same toggle.
+            let user = hexput_interpreter::Held::plain(hexput_interpreter::Value::Object(
+                hexput_interpreter::Object::from_held_entries(
+                    Vec::<(&str, hexput_interpreter::Held)>::new(),
+                    Some(hexput_interpreter::Secret::new(
+                        "r1",
+                        Some(std::sync::Arc::from("User")),
+                        Vec::new(),
+                    )),
+                ),
+            ));
+            let runtime = hexput_interpreter::Execution::with_variables(
+                std::sync::Arc::new(program),
+                [("u", user)],
+            )
+            .unwrap()
+            .with_features(
+                hexput_interpreter::Features::ALL_ENABLED
+                    .with(hexput_interpreter::Feature::RpcCalls, false),
+            )
+            .with_methods([("User", "save")])
+            .run()
+            .err()
+            .expect("refused at runtime");
+            assert_eq!(finding.code, runtime.code);
+            assert_eq!(finding.message, runtime.message);
+            assert_eq!(finding.span, runtime.span);
+        }
+    }
+
+    #[test]
+    fn any_other_call_on_a_keyed_value_is_silent() {
+        let disabled = |source: &str, policy: &Policy| {
+            let program = hexput_parser::parse(source).unwrap();
+            check(&program, &keyed(), policy)
+                .diagnostics()
+                .iter()
+                .any(|finding| finding.code.as_str() == "policy.construct_disabled")
+        };
+        // Not a method: it may be an own property.
+        assert!(!disabled("return u.other();", &NO_RPC));
+        // The toggle is on.
+        assert!(!disabled("return u.save();", &Policy::new()));
+        // Shadowed: `u` may be anything.
+        assert!(!disabled(
+            "fn f(u) { return u.save(); }; return f(1);",
+            &NO_RPC
+        ));
     }
 }

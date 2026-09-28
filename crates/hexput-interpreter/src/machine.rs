@@ -69,7 +69,7 @@
 //! (`<prefix>:<counter>`, the counter from 1, the prefix set by the Executor), stored back on its
 //! collection or place so the same one sent again carries the same ID.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -161,11 +161,14 @@ enum Frame {
         index: usize,
         in_target: bool,
     },
-    /// `[receiver, key]` → `[element]`, then continues with `links[index + 1]`.
+    /// `[receiver, key]` → `[element]`, then continues with `links[index + 1]`. `keyed` is the
+    /// receiver's object key when the next link calls the element (Story 3.12), taken before the
+    /// key expression ran.
     IndexRead {
         chain: Chain,
         index: usize,
         in_target: bool,
+        keyed: Option<Box<Keyed>>,
     },
     /// `[value]` → `[]`, assigning the identifier expression `target` the value of the
     /// expression `value`.
@@ -220,6 +223,28 @@ enum Frame {
         chain: Chain,
         in_target: bool,
     },
+    /// `[receiver, a0 … aN-1]` → stops the machine with a method call (Story 3.12): the chain's
+    /// `links[index]` names a method of a keyed receiver and `links[index + 1]` calls it.
+    /// [`Machine::resume`] continues the chain after the call.
+    MethodCall(Box<MethodAt>),
+}
+
+/// A keyed receiver (Story 3.12): its object key, and — for a receiver that is not an array or
+/// object — the secret of its place, the one holding the key. A collection carries its own.
+struct Keyed {
+    key: Arc<str>,
+    secret: Option<Secret>,
+}
+
+/// A method call waiting for its arguments (see [`Frame::MethodCall`]).
+struct MethodAt {
+    chain: Chain,
+    /// The link naming the method; the next one calls it.
+    index: usize,
+    in_target: bool,
+    /// The method's name: the property's, or the string index's.
+    name: Arc<str>,
+    receiver: Keyed,
 }
 
 /// What a loop needs to run and to be unwound to. Boxed inside [`Frame`] so one loop's state
@@ -337,8 +362,13 @@ impl References {
 pub(crate) struct PendingCall {
     pub(crate) name: String,
     pub(crate) arguments: Vec<Argument>,
-    /// From the callee's name through the call's closing parenthesis.
+    /// From the callee's name — or, for a method, the receiver expression — through the call's
+    /// closing parenthesis.
     pub(crate) span: Span,
+    /// A method call's receiver, detached like an argument (Story 3.12); `None` for a function.
+    pub(crate) receiver: Option<Argument>,
+    /// A method call's object key, from the receiver's Value Secret.
+    pub(crate) key: Option<Arc<str>>,
 }
 
 pub(crate) struct Machine<P> {
@@ -356,8 +386,9 @@ pub(crate) struct Machine<P> {
     definitions: HashMap<FnAt, usize>,
     /// Number of calls currently on the frame stack; bounded by [`CALL_DEPTH_LIMIT`].
     depth: usize,
-    /// The chain a host call suspended, to carry on with once its value arrives.
-    suspended: Option<(Chain, bool)>,
+    /// The chain a host call suspended, the link to carry on from once its value arrives, and
+    /// whether the chain is an assignment target's.
+    suspended: Option<(Chain, usize, bool)>,
     /// The limits the machine meters against.
     meter: Meter,
     /// Work done in the current slice, in units (see the module documentation).
@@ -378,6 +409,18 @@ pub(crate) struct Machine<P> {
     reply_secret: Option<(ExprId, Secret)>,
     /// Where generated Reference IDs come from.
     references: References,
+    /// The Session's Registered Methods, by object key (Story 3.12): which calls on a keyed
+    /// value are method calls, and which properties a Script may not write. Data only.
+    methods: HashMap<Arc<str>, HashSet<Arc<str>>>,
+    /// The place a chain's link read a string, number, bool or `null` from, when the link after
+    /// it names a method call on it: the chain, that next link, and the place — so the call can
+    /// find the receiver's key.
+    ///
+    /// The rule it relies on: `note_receiver_place` sets it while running `links[j]` and then
+    /// pushes the `Frame::Link` for `links[j + 1]`, which is therefore the very next frame to
+    /// run; `Machine::link` takes the slot first thing, whatever that link turns out to be. So a
+    /// place noted for one link is never seen by any other.
+    chain_place: Option<(ExprId, usize, Location)>,
 }
 
 impl<P: Deref<Target = Program> + Clone> Machine<P> {
@@ -423,6 +466,8 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 prefix: Arc::from(DEFAULT_REFERENCE_PREFIX),
                 issued: 0,
             },
+            methods: HashMap::new(),
+            chain_place: None,
         };
         for (name, held) in variables {
             let attached = machine.heap.attach(&held.value);
@@ -480,6 +525,20 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// Meter the rest of the run against `meter`.
     pub(crate) fn set_meter(&mut self, meter: Meter) {
         self.meter = meter;
+    }
+
+    /// Know the Session's Registered Methods, as `(key, name)` pairs (Story 3.12).
+    pub(crate) fn set_methods(&mut self, methods: impl IntoIterator<Item = (Arc<str>, Arc<str>)>) {
+        for (key, name) in methods {
+            self.methods.entry(key).or_default().insert(name);
+        }
+    }
+
+    /// Whether `name` is a Registered Method under `key`.
+    fn is_method(&self, key: &str, name: &str) -> bool {
+        self.methods
+            .get(key)
+            .is_some_and(|names| names.contains(name))
     }
 
     /// Generate Reference IDs as `<prefix>:<counter>` from here on.
@@ -602,6 +661,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             | Frame::Invoke { chain, index, .. }
             | Frame::CallEnd { chain, index, .. } => Site::Link(*chain, *index),
             Frame::HostCall { chain, .. } => Site::Link(*chain, 0),
+            Frame::MethodCall(at) => Site::Link(at.chain, at.index + 1),
             Frame::Located(_) => Site::Unknown,
             Frame::Loop(state) | Frame::LoopTest(state) => match &state.kind {
                 LoopKind::While { keyword, .. } | LoopKind::For { keyword, .. } => {
@@ -620,13 +680,13 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// secret keeps it only when the call is the whole value a statement stores (decision 2);
     /// otherwise it is a computed value and plain.
     pub(crate) fn resume(&mut self, held: &Held) {
-        if let Some((chain, in_target)) = self.suspended.take() {
+        if let Some((chain, next, in_target)) = self.suspended.take() {
             let value = self.heap.attach(&held.value);
             let whole_call = !in_target
-                && chain.end == 1
+                && chain.end == next
                 && matches!(
                     &self.program.expression(chain.access).kind,
-                    ExpressionKind::Access { links, .. } if links.len() == 1
+                    ExpressionKind::Access { links, .. } if links.len() == next
                 );
             self.reply_secret = match &held.secret {
                 Some(secret) if whole_call && !held.value.is_collection() => {
@@ -637,7 +697,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             self.values.push(value);
             self.frames.push(Frame::Link {
                 chain,
-                index: 1,
+                index: next,
                 in_target,
             });
         }
@@ -821,6 +881,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 chain,
                 index,
                 in_target,
+                keyed,
             } => {
                 let key = self.pop();
                 let receiver = self.pop();
@@ -832,6 +893,16 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 let AccessKind::Index { expression, .. } = &link.kind else {
                     return Err(internal(link.span));
                 };
+                // `receiver["name"](…)` on a keyed receiver: the method call, when it is one.
+                if let (Some(keyed), RtValue::String(name)) = (keyed, &key)
+                    && self.dispatches(&receiver, &keyed.key, name.as_str())
+                {
+                    let name = name.shared();
+                    self.values.push(receiver);
+                    return self
+                        .open_method_call(tree, chain, index, in_target, name, *keyed)
+                        .map(|()| None);
+                }
                 // §3: `null["__secret"]` reads as null; any other key on `null` is the ordinary
                 // null access, raised once the key is evaluated.
                 if receiver.is_null()
@@ -847,6 +918,17 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     ));
                 }
                 let element = self.read_index(tree, &receiver, &key, link, *expression)?;
+                self.note_receiver_place(chain, index, links, &element, || {
+                    match (&receiver, &key) {
+                        (RtValue::Array(array), RtValue::Number(n)) => {
+                            array_slot(*n).map(|i| Location::Element(*array, i))
+                        }
+                        (RtValue::Object(object), RtValue::String(k)) => {
+                            Some(Location::Property(*object, k.shared()))
+                        }
+                        _ => None,
+                    }
+                });
                 // The last link of a read: the whole expression is this element or property,
                 // when it exists.
                 if !in_target && index + 1 == links.len() {
@@ -951,6 +1033,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             Frame::HostCall { chain, in_target } => {
                 return self.host_call(tree, chain, in_target).map(Some);
             }
+            Frame::MethodCall(at) => return self.method_call(tree, *at).map(Some),
         }
         Ok(None)
     }
@@ -1012,6 +1095,69 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         let AccessKind::Call { arguments, .. } = &link.kind else {
             return Err(internal(link.span));
         };
+        let detached = self.detach_arguments(tree, arguments, &name.name)?;
+        self.suspended = Some((chain, 1, in_target));
+        let span = through(name.span, link.span);
+        // Until the next frame runs after it resumes, the host call is the running construct:
+        // a value it brings back that crosses the memory ceiling is spanned on it.
+        self.site = Site::Span(span);
+        Ok(Stop::HostCall(PendingCall {
+            name: name.name.clone(),
+            arguments: detached,
+            span,
+            receiver: None,
+            key: None,
+        }))
+    }
+
+    /// Suspend on the method call `at` (Story 3.12), whose receiver and arguments are on the value
+    /// stack: detach the receiver and each argument, as a host call's arguments are detached, and
+    /// remember where to carry on.
+    fn method_call(&mut self, tree: &Program, at: MethodAt) -> Result<Stop, Diagnostic> {
+        let MethodAt {
+            chain,
+            index,
+            in_target,
+            name,
+            receiver: Keyed { key, secret },
+        } = at;
+        let (base, links) = chain_links(tree, chain);
+        let Some(call) = links.get(index + 1) else {
+            return Err(internal(tree.expression(chain.access).span));
+        };
+        let AccessKind::Call { arguments, .. } = &call.kind else {
+            return Err(internal(call.span));
+        };
+        let detached = self.detach_arguments(tree, arguments, &name)?;
+        let receiver = self.pop();
+        let receiver_span = links
+            .get(..index)
+            .and_then(<[AccessLink]>::last)
+            .map_or(tree.expression(base).span, |last| {
+                through(tree.expression(base).span, last.span)
+            });
+        let receiver = self.detach_sent(&receiver, receiver_span, secret, &name)?;
+        self.suspended = Some((chain, index + 2, in_target));
+        let span = through(tree.expression(base).span, call.span);
+        self.site = Site::Span(span);
+        Ok(Stop::HostCall(PendingCall {
+            name: name.to_string(),
+            arguments: detached,
+            span,
+            receiver: Some(receiver),
+            key: Some(key),
+        }))
+    }
+
+    /// Detach the host call's arguments — the expressions `arguments`, whose values are on top of
+    /// the value stack — each with a secret (decision 4 of Story 3.11). `callee` names the
+    /// function or method in an error.
+    fn detach_arguments(
+        &mut self,
+        tree: &Program,
+        arguments: &[ExprId],
+        callee: &str,
+    ) -> Result<Vec<Argument>, Diagnostic> {
         let values = self.pop_many(arguments.len());
         let at = self.argument_places.len().saturating_sub(arguments.len());
         let mut places = self.argument_places.split_off(at);
@@ -1023,59 +1169,204 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             // one stored back on them; a scalar written as a place gets the place's, stored back
             // too; a computed scalar gets a fresh one.
             let secret = match value {
-                RtValue::Array(_) | RtValue::Object(_) => {
-                    let references = &mut self.references;
-                    self.heap
-                        .assign_references(value, &mut || references.next());
-                    None
-                }
-                RtValue::Function(_) => None,
+                RtValue::Array(_) | RtValue::Object(_) | RtValue::Function(_) => None,
                 _ => Some(self.place_secret(place.as_ref())),
             };
-            let (code, reason) = match self.heap.detach(value) {
-                Ok(value) => {
-                    detached.push(Argument {
-                        value,
-                        span,
-                        secret,
-                    });
-                    continue;
-                }
-                Err(DetachFailure::Cycle) => (
-                    Code::CYCLIC_ARGUMENT,
-                    "it contains a value that refers back to itself",
-                ),
-                Err(DetachFailure::Function) if matches!(value, RtValue::Function(_)) => (
-                    Code::FUNCTION_ARGUMENT,
-                    "a function has no wire representation",
-                ),
-                Err(DetachFailure::Function) => (
-                    Code::FUNCTION_ARGUMENT,
-                    "it contains a function, which has no wire representation",
-                ),
-            };
-            return Err(Diagnostic::new(
-                Category::Type,
-                code,
-                format!(
-                    "cannot pass this {} to `{}`: {reason}, and a host call's arguments must be \
-                     data the Backend can receive",
-                    value.type_name(),
-                    name.name
-                ),
-                span,
-            ));
+            detached.push(self.detach_sent(value, span, secret, callee)?);
         }
-        self.suspended = Some((chain, in_target));
-        let span = through(name.span, link.span);
-        // Until the next frame runs after it resumes, the host call is the running construct:
-        // a value it brings back that crosses the memory ceiling is spanned on it.
-        self.site = Site::Span(span);
-        Ok(Stop::HostCall(PendingCall {
-            name: name.name.clone(),
-            arguments: detached,
-            span: through(name.span, link.span),
-        }))
+        Ok(detached)
+    }
+
+    /// Detach `value`, about to be sent to the host function or method `callee`, spanned on
+    /// `span`: an array or object and everything in it given a secret first, a string, number,
+    /// bool or `null` travelling with `secret`, its place's.
+    ///
+    /// # Errors
+    /// `type.cyclic_argument` or `type.function_argument`, spanned on `span`.
+    fn detach_sent(
+        &mut self,
+        value: &RtValue,
+        span: Span,
+        secret: Option<Secret>,
+        callee: &str,
+    ) -> Result<Argument, Diagnostic> {
+        if let RtValue::Array(_) | RtValue::Object(_) = value {
+            let references = &mut self.references;
+            self.heap
+                .assign_references(value, &mut || references.next());
+        }
+        let (code, reason) = match self.heap.detach(value) {
+            Ok(value) => {
+                return Ok(Argument {
+                    value,
+                    span,
+                    secret,
+                });
+            }
+            Err(DetachFailure::Cycle) => (
+                Code::CYCLIC_ARGUMENT,
+                "it contains a value that refers back to itself",
+            ),
+            Err(DetachFailure::Function) if matches!(value, RtValue::Function(_)) => (
+                Code::FUNCTION_ARGUMENT,
+                "a function has no wire representation",
+            ),
+            Err(DetachFailure::Function) => (
+                Code::FUNCTION_ARGUMENT,
+                "it contains a function, which has no wire representation",
+            ),
+        };
+        Err(Diagnostic::new(
+            Category::Type,
+            code,
+            format!(
+                "cannot pass this {} to `{callee}`: {reason}, and a host call's arguments must be \
+                 data the Backend can receive",
+                value.type_name(),
+            ),
+            span,
+        ))
+    }
+
+    /// `receiver`, which the chain's `links[index]` is applied to, when it is keyed (Story 3.12):
+    /// an array or object by its own secret's key, and any other value but a function by the key
+    /// of the place it was read from — the variable the chain's base names, or the property or
+    /// element the previous link read.
+    ///
+    /// `noted` is the place the previous link noted for this one (see `Machine::chain_place`).
+    fn keyed(
+        &self,
+        tree: &Program,
+        chain: Chain,
+        index: usize,
+        receiver: &RtValue,
+        noted: Option<Location>,
+    ) -> Option<Keyed> {
+        match receiver {
+            RtValue::Array(id) | RtValue::Object(id) => {
+                let key = self.heap.collection_secret(*id)?.shared_key()?;
+                Some(Keyed {
+                    key: Arc::clone(key),
+                    secret: None,
+                })
+            }
+            RtValue::Function(_) => None,
+            _ => {
+                let place = self.receiver_place(tree, chain, index, noted)?;
+                let secret = self.heap.location_secret(&place)?;
+                Some(Keyed {
+                    key: Arc::clone(secret.shared_key()?),
+                    secret: Some(secret.clone()),
+                })
+            }
+        }
+    }
+
+    /// The place the value the chain's `links[index]` is applied to was read from, when that
+    /// value is a string, number, bool or `null` read from one.
+    fn receiver_place(
+        &self,
+        tree: &Program,
+        chain: Chain,
+        index: usize,
+        noted: Option<Location>,
+    ) -> Option<Location> {
+        if index == 0 {
+            let (base, _) = chain_links(tree, chain);
+            return match &tree.expression(base).kind {
+                ExpressionKind::Identifier(name) => {
+                    self.heap.binding_location(self.scope, &name.name)
+                }
+                _ => None,
+            };
+        }
+        noted
+    }
+
+    /// Whether calling `name` on `receiver`, whose object key is `key`, is a method call (Story
+    /// 3.12, decision 2): it is, when `name` is a Registered Method under `key` — even over an own
+    /// property of that name — or when `receiver` has no own property `name` for an ordinary
+    /// call to reach, so the call is refused as a host call. `__secret` is never one: it reads as
+    /// `null` on every value.
+    fn dispatches(&self, receiver: &RtValue, key: &str, name: &str) -> bool {
+        if name == SECRET_KEY {
+            return false;
+        }
+        if self.is_method(key, name) {
+            return true;
+        }
+        !matches!(receiver, RtValue::Object(object) if self.heap.object_get(*object, name).is_some())
+    }
+
+    /// Remember where the chain's `links[index]` read `value` from — `place` — when the link
+    /// after it names a method that the one after that calls, and `value` is not an array, object
+    /// or function: the receiver's key is its place's.
+    fn note_receiver_place(
+        &mut self,
+        chain: Chain,
+        index: usize,
+        links: &[AccessLink],
+        value: &RtValue,
+        place: impl FnOnce() -> Option<Location>,
+    ) {
+        let names_method = matches!(
+            links.get(index + 1).map(|link| &link.kind),
+            Some(AccessKind::Property(_) | AccessKind::Index { .. })
+        ) && matches!(
+            links.get(index + 2).map(|link| &link.kind),
+            Some(AccessKind::Call { .. })
+        );
+        if !names_method
+            || matches!(
+                value,
+                RtValue::Array(_) | RtValue::Object(_) | RtValue::Function(_)
+            )
+        {
+            return;
+        }
+        self.chain_place = place().map(|place| (chain.access, index + 1, place));
+    }
+
+    /// Schedule the method call on the receiver on top of the value stack: its arguments, each
+    /// noting the place it was read from, then [`Frame::MethodCall`]. Refused first when the
+    /// `rpc_calls` toggle is off — before the receiver or any argument is checked.
+    fn open_method_call(
+        &mut self,
+        tree: &Program,
+        chain: Chain,
+        index: usize,
+        in_target: bool,
+        name: Arc<str>,
+        receiver: Keyed,
+    ) -> Result<(), Diagnostic> {
+        let (base, links) = chain_links(tree, chain);
+        let Some(call) = links.get(index + 1) else {
+            return Err(internal(tree.expression(chain.access).span));
+        };
+        let AccessKind::Call { arguments, .. } = &call.kind else {
+            return Err(internal(call.span));
+        };
+        if !self.features.is_enabled(Feature::RpcCalls) {
+            self.allow(
+                Feature::RpcCalls,
+                &format!("a method call to `{name}`"),
+                through(tree.expression(base).span, call.span),
+            )?;
+        }
+        self.frames.push(Frame::MethodCall(Box::new(MethodAt {
+            chain,
+            index,
+            in_target,
+            name,
+            receiver,
+        })));
+        self.frames.extend(
+            arguments
+                .iter()
+                .rev()
+                .flat_map(|a| [Frame::Located(*a), Frame::Eval(*a)]),
+        );
+        Ok(())
     }
 
     /// The secret of `place`, given a fresh Reference ID first when it has none; a fresh one
@@ -1606,6 +1897,15 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         index: usize,
         in_target: bool,
     ) -> Result<(), Diagnostic> {
+        // Taken whatever this link is: it was noted by the frame just before, for this link alone
+        // (see `Machine::chain_place`).
+        let noted = self.chain_place.take().map(|(access, at, place)| {
+            debug_assert!(
+                access == chain.access && at == index,
+                "a receiver place noted for one link reached another"
+            );
+            place
+        });
         let (base, links) = chain_links(tree, chain);
         let Some(link) = links.get(index) else {
             return Ok(()); // chain complete; its value is on the stack
@@ -1642,6 +1942,30 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             });
             return Ok(());
         }
+        // `receiver.name(…)` or `receiver["name"](…)` on a keyed receiver may be a method call
+        // (Story 3.12). A property decides here; an index once its key is known, with the
+        // receiver's key taken now, before the key expression runs.
+        let calls_next = matches!(
+            links.get(index + 1).map(|next| &next.kind),
+            Some(AccessKind::Call { .. })
+        );
+        let mut keyed = if calls_next {
+            self.values
+                .last()
+                .and_then(|receiver| self.keyed(tree, chain, index, receiver, noted))
+        } else {
+            None
+        };
+        if let AccessKind::Property(name) = &link.kind
+            && let Some(receiver) = keyed.take_if(|receiver| {
+                self.values
+                    .last()
+                    .is_some_and(|value| self.dispatches(value, &receiver.key, &name.name))
+            })
+        {
+            let name = Arc::from(name.name.as_str());
+            return self.open_method_call(tree, chain, index, in_target, name, receiver);
+        }
         // An index on `null` is refused once its key is known (`Frame::IndexRead`): the key
         // `__secret` reads as null there too.
         if receiver_is_null && !matches!(link.kind, AccessKind::Index { .. }) {
@@ -1659,6 +1983,12 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             AccessKind::Property(name) => {
                 let receiver = self.pop();
                 let value = self.read_property(&receiver, name, link)?;
+                self.note_receiver_place(chain, index, links, &value, || match &receiver {
+                    RtValue::Object(object) => {
+                        Some(Location::Property(*object, Arc::from(name.name.as_str())))
+                    }
+                    _ => None,
+                });
                 // The last link of a read: the whole expression is this property, when it exists.
                 if let RtValue::Object(object) = receiver
                     && !in_target
@@ -1679,6 +2009,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     chain,
                     index,
                     in_target,
+                    keyed: keyed.map(Box::new),
                 });
                 self.frames.push(Frame::Eval(*expression));
             }
@@ -1732,6 +2063,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         let ExpressionKind::Access { base, links } = &expression.kind else {
             return Err(internal(expression.span));
         };
+        let expression_span = expression.span;
         let Some((link, prefix)) = links.split_last() else {
             return Err(internal(expression.span));
         };
@@ -1741,6 +2073,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 if name.name == SECRET_KEY {
                     return Ok(());
                 }
+                self.refuse_override(&receiver, &name.name, expression.span)?;
                 match &receiver {
                     RtValue::Object(object) => {
                         self.heap.object_store(*object, &name.name, value);
@@ -1760,6 +2093,9 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 self.burn_text(&key);
                 if matches!(&key, RtValue::String(k) if k.as_str() == SECRET_KEY) {
                     return Ok(());
+                }
+                if let RtValue::String(name) = &key {
+                    self.refuse_override(&receiver, name.as_str(), expression_span)?;
                 }
                 let key_span = tree.expression(*expression).span;
                 match (&receiver, &key) {
@@ -1806,6 +2142,40 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             }
             AccessKind::Call { .. } => Err(internal(link.span)),
         }
+    }
+
+    /// Refuse writing the property `name` of `receiver` when it is a Registered Method under the
+    /// receiver's object key (Story 3.12, decision 5): `capability.method_override`, spanned on
+    /// the assignment target `span`, before anything is written. Only an array or object has
+    /// properties to write; any other receiver fails as it always did.
+    fn refuse_override(
+        &self,
+        receiver: &RtValue,
+        name: &str,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let (RtValue::Array(id) | RtValue::Object(id)) = receiver else {
+            return Ok(());
+        };
+        let Some(key) = self
+            .heap
+            .collection_secret(*id)
+            .and_then(Secret::shared_key)
+        else {
+            return Ok(());
+        };
+        if !self.is_method(key, name) {
+            return Ok(());
+        }
+        Err(Diagnostic::new(
+            Category::Capability,
+            Code::METHOD_OVERRIDE,
+            format!(
+                "cannot assign `{name}` on this value: it is a Registered Method of the value, and \
+                 a Script can never override one"
+            ),
+            span,
+        ))
     }
 
     fn binary_right(&mut self, left: ExprId, operator: Spanned<BinaryOperator>, right: ExprId) {

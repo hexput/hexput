@@ -2,7 +2,7 @@
 title: 'Story 3.12: Call a Backend method on a keyed object'
 type: 'feature'
 created: '2026-09-28'
-status: 'in-progress'
+status: 'done'
 baseline_commit: '67c6182607dd98e9ecc5d242fc03686ccffbd081'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -106,18 +106,43 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] Registration `key` and capability by `(key, name)`.
-- [ ] Interpreter dispatch, receiver, override, toggle.
-- [ ] Exec and RPC: receiver on the wire, counting, deciding.
-- [ ] Check: keyed environment and the override finding.
-- [ ] Tests for every matrix row.
-- [ ] Docs.
+- [x] Registration `key` and capability by `(key, name)`.
+- [x] Interpreter dispatch, receiver, override, toggle.
+- [x] Exec and RPC: receiver on the wire, counting, deciding.
+- [x] Check: keyed environment and the override finding.
+- [x] Tests for every matrix row.
+- [x] Docs.
 
 **Acceptance Criteria:**
 - Given a keyed receiver and a registered method, when it is called, then exactly one `Call` carrying `receiver` is sent, with the receiver's secret byte-identical, and every capability, budget and toggle rule of a function call applies.
 - Given any value without a key, when `value.name(args)` runs, then behavior and wire output are identical to before this story.
 
 ## Spec Change Log
+
+Implementation readings (agent, 2026-09-28), where the frozen intent left a choice open:
+
+- **Whose key.** Decision 2 (a): an array or object is keyed by its *own* Value Secret only, and a string, number, bool or `null` by the secret of the place it is read from (the chain's base variable, or the property or element the previous link read). A place's key is never used for a collection, because the receiver then travels with the collection's secret and the Backend could not learn the key from it (decision 3). A function is never keyed.
+- **Override receivers.** Decision 5 refuses a write only on an array or object whose own secret carries the key; a keyed scalar has no properties, so writing one stays the `type` error it was. For the same reason `hexput-script` declares keyed (decision 6) only a starting variable holding a keyed array or object — declaring a scalar would make the check's finding name a different code than the runtime's.
+- **Unobservable "unchanged".** The override error ends the Script (errors are uncatchable), so "`u` unchanged" cannot be observed by a later host call; the tests pin that the refusal precedes the write and that nothing is sent, and that a non-method write (`u.other = 1; f(u)`) is what reaches the Backend.
+- **Edges.** `?.` on `null` short-circuits before dispatch (§4.4), keyed or not. `__secret` is never a method name, neither at runtime nor in the check. The check's callable list (Story 3.10) now holds the Registered Functions' names only: a bare `save()` can never reach a method.
+- **Refusal message.** A refused method call carries `` `name` is not a method this Script may call on this value `` — the same for every reason, as a function's refusals share theirs; the log line adds `key` beside `function` and `reason`.
+
+## Review Triage Log
+
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | blind + edge-case | Docs say a disabled `rpc_calls` refuses before the receiver is evaluated; the receiver (and an index key) must be evaluated to find the key | low | Real wording defect. **patch** (LANGUAGE-REFERENCE, AGENTS.md, deferred-work) |
+| 2 | blind | Whether a typo'd method on a keyed value is counted, and which error wins under `rpc_calls` off, is undocumented and untested | low | Real. **patch** (doc + count test) |
+| 3 | blind | `chain_place` is never cleared; correctness rests on an unstated ordering rule | low | Verification layer's probe showed no current bug. **patch** (take-on-read + stated rule) |
+| 4 | blind | `check_call` allocates two `String`s per call; unused `Question::key()`; duplicated `debug!` | low | Real; direct. **patch** |
+| 5 | blind + edge-case | The static check stays silent on `u.save()` under `rpc_calls` off, though it reports `f()` | low | Real gap in toggle parity. **patch** (finding pinned against the runtime) |
+| 6 | verification-gap + blind | Untested: `?.` on a keyed `null`, a keyed array receiver/override, `u["__secret"]()`, a method call inside an assignment target, repeated dispatch in loops/recursion, a keyed scalar under the check, `fn u` shadowing in the check | low | Pre-verified. **patch** (tests) |
+| 7 | edge-case | A method registered as `__secret` is accepted but undispatchable | low | Real. **patch** (refused at `Init`) |
+| 8 | edge-case | A bad receiver's error blames "an argument" | low | Real; direct. **patch** |
+| 9 | blind | `with_methods` also registers functions; `RegisteredFunction` now models methods too | low | Rejected: naming only; renaming public types across crates is more than a direct correction |
+| 10 | blind | `arguments()` prepends the receiver and removes it with `remove(0)` | low | Rejected: correctness unaffected; restructuring is not a direct correction |
+| 11 | blind | Per-execution method maps built even with the check off | low | Rejected: registrations are few; perf only |
+| 12 | blind | Status disagreement across files | false | Step 5 syncs the sprint status |
 
 ## Verification
 

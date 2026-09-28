@@ -22,7 +22,8 @@ use std::collections::{HashMap, HashSet};
 
 use hexput_ast::{
     AccessKind, AccessLink, Block, BlockId, Category, Code, Diagnostic, ExprId, Expression,
-    ExpressionKind, Feature, Function, Identifier, Program, Span, Statement, StatementKind,
+    ExpressionKind, Feature, Function, Identifier, Literal, Program, Span, Statement,
+    StatementKind,
 };
 
 use crate::operands;
@@ -78,13 +79,16 @@ pub(crate) fn run(
     environment: &Environment,
     policy: &Policy,
 ) -> Vec<Diagnostic> {
+    let reassigned = reassigned_names(program);
+    let keyed = keyed_variables(program, environment, &reassigned);
     let mut walk = Walk {
         program,
         policy,
         callables: environment
             .callables()
             .map(|names| names.iter().map(String::as_str).collect()),
-        reassigned: reassigned_names(program),
+        reassigned,
+        keyed,
         scopes: Vec::new(),
         findings: Vec::new(),
     };
@@ -137,9 +141,63 @@ fn reassigned_names(program: &Program) -> HashSet<&str> {
     names
 }
 
+/// The keyed starting variables (Story 3.12) whose every mention in the Script certainly names the
+/// keyed value: never assigned, and never declared again anywhere — by `let`, `fn`, a parameter
+/// or a `for` binding — so no scope can shadow them. Each with its Registered Methods.
+fn keyed_variables<'e>(
+    program: &Program,
+    environment: &'e Environment,
+    reassigned: &HashSet<&str>,
+) -> HashMap<&'e str, HashSet<&'e str>> {
+    if environment.keyed().is_empty() {
+        return HashMap::new();
+    }
+    let mut declared: HashSet<&str> = HashSet::new();
+    let statements = program
+        .statements
+        .iter()
+        .chain(program.blocks.iter().flat_map(|block| &block.statements));
+    for statement in statements {
+        match &statement.kind {
+            StatementKind::Let { name, .. } => {
+                declared.insert(name.name.as_str());
+            }
+            StatementKind::Function { name, function } => {
+                declared.insert(name.name.as_str());
+                declared.extend(function.parameters.iter().map(|p| p.name.as_str()));
+            }
+            StatementKind::For { binding, .. } => {
+                declared.insert(binding.name.as_str());
+            }
+            _ => {}
+        }
+    }
+    for expression in &program.expressions {
+        if let ExpressionKind::Function(function) = &expression.kind {
+            declared.extend(function.parameters.iter().map(|p| p.name.as_str()));
+        }
+    }
+    let mut keyed: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (variable, methods) in environment.keyed() {
+        let name = variable.as_str();
+        if environment.variables().iter().any(|v| v == name)
+            && !declared.contains(name)
+            && !reassigned.contains(name)
+        {
+            keyed
+                .entry(name)
+                .or_default()
+                .extend(methods.iter().map(String::as_str));
+        }
+    }
+    keyed
+}
+
 struct Walk<'p> {
     program: &'p Program,
     policy: &'p Policy,
+    /// Keyed starting variables no scope shadows, with their Registered Methods (Story 3.12).
+    keyed: HashMap<&'p str, HashSet<&'p str>>,
     /// `None` when the caller supplied no callable-name list, which suppresses the unknown-call
     /// finding entirely — as distinct from an empty list, which does not.
     callables: Option<HashSet<&'p str>>,
@@ -448,6 +506,7 @@ impl<'p> Walk<'p> {
     /// ordinary expressions.
     fn assignment(&mut self, target: ExprId, jobs: &mut Vec<Job<'p>>) {
         let ExpressionKind::Identifier(name) = &self.program.expression(target).kind else {
+            self.method_override(target);
             jobs.push(Job::Expression(target));
             return;
         };
@@ -463,6 +522,39 @@ impl<'p> Walk<'p> {
             ));
         }
         // Writing is not reading: a binding only ever assigned is still an unused local.
+    }
+
+    /// `v.m = x` or `v["m"] = x`, where `v` is a keyed starting variable no scope shadows and `m`
+    /// one of its Registered Methods: certain to fail as `capability.method_override`, with the
+    /// runtime's message and span (Story 3.12).
+    fn method_override(&mut self, target: ExprId) {
+        let expression = self.program.expression(target);
+        let ExpressionKind::Access { base, links } = &expression.kind else {
+            return;
+        };
+        let (ExpressionKind::Identifier(variable), [link]) =
+            (&self.program.expression(*base).kind, links.as_slice())
+        else {
+            return;
+        };
+        let Some(methods) = self.keyed.get(variable.name.as_str()) else {
+            return;
+        };
+        let Some(name) = self.link_name(link) else {
+            return;
+        };
+        // Writing `__secret` does nothing at all (LANGUAGE-REFERENCE §3), so it can never fail.
+        if name != "__secret" && methods.contains(name) {
+            self.findings.push(Diagnostic::new(
+                Category::Capability,
+                Code::METHOD_OVERRIDE,
+                format!(
+                    "cannot assign `{name}` on this value: it is a Registered Method of the \
+                     value, and a Script can never override one"
+                ),
+                expression.span,
+            ));
+        }
     }
 
     fn enter(&mut self, body: BlockId, jobs: &mut Vec<Job<'p>>) {
@@ -547,7 +639,10 @@ impl<'p> Walk<'p> {
         };
         match called {
             Some((name, link)) => self.call(name, link),
-            None => jobs.push(Job::Expression(base)),
+            None => {
+                self.method_call(base, links);
+                jobs.push(Job::Expression(base));
+            }
         }
         for link in links.iter().rev() {
             match &link.kind {
@@ -608,6 +703,51 @@ impl<'p> Walk<'p> {
                 // `capability.unknown_function` uses, so both underline the same range.
                 whole,
             ));
+        }
+    }
+
+    /// `v.m(…)` or `v["m"](…)` (literal) under a disabled `rpc_calls`, where `v` is a keyed
+    /// starting variable no scope shadows and `m` one of its Registered Methods: certain to be
+    /// refused, with the runtime's message and span (Story 3.12). Any other call on a keyed value
+    /// might reach an own property, so it is left alone.
+    fn method_call(&mut self, base: ExprId, links: &'p [AccessLink]) {
+        if self.policy.rpc_calls {
+            return;
+        }
+        let (ExpressionKind::Identifier(variable), [link, call, ..]) =
+            (&self.program.expression(base).kind, links)
+        else {
+            return;
+        };
+        if !matches!(call.kind, AccessKind::Call { .. }) {
+            return;
+        }
+        let Some(methods) = self.keyed.get(variable.name.as_str()) else {
+            return;
+        };
+        let Some(name) = self.link_name(link) else {
+            return;
+        };
+        if name != "__secret" && methods.contains(name) {
+            self.disabled(
+                Feature::RpcCalls,
+                &format!("a method call to `{name}`"),
+                through(variable.span, call.span),
+            );
+        }
+    }
+
+    /// The property a `.name` or `["name"]` (literal string) link names.
+    fn link_name(&self, link: &'p AccessLink) -> Option<&'p str> {
+        match &link.kind {
+            AccessKind::Property(name) => Some(name.name.as_str()),
+            AccessKind::Index { expression, .. } => {
+                match &self.program.expression(*expression).kind {
+                    ExpressionKind::Literal(Literal::String(name)) => Some(name.as_str()),
+                    _ => None,
+                }
+            }
+            AccessKind::Call { .. } => None,
         }
     }
 

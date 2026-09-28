@@ -91,6 +91,7 @@ fn finding_codes_are_stable_and_distinct() {
         (Code::UNREACHABLE_CODE, "syntax.unreachable_code"),
         (Code::UNUSED_VARIABLE, "reference.unused_variable"),
         (Code::UNKNOWN_FUNCTION, "capability.unknown_function"),
+        (Code::METHOD_OVERRIDE, "capability.method_override"),
         (Code::CONSTRUCT_DISABLED, "policy.construct_disabled"),
     ];
     for (i, (code, text)) in codes.iter().enumerate() {
@@ -154,6 +155,7 @@ fn every_code_is_enumerated_exactly_once() {
         "syntax.unreachable_code",
         "reference.unused_variable",
         "capability.unknown_function",
+        "capability.method_override",
         "policy.construct_disabled",
     ];
 

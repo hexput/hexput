@@ -250,6 +250,11 @@ impl Secret {
         self.key.as_deref()
     }
 
+    /// The object key, shared.
+    pub(crate) fn shared_key(&self) -> Option<&Arc<str>> {
+        self.key.as_ref()
+    }
+
     /// The further fields, exactly as they were handed to [`Secret::new`].
     #[must_use]
     pub fn extra(&self) -> &[u8] {

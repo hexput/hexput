@@ -2888,3 +2888,450 @@ mod value_secrets {
         assert_eq!(object.len(), 1);
     }
 }
+
+// --- Story 3.12: Registered Methods ---
+
+mod methods {
+    use std::sync::Arc;
+
+    use hexput_interpreter::{
+        Argument, Array, Diagnostic, Execution, Feature, Features, Held, Object, Outcome, Secret,
+        Value, evaluate,
+    };
+
+    fn keyed(reference: &str, key: &str) -> Secret {
+        Secret::new(reference, Some(Arc::from(key)), Vec::new())
+    }
+
+    /// `{name: "a"}` keyed `User` as `r1`, plus `extra` properties.
+    fn user_with(extra: Vec<(&str, Value)>) -> Held {
+        let mut entries = vec![("name", Held::plain(Value::String(Arc::from("a"))))];
+        entries.extend(extra.into_iter().map(|(k, v)| (k, Held::plain(v))));
+        Held::plain(Value::Object(Object::from_held_entries(
+            entries,
+            Some(keyed("r1", "User")),
+        )))
+    }
+
+    fn user() -> Held {
+        user_with(vec![])
+    }
+
+    /// One host call the Script made: name, key, receiver and arguments.
+    struct Made {
+        name: String,
+        key: Option<String>,
+        receiver: Option<Argument>,
+        arguments: Vec<Argument>,
+    }
+
+    /// Run `source` knowing the methods `methods` under `features`, answering every host call
+    /// with `answer`; the outcome and the calls made.
+    fn drive_with(
+        source: &str,
+        variables: Vec<(&str, Held)>,
+        methods: &[(&str, &str)],
+        features: Features,
+        answer: &Held,
+    ) -> (Result<Held, Diagnostic>, Vec<Made>) {
+        let program = Arc::new(hexput_parser::parse(source).unwrap());
+        let mut execution = Execution::with_variables(program, variables)
+            .unwrap()
+            .with_features(features)
+            .with_methods(methods.iter().copied());
+        let mut calls = Vec::new();
+        loop {
+            match execution.run() {
+                Err(error) => return (Err(error), calls),
+                Ok(Outcome::Finished(result)) => return (Ok(result), calls),
+                Ok(Outcome::HostCall(call)) => {
+                    calls.push(Made {
+                        name: call.name().to_owned(),
+                        key: call.key().map(str::to_owned),
+                        receiver: call.receiver().cloned(),
+                        arguments: call.arguments().to_vec(),
+                    });
+                    execution = call.resume_held(answer);
+                }
+                Ok(_) => panic!("an unmetered execution never stops at a meter"),
+            }
+        }
+    }
+
+    fn drive(
+        source: &str,
+        variables: Vec<(&str, Held)>,
+        methods: &[(&str, &str)],
+    ) -> (Result<Held, Diagnostic>, Vec<Made>) {
+        drive_with(
+            source,
+            variables,
+            methods,
+            Features::ALL_ENABLED,
+            &Held::plain(Value::Number(42.0)),
+        )
+    }
+
+    const SAVE: &[(&str, &str)] = &[("User", "save")];
+
+    fn spanned<'a>(source: &'a str, diagnostic: &Diagnostic) -> &'a str {
+        &source[diagnostic.span.range()]
+    }
+
+    #[test]
+    fn a_method_call_stops_with_its_receiver_and_key() {
+        let source = "return u.save(1);";
+        let (result, calls) = drive(source, vec![("u", user())], SAVE);
+        assert_eq!(result.unwrap().value.as_number(), Some(42.0));
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.name, "save");
+        assert_eq!(call.key.as_deref(), Some("User"));
+        let receiver = call.receiver.as_ref().expect("a receiver");
+        let object = receiver.value.as_object().unwrap();
+        assert_eq!(object.secret(), Some(&keyed("r1", "User")));
+        assert_eq!(object.get("name").and_then(Value::as_str), Some("a"));
+        assert_eq!(&source[receiver.span.range()], "u");
+        assert_eq!(call.arguments.len(), 1);
+        assert_eq!(call.arguments[0].value.as_number(), Some(1.0));
+    }
+
+    #[test]
+    fn the_call_spans_the_receiver_through_the_parenthesis() {
+        let source = "return u.nope(1);";
+        let program = Arc::new(hexput_parser::parse(source).unwrap());
+        let execution = Execution::with_variables(program, vec![("u", user())]).unwrap();
+        let Outcome::HostCall(call) = execution.run().unwrap() else {
+            panic!("a host call");
+        };
+        assert_eq!(&source[call.span().range()], "u.nope(1)");
+    }
+
+    #[test]
+    fn a_method_wins_over_an_own_property_of_its_name() {
+        let (result, calls) = drive(
+            "return u.save();",
+            vec![("u", user_with(vec![("save", Value::Number(5.0))]))],
+            SAVE,
+        );
+        assert_eq!(result.unwrap().value.as_number(), Some(42.0));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "save");
+    }
+
+    #[test]
+    fn a_name_neither_method_nor_property_stops_at_a_host_call_for_the_executor_to_refuse() {
+        let (_, calls) = drive("return u.nope();", vec![("u", user())], SAVE);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "nope");
+        assert_eq!(calls[0].key.as_deref(), Some("User"));
+    }
+
+    #[test]
+    fn an_own_property_of_a_keyed_value_is_called_as_usual() {
+        let (result, calls) = drive(
+            "u.greet = fn() { return 2; }; return u.greet();",
+            vec![("u", user())],
+            SAVE,
+        );
+        assert_eq!(result.unwrap().value.as_number(), Some(2.0));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_value_without_a_key_has_no_methods() {
+        let (result, calls) = drive(
+            "let o = {save: fn() { return 1; }}; return o.save();",
+            vec![],
+            SAVE,
+        );
+        assert_eq!(result.unwrap().value.as_number(), Some(1.0));
+        assert!(calls.is_empty());
+        // A secret without a key is no key either; nor is a plain value's missing property.
+        let unkeyed = Held::plain(Value::Object(Object::from_held_entries(
+            Vec::<(&str, Held)>::new(),
+            Some(Secret::new("r9", None, Vec::new())),
+        )));
+        let (result, calls) = drive("return u.save();", vec![("u", unkeyed)], SAVE);
+        assert_eq!(result.unwrap_err().code.as_str(), "type.not_callable");
+        assert!(calls.is_empty());
+        let (result, calls) = drive("return ({}).save();", vec![], SAVE);
+        assert_eq!(result.unwrap_err().code.as_str(), "type.not_callable");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn every_call_form_reaches_the_method() {
+        for source in [
+            "return u[\"save\"](1);",
+            "let k = \"save\"; return u[k](1);",
+            "return u?.save(1);",
+            "let o = {inner: u}; return o.inner.save(1);",
+            "let a = [u]; return a[0].save(1);",
+        ] {
+            let (result, calls) = drive(source, vec![("u", user())], SAVE);
+            assert_eq!(result.unwrap().value.as_number(), Some(42.0), "{source}");
+            assert_eq!(calls.len(), 1, "{source}");
+            assert_eq!(calls[0].name, "save", "{source}");
+            let receiver = calls[0].receiver.as_ref().unwrap();
+            assert_eq!(
+                receiver.value.secret().map(Secret::reference),
+                Some("r1"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keyed_scalar_is_a_receiver_by_the_secret_of_its_place() {
+        let n = Held::new(Value::Number(5.0), Some(keyed("r2", "Num")));
+        let methods = &[("Num", "double")];
+        for source in ["return n.double();", "return n[\"double\"]();"] {
+            let (result, calls) = drive(source, vec![("n", n.clone())], methods);
+            assert_eq!(result.unwrap().value.as_number(), Some(42.0), "{source}");
+            let receiver = calls[0].receiver.as_ref().unwrap();
+            assert_eq!(receiver.value.as_number(), Some(5.0));
+            assert_eq!(receiver.secret, Some(keyed("r2", "Num")), "{source}");
+            assert_eq!(calls[0].key.as_deref(), Some("Num"));
+        }
+        // Inside a collection: the property's or element's secret.
+        let o = Held::plain(Value::Object(Object::from_held_entries(
+            [("n", n.clone())],
+            None,
+        )));
+        let a = Held::plain(Value::Array(Array::from_held(vec![n.clone()], None)));
+        for source in ["return o.n.double();", "return a[0].double();"] {
+            let (_, calls) = drive(source, vec![("o", o.clone()), ("a", a.clone())], methods);
+            assert_eq!(calls.len(), 1, "{source}");
+            let receiver = calls[0].receiver.as_ref().unwrap();
+            assert_eq!(receiver.secret, Some(keyed("r2", "Num")), "{source}");
+        }
+        // A copy is plain, so it has no key and no methods.
+        let (result, calls) = drive("let m = n; return m.double();", vec![("n", n)], methods);
+        assert_eq!(
+            result.unwrap_err().code.as_str(),
+            "type.invalid_property_access"
+        );
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn the_chain_carries_on_after_the_reply() {
+        let reply = Held::plain(Value::Object(Object::from_entries([(
+            "x",
+            Value::Number(7.0),
+        )])));
+        let (result, _) = drive_with(
+            "return u.save().x;",
+            vec![("u", user())],
+            SAVE,
+            Features::ALL_ENABLED,
+            &reply,
+        );
+        assert_eq!(result.unwrap().value.as_number(), Some(7.0));
+        // A scalar reply stored directly keeps its secret, as a function's does.
+        let reply = Held::new(
+            Value::Number(3.0),
+            Some(Secret::new("r7", None, Vec::new())),
+        );
+        let (result, _) = drive_with(
+            "let x = u.save(); return x;",
+            vec![("u", user())],
+            SAVE,
+            Features::ALL_ENABLED,
+            &reply,
+        );
+        assert_eq!(result.unwrap().secret.unwrap().reference(), "r7");
+    }
+
+    #[test]
+    fn a_method_cannot_be_overridden() {
+        for (source, target) in [
+            ("u.save = 1; return 0;", "u.save"),
+            ("u[\"save\"] = 1; return 0;", "u[\"save\"]"),
+            ("let k = \"save\"; u[k] = 1; return 0;", "u[k]"),
+        ] {
+            let (result, calls) = drive(source, vec![("u", user())], SAVE);
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.code.as_str(),
+                "capability.method_override",
+                "{source}"
+            );
+            assert_eq!(error.category.as_str(), "capability");
+            assert_eq!(spanned(source, &error), target);
+            assert!(calls.is_empty());
+        }
+        // Any other property may be written, and without the method list nothing is a method.
+        let (result, _) = drive("u.other = 1; return u.other;", vec![("u", user())], SAVE);
+        assert_eq!(result.unwrap().value.as_number(), Some(1.0));
+        let (result, _) = drive("u.save = 1; return u.save;", vec![("u", user())], &[]);
+        assert_eq!(result.unwrap().value.as_number(), Some(1.0));
+    }
+
+    #[test]
+    fn an_override_is_refused_whatever_the_value_s_own_properties() {
+        // Refused before anything is written, whether or not the value already has a property of
+        // the method's name — and the error ends the Script, so nothing runs after it.
+        let source = "u.save = 1; return f(u);";
+        let (result, calls) = drive(
+            source,
+            vec![("u", user_with(vec![("save", Value::Number(5.0))]))],
+            SAVE,
+        );
+        assert_eq!(
+            result.unwrap_err().code.as_str(),
+            "capability.method_override"
+        );
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn rpc_calls_refuses_a_method_call_before_anything_is_checked() {
+        let off = Features::ALL_ENABLED.with(Feature::RpcCalls, false);
+        let source = "return u.save(fn() {});";
+        let (result, calls) = drive_with(
+            source,
+            vec![("u", user())],
+            SAVE,
+            off,
+            &Held::plain(Value::Null),
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.code.as_str(), "policy.construct_disabled");
+        assert_eq!(
+            error.message,
+            "a method call to `save` is disabled by policy (`features.rpc_calls`)"
+        );
+        assert_eq!(spanned(source, &error), "u.save(fn() {})");
+        assert!(calls.is_empty());
+        // An own property of a keyed value is no host call, so the toggle does not touch it.
+        let (result, _) = drive_with(
+            "u.greet = fn() { return 2; }; return u.greet();",
+            vec![("u", user())],
+            SAVE,
+            off,
+            &Held::plain(Value::Null),
+        );
+        assert_eq!(result.unwrap().value.as_number(), Some(2.0));
+    }
+
+    #[test]
+    fn a_receiver_that_cannot_be_sent_is_refused_on_the_receiver() {
+        let source = "u.me = u; return u.save();";
+        let (result, calls) = drive(source, vec![("u", user())], SAVE);
+        let error = result.unwrap_err();
+        assert_eq!(error.code.as_str(), "type.cyclic_argument");
+        assert_eq!(&source[error.span.range()], "u");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_receiver_s_contents_get_references_like_an_argument_s() {
+        let (_, calls) = drive("return u.save();", vec![("u", user())], SAVE);
+        let object = calls[0]
+            .receiver
+            .as_ref()
+            .unwrap()
+            .value
+            .as_object()
+            .unwrap();
+        let name = object.entry_secret("name").expect("a generated reference");
+        assert!(name.reference().starts_with("hx:"));
+    }
+
+    #[test]
+    fn optional_access_on_a_keyed_null_short_circuits() {
+        let n = Held::new(Value::Null, Some(keyed("r3", "User")));
+        let (result, calls) = drive("return n?.save();", vec![("n", n)], SAVE);
+        assert!(result.unwrap().value.is_null());
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_keyed_array_has_methods_and_cannot_have_them_overridden() {
+        let list = || {
+            Held::plain(Value::Array(Array::from_held(
+                vec![Held::plain(Value::Number(1.0))],
+                Some(keyed("r4", "List")),
+            )))
+        };
+        let methods = &[("List", "save")];
+        let (_, calls) = drive("return a.save();", vec![("a", list())], methods);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].key.as_deref(), Some("List"));
+        let source = "a[\"save\"] = 1; return 0;";
+        let (result, calls) = drive(source, vec![("a", list())], methods);
+        let error = result.unwrap_err();
+        assert_eq!(error.code.as_str(), "capability.method_override");
+        assert_eq!(spanned(source, &error), "a[\"save\"]");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn calling_the_secret_is_calling_null() {
+        let (result, calls) = drive(
+            "return u[\"__secret\"]();",
+            vec![("u", user())],
+            &[("User", "save"), ("User", "__secret")],
+        );
+        assert_eq!(result.unwrap_err().code.as_str(), "type.not_callable");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_method_call_inside_an_assignment_target_resumes_and_completes() {
+        let reply = Held::plain(Value::Object(Object::from_entries([(
+            "x",
+            Value::Number(1.0),
+        )])));
+        let (result, calls) = drive_with(
+            "u.save().x = 5; return 0;",
+            vec![("u", user())],
+            SAVE,
+            Features::ALL_ENABLED,
+            &reply,
+        );
+        assert_eq!(result.unwrap().value.as_number(), Some(0.0));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "save");
+    }
+
+    #[test]
+    fn the_same_call_dispatches_every_time_in_a_loop_and_in_recursion() {
+        let n = Held::new(Value::Number(5.0), Some(keyed("r2", "Num")));
+        let o = Held::plain(Value::Object(Object::from_held_entries([("n", n)], None)));
+        for source in [
+            "let i = 0; while (i < 3) { u.save(i); o.n.double(); i = i + 1; }; return 0;",
+            "fn r(k) { if (k == 0) { return 0; }; u.save(k); o.n.double(); return r(k - 1); }; \
+             return r(3);",
+        ] {
+            let (result, calls) = drive(
+                source,
+                vec![("u", user()), ("o", o.clone())],
+                &[("User", "save"), ("Num", "double")],
+            );
+            result.unwrap();
+            let seen: Vec<(&str, Option<&str>)> = calls
+                .iter()
+                .map(|call| (call.name.as_str(), call.key.as_deref()))
+                .collect();
+            assert_eq!(
+                seen,
+                [("save", Some("User")), ("double", Some("Num"))].repeat(3),
+                "{source}"
+            );
+            for call in calls.iter().filter(|call| call.name == "double") {
+                let receiver = call.receiver.as_ref().unwrap();
+                assert_eq!(receiver.secret, Some(keyed("r2", "Num")), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_knows_no_methods() {
+        let program =
+            hexput_parser::parse("let o = {save: fn() { return 1; }}; return o.save();").unwrap();
+        assert_eq!(evaluate(&program).unwrap().as_number(), Some(1.0));
+    }
+}

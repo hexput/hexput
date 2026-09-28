@@ -3680,3 +3680,170 @@ fn an_authorize_question_carries_its_arguments_in_holders() {
         },
     );
 }
+
+// --- Story 3.12: Registered Methods over the wire ---
+
+/// An `Init` registering `save` under `User` (with `blanket`) and the function `f` (blanket).
+fn init_with_method(blanket: bool) -> Value {
+    Value::Map(vec![
+        (string("config"), Value::Map(vec![])),
+        (
+            string("registrations"),
+            Value::Array(vec![
+                Value::Map(vec![
+                    (string("name"), string("save")),
+                    (string("key"), string("User")),
+                    (string("blanket"), Value::from(blanket)),
+                ]),
+                Value::Map(vec![
+                    (string("name"), string("f")),
+                    (string("blanket"), Value::from(true)),
+                ]),
+            ]),
+        ),
+    ])
+}
+
+/// A Daemon request's payload fields, by key.
+fn payload_fields(request: &Envelope<Value>) -> Vec<(String, Value)> {
+    let Value::Map(fields) = &request.payload else {
+        panic!("a request payload is a map: {request:?}");
+    };
+    fields
+        .iter()
+        .map(|(key, value)| (key.as_str().unwrap().to_owned(), value.clone()))
+        .collect()
+}
+
+/// Serve one connection initialized with `init_payload`, driven by `drive`.
+fn with_init<F, Fut>(init_payload: Value, drive: F)
+where
+    F: FnOnce(Backend) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let runtime = wired_runtime();
+    let sessions = Arc::new(Sessions::new());
+    let dispatch = discarding_dispatch();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async move {
+            let (backend, serving) = connect(&sessions, init_payload, false).await;
+            drive(backend).await;
+            finished(serving).await;
+        });
+    });
+}
+
+#[test]
+fn a_method_call_is_one_call_carrying_the_receiver_with_its_secret() {
+    with_init(init_with_method(true), |mut backend| async move {
+        backend.send(execution_with(
+            4,
+            "return u.save(1);",
+            vec![("u", held_user())],
+            None,
+        ));
+        let call = backend.next().await;
+        assert_eq!(call.message_type, MessageType::Call);
+        let fields = payload_fields(&call);
+        let keys: Vec<&str> = fields.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["name", "arguments", "execution", "receiver"]);
+        assert_eq!(fields[0].1, string("save"));
+        assert_eq!(fields[2].1, Value::from(4));
+        // The receiver's secret exactly as the Backend supplied it.
+        let Value::Map(receiver) = &fields[3].1 else {
+            panic!("a holder");
+        };
+        let Value::Map(original) = held_user() else {
+            unreachable!()
+        };
+        assert_eq!(receiver[0], original[0]);
+        backend.reply(
+            call.id.unwrap(),
+            MessageType::Result,
+            Value::Map(vec![(string("value"), Value::from(9))]),
+        );
+        assert_eq!(value_of(&backend.next().await), Value::from(9));
+        // A function's call is unchanged: no `receiver` key at all.
+        backend.send(execution(5, "return f(1);"));
+        let call = backend.next().await;
+        let keys: Vec<String> = payload_fields(&call).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["name", "arguments", "execution"]);
+        backend.reply(
+            call.id.unwrap(),
+            MessageType::Result,
+            Value::Map(vec![(string("value"), Value::Nil)]),
+        );
+        assert_eq!(value_of(&backend.next().await), Value::Nil);
+        backend.close();
+    });
+}
+
+#[test]
+fn a_per_call_method_is_asked_about_with_its_receiver_and_refused_like_a_function() {
+    with_init(init_with_method(false), |mut backend| async move {
+        backend.send(execution_with(
+            1,
+            "return u.save();",
+            vec![("u", held_user())],
+            None,
+        ));
+        let question = backend.next().await;
+        assert_eq!(question.message_type, MessageType::Authorize);
+        let keys: Vec<String> = payload_fields(&question)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, ["name", "arguments", "execution", "receiver"]);
+        backend.allow(question.id.unwrap(), Value::from(false));
+        let reply = backend.next().await;
+        assert_eq!(code_of(&reply), "capability.unknown_function");
+        backend.close();
+    });
+}
+
+#[test]
+fn unknown_methods_and_overrides_send_nothing() {
+    with_init(init_with_method(true), |mut backend| async move {
+        backend.send(execution_with(
+            1,
+            "return u.nope();",
+            vec![("u", held_user())],
+            None,
+        ));
+        assert_eq!(
+            code_of(&backend.next().await),
+            "capability.unknown_function"
+        );
+        backend.send(execution_with(
+            2,
+            "u.save = 1; return 0;",
+            vec![("u", held_user())],
+            None,
+        ));
+        assert_eq!(code_of(&backend.next().await), "capability.method_override");
+        backend.close();
+    });
+}
+
+#[test]
+fn a_bad_method_registration_creates_no_session() {
+    for key in [string(""), Value::from(1)] {
+        let payload = Value::Map(vec![
+            (string("config"), Value::Map(vec![])),
+            (
+                string("registrations"),
+                Value::Array(vec![Value::Map(vec![
+                    (string("name"), string("save")),
+                    (string("key"), key),
+                ])]),
+            ),
+        ]);
+        let sessions = Arc::new(Sessions::new());
+        let registry = Arc::clone(&sessions);
+        // Probed while the connection is still open: a Session would still be there.
+        let sent = serve_probed(&sessions, vec![init(1, payload)], move |_| {
+            assert_eq!(registry.len(), 0);
+        });
+        assert_eq!(code_of(&sent[0]), "protocol.invalid_payload");
+    }
+}

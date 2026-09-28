@@ -15,7 +15,7 @@ fn session() -> Capabilities {
 
 /// The question `check_call` asks about `name`, which must be registered without a grant.
 fn question(capabilities: &Capabilities, name: &str) -> Question {
-    match capabilities.check_call(name, span()) {
+    match capabilities.check_call(None, name, span()) {
         Ok(Decision::AskHandler(question)) => question,
         other => panic!("expected a question for `{name}`, got {other:?}"),
     }
@@ -24,7 +24,7 @@ fn question(capabilities: &Capabilities, name: &str) -> Question {
 #[test]
 fn a_blanket_granted_function_may_be_called_without_asking() {
     assert!(matches!(
-        session().check_call("getOrder", span()),
+        session().check_call(None, "getOrder", span()),
         Ok(Decision::Allowed)
     ));
 }
@@ -69,7 +69,7 @@ fn every_other_answer_is_refused_with_its_own_reason() {
         ),
     ];
     let unregistered = session()
-        .check_call("nope", span())
+        .check_call(None, "nope", span())
         .unwrap_err()
         .into_diagnostic();
     for (answer, reason, spelled) in cases {
@@ -91,7 +91,7 @@ fn every_other_answer_is_refused_with_its_own_reason() {
 
 #[test]
 fn an_unregistered_function_is_refused_as_unregistered() {
-    let refusal = session().check_call("nope", span()).unwrap_err();
+    let refusal = session().check_call(None, "nope", span()).unwrap_err();
     assert_eq!(refusal.reason(), Reason::Unregistered);
     assert_eq!(refusal.reason().as_str(), "unregistered");
     let error = refusal.diagnostic();
@@ -118,7 +118,7 @@ fn every_call_asks_again() {
 #[test]
 fn nothing_is_callable_with_no_capabilities() {
     let refusal = Capabilities::none()
-        .check_call("getOrder", span())
+        .check_call(None, "getOrder", span())
         .unwrap_err();
     assert_eq!(refusal.reason(), Reason::Unregistered);
 }
@@ -126,14 +126,14 @@ fn nothing_is_callable_with_no_capabilities() {
 #[test]
 fn a_name_listed_twice_is_blanket_granted_only_if_every_listing_grants_it() {
     for listed in [[("f", false), ("f", true)], [("f", true), ("f", false)]] {
-        let decision = Capabilities::registered(listed).check_call("f", span());
+        let decision = Capabilities::registered(listed).check_call(None, "f", span());
         assert!(
             matches!(decision, Ok(Decision::AskHandler(_))),
             "{listed:?}: {decision:?}"
         );
     }
     assert!(matches!(
-        Capabilities::registered([("f", true), ("f", true)]).check_call("f", span()),
+        Capabilities::registered([("f", true), ("f", true)]).check_call(None, "f", span()),
         Ok(Decision::Allowed)
     ));
 }
@@ -386,4 +386,90 @@ mod limits {
             .with_authorization_timeout(Duration::from_millis(100));
         assert_eq!(Limits::from_settings(&settings), expected);
     }
+}
+
+// --- Story 3.12: Registered Methods ---
+
+/// `save` under `User` (blanket) and `delete` under `User` (per call), beside a function `save`
+/// asked per call.
+fn with_methods() -> Capabilities {
+    Capabilities::registered([("save", false)]).with_methods([
+        (Some("User"), "save", true),
+        (Some("User"), "delete", false),
+    ])
+}
+
+#[test]
+fn a_method_is_decided_by_its_key_and_name_like_a_function() {
+    let capabilities = with_methods();
+    assert!(matches!(
+        capabilities.check_call(Some("User"), "save", span()),
+        Ok(Decision::Allowed)
+    ));
+    // The function of the same name keeps its own grant.
+    assert!(matches!(
+        capabilities.check_call(None, "save", span()),
+        Ok(Decision::AskHandler(_))
+    ));
+    let Ok(Decision::AskHandler(question)) =
+        capabilities.check_call(Some("User"), "delete", span())
+    else {
+        panic!("a per-call method asks");
+    };
+    assert_eq!(question.name(), "delete");
+    let refusal = question.decide(HandlerAnswer::Boolean(false)).unwrap_err();
+    assert_eq!(refusal.reason(), Reason::Refused);
+    assert_eq!(
+        refusal.diagnostic().code.as_str(),
+        "capability.unknown_function"
+    );
+}
+
+#[test]
+fn a_method_has_no_fallback_to_another_key_or_to_a_function() {
+    let capabilities = with_methods();
+    for (key, name) in [
+        (Some("Order"), "save"),
+        (Some("User"), "nope"),
+        (None, "delete"),
+    ] {
+        let refusal = capabilities.check_call(key, name, span()).unwrap_err();
+        assert_eq!(refusal.reason(), Reason::Unregistered, "{key:?} {name}");
+        assert_eq!(
+            refusal.diagnostic().code.as_str(),
+            "capability.unknown_function"
+        );
+        assert_eq!(refusal.diagnostic().span, span());
+    }
+}
+
+#[test]
+fn every_method_refusal_is_the_same_error() {
+    // `delete` exists under `User` only.
+    let unregistered = with_methods()
+        .check_call(Some("Order"), "delete", span())
+        .unwrap_err();
+    let denied = question_about(&with_methods(), "delete")
+        .decide(HandlerAnswer::TimedOut)
+        .unwrap_err();
+    assert_eq!(denied.diagnostic(), unregistered.diagnostic());
+    assert_eq!(unregistered.reason(), Reason::Unregistered);
+    assert_eq!(denied.reason(), Reason::HandlerTimeout);
+}
+
+/// The question `check_call` asks about the `User` method `name`.
+fn question_about(capabilities: &Capabilities, name: &str) -> Question {
+    match capabilities.check_call(Some("User"), name, span()) {
+        Ok(Decision::AskHandler(question)) => question,
+        other => panic!("expected a question for `{name}`, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_methods_are_listed_by_key_for_the_interpreter() {
+    let capabilities = with_methods();
+    let mut methods: Vec<_> = capabilities.methods().collect();
+    methods.sort_unstable();
+    assert_eq!(methods, vec![("User", "delete"), ("User", "save")]);
+    assert_eq!(session().methods().count(), 0);
 }

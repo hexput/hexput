@@ -41,6 +41,12 @@
 //! charges nothing — it is not Script code, so it is not charged to the CPU budget — and its
 //! findings are never cached.
 //!
+//! Registered Methods (Story 3.12) arrive among the registrations, each under its object key. The
+//! static check takes only the functions' names as its callable list — a method is never called
+//! by a bare name — and declares keyed every starting variable holding an array or object whose
+//! Value Secret carries a key methods are registered under, so a Script overriding one is
+//! reported (`capability.method_override`).
+//!
 //! Value Secrets (Story 3.11) cross here too: a starting variable may be a holder
 //! (`{__secret: {ref, key?, …}, value}`, anywhere inside it as well), decoded by
 //! `hexput_exec::wire` — a malformed one is `protocol.invalid_payload` naming its path — and the
@@ -52,10 +58,14 @@
 //!
 //! Binds: AD-3, AD-6, AD-8.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hexput_check::{Environment, Policy, Severity};
+/// A Session's registration as Direct Execution takes it — a Registered Function, or a
+/// Registered Method under an object key (Story 3.12) — re-exported so the connection, which
+/// reads the Session's registrations, can hand them over without an edge to the Executor.
+pub use hexput_exec::Registration;
 use hexput_exec::wire;
 use hexput_exec::{Caller, Host, Limits};
 use hexput_interpreter::{Category, Code, Diagnostic, Held, Program, Span};
@@ -84,8 +94,9 @@ const ENVELOPE_ROOM: usize = 64;
 /// `source` (the Script, a string), `variables` (its starting variables, a map from §2
 /// identifier to value) and optionally `overrides` (execution limits for this execution alone,
 /// the shape of `Init`'s `config`; absent or nil sets none). The Script may call the Registered
-/// Functions in `registrations` — each `(name, blanket)`, the name and whether it holds a blanket
-/// grant — as the Executor allows, through `caller` (Stories 3.1–3.3).
+/// Functions and Methods in `registrations` — each with its name, a method's object key, and
+/// whether it holds a blanket grant — as the Executor allows, through `caller` (Stories 3.1–3.3,
+/// 3.12).
 ///
 /// It runs under `settings` — the Session's Config settings, as they were when the execution was
 /// dispatched — overlaid with the payload's `overrides` (Story 3.7). Neither is changed: the
@@ -135,15 +146,30 @@ const ENVELOPE_ROOM: usize = 64;
 /// If the work on the blocking pool panics, the panic continues here.
 pub async fn direct_execution(
     payload: Value,
-    registrations: Vec<(String, bool)>,
+    registrations: Vec<Registration>,
     settings: Settings,
     caller: Caller,
 ) -> Result<Value, Box<ErrorBody>> {
-    let names: Vec<String> = registrations.iter().map(|(name, _)| name.clone()).collect();
+    // What the static check needs: the Registered Functions' names — the only names a bare call
+    // can reach — and the Registered Methods by key.
+    let names: Vec<String> = registrations
+        .iter()
+        .filter(|r| r.key.is_none())
+        .map(|r| r.name.clone())
+        .collect();
+    let mut methods: HashMap<String, Vec<String>> = HashMap::new();
+    for registration in &registrations {
+        if let Some(key) = &registration.key {
+            methods
+                .entry(key.clone())
+                .or_default()
+                .push(registration.name.clone());
+        }
+    }
     let (program, variables, effective, checked) = blocking(move || {
         let (program, variables, overrides) = prepare(&payload)?;
         let effective = settings.overlay(&overrides);
-        let checked = static_check(&program, &variables, names, &effective);
+        let checked = static_check(&program, &variables, names, &methods, &effective);
         Ok::<_, Box<ErrorBody>>((program, variables, effective, checked))
     })
     .await?;
@@ -211,15 +237,29 @@ fn static_check(
     program: &Program,
     variables: &[(Arc<str>, Held)],
     callables: Vec<String>,
+    methods: &HashMap<String, Vec<String>>,
     effective: &Settings,
 ) -> Result<Vec<ErrorBody>, Rejection> {
     let mode = effective.check();
     if mode == CheckMode::Off {
         return Ok(Vec::new());
     }
-    let environment = Environment::new()
+    let mut environment = Environment::new()
         .with_variables(variables.iter().map(|(name, _)| name.to_string()))
         .with_callables(callables);
+    // A starting variable holding an array or object whose own Value Secret carries a key the
+    // Session registered methods under (Story 3.12). A keyed string, number, bool or `null` has
+    // no properties to override — writing one is a `type` error — so it is never declared keyed.
+    for (name, held) in variables {
+        if let Some(methods) = held
+            .value
+            .secret()
+            .and_then(|secret| secret.key())
+            .and_then(|key| methods.get(key))
+        {
+            environment = environment.with_keyed(name.to_string(), methods.iter().cloned());
+        }
+    }
     let findings = hexput_check::check(
         program,
         &environment,

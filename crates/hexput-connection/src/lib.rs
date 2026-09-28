@@ -130,6 +130,7 @@ use hexput_port::{
     ProtocolError, Received, Value, error_response,
 };
 use hexput_rpc::{Call, Caller, Calls};
+use hexput_script::Registration;
 use hexput_session::{ClientId, Config, ConnectionId, InitRequest, Sessions, Settings};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{Instrument, Span};
@@ -267,7 +268,11 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                             .unwrap_or_default();
                         let registrations = registrations
                             .into_iter()
-                            .map(|r| (r.name().to_owned(), r.blanket()))
+                            .map(|r| Registration {
+                                name: r.name().to_owned(),
+                                key: r.key().map(str::to_owned),
+                                blanket: r.blanket(),
+                            })
                             .collect();
                         // The task carries the request's span, so everything the execution logs
                         // names its connection, its Client ID and its request.
@@ -530,7 +535,7 @@ fn config_update(request: &Envelope<Value>, connection: &Connection<'_>) -> Enve
 async fn execute(
     id: Option<CorrelationId>,
     payload: Value,
-    registrations: Vec<(String, bool)>,
+    registrations: Vec<Registration>,
     settings: Settings,
     caller: Caller,
 ) -> Envelope<Value> {

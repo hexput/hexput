@@ -268,6 +268,105 @@ fn a_duplicate_registration_is_named() {
     );
 }
 
+// --- Story 3.12: Registered Methods ---
+
+#[test]
+fn a_registration_with_a_key_is_a_method_under_it() {
+    let init = InitRequest::from_value(&payload(
+        Value::Map(vec![]),
+        Value::Array(vec![
+            map(vec![
+                ("name", s("save")),
+                ("key", s("User")),
+                ("blanket", Value::from(true)),
+            ]),
+            map(vec![("name", s("save"))]),
+            map(vec![("key", s("Order")), ("name", s("save"))]),
+        ]),
+    ))
+    .unwrap();
+    let listed: Vec<_> = init
+        .registrations()
+        .iter()
+        .map(|r| (r.key(), r.name(), r.blanket()))
+        .collect();
+    // A function and methods under two keys share the name `save`.
+    assert_eq!(
+        listed,
+        vec![
+            (Some("User"), "save", true),
+            (None, "save", false),
+            (Some("Order"), "save", false),
+        ]
+    );
+}
+
+#[test]
+fn a_key_that_is_empty_or_not_a_string_is_refused_by_index() {
+    for (bad, problem) in [
+        (s(""), "is empty"),
+        (Value::from(1), "is not a string"),
+        (Value::Nil, "is not a string"),
+        (Value::Boolean(true), "is not a string"),
+    ] {
+        let message = refusal(&payload(
+            Value::Map(vec![]),
+            Value::Array(vec![
+                map(vec![("name", s("a"))]),
+                map(vec![("name", s("b")), ("key", bad)]),
+            ]),
+        ));
+        assert_eq!(message, format!("`registrations[1].key` {problem}"));
+    }
+    let message = refusal(&payload(
+        Value::Map(vec![]),
+        Value::Array(vec![map(vec![
+            ("name", s("a")),
+            ("key", s("User")),
+            ("key", s("Order")),
+        ])]),
+    ));
+    assert_eq!(message, "`registrations[0]` repeats the key `key`");
+}
+
+#[test]
+fn a_method_named_secret_is_refused_and_a_function_so_named_is_not() {
+    let message = refusal(&payload(
+        Value::Map(vec![]),
+        Value::Array(vec![
+            map(vec![("name", s("save")), ("key", s("User"))]),
+            map(vec![("name", s("__secret")), ("key", s("User"))]),
+        ]),
+    ));
+    assert_eq!(
+        message,
+        "`registrations[1].name` cannot be `__secret` for a method: a Script can never call it"
+    );
+    // A bare-name function is reachable by a call, so its name is the Backend's business.
+    InitRequest::from_value(&payload(
+        Value::Map(vec![]),
+        Value::Array(vec![map(vec![("name", s("__secret"))])]),
+    ))
+    .unwrap();
+}
+
+#[test]
+fn a_duplicate_method_under_one_key_is_named() {
+    let message = refusal(&payload(
+        Value::Map(vec![]),
+        Value::Array(vec![
+            map(vec![("name", s("save")), ("key", s("User"))]),
+            map(vec![("name", s("save")), ("key", s("Order"))]),
+            map(vec![("name", s("save")), ("key", s("User"))]),
+        ]),
+    ));
+    assert_eq!(
+        message,
+        "`save` under key `User` is registered twice, at `registrations[0]` and \
+         `registrations[2]`"
+    );
+}
+
 // --- the registry ---
 
 /// A Connection opening and completing init: what `hexput-connection` does, in that order.

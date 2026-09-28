@@ -23,6 +23,10 @@
 //! handler failed to answer. Only the [`Refusal::reason`] tells them apart, for the Daemon's own
 //! log.
 //!
+//! A **Registered Method** (Story 3.12, FR-27) is decided by exactly the same rules, looked up by
+//! the receiver's object key and its name: [`Capabilities::check_call`] takes the key (`None` for
+//! a function), so a method's grant, per-call question and refusal are a function's.
+//!
 //! This crate asks nothing itself: `hexput-exec` puts the question to the Backend and reports what
 //! came back. Nothing here caches an answer — every call of a function granted per call is a new
 //! [`Decision::AskHandler`].
@@ -509,11 +513,14 @@ fn exceeded(dimension: Dimension, code: Code, message: String, span: Span) -> Ex
     }
 }
 
-/// The host functions one execution may call.
+/// The host functions and methods one execution may call.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
-    /// Registered name -> whether it holds a blanket grant.
-    registered: HashMap<String, bool>,
+    /// Registered Function name -> whether it holds a blanket grant.
+    functions: HashMap<String, bool>,
+    /// Object key -> Registered Method name -> whether it holds a blanket grant (Story 3.12).
+    /// Nested, so a lookup borrows the key and name it is given.
+    methods: HashMap<String, HashMap<String, bool>>,
 }
 
 /// Why a host call was refused. For the Daemon's log only: the Script sees the same error for
@@ -521,7 +528,8 @@ pub struct Capabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Reason {
-    /// No Registered Function of the Session has the name.
+    /// No Registered Function of the Session has the name — or, for a method call, no Registered
+    /// Method under the receiver's key.
     Unregistered,
     /// The Backend's per-call handler answered `false`.
     Refused,
@@ -568,6 +576,8 @@ pub enum Decision {
 #[derive(Debug)]
 #[must_use]
 pub struct Question {
+    /// Whether the question is about a Registered Method, for the refusal's message.
+    method: bool,
     name: String,
     span: Span,
 }
@@ -589,7 +599,7 @@ pub enum HandlerAnswer {
 }
 
 impl Question {
-    /// The function the question is about.
+    /// The function or method the question is about.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -609,7 +619,7 @@ impl Question {
             HandlerAnswer::TimedOut => Reason::HandlerTimeout,
             HandlerAnswer::NoReply => Reason::HandlerNoReply,
         };
-        Err(refusal(reason, &self.name, self.span))
+        Err(refusal(reason, self.method, &self.name, self.span))
     }
 }
 
@@ -653,46 +663,89 @@ impl Capabilities {
     /// decided per call.
     #[must_use]
     pub fn registered<N: Into<String>>(registrations: impl IntoIterator<Item = (N, bool)>) -> Self {
-        let mut registered = HashMap::new();
-        for (name, blanket) in registrations {
-            registered
+        Self::default().with_methods(
+            registrations
+                .into_iter()
+                .map(|(name, blanket)| (None::<String>, name, blanket)),
+        )
+    }
+
+    /// These capabilities with `registrations` added, as `(key, name, blanket)`: a Registered
+    /// Method under its object key when `key` is `Some`, a Registered Function when it is `None`
+    /// (Story 3.12). Folds fail-closed per `(key, name)`, like [`Capabilities::registered`].
+    #[must_use]
+    pub fn with_methods<K: Into<String>, N: Into<String>>(
+        mut self,
+        registrations: impl IntoIterator<Item = (Option<K>, N, bool)>,
+    ) -> Self {
+        for (key, name, blanket) in registrations {
+            let names = match key {
+                Some(key) => self.methods.entry(key.into()).or_default(),
+                None => &mut self.functions,
+            };
+            names
                 .entry(name.into())
                 .and_modify(|granted: &mut bool| *granted &= blanket)
                 .or_insert(blanket);
         }
-        Self { registered }
+        self
     }
 
-    /// Decide whether the Script may call the host function `name`; `span` is the call's.
+    /// Every Registered Method, as `(key, name)`, in no particular order: what the interpreter
+    /// needs to tell a method call from a property call and to refuse overriding one. Data only:
+    /// knowing a name grants nothing, and every call is still decided by
+    /// [`Capabilities::check_call`].
+    pub fn methods(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.methods
+            .iter()
+            .flat_map(|(key, names)| names.keys().map(move |name| (key.as_str(), name.as_str())))
+    }
+
+    /// Decide whether the Script may call the host function `name` — or, when `key` is `Some`,
+    /// the Registered Method `name` under that object key, on a receiver whose Value Secret
+    /// carries it (Story 3.12). `span` is the call's.
     ///
-    /// [`Decision::Allowed`] for a blanket-granted name; [`Decision::AskHandler`] for a name
-    /// registered without a blanket grant, asked anew on every call.
+    /// [`Decision::Allowed`] for a blanket grant; [`Decision::AskHandler`] for a registration
+    /// without one, asked anew on every call. A method is looked up under its key alone: there
+    /// is no fallback to a function, or to another key.
     ///
     /// # Errors
-    /// A [`Refusal`] carrying `capability.unknown_function`, spanned on the call, when `name` is
-    /// not a Registered Function of this execution's Session. It is the same error every refusal
-    /// carries, [`Question::decide`]'s included; only [`Refusal::reason`] differs.
-    pub fn check_call(&self, name: &str, span: Span) -> Result<Decision, Refusal> {
-        match self.registered.get(name) {
+    /// A [`Refusal`] carrying `capability.unknown_function`, spanned on the call, when nothing of
+    /// this execution's Session is registered under `(key, name)`. It is the same error every
+    /// refusal of a function (or, for a method, of a method) carries, [`Question::decide`]'s
+    /// included; only [`Refusal::reason`] differs.
+    pub fn check_call(
+        &self,
+        key: Option<&str>,
+        name: &str,
+        span: Span,
+    ) -> Result<Decision, Refusal> {
+        let granted = match key {
+            Some(key) => self.methods.get(key).and_then(|names| names.get(name)),
+            None => self.functions.get(name),
+        };
+        match granted {
             Some(true) => Ok(Decision::Allowed),
             Some(false) => Ok(Decision::AskHandler(Question {
+                method: key.is_some(),
                 name: name.to_owned(),
                 span,
             })),
-            None => Err(refusal(Reason::Unregistered, name, span)),
+            None => Err(refusal(Reason::Unregistered, key.is_some(), name, span)),
         }
     }
 }
 
-/// A refusal of a call to `name` for `reason`: the one error every refusal carries.
-fn refusal(reason: Reason, name: &str, span: Span) -> Refusal {
+/// A refusal of a call to `name` — a method's when `method` — for `reason`: the one error every
+/// refusal carries, whatever the reason.
+fn refusal(reason: Reason, method: bool, name: &str, span: Span) -> Refusal {
+    let message = if method {
+        format!("`{name}` is not a method this Script may call on this value")
+    } else {
+        format!("`{name}` is not declared, and it is not a function this Script may call")
+    };
     Refusal {
         reason,
-        diagnostic: Diagnostic::new(
-            Category::Capability,
-            Code::UNKNOWN_FUNCTION,
-            format!("`{name}` is not declared, and it is not a function this Script may call"),
-            span,
-        ),
+        diagnostic: Diagnostic::new(Category::Capability, Code::UNKNOWN_FUNCTION, message, span),
     }
 }

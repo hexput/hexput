@@ -7,7 +7,8 @@
 use std::sync::{Arc, Mutex};
 
 use hexput_exec::{
-    ARGUMENT_DEPTH_LIMIT, Diagnostic, Held, Host, Limits, Secret, Value, execute, execute_held,
+    ARGUMENT_DEPTH_LIMIT, Diagnostic, Held, Host, Limits, Registration, Secret, Value, execute,
+    execute_held,
 };
 use hexput_port::{CorrelationId, Envelope, MessageType};
 use hexput_rpc::{Calls, Value as Wire};
@@ -110,6 +111,9 @@ struct Run {
     asked: Vec<Made>,
     /// Every message the stand-in saw, in order: its type and the function's name.
     order: Vec<(MessageType, String)>,
+    /// Every message's `receiver`, exactly as sent, in the same order (Story 3.12): `None` for a
+    /// function's, which has no such key.
+    receivers: Vec<Option<Wire>>,
     /// Every event the Executor logged at `debug` or above, one JSON object each.
     events: Vec<serde_json::Value>,
 }
@@ -277,7 +281,22 @@ fn hosted_run_held(
     answer: Answer,
     limits: Limits,
 ) -> Run {
+    let registrations = registered.iter().copied().map(Registration::from).collect();
+    hosted_run_registered(source, variables, registrations, authorize, answer, limits)
+}
+
+/// [`hosted_run_held`] with any registrations, Registered Methods too (Story 3.12).
+fn hosted_run_registered(
+    source: &str,
+    variables: Vec<(Arc<str>, Held)>,
+    registrations: Vec<Registration>,
+    authorize: Handler,
+    answer: Answer,
+    limits: Limits,
+) -> Run {
     let seen: Seen = Arc::default();
+    let receivers: Arc<Mutex<Vec<Option<Wire>>>> = Arc::default();
+    let received = Arc::clone(&receivers);
     let raw: Seen = Arc::default();
     let questions: Seen = Arc::default();
     let order: Arc<Mutex<Vec<(MessageType, String)>>> = Arc::default();
@@ -296,9 +315,15 @@ fn hosted_run_held(
             let Wire::Map(fields) = &envelope.payload else {
                 panic!("a Call payload is a map");
             };
-            assert_eq!(fields.len(), 2, "exactly `name` and `arguments`");
             assert_eq!(fields[0].0, s("name"));
             assert_eq!(fields[1].0, s("arguments"));
+            // Exactly `name` and `arguments`, plus `receiver` for a method (Story 3.12).
+            let receiver = match &fields[2..] {
+                [] => None,
+                [(key, receiver)] if *key == s("receiver") => Some(receiver.clone()),
+                other => panic!("unexpected payload keys: {other:?}"),
+            };
+            received.lock().unwrap().push(receiver);
             let name = fields[0].1.as_str().unwrap().to_owned();
             let Wire::Array(exact) = fields[1].1.clone() else {
                 panic!("`arguments` is an array");
@@ -334,7 +359,7 @@ fn hosted_run_held(
             }
         }
     });
-    let host = Host::new(registered.iter().copied(), caller);
+    let host = Host::new(registrations, caller);
     let result = runtime.block_on(execute_held(program(source), variables, host, limits));
     let (result, secret) = match result {
         Ok(held) => (Ok(held.value), held.secret),
@@ -344,6 +369,7 @@ fn hosted_run_held(
     let raw_calls = raw.lock().unwrap().clone();
     let asked = questions.lock().unwrap().clone();
     let order = order.lock().unwrap().clone();
+    let receivers = receivers.lock().unwrap().clone();
     Run {
         result,
         secret,
@@ -351,6 +377,7 @@ fn hosted_run_held(
         raw_calls,
         asked,
         order,
+        receivers,
         events: Vec::new(),
     }
 }
@@ -2453,5 +2480,522 @@ mod value_secrets {
             wire::to_wire(&plain),
             map(vec![("a", Wire::Array(vec![Wire::from(1)]))])
         );
+    }
+}
+
+// --- Story 3.12: Registered Methods ---
+
+mod methods {
+    use std::sync::{Arc, Mutex};
+
+    use hexput_exec::wire::{self, Path};
+    use hexput_exec::{Limits, Registration};
+    use hexput_port::MessageType;
+    use hexput_rpc::Value as Wire;
+
+    use super::{
+        Answer, Captured, Handler, Run, answering, hosted_run_registered, map, refusing, s,
+        spanned, value,
+    };
+
+    fn holder(secret: Vec<(&str, Wire)>, value: Wire) -> Wire {
+        map(vec![("__secret", map(secret)), ("value", value)])
+    }
+
+    /// The `__secret` a `User` travels with: `ref` r1, `key` User, a further field `tier`.
+    fn user_secret() -> Wire {
+        map(vec![
+            ("ref", s("r1")),
+            ("key", s("User")),
+            ("tier", Wire::from(3)),
+        ])
+    }
+
+    /// `{name: "a"}` plus `extra`, held as a `User`.
+    fn user_with(extra: Vec<(&str, Wire)>) -> Wire {
+        let mut fields = vec![("name", s("a"))];
+        fields.extend(extra);
+        map(vec![("__secret", user_secret()), ("value", map(fields))])
+    }
+
+    fn user() -> Wire {
+        user_with(vec![])
+    }
+
+    /// `save` under `User`, blanket-granted.
+    fn save() -> Vec<Registration> {
+        vec![Registration::method("User", "save", true)]
+    }
+
+    fn nothing() -> Answer {
+        Box::new(|_, _| value(Wire::Nil))
+    }
+
+    /// Run `source` against the stand-in, with the logged events.
+    fn run_with(
+        source: &str,
+        variables: Vec<(&str, Wire)>,
+        registrations: Vec<Registration>,
+        authorize: Handler,
+        answer: Answer,
+        limits: Limits,
+    ) -> Run {
+        let variables = variables
+            .into_iter()
+            .map(|(name, wire)| {
+                let held = wire::to_hexput(&wire, &mut Path::variable(name)).unwrap();
+                (Arc::from(name), held)
+            })
+            .collect();
+        let log = Captured::default();
+        let writer = log.clone();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .json()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(Mutex::new(writer))
+                .finish(),
+        );
+        let mut run = tracing::dispatcher::with_default(&dispatch, || {
+            hosted_run_registered(source, variables, registrations, authorize, answer, limits)
+        });
+        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        run.events = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        run
+    }
+
+    fn run(source: &str, registrations: Vec<Registration>, answer: Answer) -> Run {
+        run_with(
+            source,
+            vec![("u", user())],
+            registrations,
+            refusing(),
+            answer,
+            Limits::default(),
+        )
+    }
+
+    /// The `__secret` of a sent holder.
+    fn secret_of(sent: &Wire) -> &Wire {
+        let Wire::Map(fields) = sent else {
+            panic!("a holder: {sent:?}");
+        };
+        assert_eq!(fields[0].0, s("__secret"));
+        &fields[0].1
+    }
+
+    /// The refusals logged, as `(function, key, reason)`.
+    fn refusals(run: &Run) -> Vec<(String, Option<String>, String)> {
+        run.events
+            .iter()
+            .filter(|event| event["fields"]["message"] == "refused a host call")
+            .map(|event| {
+                let field = |name: &str| event["fields"][name].as_str().map(str::to_owned);
+                (
+                    field("function").unwrap(),
+                    field("key"),
+                    field("reason").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_method_call_sends_one_call_carrying_its_receiver_unchanged() {
+        let run = run(
+            "return u.save(1);",
+            save(),
+            Box::new(|_, _| value(Wire::from(9))),
+        );
+        assert_eq!(run.result.unwrap().as_number(), Some(9.0));
+        assert_eq!(run.order, vec![(MessageType::Call, "save".to_owned())]);
+        assert_eq!(run.calls, vec![("save".to_owned(), vec![Wire::from(1)])]);
+        let receiver = run.receivers[0].as_ref().expect("a receiver");
+        assert_eq!(secret_of(receiver), &user_secret());
+        assert_eq!(super::unheld(receiver), map(vec![("name", s("a"))]));
+    }
+
+    #[test]
+    fn a_method_wins_over_an_own_property_of_its_name() {
+        let run = run_with(
+            "return u.save();",
+            vec![("u", user_with(vec![("save", Wire::from(5))]))],
+            save(),
+            refusing(),
+            Box::new(|_, _| value(Wire::from(9))),
+            Limits::default(),
+        );
+        assert_eq!(run.result.unwrap().as_number(), Some(9.0));
+        assert_eq!(run.calls.len(), 1);
+    }
+
+    #[test]
+    fn a_name_neither_method_nor_property_is_refused_and_nothing_is_sent() {
+        let source = "return u.nope();";
+        let run = run(source, save(), nothing());
+        let error = run.result.as_ref().unwrap_err();
+        assert_eq!(error.code.as_str(), "capability.unknown_function");
+        assert_eq!(spanned(source, error), "u.nope()");
+        assert!(run.order.is_empty());
+        assert_eq!(
+            refusals(&run),
+            vec![(
+                "nope".to_owned(),
+                Some("User".to_owned()),
+                "unregistered".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_own_property_of_a_keyed_value_sends_nothing() {
+        let run = run(
+            "u.greet = fn() { return 2; }; return u.greet();",
+            save(),
+            nothing(),
+        );
+        assert_eq!(run.result.unwrap().as_number(), Some(2.0));
+        assert!(run.order.is_empty());
+    }
+
+    #[test]
+    fn a_value_without_a_key_is_exactly_as_before() {
+        let run = run(
+            "let o = {save: fn() { return 1; }}; f(1); return o.save();",
+            vec![
+                Registration::method("User", "save", true),
+                Registration::function("f", true),
+            ],
+            nothing(),
+        );
+        assert_eq!(run.result.unwrap().as_number(), Some(1.0));
+        // Only the function call went out, and it carries no `receiver`.
+        assert_eq!(run.order, vec![(MessageType::Call, "f".to_owned())]);
+        assert_eq!(run.receivers, vec![None]);
+    }
+
+    #[test]
+    fn a_method_without_a_blanket_grant_asks_with_its_receiver_first() {
+        let registrations = || vec![Registration::method("User", "save", false)];
+        let run = run_with(
+            "return u.save(1);",
+            vec![("u", user())],
+            registrations(),
+            answering(Wire::Boolean(true)),
+            Box::new(|_, _| value(Wire::from(9))),
+            Limits::default(),
+        );
+        assert_eq!(run.result.unwrap().as_number(), Some(9.0));
+        assert_eq!(
+            run.order,
+            vec![
+                (MessageType::Authorize, "save".to_owned()),
+                (MessageType::Call, "save".to_owned()),
+            ]
+        );
+        assert_eq!(run.asked, vec![("save".to_owned(), vec![Wire::from(1)])]);
+        for receiver in &run.receivers {
+            assert_eq!(secret_of(receiver.as_ref().unwrap()), &user_secret());
+        }
+        // Refused: the same error an unregistered method gets, and no `Call`.
+        let run = run_with(
+            "return u.save(1);",
+            vec![("u", user())],
+            registrations(),
+            refusing(),
+            nothing(),
+            Limits::default(),
+        );
+        assert_eq!(
+            run.result.as_ref().unwrap_err().code.as_str(),
+            "capability.unknown_function"
+        );
+        assert_eq!(run.order, vec![(MessageType::Authorize, "save".to_owned())]);
+        assert_eq!(
+            refusals(&run),
+            vec![(
+                "save".to_owned(),
+                Some("User".to_owned()),
+                "refused".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn methods_are_looked_up_under_the_receiver_s_key_alone() {
+        let order = map(vec![
+            ("__secret", map(vec![("ref", s("o1")), ("key", s("Order"))])),
+            ("value", map(vec![])),
+        ]);
+        // Keyed `Order`, with `save` only under `User`; and a function `save` is no method.
+        for registrations in [save(), vec![Registration::function("save", true)]] {
+            let run = run_with(
+                "return u.save();",
+                vec![("u", order.clone())],
+                registrations,
+                refusing(),
+                nothing(),
+                Limits::default(),
+            );
+            assert_eq!(
+                run.result.unwrap_err().code.as_str(),
+                "capability.unknown_function"
+            );
+            assert!(run.order.is_empty());
+        }
+        // Nor is a method a function.
+        let run = run("return save();", save(), nothing());
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "capability.unknown_function"
+        );
+        assert!(run.order.is_empty());
+    }
+
+    #[test]
+    fn a_method_and_a_function_may_share_a_name() {
+        let run = run(
+            "return [save(), u.save()];",
+            vec![
+                Registration::function("save", true),
+                Registration::method("User", "save", true),
+            ],
+            Box::new(|_, _| value(Wire::from(1))),
+        );
+        run.result.unwrap();
+        assert_eq!(run.receivers.len(), 2);
+        assert!(run.receivers[0].is_none());
+        assert!(run.receivers[1].is_some());
+    }
+
+    #[test]
+    fn rpc_calls_refuses_a_method_call_and_sends_nothing() {
+        let limits = Limits::default().with_features(
+            hexput_exec::Limits::default()
+                .features()
+                .with(hexput_enforce::Feature::RpcCalls, false),
+        );
+        let run = run_with(
+            "return u.save();",
+            vec![("u", user())],
+            save(),
+            refusing(),
+            nothing(),
+            limits,
+        );
+        let error = run.result.unwrap_err();
+        assert_eq!(error.code.as_str(), "policy.construct_disabled");
+        assert!(run.order.is_empty());
+    }
+
+    #[test]
+    fn a_method_call_counts_like_a_function_call() {
+        let source = "u.save(); u.save(); return 0;";
+        let run = run_with(
+            source,
+            vec![("u", user())],
+            save(),
+            refusing(),
+            nothing(),
+            Limits::default().with_rpc_calls(1),
+        );
+        let error = run.result.unwrap_err();
+        assert_eq!(error.code.as_str(), "budget.rpc_calls_exceeded");
+        assert_eq!(
+            &source[error.span.range()],
+            "u.save()",
+            "the second call, spanned on the call"
+        );
+        assert_eq!(run.calls.len(), 1);
+        // And as a side effect, on its own limit.
+        let run = run_with(
+            source,
+            vec![("u", user())],
+            save(),
+            refusing(),
+            nothing(),
+            Limits::default().with_side_effects(1),
+        );
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "budget.side_effects_exceeded"
+        );
+        // A refused method call counts too, before its capability is decided.
+        let run = run_with(
+            "u.nope(); return 0;",
+            vec![("u", user())],
+            save(),
+            refusing(),
+            nothing(),
+            Limits::default().with_rpc_calls(0),
+        );
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "budget.rpc_calls_exceeded"
+        );
+    }
+
+    #[test]
+    fn a_method_cannot_be_overridden_and_nothing_is_sent() {
+        for (source, target) in [
+            ("u.save = 1; f(u); return 0;", "u.save"),
+            ("u[\"save\"] = 1; f(u); return 0;", "u[\"save\"]"),
+        ] {
+            let run = run_with(
+                source,
+                vec![("u", user())],
+                vec![
+                    Registration::method("User", "save", true),
+                    Registration::function("f", true),
+                ],
+                refusing(),
+                nothing(),
+                Limits::default(),
+            );
+            let error = run.result.unwrap_err();
+            assert_eq!(error.code.as_str(), "capability.method_override");
+            assert_eq!(spanned(source, &error), target);
+            assert!(run.order.is_empty(), "{source}");
+        }
+        // Writing `u` before the call shows the call sees what the Script left: only a property
+        // that is no method could be written.
+        let run = run_with(
+            "u.other = 1; f(u); return 0;",
+            vec![("u", user())],
+            vec![
+                Registration::method("User", "save", true),
+                Registration::function("f", true),
+            ],
+            refusing(),
+            nothing(),
+            Limits::default(),
+        );
+        run.result.unwrap();
+        assert_eq!(
+            run.calls[0].1[0],
+            map(vec![("name", s("a")), ("other", Wire::from(1))])
+        );
+    }
+
+    #[test]
+    fn a_call_on_a_keyed_value_that_reaches_nothing_is_counted_then_refused() {
+        let source = "return u.nmae();";
+        let at = |limits: Limits| {
+            run_with(
+                source,
+                vec![("u", user())],
+                save(),
+                refusing(),
+                nothing(),
+                limits,
+            )
+        };
+        // Counted as one RPC call and one side effect: a limit of one lets it through to the
+        // capability refusal, a limit of zero stops it there.
+        let run = at(Limits::default().with_rpc_calls(1).with_side_effects(1));
+        assert_eq!(
+            run.result.as_ref().unwrap_err().code.as_str(),
+            "capability.unknown_function"
+        );
+        assert!(run.order.is_empty());
+        for (limits, code) in [
+            (
+                Limits::default().with_rpc_calls(0),
+                "budget.rpc_calls_exceeded",
+            ),
+            (
+                Limits::default().with_side_effects(0),
+                "budget.side_effects_exceeded",
+            ),
+        ] {
+            let run = at(limits);
+            let error = run.result.unwrap_err();
+            assert_eq!(error.code.as_str(), code);
+            assert_eq!(spanned(source, &error), "u.nmae()");
+            assert!(run.order.is_empty());
+        }
+        // Under a disabled `rpc_calls` it is the policy refusal, like every host call.
+        let off = Limits::default().with_features(
+            Limits::default()
+                .features()
+                .with(hexput_enforce::Feature::RpcCalls, false),
+        );
+        let run = at(off);
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "policy.construct_disabled"
+        );
+        assert!(run.order.is_empty());
+    }
+
+    #[test]
+    fn a_receiver_too_large_to_send_is_named_as_the_receiver() {
+        let big = "x".repeat(hexput_rpc::MAX_FRAME_LEN + 1);
+        let source = "return u.save(1);";
+        let run = run_with(
+            source,
+            vec![("u", user_with(vec![("big", s(&big))]))],
+            save(),
+            refusing(),
+            nothing(),
+            Limits::default().with_memory(256 * 1024 * 1024),
+        );
+        let error = run.result.unwrap_err();
+        assert_eq!(error.code.as_str(), "host.function_failed");
+        assert!(
+            error.message.contains("its receiver encodes to more than"),
+            "{}",
+            error.message
+        );
+        assert_eq!(spanned(source, &error), "u.save(1)");
+        assert!(run.order.is_empty());
+    }
+
+    #[test]
+    fn the_receiver_counts_toward_the_argument_depth() {
+        let deep = map(vec![
+            ("__secret", user_secret()),
+            ("value", map(vec![("a", map(vec![("b", map(vec![]))]))])),
+        ]);
+        let source = "return u.save();";
+        let at = |depth: usize| {
+            run_with(
+                source,
+                vec![("u", deep.clone())],
+                save(),
+                refusing(),
+                nothing(),
+                Limits::default().with_argument_depth(depth),
+            )
+        };
+        at(3).result.unwrap();
+        let run = at(2);
+        let error = run.result.unwrap_err();
+        assert_eq!(error.code.as_str(), "depth.argument_too_deep");
+        assert_eq!(spanned(source, &error), "u");
+        assert!(run.order.is_empty());
+    }
+
+    #[test]
+    fn a_keyed_scalar_receiver_travels_with_its_place_s_secret() {
+        let n = holder(vec![("ref", s("r2")), ("key", s("Num"))], Wire::from(5));
+        let run = run_with(
+            "return n.double();",
+            vec![("n", n)],
+            vec![Registration::method("Num", "double", true)],
+            refusing(),
+            Box::new(|_, _| value(Wire::from(10))),
+            Limits::default(),
+        );
+        assert_eq!(run.result.unwrap().as_number(), Some(10.0));
+        let receiver = run.receivers[0].as_ref().unwrap();
+        assert_eq!(
+            secret_of(receiver),
+            &map(vec![("ref", s("r2")), ("key", s("Num"))])
+        );
+        assert_eq!(super::unheld(receiver), Wire::from(5));
     }
 }

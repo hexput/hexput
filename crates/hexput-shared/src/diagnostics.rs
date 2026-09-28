@@ -292,6 +292,12 @@ impl Code {
     /// Also the runtime failure itself (Story 3.1): a host call to a name the Session did not
     /// register, or any host call where there is no host (`hexput eval`).
     pub const UNKNOWN_FUNCTION: Self = Self::new("capability.unknown_function");
+    /// A write of a property a Registered Method owns (Story 3.12, FR-27): `v.name = x` or
+    /// `v["name"] = x` where `v`'s Value Secret carries a key the Session registered the method
+    /// `name` under. The value is left unchanged — a Script can never override a method. Raised
+    /// at runtime, and by the static check when a starting variable is provably keyed. Category
+    /// `capability`.
+    pub const METHOD_OVERRIDE: Self = Self::new("capability.method_override");
     /// A language construct the active policy disables (FR-3), named by its toggle. Category
     /// `policy`.
     pub const CONSTRUCT_DISABLED: Self = Self::new("policy.construct_disabled");
@@ -341,6 +347,7 @@ impl Code {
         Self::UNREACHABLE_CODE,
         Self::UNUSED_VARIABLE,
         Self::UNKNOWN_FUNCTION,
+        Self::METHOD_OVERRIDE,
         Self::CONSTRUCT_DISABLED,
     ];
 }

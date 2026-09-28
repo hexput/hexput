@@ -77,9 +77,14 @@ impl Config {
 }
 
 /// A function the Backend exposes to its Scripts, named at init (FR-1, FR-6), with its
-/// Capability grant.
+/// Capability grant — or, when it names an object key, a **Registered Method** under that key
+/// (FR-27, Story 3.12).
 ///
-/// On the wire a registration is `{name, blanket}`, `blanket` an optional boolean. A blanket
+/// On the wire a registration is `{name, blanket?, key?}`: `blanket` an optional boolean, `key`
+/// an optional non-empty string. A registration with a `key` is a method a Script calls as
+/// `value.name(args)` on a value whose Value Secret carries that key; one without is a function,
+/// called by its bare name. Names are unique per `(key, name)`, so a function and a method, or
+/// methods under two keys, may share one. A blanket
 /// grant (Story 3.2) makes the function callable by every Script of the Session with no per-call
 /// round trip. Without one every call is decided by the Backend's per-call handler (Story 3.3),
 /// asked anew each time. Whether a call may go ahead is decided in `hexput-enforce`,
@@ -87,6 +92,7 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredFunction {
     name: String,
+    key: Option<String>,
     blanket: bool,
 }
 
@@ -95,6 +101,12 @@ impl RegisteredFunction {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The object key a Registered Method is bound under; `None` for a Registered Function.
+    #[must_use]
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
     }
 
     /// Whether the Backend granted it blanket at registration.
@@ -144,6 +156,7 @@ const CONFIG: &str = "config";
 const REGISTRATIONS: &str = "registrations";
 const NAME: &str = "name";
 const BLANKET: &str = "blanket";
+const KEY: &str = "key";
 
 impl InitRequest {
     /// Decode an `Init` payload: a map with exactly the keys `config` and `registrations`.
@@ -290,8 +303,9 @@ fn decode_registrations(value: &Value) -> Result<Vec<RegisteredFunction>, InitEr
         return Err(InitError::new(format!("`{REGISTRATIONS}` is not an array")));
     };
     let mut registrations: Vec<RegisteredFunction> = Vec::with_capacity(entries.len());
-    // Name -> first index, so a duplicate is found without a quadratic scan of a large list.
-    let mut seen: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
+    // (key, name) -> first index, so a duplicate is found without a quadratic scan of a large
+    // list. Uniqueness is per key: a function and a method may share a name.
+    let mut seen: HashMap<(Option<&str>, &str), usize> = HashMap::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         // Built only on failure: a long valid list costs no formatting.
         let at = || format!("`{REGISTRATIONS}[{index}]`");
@@ -300,10 +314,12 @@ fn decode_registrations(value: &Value) -> Result<Vec<RegisteredFunction>, InitEr
         };
         let mut name = None;
         let mut blanket = None;
+        let mut object_key = None;
         for (key, value) in fields {
             let (slot, spelled) = match key.as_str() {
                 Some(NAME) => (&mut name, NAME),
                 Some(BLANKET) => (&mut blanket, BLANKET),
+                Some(KEY) => (&mut object_key, KEY),
                 _ => {
                     return Err(InitError::new(format!(
                         "{} has an unknown key {}",
@@ -331,6 +347,21 @@ fn decode_registrations(value: &Value) -> Result<Vec<RegisteredFunction>, InitEr
                 )));
             }
         };
+        // Absent means a function; anything present must be a non-empty string.
+        let object_key = match object_key.map(Value::as_str) {
+            None => None,
+            Some(Some("")) => {
+                return Err(InitError::new(format!(
+                    "`{REGISTRATIONS}[{index}].{KEY}` is empty"
+                )));
+            }
+            Some(Some(key)) => Some(key),
+            Some(None) => {
+                return Err(InitError::new(format!(
+                    "`{REGISTRATIONS}[{index}].{KEY}` is not a string"
+                )));
+            }
+        };
         let field = || format!("`{REGISTRATIONS}[{index}].{NAME}`");
         let Some(name) = name else {
             return Err(InitError::new(format!("{} is missing", field())));
@@ -341,15 +372,27 @@ fn decode_registrations(value: &Value) -> Result<Vec<RegisteredFunction>, InitEr
         if name.is_empty() {
             return Err(InitError::new(format!("{} is empty", field())));
         }
-        if let Some(first) = seen.insert(name, index) {
+        // A Script never sees a `__secret` property (LANGUAGE-REFERENCE §3), so a method of that
+        // name could never be called: refused, so a Backend never believes it exposed one.
+        if object_key.is_some() && name == "__secret" {
             return Err(InitError::new(format!(
-                "`{}` is registered twice, at `{REGISTRATIONS}[{first}]` and \
-                 `{REGISTRATIONS}[{index}]`",
-                bounded(name)
+                "{} cannot be `__secret` for a method: a Script can never call it",
+                field()
+            )));
+        }
+        if let Some(first) = seen.insert((object_key, name), index) {
+            let what = object_key.map_or_else(
+                || format!("`{}`", bounded(name)),
+                |key| format!("`{}` under key `{}`", bounded(name), bounded(key)),
+            );
+            return Err(InitError::new(format!(
+                "{what} is registered twice, at `{REGISTRATIONS}[{first}]` and \
+                 `{REGISTRATIONS}[{index}]`"
             )));
         }
         registrations.push(RegisteredFunction {
             name: name.to_owned(),
+            key: object_key.map(str::to_owned),
             blanket,
         });
     }

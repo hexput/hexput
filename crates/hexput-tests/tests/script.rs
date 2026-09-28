@@ -5,7 +5,7 @@ use hexput_port::{
     CorrelationId, Envelope, ErrorBody, MAX_FRAME_LEN, MAX_NESTING_DEPTH, MessageType, Setting,
     Settings, Value, decode, encode, encode_frame,
 };
-use hexput_script::MAX_RESULT_DEPTH;
+use hexput_script::{MAX_RESULT_DEPTH, Registration};
 use rmpv::Integer;
 
 /// Serve one Direct Execution with no Registered Functions, on a runtime of its own.
@@ -27,6 +27,19 @@ fn direct_execution_registering(
 fn direct_execution_configured(
     payload: &Value,
     registrations: Vec<(String, bool)>,
+    settings: Settings,
+) -> Result<Value, Box<ErrorBody>> {
+    direct_execution_with(
+        payload,
+        registrations.into_iter().map(Registration::from).collect(),
+        settings,
+    )
+}
+
+/// [`direct_execution_configured`] with any registrations — Registered Methods too (Story 3.12).
+fn direct_execution_with(
+    payload: &Value,
+    registrations: Vec<Registration>,
     settings: Settings,
 ) -> Result<Value, Box<ErrorBody>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -866,4 +879,86 @@ fn holders_that_take_a_result_past_the_depth_limit_make_it_too_deep() {
     );
     let bytes = encode(&envelope).unwrap();
     assert_eq!(decode(&bytes).unwrap(), envelope);
+}
+
+// --- Story 3.12: Registered Methods and the static check ---
+
+/// `{name: "a"}` held as a `User`.
+fn keyed_user() -> Value {
+    map(vec![
+        ("__secret", map(vec![("ref", s("r1")), ("key", s("User"))])),
+        ("value", map(vec![("name", s("a"))])),
+    ])
+}
+
+#[test]
+fn the_check_rejects_overriding_a_method_of_a_keyed_starting_variable() {
+    use hexput_port::CheckMode;
+    let body = *direct_execution_with(
+        &payload("u.save = 1; return 1;", vec![("u", keyed_user())]),
+        vec![Registration::method("User", "save", true)],
+        checked(CheckMode::Error),
+    )
+    .expect_err("rejected at submission");
+    assert_eq!(body.code, "capability.method_override");
+    assert_eq!(codes(&body.findings), ["capability.method_override"]);
+    // A method under another key, or a plain starting variable, is nothing to override.
+    for (variable, key) in [(keyed_user(), "Order"), (map(vec![]), "User")] {
+        let reply = direct_execution_with(
+            &payload("u.save = 1; return u.save;", vec![("u", variable)]),
+            vec![Registration::method(key, "save", true)],
+            checked(CheckMode::Error),
+        )
+        .unwrap();
+        assert_eq!(reply, map(vec![("value", int(1))]));
+    }
+    // With the check off, the runtime refuses it all the same.
+    let body = *direct_execution_with(
+        &payload("u.save = 1; return 1;", vec![("u", keyed_user())]),
+        vec![Registration::method("User", "save", true)],
+        Settings::new(),
+    )
+    .expect_err("refused at runtime");
+    assert_eq!(body.code, "capability.method_override");
+    assert!(body.findings.is_empty());
+}
+
+#[test]
+fn a_method_is_no_callable_name_for_the_check() {
+    use hexput_port::CheckMode;
+    // `save` is a method under `User`: a bare `save()` can never reach it.
+    let body = *direct_execution_with(
+        &payload("if (false) { save(); }; return 1;", vec![]),
+        vec![Registration::method("User", "save", true)],
+        checked(CheckMode::Error),
+    )
+    .expect_err("an unknown call");
+    assert_eq!(body.code, "capability.unknown_function");
+    // Calling it on a keyed value is no finding; the call itself runs (and here, with the
+    // connection gone, gets no reply).
+    let body = *direct_execution_with(
+        &payload("return u.save();", vec![("u", keyed_user())]),
+        vec![Registration::method("User", "save", true)],
+        checked(CheckMode::Error),
+    )
+    .expect_err("no reply");
+    assert_eq!(body.code, "host.no_reply");
+    assert!(body.findings.is_empty());
+}
+
+#[test]
+fn a_keyed_scalar_starting_variable_is_no_override_finding() {
+    use hexput_port::CheckMode;
+    let n = map(vec![
+        ("__secret", map(vec![("ref", s("r2")), ("key", s("Num"))])),
+        ("value", int(5)),
+    ]);
+    let body = *direct_execution_with(
+        &payload("n.double = 1; return 0;", vec![("n", n)]),
+        vec![Registration::method("Num", "double", true)],
+        checked(CheckMode::Error),
+    )
+    .expect_err("the runtime refuses it");
+    assert_eq!(body.code, "type.invalid_property_access");
+    assert!(body.findings.is_empty(), "{:?}", body.findings);
 }

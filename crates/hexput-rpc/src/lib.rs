@@ -29,11 +29,15 @@
 //!   but `hexput-exec` and this one, or a `Call` envelope is built outside this crate. A sealed
 //!   token the compiler enforces is still open.
 //!
+//! A Registered Method (Story 3.12) travels in the same generic `Call`: its payload adds
+//! `receiver`, the value the method is called on, as a holder carrying its Value Secret — from
+//! which the Backend learns the object key. A function's payload has no `receiver` key at all.
+//!
 //! # Asking the per-call handler (Story 3.3)
 //!
 //! A Registered Function granted per call rather than blanket is decided by the Backend's own
 //! handler, one call at a time. The question is its own message, sent before any `Call`:
-//! `Authorize` with the same `{name, arguments}` payload, under an id from the same per-connection
+//! `Authorize` with the same `{name, arguments}` payload (and `receiver` for a method), under an id from the same per-connection
 //! counter, answered `Result {value}` or `Error` like a `Call`. [`Caller::ask_authorization`]
 //! queues it and waits exactly like [`Caller::dispatch_authorized`], and returns the raw answer —
 //! what it means is `hexput-enforce`'s decision, reached through `hexput-exec`, never this crate's.
@@ -73,16 +77,27 @@ const ARGUMENTS: &str = "arguments";
 const VALUE: &str = "value";
 const MESSAGE: &str = "message";
 const EXECUTION: &str = "execution";
+const RECEIVER: &str = "receiver";
 
 /// A `Call` or `Authorize` payload: `{name, arguments}`, plus `execution` — the id of the request
-/// that started the execution making it — when the execution is named.
-fn payload(execution: Option<CorrelationId>, name: String, arguments: Vec<Value>) -> Value {
+/// that started the execution making it — when the execution is named, and `receiver` — the value
+/// a Registered Method is called on — for a method call alone (Story 3.12), so a function's
+/// payload is unchanged.
+fn payload(
+    execution: Option<CorrelationId>,
+    name: String,
+    arguments: Vec<Value>,
+    receiver: Option<Value>,
+) -> Value {
     let mut fields = vec![
         (Value::from(NAME), Value::from(name)),
         (Value::from(ARGUMENTS), Value::Array(arguments)),
     ];
     if let Some(execution) = execution {
         fields.push((Value::from(EXECUTION), Value::from(execution.get())));
+    }
+    if let Some(receiver) = receiver {
+        fields.push((Value::from(RECEIVER), receiver));
     }
     Value::Map(fields)
 }
@@ -117,6 +132,7 @@ pub struct Call {
     execution: Option<CorrelationId>,
     name: String,
     arguments: Vec<Value>,
+    receiver: Option<Value>,
     reply: oneshot::Sender<Result<Value, CallFailure>>,
 }
 
@@ -144,8 +160,10 @@ impl Caller {
         }
     }
 
-    /// Call the Registered Function `name` with `arguments`, and wait for the Backend's answer:
-    /// the reply's `value`, or why there is none.
+    /// Call the Registered Function `name` with `arguments` — or, with a `receiver`, the
+    /// Registered Method `name` on that value (Story 3.12) — and wait for the Backend's answer:
+    /// the reply's `value`, or why there is none. `receiver` travels as the payload's `receiver`,
+    /// exactly as given; without one the payload has no such key.
     ///
     /// Only for a call `hexput-enforce` has already allowed: this sends whatever it is given.
     /// `hexput-exec` is its one caller (AD-3), kept so by a source-text guard in
@@ -160,13 +178,16 @@ impl Caller {
         &self,
         name: impl Into<String>,
         arguments: Vec<Value>,
+        receiver: Option<Value>,
     ) -> Result<Value, CallFailure> {
-        self.submit(Request::Call, name.into(), arguments).await
+        self.submit(Request::Call, name.into(), arguments, receiver)
+            .await
     }
 
     /// Ask the Backend's per-call handler whether the Script may call the Registered Function
-    /// `name` with `arguments`, and wait for its answer: the reply's `value`, or why there is
-    /// none. Sends an `Authorize`, never a `Call`: nothing runs on the Backend but its handler.
+    /// `name` with `arguments` — or, with a `receiver`, the Registered Method `name` on that value
+    /// — and wait for its answer: the reply's `value`, or why there is none. Sends an
+    /// `Authorize`, never a `Call`: nothing runs on the Backend but its handler.
     ///
     /// Returns the answer as the Backend gave it — any value; deciding what it means is
     /// `hexput-enforce`'s. Only for `hexput-exec`, kept so by the same source-text guard as
@@ -181,8 +202,9 @@ impl Caller {
         &self,
         name: impl Into<String>,
         arguments: Vec<Value>,
+        receiver: Option<Value>,
     ) -> Result<Value, CallFailure> {
-        self.submit(Request::Authorize, name.into(), arguments)
+        self.submit(Request::Authorize, name.into(), arguments, receiver)
             .await
     }
 
@@ -192,6 +214,7 @@ impl Caller {
         request: Request,
         name: String,
         arguments: Vec<Value>,
+        receiver: Option<Value>,
     ) -> Result<Value, CallFailure> {
         let (reply, answer) = oneshot::channel();
         let call = Call {
@@ -199,6 +222,7 @@ impl Caller {
             execution: self.execution,
             name,
             arguments,
+            receiver,
             reply,
         };
         if self.calls.send(call).is_err() {
@@ -247,7 +271,8 @@ impl Calls {
 
     /// Give `call` the next Daemon-issued id, record it as pending, and return the envelope to
     /// write: a `Call`, or an `Authorize` for a question, either with the payload
-    /// `{name, arguments}`, plus `execution` when the execution is named.
+    /// `{name, arguments}`, plus `execution` when the execution is named and `receiver` for a
+    /// method call.
     ///
     /// `None` when its execution already stopped waiting — a question whose timeout elapsed while
     /// it was still queued: nothing is written and nothing is left pending, so the Backend is
@@ -267,7 +292,7 @@ impl Calls {
         Some(Envelope::new(
             id,
             message_type,
-            payload(call.execution, call.name, call.arguments),
+            payload(call.execution, call.name, call.arguments, call.receiver),
         ))
     }
 

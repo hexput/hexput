@@ -79,6 +79,22 @@
 //! or place sent again carries the same ID. [`evaluate`] and [`evaluate_with_variables`] take no
 //! secrets and return none.
 //!
+//! # Registered Methods (Story 3.12)
+//!
+//! A value whose Value Secret carries an object key — an array's or object's own secret, or, for
+//! any other value but a function, the secret of the variable, property or element it is read
+//! from — may have Registered Methods (FR-27, LANGUAGE-REFERENCE §8). `value.name(args)` and
+//! `value["name"](args)` (`?.` too) on such a value is a **method call** when `name` is a
+//! method under its key ([`Execution::with_methods`]), even over an own property `name`; when it
+//! is not, an own property `name` is called as usual, and anything else is a method call the
+//! Executor refuses as `capability.unknown_function`. Either way a method call stops at a
+//! [`HostCall`] carrying the receiver ([`HostCall::receiver`], detached like an argument, with its
+//! secret) and the key. The `rpc_calls` toggle refuses one before the receiver or any argument is
+//! checked. A value with no key has no methods, and behaves exactly as before.
+//!
+//! Writing a property that is a method under the value's key — `v.name = x`, `v["name"] = x` —
+//! is `capability.method_override`, spanned on the assignment target, and changes nothing.
+//!
 //! # Starting variables
 //!
 //! [`evaluate`] runs a Script with nothing but what its own source declares. [`evaluate_with_variables`]
@@ -245,11 +261,19 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
         machine::Stop::HostCall(call) => Err(Diagnostic::new(
             Category::Capability,
             Code::UNKNOWN_FUNCTION,
-            format!(
-                "`{}` is not declared, and there is no host here to call it on: a Script run on \
-                 its own can call only the functions it declares",
-                call.name
-            ),
+            if call.receiver.is_some() {
+                format!(
+                    "`{}` is not a method this Script may call on this value: there is no host \
+                     here to call it on",
+                    call.name
+                )
+            } else {
+                format!(
+                    "`{}` is not declared, and there is no host here to call it on: a Script run \
+                     on its own can call only the functions it declares",
+                    call.name
+                )
+            },
             call.span,
         )),
     }
@@ -351,6 +375,26 @@ impl Execution {
         self
     }
 
+    /// Tell this execution the Session's Registered Methods (Story 3.12), as `(key, name)` pairs:
+    /// `value.name(args)` on a value whose Value Secret carries `key` is then a method call, even
+    /// over an own property `name`, and writing the property `name` of such a value is
+    /// `capability.method_override`. Data only, like the feature toggles: it grants nothing, and
+    /// every method call still stops at a [`HostCall`] for the Executor to decide. Without it —
+    /// and in [`evaluate`] — no name is a method, so a keyed value's own property is called as
+    /// usual and any other call on it stops at a [`HostCall`] the Executor refuses.
+    #[must_use]
+    pub fn with_methods<K: Into<Arc<str>>, N: Into<Arc<str>>>(
+        mut self,
+        methods: impl IntoIterator<Item = (K, N)>,
+    ) -> Self {
+        self.machine.set_methods(
+            methods
+                .into_iter()
+                .map(|(key, name)| (key.into(), name.into())),
+        );
+        self
+    }
+
     /// Generate this execution's Reference IDs as `<prefix>:<counter>`, the counter from 1
     /// (Story 3.11). The Executor passes `hx:` and a per-execution nonce; a new execution uses
     /// `hx:0000000000000000`. Reference IDs already issued keep their spelling.
@@ -387,6 +431,8 @@ impl Execution {
                 name: call.name,
                 arguments: call.arguments,
                 span: call.span,
+                receiver: call.receiver,
+                key: call.key,
                 execution: Self { machine },
             })),
             machine::Stop::Paused(span) => Ok(Outcome::Paused(Paused {
@@ -494,7 +540,8 @@ impl AllocationsExceeded {
     }
 }
 
-/// A host call an [`Execution`] is suspended on: a call to a bare name no scope declares (§8).
+/// A host call an [`Execution`] is suspended on: a call to a bare name no scope declares (§8), or
+/// a method call on a keyed value (Story 3.12) — [`HostCall::receiver`] tells them apart.
 ///
 /// Dropping it ends the execution. [`HostCall::resume`] hands the execution back with the call's
 /// value in place.
@@ -502,6 +549,8 @@ pub struct HostCall {
     name: String,
     arguments: Vec<Argument>,
     span: Span,
+    receiver: Option<Argument>,
+    key: Option<Arc<str>>,
     execution: Execution,
 }
 
@@ -518,11 +567,27 @@ impl HostCall {
         &self.arguments
     }
 
-    /// The call, from the callee's name through its closing parenthesis — where an error about
-    /// the call as a whole points.
+    /// The call, from the callee's name — or, for a method call, the receiver expression —
+    /// through its closing parenthesis: where an error about the call as a whole points.
     #[must_use]
     pub const fn span(&self) -> Span {
         self.span
+    }
+
+    /// For a method call (Story 3.12), the value the method is called on — detached like an
+    /// argument and with the span of the receiver expression. Its Value Secret is the one it
+    /// carries in the Script: an array's or object's own, or, for any other value, the
+    /// [`Argument::secret`] of the place it was read from. `None` for a function call.
+    #[must_use]
+    pub const fn receiver(&self) -> Option<&Argument> {
+        self.receiver.as_ref()
+    }
+
+    /// For a method call, the object key its receiver's Value Secret carries — what the Executor
+    /// looks the method up under. `None` for a function call.
+    #[must_use]
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
     }
 
     /// Give the call `value` as its result and hand back the execution, ready to

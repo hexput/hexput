@@ -268,6 +268,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-9-switch-off-language-constructs-by-policy.md`
   summary: The `rpc_calls` toggle is checked only on the bare-name host-call path; Registered Method calls (`value.name(args)`, Story 3.12) must be refused by it too.
   evidence: Review finding (blind, low). LANGUAGE-REFERENCE says `rpc_calls` switches off every host call (§8), which includes methods. Add the check and a test with Story 3.12.
+  status: RESOLVED 2026-09-28 by `spec-3-12-call-a-backend-method-on-a-keyed-object.md` decision 4 — the interpreter refuses a method call under a disabled `rpc_calls` toggle as `` a method call to `name` is disabled by policy (`features.rpc_calls`) ``, spanned on the call, after its receiver (and an index key) is evaluated, before the receiver or any argument is checked or counted, so it is never counted and nothing is sent. Pinned in `tests/interpreter.rs` (`methods::rpc_calls_refuses_a_method_call_before_anything_is_checked`) and `tests/exec.rs` (`methods::rpc_calls_refuses_a_method_call_and_sends_nothing`). An own property of a keyed value (decision 2 (c)) is no host call and is unaffected.
 
 - source_spec: `spec-3-10-turn-the-static-check-on-or-off.md`
   summary: The Daemon-side static check pass runs on the blocking pool with no time bound or cancellation; it is not charged to the Script's CPU budget.
@@ -280,6 +281,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-11-carry-hidden-metadata-on-values-the-script-cannot-touch.md`
   summary: A `Call` reply's secret stored into a place that already has a Reference ID is dropped, losing its `key` and further fields.
   evidence: Review finding (blind, low). The place keeps its own ID by rule (LANGUAGE-REFERENCE §3). Revisit with Story 3.12 (keys) and 3.13 (modifications) whether the reply's key/fields should merge.
+  note: 2026-09-28, Story 3.12 — still open, now with a visible effect: a keyed string, number, bool or `null` a `Call` returns into a place that already holds a Reference ID loses its `key`, so it has no Registered Methods there (a keyed array or object carries its own secret and is unaffected). Left to Story 3.13, which decides how a reply's secret and a place's ID relate.
 
 - source_spec: `spec-3-11-carry-hidden-metadata-on-values-the-script-cannot-touch.md`
   summary: Holders multiply a `Call` argument's wire size (every nested scalar becomes a holder) and roughly halve its usable nesting; each generated secret is charged to memory; none of this cost is documented or benchmarked, and the memory charge for generated/cleared secrets is untested.

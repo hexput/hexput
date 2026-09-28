@@ -107,6 +107,19 @@
 //! carries only the secrets the Backend supplied — a generated one never leaves in it — and the
 //! output size budget counts its holders.
 //!
+//! # Registered Methods (Story 3.12)
+//!
+//! A [`Registration`] may name an object key, which makes it a Registered Method under that key.
+//! The Executor hands the interpreter the method names per key — data only — so `value.name(args)`
+//! on a keyed value stops at a host call carrying the receiver and its key
+//! ([`HostCall::receiver`], [`HostCall::key`]). From there a method call is a function call in
+//! every respect: the receiver is measured with the arguments (it counts toward the argument
+//! depth limit, spanned on the receiver expression), the call is charged as one RPC call and one
+//! side effect, `hexput-enforce` decides it by `(key, name)` — blanket, per-call `Authorize`, or
+//! refused as the same `capability.unknown_function` — and the `Call` and `Authorize` payloads
+//! carry `receiver`, a holder with the receiver's secret unchanged. A refusal is logged with the
+//! method's `key` beside `function` and `reason`.
+//!
 //! Binds: AD-3, AD-6.
 
 pub mod wire;
@@ -152,8 +165,50 @@ pub const AUTHORIZATION_TIMEOUT: Duration = hexput_enforce::DEFAULT_AUTHORIZATIO
 /// CPU time past the limit.
 pub const SLICE: NonZeroU64 = NonZeroU64::new(10_000).expect("non-zero");
 
-/// What an execution may reach outside itself: which host functions it may call, and the
-/// connection that carries the calls.
+/// One of a Session's registrations, as the Executor takes it: a Registered Function (no `key`)
+/// or a Registered Method under an object key (Story 3.12), and whether the Backend granted it
+/// blanket at registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    /// The name a Script calls it by.
+    pub name: String,
+    /// The object key a method is bound under; `None` for a function.
+    pub key: Option<String>,
+    /// Whether it holds a blanket grant.
+    pub blanket: bool,
+}
+
+impl Registration {
+    /// A Registered Function.
+    #[must_use]
+    pub fn function(name: impl Into<String>, blanket: bool) -> Self {
+        Self {
+            name: name.into(),
+            key: None,
+            blanket,
+        }
+    }
+
+    /// A Registered Method `name` under the object key `key`.
+    #[must_use]
+    pub fn method(key: impl Into<String>, name: impl Into<String>, blanket: bool) -> Self {
+        Self {
+            name: name.into(),
+            key: Some(key.into()),
+            blanket,
+        }
+    }
+}
+
+/// A `(name, blanket)` pair is a Registered Function.
+impl<N: Into<String>> From<(N, bool)> for Registration {
+    fn from((name, blanket): (N, bool)) -> Self {
+        Self::function(name, blanket)
+    }
+}
+
+/// What an execution may reach outside itself: which host functions and methods it may call,
+/// and the connection that carries the calls.
 #[derive(Debug, Default)]
 pub struct Host {
     capabilities: Capabilities,
@@ -167,15 +222,19 @@ impl Host {
         Self::default()
     }
 
-    /// A Session's host: its Registered Functions as `(name, blanket)` pairs — each name, and
-    /// whether the Backend granted it blanket at registration — reached through `caller`.
+    /// A Session's host: its registrations — Registered Functions, which a `(name, blanket)`
+    /// pair converts into, and Registered Methods ([`Registration::method`]) — each with whether
+    /// the Backend granted it blanket at registration, reached through `caller`.
     #[must_use]
-    pub fn new<N: Into<String>>(
-        registrations: impl IntoIterator<Item = (N, bool)>,
+    pub fn new<R: Into<Registration>>(
+        registrations: impl IntoIterator<Item = R>,
         caller: Caller,
     ) -> Self {
         Self {
-            capabilities: Capabilities::registered(registrations),
+            capabilities: Capabilities::none().with_methods(registrations.into_iter().map(|r| {
+                let Registration { name, key, blanket } = r.into();
+                (key, name, blanket)
+            })),
             caller: Some(caller),
         }
     }
@@ -224,11 +283,18 @@ impl Halt {
 enum Step {
     /// The Script ended with this result.
     Finished(Held),
-    /// The Script waits on this host call, whose arguments are ready to send; when the call is
-    /// granted per call, the question for the Backend's handler comes first.
-    Call(HostCall, Vec<hexput_rpc::Value>, Option<Question>),
-    /// The Script made a host call `hexput-enforce` refused: the function's name, and why.
-    Refused(String, Refusal),
+    /// The Script waits on this host call, whose arguments (and receiver) are ready to send; when
+    /// the call is granted per call, the question for the Backend's handler comes first.
+    Call(Box<HostCall>, Sent, Option<Question>),
+    /// The Script made a host call `hexput-enforce` refused: the function's or method's name, a
+    /// method's key, and why.
+    Refused(String, Option<String>, Refusal),
+}
+
+/// What a host call sends, as wire values: its arguments, and a method call's receiver.
+struct Sent {
+    arguments: Vec<hexput_rpc::Value>,
+    receiver: Option<hexput_rpc::Value>,
 }
 
 /// Run a parsed Script whose root scope binds `variables` — its starting variables — reaching the
@@ -321,9 +387,16 @@ pub async fn execute_held(
             let mut budget = budget;
             // Binding the starting variables is charged with the first slice.
             let started = Instant::now();
+            // The method names only tell a method call from a property call and refuse an
+            // override; every call is still decided by `check_call` below.
+            let methods: Vec<(Arc<str>, Arc<str>)> = capabilities
+                .methods()
+                .map(|(key, name)| (Arc::from(key), Arc::from(name)))
+                .collect();
             let execution = Execution::with_variables(program, variables)?
                 .metered(meter)
                 .with_features(limits.features())
+                .with_methods(methods)
                 .with_reference_prefix(reference_prefix());
             let step = segment(execution, &mut budget, &capabilities, whole, started)?;
             Ok((step, budget))
@@ -332,27 +405,41 @@ pub async fn execute_held(
         .map_err(Halt::into_diagnostic)?
     };
     loop {
-        let (call, arguments, question) = match step {
+        let (
+            call,
+            Sent {
+                arguments,
+                receiver,
+            },
+            question,
+        ) = match step {
             Step::Finished(result) => return Ok(result),
-            Step::Call(call, arguments, question) => (call, arguments, question),
-            Step::Refused(function, refusal) => return Err(refused(&function, refusal)),
+            Step::Call(call, sent, question) => (call, sent, question),
+            Step::Refused(function, key, refusal) => {
+                return Err(refused(&function, key.as_deref(), refusal));
+            }
         };
         if let Some(question) = question {
             let answer = ask(
                 caller.as_ref(),
                 &question,
                 arguments.clone(),
+                receiver.clone(),
                 authorization_timeout,
             )
             .await;
             if let Err(refusal) = question.decide(answer) {
-                return Err(refused(call.name(), refusal));
+                return Err(refused(call.name(), call.key(), refusal));
             }
         }
         let reply = match &caller {
             // Authorized: `advance` returned this call only after `check_call` allowed it, and a
             // call granted per call reaches here only once its handler answered `true`.
-            Some(caller) => caller.dispatch_authorized(call.name(), arguments).await,
+            Some(caller) => {
+                caller
+                    .dispatch_authorized(call.name(), arguments, receiver)
+                    .await
+            }
             // Unreachable in practice: without a caller nothing is registered, so the capability
             // check refused the call already.
             None => Err(CallFailure::NoReply),
@@ -431,9 +518,11 @@ fn segment(
 /// Log a refused host call and return the Script's error. Logged here, in the execution's own
 /// task, so the event carries the request's span; the reason is for the Daemon's log only, never
 /// the Script's error.
-fn refused(function: &str, refusal: Refusal) -> Diagnostic {
+fn refused(function: &str, key: Option<&str>, refusal: Refusal) -> Diagnostic {
+    // `key` is recorded only for a method: a function's refusal logs no such field.
     tracing::debug!(
         function,
+        key,
         reason = refusal.reason().as_str(),
         "refused a host call"
     );
@@ -446,13 +535,14 @@ async fn ask(
     caller: Option<&Caller>,
     question: &Question,
     arguments: Vec<hexput_rpc::Value>,
+    receiver: Option<hexput_rpc::Value>,
     timeout: Duration,
 ) -> HandlerAnswer {
     // Unreachable in practice, like a dispatch without a caller: nothing is registered.
     let Some(caller) = caller else {
         return HandlerAnswer::NoReply;
     };
-    let answer = caller.ask_authorization(question.name(), arguments);
+    let answer = caller.ask_authorization(question.name(), arguments, receiver);
     match tokio::time::timeout(timeout, answer).await {
         Err(_elapsed) => HandlerAnswer::TimedOut,
         Ok(Ok(hexput_rpc::Value::Boolean(allowed))) => HandlerAnswer::Boolean(allowed),
@@ -496,24 +586,39 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 /// before the capability decision, so a refused or denied call counts; a call whose arguments
 /// cannot be sent never became a host call and is not charged.
 fn advance(call: HostCall, capabilities: &Capabilities, budget: &mut Budget) -> Result<Step, Halt> {
-    let arguments = arguments(&call, budget.limits().argument_depth())?;
+    let sent = arguments(&call, budget.limits().argument_depth())?;
     budget
         .charge_rpc_call(call.span())
         .map_err(Halt::Exceeded)?;
-    match capabilities.check_call(call.name(), call.span()) {
-        Ok(Decision::Allowed) => Ok(Step::Call(call, arguments, None)),
-        Ok(Decision::AskHandler(question)) => Ok(Step::Call(call, arguments, Some(question))),
-        Err(refusal) => Ok(Step::Refused(call.name().to_owned(), refusal)),
+    // A method is looked up under its receiver's key (Story 3.12), a function under none.
+    match capabilities.check_call(call.key(), call.name(), call.span()) {
+        Ok(Decision::Allowed) => Ok(Step::Call(Box::new(call), sent, None)),
+        Ok(Decision::AskHandler(question)) => Ok(Step::Call(Box::new(call), sent, Some(question))),
+        Err(refusal) => Ok(Step::Refused(
+            call.name().to_owned(),
+            call.key().map(str::to_owned),
+            refusal,
+        )),
     }
 }
 
-/// A host call's arguments as wire values, each measured first against the argument depth limit
-/// `depth`.
-fn arguments(call: &HostCall, depth: usize) -> Result<Vec<hexput_rpc::Value>, Diagnostic> {
+/// A host call's arguments — and a method call's receiver, first — as wire values, each
+/// measured first against the argument depth limit `depth`.
+fn arguments(call: &HostCall, depth: usize) -> Result<Sent, Diagnostic> {
     // One frame carries every argument; the envelope and payload maps' own bytes are small
     // enough that a lower bound over the arguments alone is the useful check.
     let mut budget = hexput_rpc::MAX_FRAME_LEN;
-    for argument in call.arguments() {
+    // The receiver, when there is one, comes first, so an error on it names it alone.
+    let receiver = call.receiver().map(|receiver| (true, receiver));
+    let sent = receiver
+        .into_iter()
+        .chain(call.arguments().iter().map(|argument| (false, argument)));
+    for (is_receiver, argument) in sent.clone() {
+        let what = if is_receiver {
+            "its receiver"
+        } else {
+            "an argument"
+        };
         match wire::measure_held(
             &argument.value,
             argument.secret.as_ref(),
@@ -538,8 +643,8 @@ fn arguments(call: &HostCall, depth: usize) -> Result<Vec<hexput_rpc::Value>, Di
                 return Err(host_error(
                     Code::FUNCTION_FAILED,
                     format!(
-                        "the call to `{}` could not be sent: an argument holds a value with no \
-                         wire representation",
+                        "the call to `{}` could not be sent: {what} holds a value with no wire \
+                         representation",
                         call.name()
                     ),
                     call,
@@ -549,9 +654,14 @@ fn arguments(call: &HostCall, depth: usize) -> Result<Vec<hexput_rpc::Value>, Di
                 return Err(host_error(
                     Code::FUNCTION_FAILED,
                     format!(
-                        "the call to `{}` could not be sent: its arguments encode to more than \
-                         the maximum frame of {} bytes",
+                        "the call to `{}` could not be sent: {} to more than the maximum frame \
+                         of {} bytes",
                         call.name(),
+                        if is_receiver {
+                            "its receiver encodes"
+                        } else {
+                            "its arguments encode"
+                        },
                         hexput_rpc::MAX_FRAME_LEN
                     ),
                     call,
@@ -559,8 +669,13 @@ fn arguments(call: &HostCall, depth: usize) -> Result<Vec<hexput_rpc::Value>, Di
             }
         }
     }
-    let mut sent = Vec::with_capacity(call.arguments().len());
-    for argument in call.arguments() {
+    let mut values = Vec::with_capacity(call.arguments().len() + 1);
+    for (is_receiver, argument) in sent {
+        let what = if is_receiver {
+            "its receiver"
+        } else {
+            "an argument"
+        };
         let value = wire::to_wire_held(&argument.value, argument.secret.as_ref());
         // The Script's nesting is within the limit; its holders may still take it past what a
         // frame may nest.
@@ -568,17 +683,21 @@ fn arguments(call: &HostCall, depth: usize) -> Result<Vec<hexput_rpc::Value>, Di
             return Err(host_error(
                 Code::FUNCTION_FAILED,
                 format!(
-                    "the call to `{}` could not be sent: with its Value Secrets an argument nests \
-                     more than {} levels deep, past what a frame may carry",
+                    "the call to `{}` could not be sent: with its Value Secrets {what} nests more \
+                     than {} levels deep, past what a frame may carry",
                     call.name(),
                     wire::MAX_ARGUMENT_WIRE_DEPTH
                 ),
                 call,
             ));
         }
-        sent.push(value);
+        values.push(value);
     }
-    Ok(sent)
+    let receiver = call.receiver().is_some().then(|| values.remove(0));
+    Ok(Sent {
+        arguments: values,
+        receiver,
+    })
 }
 
 /// The value a host call resumes the Script with, or the `host` error that ends it.

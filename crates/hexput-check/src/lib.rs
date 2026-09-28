@@ -12,7 +12,9 @@
 //! Everything LANGUAGE-REFERENCE §10 lists that is decidable from an AST: undeclared identifier
 //! reads and assignments, wrong argument counts against functions the Script itself declares,
 //! type errors between literal operands, unreachable code, unused locals, calls to names the
-//! caller did not say are callable, and uses of a construct the policy disables.
+//! caller did not say are callable, and uses of a construct the policy disables — and, when the
+//! environment declares a starting variable keyed ([`Environment::with_keyed`]), a write that
+//! would override one of its Registered Methods (`capability.method_override`, Story 3.12).
 //!
 //! # What it deliberately does not report
 //!
@@ -119,6 +121,7 @@ impl Default for Policy {
 pub struct Environment {
     variables: Vec<String>,
     callables: Option<Vec<String>>,
+    keyed: Vec<(String, Vec<String>)>,
 }
 
 impl Environment {
@@ -161,6 +164,37 @@ impl Environment {
     {
         self.callables = Some(names.into_iter().map(Into::into).collect());
         self
+    }
+
+    /// Declare the starting variable `variable` **keyed** (Story 3.12): an array or object whose
+    /// Value Secret carries an object key, under which the Session registered the Registered
+    /// Methods `methods`. A Script that writes one of those methods as a property of the
+    /// variable — `variable.m = x` or `variable["m"] = x` — is then reported as
+    /// `capability.method_override`, provided the variable is never reassigned or shadowed
+    /// anywhere in the Script, so the write certainly reaches the keyed value.
+    ///
+    /// Adds to the keyed variables set before; the variable must also be among
+    /// [`Environment::with_variables`]' names, or it is not a starting variable and nothing is
+    /// reported. A variable holding a string, number, bool or `null` must not be declared keyed:
+    /// it has no properties to override, and writing one fails as a `type` error instead.
+    #[must_use]
+    pub fn with_keyed<N, I, M>(mut self, variable: N, methods: I) -> Self
+    where
+        N: Into<String>,
+        I: IntoIterator<Item = M>,
+        M: Into<String>,
+    {
+        self.keyed.push((
+            variable.into(),
+            methods.into_iter().map(Into::into).collect(),
+        ));
+        self
+    }
+
+    /// The keyed starting variables, each with its Registered Methods, in the order supplied.
+    #[must_use]
+    pub fn keyed(&self) -> &[(String, Vec<String>)] {
+        &self.keyed
     }
 
     /// The starting-variable names, in the order supplied.

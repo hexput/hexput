@@ -1171,10 +1171,11 @@ impl Backend {
     }
 
     /// The next envelope, which must be a `message_type` request from the Daemon with the payload
-    /// `{name, arguments, execution}`: its id, name and arguments.
+    /// `{name, arguments, execution}`: its id, name and arguments — each argument, and everything
+    /// inside it, asserted to travel as a Value Secret holder (Story 3.11), then stripped of them.
     async fn request(&mut self, message_type: MessageType) -> (CorrelationId, String, Vec<Value>) {
         let (id, name, arguments, _) = self.request_from(message_type).await;
-        (id, name, arguments)
+        (id, name, arguments.iter().map(unheld).collect())
     }
 
     /// The next envelope, which must be a `message_type` request from the Daemon with the payload
@@ -1295,6 +1296,36 @@ fn wired_runtime() -> tokio::runtime::Runtime {
         })
         .build()
         .unwrap()
+}
+
+/// A wire value with every Value Secret holder replaced by its value, after asserting that the
+/// value, and every value inside it, is one (Story 3.11: everything a `Call` sends is).
+fn unheld(value: &Value) -> Value {
+    let Value::Map(fields) = value else {
+        panic!("not a Value Secret holder: {value:?}");
+    };
+    assert_eq!(
+        fields.len(),
+        2,
+        "a holder is exactly `__secret` and `value`: {value:?}"
+    );
+    assert_eq!(fields[0].0, string("__secret"));
+    assert_eq!(fields[1].0, string("value"));
+    let Value::Map(secret) = &fields[0].1 else {
+        panic!("`__secret` is a map: {value:?}");
+    };
+    assert_eq!(secret[0].0, string("ref"));
+    assert!(secret[0].1.as_str().is_some_and(|r| !r.is_empty()));
+    match &fields[1].1 {
+        Value::Array(items) => Value::Array(items.iter().map(unheld).collect()),
+        Value::Map(entries) => Value::Map(
+            entries
+                .iter()
+                .map(|(key, item)| (key.clone(), unheld(item)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 fn value_of(response: &Envelope<Value>) -> Value {
@@ -3333,6 +3364,319 @@ fn rpc_calls_disabled_under_error_rejects_a_registered_call_and_sends_nothing() 
                 backend.from_daemon.recv().await.is_none(),
                 "no `Call` was written"
             );
+        },
+    );
+}
+
+// --- Story 3.11: Value Secrets over the wire ---
+
+/// A holder: `{__secret: {…secret}, value}`.
+fn holder(secret: Vec<(&str, Value)>, value: Value) -> Value {
+    Value::Map(vec![
+        (
+            string("__secret"),
+            Value::Map(secret.into_iter().map(|(k, v)| (string(k), v)).collect()),
+        ),
+        (string("value"), value),
+    ])
+}
+
+/// `{name: "a"}` held with `ref` r1, `key` User and a further field `tier`.
+fn held_user() -> Value {
+    holder(
+        vec![
+            ("ref", string("r1")),
+            ("key", string("User")),
+            ("tier", Value::from(3)),
+        ],
+        Value::Map(vec![(string("name"), string("a"))]),
+    )
+}
+
+/// The reply to one execution of `source` with `variables`, on a Session with nothing registered.
+fn execute_once(source: &str, variables: Vec<(&str, Value)>) -> Envelope<Value> {
+    let (sent, _) = serve(
+        vec![
+            init(1, init_payload(&[])),
+            execution_with(2, source, variables, None),
+        ],
+        None,
+    );
+    assert_eq!(sent.len(), 2);
+    sent[1].clone()
+}
+
+/// The `ref` a sent value's holder carries.
+fn reference_of(sent: &Value) -> String {
+    let Value::Map(fields) = sent else {
+        panic!("a holder: {sent:?}");
+    };
+    let Value::Map(secret) = &fields[0].1 else {
+        panic!("a `__secret` map: {sent:?}");
+    };
+    secret[0].1.as_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_held_starting_variable_reads_like_its_value() {
+    let reply = execute_once("return u.name;", vec![("u", held_user())]);
+    assert_eq!(
+        reply.payload,
+        Value::Map(vec![(string("value"), string("a"))])
+    );
+}
+
+#[test]
+fn a_held_value_returned_goes_back_byte_for_byte() {
+    let reply = execute_once("return u;", vec![("u", held_user())]);
+    let expected = Value::Map(vec![(string("value"), held_user())]);
+    let bytes = |value: &Value| {
+        let mut out = Vec::new();
+        hexput_port::rmpv::encode::write_value(&mut out, value).unwrap();
+        out
+    };
+    assert_eq!(bytes(&reply.payload), bytes(&expected));
+}
+
+#[test]
+fn the_secret_is_invisible_and_cannot_be_written() {
+    let reply = execute_once(
+        "return [u.__secret, u[\"__secret\"], u?.__secret, 5 .__secret];",
+        vec![("u", held_user())],
+    );
+    assert_eq!(
+        value_of(&reply),
+        Value::Array(vec![Value::Nil, Value::Nil, Value::Nil, Value::Nil])
+    );
+    let reply = execute_once(
+        "u.__secret = 1; u[\"__secret\"] = 2; let o = {__secret: 3, a: 1}; let n = 0; \
+         for (k in o) { n = n + 1; }; return [n, o, u, u == u, s == \"x\"];",
+        vec![
+            ("u", held_user()),
+            ("s", holder(vec![("ref", string("r9"))], string("x"))),
+        ],
+    );
+    assert_eq!(
+        value_of(&reply),
+        Value::Array(vec![
+            Value::from(1),
+            Value::Map(vec![(string("a"), Value::from(1))]),
+            held_user(),
+            Value::Boolean(true),
+            Value::Boolean(true),
+        ])
+    );
+}
+
+#[test]
+fn a_malformed_starting_variable_holder_is_an_invalid_payload() {
+    let cases = [
+        (
+            Value::Map(vec![
+                (string("__secret"), Value::from(1)),
+                (string("value"), Value::from(2)),
+            ]),
+            "`variables.u.__secret`",
+        ),
+        (
+            Value::Map(vec![
+                (string("__secret"), Value::Map(vec![])),
+                (string("value"), Value::from(1)),
+            ]),
+            "`variables.u.__secret`",
+        ),
+        (
+            holder(
+                vec![("ref", string("a"))],
+                holder(vec![("ref", string("b"))], Value::from(1)),
+            ),
+            "`variables.u.value`",
+        ),
+        (
+            Value::Map(vec![
+                (
+                    string("__secret"),
+                    Value::Map(vec![(string("ref"), string("r"))]),
+                ),
+                (string("value"), Value::from(1)),
+                (string("x"), Value::from(2)),
+            ]),
+            "`variables.u`",
+        ),
+    ];
+    for (variable, path) in cases {
+        let reply = execute_once("return 1;", vec![("u", variable)]);
+        assert_eq!(code_of(&reply), "protocol.invalid_payload");
+        assert!(
+            message_of(&reply).starts_with(path),
+            "{}",
+            message_of(&reply)
+        );
+    }
+}
+
+#[test]
+fn every_value_a_call_sends_is_held_and_keeps_its_reference() {
+    hosted(
+        &wired_runtime(),
+        &[("f", true), ("g", true)],
+        false,
+        |mut backend| async move {
+            backend.send(execution_with(
+                1,
+                "let o = {a: 1}; f(o); f(o); f(u); f(n); let m = n; f(m); \
+                 let x = g(); f(x); return 0;",
+                vec![
+                    ("u", held_user()),
+                    ("n", holder(vec![("ref", string("r2"))], Value::from(5))),
+                ],
+                None,
+            ));
+            let mut sent = Vec::new();
+            for _ in 0..7 {
+                let (id, name, arguments, _) = backend.request_from(MessageType::Call).await;
+                let answer = if name == "g" {
+                    holder(vec![("ref", string("r3"))], Value::from(7))
+                } else {
+                    Value::Nil
+                };
+                backend.reply(
+                    id,
+                    MessageType::Result,
+                    Value::Map(vec![(string("value"), answer)]),
+                );
+                if name == "f" {
+                    sent.push(arguments[0].clone());
+                }
+            }
+            let reply = backend.next().await;
+            assert_eq!(value_of(&reply), Value::from(0));
+            // The same object twice: the same generated IDs, its property's included.
+            assert_eq!(sent[0], sent[1]);
+            assert!(reference_of(&sent[0]).starts_with("hx:"));
+            // The Backend's own secret goes out as it came in.
+            let Value::Map(fields) = &sent[2] else {
+                panic!("a holder");
+            };
+            let Value::Map(original) = held_user() else {
+                unreachable!()
+            };
+            assert_eq!(fields[0], original[0], "`__secret` exactly as supplied");
+            // A place keeps its Reference ID; its copy is a new place.
+            assert_eq!(reference_of(&sent[3]), "r2");
+            assert!(reference_of(&sent[4]).starts_with("hx:"));
+            // A call's value stored directly keeps the secret it came with.
+            assert_eq!(reference_of(&sent[5]), "r3");
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_reply_with_a_malformed_holder_fails_the_call() {
+    hosted(
+        &wired_runtime(),
+        &[("f", true)],
+        false,
+        |mut backend| async move {
+            backend.send(execution(1, "return f();"));
+            let (id, _, _) = backend.call().await;
+            backend.reply(
+                id,
+                MessageType::Result,
+                Value::Map(vec![(
+                    string("value"),
+                    Value::Map(vec![
+                        (string("__secret"), Value::from(1)),
+                        (string("value"), Value::Nil),
+                    ]),
+                )]),
+            );
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "host.function_failed");
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_secret_unaware_backend_making_calls_gets_the_plain_result_byte_for_byte() {
+    hosted(
+        &wired_runtime(),
+        &[("f", true)],
+        false,
+        |mut backend| async move {
+            backend.send(execution(
+                1,
+                "let o = {a: 1}; let n = 2; let a = [o]; f(o); f(n); f(a); f(o); \
+                 return [o, n, a, {o: o}];",
+            ));
+            for _ in 0..4 {
+                let (id, _, _) = backend.call().await;
+                backend.reply(
+                    id,
+                    MessageType::Result,
+                    Value::Map(vec![(string("value"), Value::Nil)]),
+                );
+            }
+            let reply = backend.next().await;
+            let o = Value::Map(vec![(string("a"), Value::from(1))]);
+            let expected = Value::Map(vec![(
+                string("value"),
+                Value::Array(vec![
+                    o.clone(),
+                    Value::from(2),
+                    Value::Array(vec![o.clone()]),
+                    Value::Map(vec![(string("o"), o)]),
+                ]),
+            )]);
+            let bytes = |value: &Value| {
+                let mut out = Vec::new();
+                hexput_port::rmpv::encode::write_value(&mut out, value).unwrap();
+                out
+            };
+            assert_eq!(reply.message_type, MessageType::Result);
+            assert_eq!(bytes(&reply.payload), bytes(&expected));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn an_authorize_question_carries_its_arguments_in_holders() {
+    hosted(
+        &wired_runtime(),
+        &[("f", false)],
+        false,
+        |mut backend| async move {
+            backend.send(execution_with(
+                1,
+                "f(u, 7); return 0;",
+                vec![("u", held_user())],
+                None,
+            ));
+            let (question, _, arguments, _) = backend.request_from(MessageType::Authorize).await;
+            let Value::Map(original) = held_user() else {
+                unreachable!()
+            };
+            let Value::Map(first) = &arguments[0] else {
+                panic!("a holder: {:?}", arguments[0]);
+            };
+            assert_eq!(first[0], original[0], "the Backend's secret, as supplied");
+            assert!(reference_of(&arguments[1]).starts_with("hx:"));
+            backend.allow(question, Value::from(true));
+            let (call, _, sent, _) = backend.request_from(MessageType::Call).await;
+            assert_eq!(
+                sent, arguments,
+                "the call sends what the question asked about"
+            );
+            backend.reply(
+                call,
+                MessageType::Result,
+                Value::Map(vec![(string("value"), Value::Nil)]),
+            );
+            assert_eq!(value_of(&backend.next().await), Value::from(0));
+            backend.close();
         },
     );
 }

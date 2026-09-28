@@ -93,6 +93,20 @@
 //! handler's timeout, and the Executor applies both from there — an error naming the depth limit
 //! names the one in force.
 //!
+//! # Value Secrets (Story 3.11)
+//!
+//! Values cross the boundary with their Value Secrets ([`wire`] has the holder shape). A
+//! starting variable or a host call's value arrives [`Held`]; a reply holding a malformed holder
+//! is a malformed reply, `host.function_failed`. Every value a `Call` or `Authorize` sends is a
+//! holder: the interpreter gives each value without a secret a Reference ID, `hx:<nonce>:<n>` —
+//! the nonce 16 lowercase hex digits drawn once per execution from `std`'s `RandomState`, the
+//! counter from 1, so each is unique within the execution and collides with another execution's
+//! only with negligible probability — and a Backend's own IDs travel as given. The argument depth limit counts the
+//! Script's nesting, not the holders; an argument whose holders take it past what a frame may
+//! nest ([`wire::MAX_ARGUMENT_WIRE_DEPTH`]) cannot be sent, `host.function_failed`. The result
+//! carries only the secrets the Backend supplied — a generated one never leaves in it — and the
+//! output size budget counts its holders.
+//!
 //! Binds: AD-3, AD-6.
 
 pub mod wire;
@@ -109,7 +123,7 @@ pub use hexput_enforce::Limits;
 use hexput_interpreter::{Category, Code, Execution, HostCall, Meter, Outcome, Span};
 use hexput_rpc::CallFailure;
 
-pub use hexput_interpreter::{Diagnostic, Program, Value};
+pub use hexput_interpreter::{Diagnostic, Held, Program, Secret, Value};
 /// The handle a connection gives an execution for its host calls. Re-exported so
 /// `hexput-script`, which takes one and passes it on, can name it; the connection, which creates
 /// it, depends on `hexput-rpc` itself.
@@ -209,7 +223,7 @@ impl Halt {
 /// Where one segment of an execution left it.
 enum Step {
     /// The Script ended with this result.
-    Finished(Value),
+    Finished(Held),
     /// The Script waits on this host call, whose arguments are ready to send; when the call is
     /// granted per call, the question for the Backend's handler comes first.
     Call(HostCall, Vec<hexput_rpc::Value>, Option<Question>),
@@ -262,6 +276,31 @@ pub async fn execute_with_limits(
     host: Host,
     limits: Limits,
 ) -> Result<Value, Diagnostic> {
+    let variables = variables
+        .into_iter()
+        .map(|(name, value)| (name, Held::plain(value)))
+        .collect();
+    execute_held(program, variables, host, limits)
+        .await
+        .map(|result| result.value)
+}
+
+/// [`execute_with_limits`] with Value Secrets (Story 3.11): each starting variable may arrive
+/// [`Held`], with the secret of the variable it lands in, and the result comes back `Held`, with
+/// the secret of the place the Script returned it from when the `return` names one (an array's or
+/// object's own secrets are inside the value either way). What Direct Execution calls.
+///
+/// # Errors
+/// As [`execute`].
+///
+/// # Panics
+/// As [`execute`].
+pub async fn execute_held(
+    program: Arc<Program>,
+    variables: Vec<(Arc<str>, Held)>,
+    host: Host,
+    limits: Limits,
+) -> Result<Held, Diagnostic> {
     let Host {
         capabilities,
         caller,
@@ -284,7 +323,8 @@ pub async fn execute_with_limits(
             let started = Instant::now();
             let execution = Execution::with_variables(program, variables)?
                 .metered(meter)
-                .with_features(limits.features());
+                .with_features(limits.features())
+                .with_reference_prefix(reference_prefix());
             let step = segment(execution, &mut budget, &capabilities, whole, started)?;
             Ok((step, budget))
         })
@@ -323,7 +363,7 @@ pub async fn execute_with_limits(
             // helps cross is reported before the next call is sent.
             let started = Instant::now();
             let value = received(&call, reply)?;
-            let execution = call.resume(&value);
+            let execution = call.resume_held(&value);
             let step = segment(execution, &mut budget, &capabilities, whole, started)?;
             Ok((step, budget))
         })
@@ -365,9 +405,8 @@ fn segment(
                     .charge_cpu(started.elapsed(), whole)
                     .map_err(Halt::Exceeded)?;
                 let limit = budget.limits().output_size();
-                budget
-                    .charge_output(wire::payload_size(&result, limit), whole)
-                    .map_err(Halt::Exceeded)?;
+                let size = wire::payload_size_held(&result.value, result.secret.as_ref(), limit);
+                budget.charge_output(size, whole).map_err(Halt::Exceeded)?;
                 return Ok(Step::Finished(result));
             }
             Outcome::HostCall(call) => {
@@ -425,6 +464,18 @@ async fn ask(
     }
 }
 
+/// This execution's Reference ID prefix: `hx:` and a nonce of 16 lowercase hex digits, drawn from
+/// `std`'s randomly keyed hasher. The counter after it makes each generated ID unique within the
+/// execution; two executions' IDs collide only if their 64-bit nonces do, a negligible chance —
+/// not an impossibility.
+fn reference_prefix() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    static DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let draw = DRAWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nonce = RandomState::new().hash_one((draw, Instant::now()));
+    format!("hx:{nonce:016x}")
+}
+
 /// Run `work` on the blocking pool and wait for it.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::task::spawn_blocking(work).await {
@@ -463,7 +514,12 @@ fn arguments(call: &HostCall, depth: usize) -> Result<Vec<hexput_rpc::Value>, Di
     // enough that a lower bound over the arguments alone is the useful check.
     let mut budget = hexput_rpc::MAX_FRAME_LEN;
     for argument in call.arguments() {
-        match wire::measure(&argument.value, depth, &mut budget) {
+        match wire::measure_held(
+            &argument.value,
+            argument.secret.as_ref(),
+            depth,
+            &mut budget,
+        ) {
             Ok(()) => {}
             Err(wire::Unsendable::TooDeep) => {
                 return Err(Diagnostic::new(
@@ -503,18 +559,33 @@ fn arguments(call: &HostCall, depth: usize) -> Result<Vec<hexput_rpc::Value>, Di
             }
         }
     }
-    Ok(call
-        .arguments()
-        .iter()
-        .map(|argument| wire::to_wire(&argument.value))
-        .collect())
+    let mut sent = Vec::with_capacity(call.arguments().len());
+    for argument in call.arguments() {
+        let value = wire::to_wire_held(&argument.value, argument.secret.as_ref());
+        // The Script's nesting is within the limit; its holders may still take it past what a
+        // frame may nest.
+        if wire::wire_depth(&value) > wire::MAX_ARGUMENT_WIRE_DEPTH {
+            return Err(host_error(
+                Code::FUNCTION_FAILED,
+                format!(
+                    "the call to `{}` could not be sent: with its Value Secrets an argument nests \
+                     more than {} levels deep, past what a frame may carry",
+                    call.name(),
+                    wire::MAX_ARGUMENT_WIRE_DEPTH
+                ),
+                call,
+            ));
+        }
+        sent.push(value);
+    }
+    Ok(sent)
 }
 
 /// The value a host call resumes the Script with, or the `host` error that ends it.
 fn received(
     call: &HostCall,
     reply: Result<hexput_rpc::Value, CallFailure>,
-) -> Result<Value, Diagnostic> {
+) -> Result<Held, Diagnostic> {
     let name = call.name();
     let (code, message) = match reply {
         Ok(value) => match wire::to_hexput(&value, &mut wire::Path::reply()) {

@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use hexput_exec::{
-    ARGUMENT_DEPTH_LIMIT, Diagnostic, Host, Limits, Value, execute, execute_with_limits,
+    ARGUMENT_DEPTH_LIMIT, Diagnostic, Held, Host, Limits, Secret, Value, execute, execute_held,
 };
 use hexput_port::{CorrelationId, Envelope, MessageType};
 use hexput_rpc::{Calls, Value as Wire};
@@ -99,8 +99,13 @@ fn answering(answer: Wire) -> Handler {
 /// Everything one hosted run produced.
 struct Run {
     result: Result<Value, Diagnostic>,
-    /// Every `Call` the stand-in saw.
+    /// The secret of the place the result was returned from, when it has one (Story 3.11).
+    secret: Option<Secret>,
+    /// Every `Call` the stand-in saw, with its arguments' Value Secret holders stripped — each
+    /// argument, and everything inside one, is asserted to be a holder first.
     calls: Vec<Made>,
+    /// Every `Call` the stand-in saw, exactly as it was sent.
+    raw_calls: Vec<Made>,
     /// Every `Authorize` question the stand-in saw.
     asked: Vec<Made>,
     /// Every message the stand-in saw, in order: its type and the function's name.
@@ -226,15 +231,63 @@ fn hosted_run(
     answer: Answer,
     limits: Limits,
 ) -> Run {
+    let variables = variables
+        .into_iter()
+        .map(|(name, value)| (name, Held::plain(value)))
+        .collect();
+    hosted_run_held(source, variables, registered, authorize, answer, limits)
+}
+
+/// A wire value with every Value Secret holder replaced by its value, after asserting that the
+/// value, and every value inside it, is one (Story 3.11: everything a `Call` sends is).
+fn unheld(value: &Wire) -> Wire {
+    let Wire::Map(fields) = value else {
+        panic!("not a Value Secret holder: {value:?}");
+    };
+    assert_eq!(
+        fields.len(),
+        2,
+        "a holder is exactly `__secret` and `value`: {value:?}"
+    );
+    assert_eq!(fields[0].0, s("__secret"));
+    assert_eq!(fields[1].0, s("value"));
+    let Wire::Map(secret) = &fields[0].1 else {
+        panic!("`__secret` is a map: {value:?}");
+    };
+    assert_eq!(secret[0].0, s("ref"));
+    assert!(secret[0].1.as_str().is_some_and(|r| !r.is_empty()));
+    match &fields[1].1 {
+        Wire::Array(items) => Wire::Array(items.iter().map(unheld).collect()),
+        Wire::Map(entries) => Wire::Map(
+            entries
+                .iter()
+                .map(|(key, item)| (key.clone(), unheld(item)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// [`hosted_run`] with starting variables that may carry Value Secrets.
+fn hosted_run_held(
+    source: &str,
+    variables: Vec<(Arc<str>, Held)>,
+    registered: &[(&str, bool)],
+    authorize: Handler,
+    answer: Answer,
+    limits: Limits,
+) -> Run {
     let seen: Seen = Arc::default();
+    let raw: Seen = Arc::default();
     let questions: Seen = Arc::default();
     let order: Arc<Mutex<Vec<(MessageType, String)>>> = Arc::default();
     let runtime = runtime();
     let (mut calls, caller) = Calls::new();
-    let (log, asked, sequence) = (
+    let (log, asked, sequence, sent) = (
         Arc::clone(&seen),
         Arc::clone(&questions),
         Arc::clone(&order),
+        Arc::clone(&raw),
     );
     runtime.spawn(async move {
         while let Some(call) = calls.submitted().await {
@@ -247,9 +300,13 @@ fn hosted_run(
             assert_eq!(fields[0].0, s("name"));
             assert_eq!(fields[1].0, s("arguments"));
             let name = fields[0].1.as_str().unwrap().to_owned();
-            let Wire::Array(arguments) = fields[1].1.clone() else {
+            let Wire::Array(exact) = fields[1].1.clone() else {
                 panic!("`arguments` is an array");
             };
+            let arguments: Vec<Wire> = exact.iter().map(unheld).collect();
+            if envelope.message_type == MessageType::Call {
+                sent.lock().unwrap().push((name.clone(), exact));
+            }
             sequence
                 .lock()
                 .unwrap()
@@ -278,18 +335,20 @@ fn hosted_run(
         }
     });
     let host = Host::new(registered.iter().copied(), caller);
-    let result = runtime.block_on(execute_with_limits(
-        program(source),
-        variables,
-        host,
-        limits,
-    ));
+    let result = runtime.block_on(execute_held(program(source), variables, host, limits));
+    let (result, secret) = match result {
+        Ok(held) => (Ok(held.value), held.secret),
+        Err(error) => (Err(error), None),
+    };
     let calls = seen.lock().unwrap().clone();
+    let raw_calls = raw.lock().unwrap().clone();
     let asked = questions.lock().unwrap().clone();
     let order = order.lock().unwrap().clone();
     Run {
         result,
+        secret,
         calls,
+        raw_calls,
         asked,
         order,
         events: Vec::new(),
@@ -1925,5 +1984,474 @@ mod features {
         let diagnostic = run.result.unwrap_err();
         assert_eq!(diagnostic.code.as_str(), "budget.allocations_exceeded");
         assert_eq!(diagnostic.category.as_str(), "budget");
+    }
+}
+
+// --- Story 3.11: Value Secrets over the boundary ---
+
+mod value_secrets {
+    use std::sync::Arc;
+
+    use hexput_exec::wire::{self, Path};
+    use hexput_exec::{Held, Limits, Value};
+    use hexput_rpc::Value as Wire;
+
+    use super::{Answer, Run, hosted_run_held, map, refusing, s, value};
+
+    /// A holder: `{__secret: {…secret}, value}`.
+    fn holder(secret: Vec<(&str, Wire)>, value: Wire) -> Wire {
+        map(vec![("__secret", map(secret)), ("value", value)])
+    }
+
+    /// `{name: "a"}` held with `ref` r1, `key` User and a further field `tier`.
+    fn user() -> Wire {
+        holder(
+            vec![
+                ("ref", s("r1")),
+                ("key", s("User")),
+                ("tier", Wire::from(3)),
+            ],
+            map(vec![("name", s("a"))]),
+        )
+    }
+
+    fn decode(wire: &Wire) -> Result<Held, String> {
+        wire::to_hexput(wire, &mut Path::variable("u"))
+    }
+
+    fn run(source: &str, variables: Vec<(&str, Wire)>, answer: Answer) -> Run {
+        let variables = variables
+            .into_iter()
+            .map(|(name, wire)| (Arc::from(name), decode(&wire).unwrap()))
+            .collect();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            hosted_run_held(
+                source,
+                variables,
+                &[("f", true), ("g", true)],
+                refusing(),
+                answer,
+                Limits::default(),
+            )
+        })
+    }
+
+    /// The `ref` a sent value's holder carries.
+    fn reference(sent: &Wire) -> String {
+        let Wire::Map(fields) = sent else {
+            panic!("a holder: {sent:?}");
+        };
+        let Wire::Map(secret) = &fields[0].1 else {
+            panic!("a `__secret` map: {sent:?}");
+        };
+        secret[0].1.as_str().unwrap().to_owned()
+    }
+
+    /// The value inside a sent holder.
+    fn inside(sent: &Wire) -> &Wire {
+        let Wire::Map(fields) = sent else {
+            panic!("a holder: {sent:?}");
+        };
+        &fields[1].1
+    }
+
+    #[test]
+    fn a_holder_decodes_and_encodes_back_in_canonical_form() {
+        for wire in [
+            user(),
+            holder(vec![("ref", s("r2"))], Wire::from(5)),
+            holder(vec![("ref", s("r3"))], Wire::Nil),
+            holder(
+                vec![
+                    ("x", Wire::Array(vec![Wire::from(1)])),
+                    ("ref", s("r4")),
+                    ("b", Wire::Binary(vec![1, 2])),
+                ],
+                Wire::Array(vec![holder(vec![("ref", s("r5"))], s("t")), Wire::from(2)]),
+            ),
+        ] {
+            let held = decode(&wire).unwrap();
+            let back = wire::to_wire_held(&held.value, held.secret.as_ref());
+            // `ref` and `key` lead; the further fields keep their order.
+            let expected = normalized(&wire);
+            assert_eq!(
+                rmp_serde::to_vec(&back).unwrap(),
+                rmp_serde::to_vec(&expected).unwrap(),
+                "{wire:?}"
+            );
+        }
+    }
+
+    /// `wire` with every `__secret` map ordered `ref`, `key`, then the rest.
+    fn normalized(wire: &Wire) -> Wire {
+        match wire {
+            Wire::Map(fields) => Wire::Map(
+                fields
+                    .iter()
+                    .map(|(key, item)| {
+                        let item = if key.as_str() == Some("__secret") {
+                            let Wire::Map(secret) = item else {
+                                unreachable!()
+                            };
+                            let rank = |k: &Wire| match k.as_str() {
+                                Some("ref") => 0,
+                                Some("key") => 1,
+                                _ => 2,
+                            };
+                            let mut secret = secret.clone();
+                            secret.sort_by_key(|(k, _)| rank(k));
+                            Wire::Map(secret)
+                        } else {
+                            normalized(item)
+                        };
+                        (key.clone(), item)
+                    })
+                    .collect(),
+            ),
+            Wire::Array(items) => Wire::Array(items.iter().map(normalized).collect()),
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn a_holder_around_a_collection_gives_it_its_secret_and_a_scalar_its_place() {
+        let held = decode(&user()).unwrap();
+        assert!(held.secret.is_none());
+        let secret = held.value.secret().unwrap();
+        assert_eq!(secret.reference(), "r1");
+        assert_eq!(secret.key(), Some("User"));
+        let held = decode(&holder(vec![("ref", s("r2"))], Wire::from(5))).unwrap();
+        assert_eq!(held.secret.unwrap().reference(), "r2");
+        assert_eq!(held.value.as_number(), Some(5.0));
+    }
+
+    #[test]
+    fn a_malformed_holder_is_refused_naming_its_path() {
+        let cases = [
+            (
+                map(vec![("__secret", Wire::from(1)), ("value", Wire::from(2))]),
+                "`variables.u.__secret` must be a map with a string `ref`",
+            ),
+            (
+                map(vec![("__secret", map(vec![])), ("value", Wire::from(1))]),
+                "`variables.u.__secret` must be a map with a string `ref`",
+            ),
+            (
+                holder(vec![("ref", s(""))], Wire::Nil),
+                "`variables.u.__secret` must have a `ref` that is a non-empty string",
+            ),
+            (
+                holder(vec![("ref", s(&"r".repeat(257)))], Wire::Nil),
+                "`variables.u.__secret` must have a `ref` that is a non-empty string",
+            ),
+            (
+                holder(vec![("ref", s("r")), ("key", Wire::from(1))], Wire::Nil),
+                "`variables.u.__secret` must have a `key` that is a string",
+            ),
+            (
+                holder(
+                    vec![("ref", s("a"))],
+                    holder(vec![("ref", s("b"))], Wire::from(1)),
+                ),
+                "`variables.u.value` is a Value Secret holder directly inside another holder",
+            ),
+            (
+                map(vec![
+                    ("__secret", map(vec![("ref", s("r"))])),
+                    ("value", Wire::from(1)),
+                    ("x", Wire::from(2)),
+                ]),
+                "`variables.u` has a `__secret` key but is not a Value Secret holder",
+            ),
+            (
+                map(vec![("__secret", map(vec![("ref", s("r"))]))]),
+                "`variables.u` has a `__secret` key but is not a Value Secret holder",
+            ),
+            (
+                map(vec![(
+                    "a",
+                    Wire::Array(vec![map(vec![("__secret", Wire::Nil)])]),
+                )]),
+                "`variables.u.a[0]` has a `__secret` key",
+            ),
+        ];
+        for (wire, expected) in cases {
+            let error = decode(&wire).expect_err("refused");
+            assert!(error.starts_with(expected), "{error}");
+        }
+        // Inside a collection's elements, holders may nest.
+        let nested = holder(
+            vec![("ref", s("a"))],
+            Wire::Array(vec![holder(vec![("ref", s("b"))], Wire::from(1))]),
+        );
+        assert!(decode(&nested).is_ok());
+    }
+
+    #[test]
+    fn a_reply_with_a_malformed_holder_is_a_failed_call() {
+        let run = run(
+            "return f();",
+            vec![],
+            Box::new(|_, _| value(map(vec![("__secret", Wire::from(1)), ("value", Wire::Nil)]))),
+        );
+        let error = run.result.unwrap_err();
+        assert_eq!(error.code.as_str(), "host.function_failed");
+        assert!(
+            error.message.contains("`value.__secret`"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_collection_sent_twice_carries_the_same_generated_reference() {
+        let run = run(
+            "let o = {a: 1}; f(o); f(o); return 0;",
+            vec![],
+            Box::new(|_, _| value(Wire::Nil)),
+        );
+        run.result.unwrap();
+        let first = &run.raw_calls[0].1[0];
+        let second = &run.raw_calls[1].1[0];
+        assert_eq!(first, second, "the object and its property keep their IDs");
+        let id = reference(first);
+        let (prefix, counter) = id.rsplit_once(':').unwrap();
+        assert!(prefix.starts_with("hx:") && prefix.len() == 19, "{id}");
+        assert!(
+            prefix[3..]
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        assert!(counter.parse::<u64>().is_ok(), "{id}");
+        let Wire::Map(entries) = inside(first) else {
+            panic!("an object");
+        };
+        let property = reference(&entries[0].1);
+        assert!(property.starts_with(prefix) && property != id);
+    }
+
+    #[test]
+    fn two_executions_draw_different_nonces() {
+        let prefix = |run: &Run| {
+            let id = reference(&run.raw_calls[0].1[0]);
+            id.rsplit_once(':').unwrap().0.to_owned()
+        };
+        let a = run("f(1);", vec![], Box::new(|_, _| value(Wire::Nil)));
+        let b = run("f(1);", vec![], Box::new(|_, _| value(Wire::Nil)));
+        assert_ne!(prefix(&a), prefix(&b));
+    }
+
+    #[test]
+    fn a_backend_secret_goes_out_as_it_came_in() {
+        let run = run(
+            "f(u); return 0;",
+            vec![("u", user())],
+            Box::new(|_, _| value(Wire::Nil)),
+        );
+        run.result.unwrap();
+        let sent = &run.raw_calls[0].1[0];
+        let Wire::Map(fields) = sent else { panic!() };
+        assert_eq!(
+            fields[0].1,
+            map(vec![
+                ("ref", s("r1")),
+                ("key", s("User")),
+                ("tier", Wire::from(3))
+            ])
+        );
+    }
+
+    #[test]
+    fn a_scalar_place_and_its_copy() {
+        let run = run(
+            "f(n); let m = n; f(m); return 0;",
+            vec![("n", holder(vec![("ref", s("r2"))], Wire::from(5)))],
+            Box::new(|_, _| value(Wire::Nil)),
+        );
+        run.result.unwrap();
+        assert_eq!(reference(&run.raw_calls[0].1[0]), "r2");
+        assert!(reference(&run.raw_calls[1].1[0]).starts_with("hx:"));
+    }
+
+    #[test]
+    fn a_call_value_stored_directly_goes_back_with_its_reference() {
+        let run = run(
+            "let x = f(); g(x); g(f()); return x;",
+            vec![],
+            Box::new(|name, _| match name {
+                "f" => value(holder(vec![("ref", s("r3"))], Wire::from(7))),
+                _ => value(Wire::Nil),
+            }),
+        );
+        assert_eq!(run.result.unwrap().as_number(), Some(7.0));
+        assert_eq!(run.secret.unwrap().reference(), "r3");
+        let sent: Vec<String> = run
+            .raw_calls
+            .iter()
+            .filter(|(name, _)| name == "g")
+            .map(|(_, arguments)| reference(&arguments[0]))
+            .collect();
+        assert_eq!(sent[0], "r3");
+        assert!(sent[1].starts_with("hx:"));
+    }
+
+    #[test]
+    fn the_argument_depth_counts_the_script_and_the_frame_counts_the_holders() {
+        let nested = |depth: usize| {
+            format!(
+                "let a = []; let i = 1; while (i < {depth}) {{ a = [a]; i = i + 1; }}; f(a); \
+                 return 0;"
+            )
+        };
+        let limits = Limits::default().with_argument_depth(64);
+        let within = |depth: usize| {
+            let variables = Vec::new();
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::sink)
+                    .finish(),
+            );
+            tracing::dispatcher::with_default(&dispatch, || {
+                hosted_run_held(
+                    &nested(depth),
+                    variables,
+                    &[("f", true)],
+                    refusing(),
+                    Box::new(|_, _| value(Wire::Nil)),
+                    limits,
+                )
+            })
+        };
+        // Sixty levels are 120 with their holders: within the frame.
+        let run = within(60);
+        run.result.unwrap();
+        assert_eq!(wire::wire_depth(&run.raw_calls[0].1[0]), 120);
+        // Sixty-four pass the argument depth limit in force, but not the frame's with holders.
+        let run = within(64);
+        let error = run.result.unwrap_err();
+        assert_eq!(error.code.as_str(), "host.function_failed");
+        assert!(run.raw_calls.is_empty());
+        // Past the argument depth limit is still the depth error.
+        let error = within(65).result.unwrap_err();
+        assert_eq!(error.code.as_str(), "depth.argument_too_deep");
+    }
+
+    #[test]
+    fn the_payload_size_counts_every_holder_exactly() {
+        let cases = [
+            user(),
+            holder(vec![("ref", s("r2"))], Wire::from(5)),
+            holder(
+                vec![("ref", s(&"r".repeat(256))), ("key", s(&"k".repeat(40)))],
+                Wire::Nil,
+            ),
+            holder(
+                vec![
+                    ("ref", s("r4")),
+                    ("b", Wire::Binary(vec![1, 2])),
+                    (
+                        "n",
+                        map(vec![(
+                            "deep",
+                            Wire::Array(vec![Wire::from(-1), Wire::F64(1.5)]),
+                        )]),
+                    ),
+                ],
+                Wire::Array(vec![
+                    holder(vec![("ref", s("r5"))], s("t")),
+                    Wire::from(2),
+                    // Eighteen fields in `__secret`: a map16 header.
+                    Wire::Map(vec![
+                        (
+                            s("__secret"),
+                            Wire::Map(
+                                std::iter::once((s("ref"), s("r6")))
+                                    .chain((0..17).map(|i| (s(&format!("x{i}")), Wire::Nil)))
+                                    .collect(),
+                            ),
+                        ),
+                        (s("value"), Wire::Nil),
+                    ]),
+                ]),
+            ),
+        ];
+        for case in cases {
+            let held = decode(&case).unwrap();
+            let payload = map(vec![(
+                "value",
+                wire::to_wire_held(&held.value, held.secret.as_ref()),
+            )]);
+            assert_eq!(
+                wire::payload_size_held(&held.value, held.secret.as_ref(), usize::MAX),
+                rmp_serde::to_vec(&payload).unwrap().len(),
+                "{case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_scalar_returned_is_charged_with_its_holder() {
+        // `{value: 5}` is 8 bytes; in its holder with `ref` r2, 32.
+        let n = holder(vec![("ref", s("r2"))], Wire::from(5));
+        let held = decode(&n).unwrap();
+        let plain = wire::payload_size(&held.value, usize::MAX);
+        let full = wire::payload_size_held(&held.value, held.secret.as_ref(), usize::MAX);
+        assert!(plain < 20 && full > 20, "{plain} {full}");
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        let run = tracing::dispatcher::with_default(&dispatch, || {
+            hosted_run_held(
+                "return n;",
+                vec![(Arc::from("n"), held)],
+                &[],
+                refusing(),
+                Box::new(|_, _| value(Wire::Nil)),
+                Limits::default().with_output_size(20),
+            )
+        });
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "budget.output_size_exceeded"
+        );
+    }
+
+    #[test]
+    fn a_generated_reference_never_reaches_the_result() {
+        let run = run(
+            "let o = {a: 1}; let n = 2; f(o); f(n); return n;",
+            vec![],
+            Box::new(|_, _| value(Wire::Nil)),
+        );
+        assert_eq!(run.result.unwrap().as_number(), Some(2.0));
+        let secret = run
+            .secret
+            .expect("`n`'s place holds the ID its call generated");
+        assert!(secret.is_generated());
+        let held = Held::new(Value::Number(2.0), Some(secret));
+        assert_eq!(wire::result_to_wire(&held), Ok(Wire::from(2)));
+        assert_eq!(
+            wire::payload_size_held(&held.value, held.secret.as_ref(), usize::MAX),
+            wire::payload_size(&held.value, usize::MAX)
+        );
+    }
+
+    #[test]
+    fn a_result_without_secrets_is_the_plain_payload() {
+        let plain: Value = decode(&map(vec![("a", Wire::Array(vec![Wire::from(1)]))]))
+            .unwrap()
+            .value;
+        assert_eq!(
+            wire::to_wire(&plain),
+            map(vec![("a", Wire::Array(vec![Wire::from(1)]))])
+        );
     }
 }

@@ -72,6 +72,11 @@ fn failure(payload: &Value) -> ErrorBody {
     *direct_execution(payload).expect_err("a refusal")
 }
 
+/// Whether the result `value` may be sent, by the check production runs: `result_to_wire`.
+fn result_check(value: &hexput_exec::Value) -> Result<(), hexput_exec::wire::Unsendable> {
+    hexput_exec::wire::result_to_wire(&hexput_exec::Held::plain(value.clone())).map(drop)
+}
+
 fn int(n: i64) -> Value {
     Value::from(n)
 }
@@ -345,7 +350,9 @@ fn a_result_at_the_depth_limit_is_sent_and_decodes_back() {
 
 #[test]
 fn a_result_past_the_depth_limit_is_refused_before_it_is_converted() {
-    for n in [MAX_RESULT_DEPTH + 1, 100_000] {
+    // 10 000 levels: far past the limit, and well within the CPU time budget on a debug build
+    // (100 000 came within a tenth of it).
+    for n in [MAX_RESULT_DEPTH + 1, 10_000] {
         let body = nested(n).unwrap_err();
         assert_eq!(body.code, "protocol.result_too_deep");
         assert_eq!(body.category, "protocol");
@@ -372,7 +379,7 @@ fn a_result_just_under_the_frame_passes_the_frame_check() {
     // (Story 3.6) — so the frame check is asserted on its own.
     let text = "x".repeat(MAX_FRAME_LEN - 1024);
     let result = hexput_exec::Value::String(text.as_str().into());
-    assert_eq!(hexput_exec::wire::check_result(&result), Ok(()));
+    assert_eq!(result_check(&result), Ok(()));
     let envelope = Envelope::new(
         CorrelationId(1),
         MessageType::Result,
@@ -395,7 +402,7 @@ fn a_result_certain_to_exceed_a_frame_is_past_the_output_size_budget_first() {
     assert_eq!(body.code, "budget.output_size_exceeded");
     let result = hexput_exec::Value::String("x".repeat(MAX_FRAME_LEN + 1).into());
     assert_eq!(
-        hexput_exec::wire::check_result(&result),
+        result_check(&result),
         Err(hexput_exec::wire::Unsendable::TooLarge)
     );
 }
@@ -417,7 +424,7 @@ fn a_result_sharing_one_collection_exponentially_is_refused_without_expanding_it
         ]));
     }
     assert_eq!(
-        hexput_exec::wire::check_result(&shared),
+        result_check(&shared),
         Err(hexput_exec::wire::Unsendable::TooLarge)
     );
 }
@@ -818,4 +825,45 @@ fn findings_that_would_not_fit_a_frame_are_left_out_and_the_value_wins() {
     };
     assert_eq!(fields.len(), 1, "exactly `{{value}}`");
     assert_eq!(fields[0].0, s("value"));
+}
+
+// --- Story 3.11: a result's Value Secret holders count towards its wire depth ---
+
+/// A starting variable nested `levels` arrays deep, its outer `held` levels each in a
+/// Backend-supplied holder: `levels + held` levels on the wire.
+fn nested_held(levels: usize, held: usize) -> Value {
+    let mut value = Value::Nil;
+    for level in (0..levels).rev() {
+        value = Value::Array(vec![value]);
+        if level < held {
+            value = map(vec![
+                ("__secret", map(vec![("ref", s(&format!("r{level}")))])),
+                ("value", value),
+            ]);
+        }
+    }
+    value
+}
+
+#[test]
+fn holders_that_take_a_result_past_the_depth_limit_make_it_too_deep() {
+    let levels = 100;
+    // The Script's own nesting fits; with its holders the result is one level too deep.
+    let past = nested_held(levels, MAX_RESULT_DEPTH - levels + 1);
+    let body = failure(&payload("return v;", vec![("v", past)]));
+    assert_eq!(body.code, "protocol.result_too_deep");
+    // At the limit it is sent, and a peer applying the same frame limit reads it back.
+    let at = nested_held(levels, MAX_RESULT_DEPTH - levels);
+    let value = run("return v;", vec![("v", at.clone())]);
+    assert_eq!(
+        value, at,
+        "every Backend-supplied holder goes back as it came"
+    );
+    let envelope = Envelope::new(
+        CorrelationId(1),
+        MessageType::Result,
+        map(vec![("value", value)]),
+    );
+    let bytes = encode(&envelope).unwrap();
+    assert_eq!(decode(&bytes).unwrap(), envelope);
 }

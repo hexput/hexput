@@ -12,11 +12,32 @@
 //!
 //! `Value` deliberately has no `PartialEq`: structural equality is not language equality
 //! (§4.2), and the result type should not suggest otherwise.
+//!
+//! # Value Secrets (Story 3.11)
+//!
+//! A value that crosses between the Script and the Backend may carry a hidden [`Secret`]
+//! (LANGUAGE-REFERENCE §3): a Reference ID, an optional key and the Backend's further fields,
+//! which the interpreter carries but never reads. Where it sits follows §3's rule that a Reference
+//! ID names a *location*:
+//!
+//! * an array or object carries its own ([`Array::secret`], [`Object::secret`]), shared by
+//!   identity wherever the collection is held;
+//! * a string, number, bool or `null` carries it on the place that holds it — an element
+//!   ([`Array::element_secret`]), a property ([`Object::entry_secret`]), or, at the top level (a
+//!   starting variable, a host call's value or argument, the Script result), beside the value in a
+//!   [`Held`].
+//!
+//! A Script can never observe any of it: no operation reads a secret, and the key `__secret` never
+//! exists in its view of an object.
 
 use core::fmt;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
+
+/// The key a Value Secret travels under, and which a Script can therefore never see (§3).
+pub(crate) const SECRET_KEY: &str = "__secret";
 
 /// One detached Hexput value.
 ///
@@ -37,6 +58,24 @@ pub enum Value {
 }
 
 impl Value {
+    /// The Value Secret this value carries itself: an array's or object's own; `None` for every
+    /// other kind, whose secret belongs to the place that holds it (see [`Held`]).
+    #[must_use]
+    pub fn secret(&self) -> Option<&Secret> {
+        match self {
+            Self::Array(array) => array.secret(),
+            Self::Object(object) => object.secret(),
+            _ => None,
+        }
+    }
+
+    /// Whether this is an array or an object: a value that carries its own secret rather than
+    /// taking its location's.
+    #[must_use]
+    pub const fn is_collection(&self) -> bool {
+        matches!(self, Self::Array(_) | Self::Object(_))
+    }
+
     /// The type name used in diagnostics: `null`, `bool`, `number`, `string`, `array`, `object`.
     #[must_use]
     pub const fn type_name(&self) -> &'static str {
@@ -132,12 +171,228 @@ pub struct Array(Arc<Elements>);
 #[derive(Clone)]
 pub struct Object(Arc<Entries>);
 
-struct Elements(Vec<Value>);
-struct Entries(IndexMap<Arc<str>, Value>);
+struct Elements {
+    items: Vec<Value>,
+    /// Each element's location secret, by position; empty when no element has one. Only ever
+    /// `Some` for an element that is not itself a collection.
+    secrets: Vec<Option<Secret>>,
+    /// The array's own secret.
+    secret: Option<Secret>,
+}
+
+struct Entries {
+    entries: IndexMap<Arc<str>, Value>,
+    /// Each property's location secret; only for a property whose value is not a collection.
+    secrets: HashMap<Arc<str>, Secret>,
+    /// The object's own secret.
+    secret: Option<Secret>,
+}
+
+/// A Value Secret (LANGUAGE-REFERENCE §3, FR-28): the hidden metadata the Backend attaches to a
+/// value — its Reference ID, an optional object key, and every further field it put there.
+///
+/// The interpreter carries a secret and never reads it: the further fields are an opaque blob
+/// ([`Secret::extra`]) that the Executor encodes and decodes. No Script operation can reach any
+/// part of it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret {
+    reference: Arc<str>,
+    key: Option<Arc<str>>,
+    extra: Arc<[u8]>,
+    /// Whether this execution generated it for a host call, rather than receiving it from the
+    /// Backend. Never on the wire: it only keeps a generated secret out of the Script's result.
+    generated: bool,
+}
+
+impl Secret {
+    /// A secret with Reference ID `reference`, object key `key`, and `extra` — the Backend's
+    /// further fields, encoded by whoever decoded them (empty for none).
+    #[must_use]
+    pub fn new(
+        reference: impl Into<Arc<str>>,
+        key: Option<Arc<str>>,
+        extra: impl Into<Arc<[u8]>>,
+    ) -> Self {
+        Self {
+            reference: reference.into(),
+            key,
+            extra: extra.into(),
+            generated: false,
+        }
+    }
+
+    /// A secret this execution generated for a value it sent to the host (Story 3.11): it
+    /// travels in every later `Call`, and never in the Script's result.
+    pub(crate) fn generated(reference: String) -> Self {
+        Self {
+            generated: true,
+            ..Self::new(reference, None, Vec::new())
+        }
+    }
+
+    /// Whether this execution generated the secret, rather than receiving it from the Backend. A
+    /// generated secret is sent in `Call`s but never in the Script's result, so a Backend that
+    /// supplies no secrets gets exactly the plain result it always did.
+    #[must_use]
+    pub const fn is_generated(&self) -> bool {
+        self.generated
+    }
+
+    /// The Reference ID, `ref` on the wire.
+    #[must_use]
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    /// The object key, `key` on the wire, when there is one.
+    #[must_use]
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    /// The further fields, exactly as they were handed to [`Secret::new`].
+    #[must_use]
+    pub fn extra(&self) -> &[u8] {
+        &self.extra
+    }
+
+    /// What holding this secret costs an execution's memory meter: the record and its three
+    /// shared allocations' headers, plus their bytes.
+    pub(crate) fn footprint(&self) -> usize {
+        size_of::<Self>()
+            + 6 * size_of::<usize>()
+            + self.reference.len()
+            + self.key.as_ref().map_or(0, |key| key.len())
+            + self.extra.len()
+    }
+}
+
+/// The Reference ID and key, and only the size of the further fields: a secret is the Backend's,
+/// and a log line has no business spelling out what it put there.
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Secret")
+            .field("reference", &self.reference)
+            .field("key", &self.key)
+            .field("extra_bytes", &self.extra.len())
+            .field("generated", &self.generated)
+            .finish()
+    }
+}
+
+/// A value together with the secret of the place it sits in — what crosses the boundary at the
+/// top level: a starting variable, a host call's value, the Script result.
+///
+/// `secret` is the *location's* secret, meaningful only for a string, number, bool or `null`. An
+/// array or object carries its own ([`Value::secret`]), and a location secret beside one is
+/// ignored: [`Held::effective_secret`] is the one a position travels with.
+#[derive(Clone, Debug)]
+pub struct Held {
+    pub value: Value,
+    pub secret: Option<Secret>,
+}
+
+impl Held {
+    /// `value` in a place with `secret`.
+    #[must_use]
+    pub const fn new(value: Value, secret: Option<Secret>) -> Self {
+        Self { value, secret }
+    }
+
+    /// `value` in a place with no secret.
+    #[must_use]
+    pub const fn plain(value: Value) -> Self {
+        Self {
+            value,
+            secret: None,
+        }
+    }
+
+    /// The secret this position travels with: a collection's own, otherwise the location's.
+    #[must_use]
+    pub fn effective_secret(&self) -> Option<&Secret> {
+        effective(&self.value, self.secret.as_ref())
+    }
+}
+
+impl From<Value> for Held {
+    fn from(value: Value) -> Self {
+        Self::plain(value)
+    }
+}
+
+/// The secret a position holding `value` with location secret `location` travels with.
+fn effective<'a>(value: &'a Value, location: Option<&'a Secret>) -> Option<&'a Secret> {
+    if value.is_collection() {
+        value.secret()
+    } else {
+        location
+    }
+}
 
 impl Array {
     pub(crate) fn new(items: Vec<Value>) -> Self {
-        Self(Arc::new(Elements(items)))
+        Self::from_parts(items, Vec::new(), None)
+    }
+
+    /// An array from its elements, their location secrets by position (empty for none; a secret
+    /// beside a collection is dropped) and its own secret.
+    pub(crate) fn from_parts(
+        items: Vec<Value>,
+        mut secrets: Vec<Option<Secret>>,
+        secret: Option<Secret>,
+    ) -> Self {
+        secrets.truncate(items.len());
+        for (item, slot) in items.iter().zip(secrets.iter_mut()) {
+            if item.is_collection() {
+                *slot = None;
+            }
+        }
+        if secrets.iter().all(Option::is_none) {
+            secrets = Vec::new();
+        } else {
+            secrets.resize(items.len(), None);
+        }
+        Self(Arc::new(Elements {
+            items,
+            secrets,
+            secret,
+        }))
+    }
+
+    /// Build a detached array whose elements sit in places with secrets, and which has its own
+    /// `secret` — how a Backend's holders reach a Script (Story 3.11). A location secret beside
+    /// an element that is itself an array or object is ignored: that element carries its own.
+    #[must_use]
+    pub fn from_held(items: Vec<Held>, secret: Option<Secret>) -> Self {
+        let (items, secrets) = items
+            .into_iter()
+            .map(|held| (held.value, held.secret))
+            .unzip();
+        Self::from_parts(items, secrets, secret)
+    }
+
+    /// The array's own Value Secret.
+    #[must_use]
+    pub fn secret(&self) -> Option<&Secret> {
+        self.0.secret.as_ref()
+    }
+
+    /// The secret of the place at `index`: `None` when there is none, or when the element is an
+    /// array or object (which carries its own).
+    #[must_use]
+    pub fn element_secret(&self, index: usize) -> Option<&Secret> {
+        self.0.secrets.get(index).and_then(Option::as_ref)
+    }
+
+    /// The elements, in order, each with the secret it travels with (see
+    /// [`Held::effective_secret`]).
+    pub fn iter_with_secrets(&self) -> impl ExactSizeIterator<Item = (&Value, Option<&Secret>)> {
+        self.0
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item, effective(item, self.element_secret(index))))
     }
 
     /// Build a detached array from its elements, in order.
@@ -151,35 +406,102 @@ impl Array {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.0.len()
+        self.0.items.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.0.is_empty()
+        self.0.items.is_empty()
     }
 
     /// The element at `index`, if present.
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&Value> {
-        self.0.0.get(index)
+        self.0.items.get(index)
     }
 
     /// The elements, in order.
     #[must_use]
     pub fn to_vec(&self) -> Vec<Value> {
-        self.0.0.clone()
+        self.0.items.clone()
     }
 
     /// The elements, in order, borrowed — for a caller that walks a result without copying it.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &Value> {
-        self.0.0.iter()
+        self.0.items.iter()
     }
 }
 
 impl Object {
     pub(crate) fn new(entries: IndexMap<Arc<str>, Value>) -> Self {
-        Self(Arc::new(Entries(entries)))
+        Self::from_parts(entries, HashMap::new(), None)
+    }
+
+    /// An object from its entries, their location secrets (a secret beside a collection, or for
+    /// a key the object does not have, is dropped) and its own secret. A `__secret` key is never
+    /// part of an object (§3), so one here is dropped too.
+    pub(crate) fn from_parts(
+        mut entries: IndexMap<Arc<str>, Value>,
+        mut secrets: HashMap<Arc<str>, Secret>,
+        secret: Option<Secret>,
+    ) -> Self {
+        entries.shift_remove(SECRET_KEY);
+        secrets.retain(|key, _| entries.get(key).is_some_and(|value| !value.is_collection()));
+        Self(Arc::new(Entries {
+            entries,
+            secrets,
+            secret,
+        }))
+    }
+
+    /// Build a detached object whose entries sit in places with secrets, and which has its own
+    /// `secret` — how a Backend's holders reach a Script (Story 3.11). Keys behave as in
+    /// [`Object::from_entries`]; a location secret beside an array or object is ignored, as that
+    /// value carries its own.
+    #[must_use]
+    pub fn from_held_entries<K: Into<Arc<str>>>(
+        entries: impl IntoIterator<Item = (K, Held)>,
+        secret: Option<Secret>,
+    ) -> Self {
+        let mut values = IndexMap::new();
+        let mut secrets = HashMap::new();
+        for (key, held) in entries {
+            let key: Arc<str> = key.into();
+            match held.secret {
+                Some(location) => {
+                    secrets.insert(Arc::clone(&key), location);
+                }
+                None => {
+                    secrets.remove(&key);
+                }
+            }
+            values.insert(key, held.value);
+        }
+        Self::from_parts(values, secrets, secret)
+    }
+
+    /// The object's own Value Secret.
+    #[must_use]
+    pub fn secret(&self) -> Option<&Secret> {
+        self.0.secret.as_ref()
+    }
+
+    /// The secret of the place under `key`: `None` when there is none, or when the value there
+    /// is an array or object (which carries its own).
+    #[must_use]
+    pub fn entry_secret(&self, key: &str) -> Option<&Secret> {
+        self.0.secrets.get(key)
+    }
+
+    /// The entries in insertion order, each with the secret its value travels with (see
+    /// [`Held::effective_secret`]).
+    pub fn iter_with_secrets(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&str, &Value, Option<&Secret>)> {
+        self.0
+            .entries
+            .iter()
+            .map(|(key, value)| (&**key, value, effective(value, self.0.secrets.get(key))))
     }
 
     /// Build a detached object from its entries, which keep the order they are given in (§3).
@@ -191,6 +513,8 @@ impl Object {
     ///
     /// The way a caller outside this crate supplies an object as a starting variable
     /// ([`crate::evaluate_with_variables`]).
+    ///
+    /// A `__secret` key is dropped: it never exists in a Script's view of an object (§3).
     #[must_use]
     pub fn from_entries<K: Into<Arc<str>>>(entries: impl IntoIterator<Item = (K, Value)>) -> Self {
         Self::new(entries.into_iter().map(|(k, v)| (k.into(), v)).collect())
@@ -198,31 +522,31 @@ impl Object {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.0.len()
+        self.0.entries.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.0.is_empty()
+        self.0.entries.is_empty()
     }
 
     /// The value under `key`, if present.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.0.0.get(key)
+        self.0.entries.get(key)
     }
 
     /// The entries in insertion order, borrowed — for a caller that walks a result without
     /// copying it.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Value)> {
-        self.0.0.iter().map(|(k, v)| (&**k, v))
+        self.0.entries.iter().map(|(k, v)| (&**k, v))
     }
 
     /// The entries in insertion order.
     #[must_use]
     pub fn entries(&self) -> Vec<(Arc<str>, Value)> {
         self.0
-            .0
+            .entries
             .iter()
             .map(|(k, v)| (Arc::clone(k), v.clone()))
             .collect()
@@ -233,13 +557,13 @@ impl Object {
 // about to be freed hands its children to a flat work list instead.
 impl Drop for Elements {
     fn drop(&mut self) {
-        drop_flat(core::mem::take(&mut self.0));
+        drop_flat(core::mem::take(&mut self.items));
     }
 }
 
 impl Drop for Entries {
     fn drop(&mut self) {
-        let values = core::mem::take(&mut self.0).into_values().collect();
+        let values = core::mem::take(&mut self.entries).into_values().collect();
         drop_flat(values);
     }
 }
@@ -251,12 +575,12 @@ fn drop_flat(mut pending: Vec<Value>) {
                 // `into_inner` succeeds for exactly one of the last handles, so the storage is
                 // emptied here and then dropped shallowly.
                 if let Some(mut elements) = Arc::into_inner(shared) {
-                    pending.append(&mut elements.0);
+                    pending.append(&mut elements.items);
                 }
             }
             Value::Object(Object(shared)) => {
                 if let Some(mut entries) = Arc::into_inner(shared) {
-                    pending.extend(entries.0.drain(..).map(|(_, v)| v));
+                    pending.extend(entries.entries.drain(..).map(|(_, v)| v));
                 }
             }
             _ => {}

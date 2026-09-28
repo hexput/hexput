@@ -19,10 +19,15 @@
 
 use std::collections::HashMap;
 
-use crate::heap::{BINDING, Heap, RtValue, Slot, SlotId};
+use crate::heap::{BINDING, Heap, Location, Meta, RtValue, Slot, SlotId};
+use crate::value::Secret;
 
 pub(crate) struct ScopeRecord {
     bindings: HashMap<String, RtValue>,
+    /// The Value Secrets of bindings whose place a Reference ID names (Story 3.11): a starting
+    /// variable the Backend supplied in a holder, a variable a host call's value was stored into,
+    /// or one a Script passed to the host.
+    secrets: Meta<String>,
     parent: Option<SlotId>,
     /// Set once a function value closed over this scope (or over one nested inside it).
     captured: bool,
@@ -31,7 +36,11 @@ pub(crate) struct ScopeRecord {
 impl ScopeRecord {
     /// What the bindings cost the heap's memory meter, their values' strings excepted.
     pub(crate) fn footprint(&self) -> usize {
-        self.bindings.keys().map(|name| BINDING + name.len()).sum()
+        self.bindings
+            .keys()
+            .map(|name| BINDING + name.len())
+            .sum::<usize>()
+            + self.secrets.bytes()
     }
 }
 
@@ -40,6 +49,7 @@ impl Heap {
     pub(crate) fn push_scope(&mut self, parent: Option<SlotId>) -> SlotId {
         self.alloc(Slot::Scope(ScopeRecord {
             bindings: HashMap::new(),
+            secrets: Meta::default(),
             parent,
             captured: false,
         }))
@@ -94,12 +104,61 @@ impl Heap {
         names
     }
 
-    /// Bind `name` in `scope`. The parser has already rejected same-block redeclaration.
+    /// Bind `name` in `scope`, as a fresh place with no secret. The parser has already rejected
+    /// same-block redeclaration.
     pub(crate) fn declare(&mut self, scope: SlotId, name: &str, value: RtValue) {
-        if let Some(record) = self.scope_mut(scope)
-            && record.bindings.insert(name.to_owned(), value).is_none()
-        {
-            self.grow(BINDING + name.len());
+        let Some(record) = self.scope_mut(scope) else {
+            return;
+        };
+        let freed = record.secrets.clear_location(name);
+        let grew = if record.bindings.insert(name.to_owned(), value).is_none() {
+            BINDING + name.len()
+        } else {
+            0
+        };
+        self.grow(grew);
+        self.shrink(freed);
+    }
+
+    /// Bind `name` in `scope` to `value`, in a place with `secret` when there is one.
+    pub(crate) fn declare_held(
+        &mut self,
+        scope: SlotId,
+        name: &str,
+        value: RtValue,
+        secret: Option<Secret>,
+    ) {
+        self.declare(scope, name, value);
+        if let Some(secret) = secret {
+            let bytes = self.set_binding_secret(scope, name, secret);
+            self.grow(bytes);
+        }
+    }
+
+    /// The place `name` is bound in, seen from `scope`.
+    pub(crate) fn binding_location(&self, scope: SlotId, name: &str) -> Option<Location> {
+        self.resolve(scope, name)
+            .map(|owner| Location::Binding(owner, name.to_owned()))
+    }
+
+    /// The secret of the binding `name` in `owner` itself (not its parents).
+    pub(crate) fn binding_secret(&self, owner: SlotId, name: &str) -> Option<&Secret> {
+        self.scope(owner)?.secrets.location(name)
+    }
+
+    /// Give the binding `name` in `owner` itself the secret `secret`, unless it has one or is not
+    /// bound there; the bytes this added, which the caller charges.
+    pub(crate) fn set_binding_secret(
+        &mut self,
+        owner: SlotId,
+        name: &str,
+        secret: Secret,
+    ) -> usize {
+        match self.scope_mut(owner) {
+            Some(record) if record.bindings.contains_key(name) => {
+                record.secrets.set_location(name.to_owned(), secret)
+            }
+            _ => 0,
         }
     }
 

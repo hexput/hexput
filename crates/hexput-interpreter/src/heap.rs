@@ -36,8 +36,20 @@
 //! object key) that takes the collection's length past a power of two: from 1 to 2, 2 to 3, 4 to
 //! 5, 8 to 9, and so on. Values copied in from outside — starting variables and host-call replies
 //! — are never counted: [`Heap::attach`] builds them without touching the count.
+//!
+//! # Value Secrets (Story 3.11)
+//!
+//! A collection slot keeps its own [`Secret`] and the secrets of its scalar locations — elements
+//! by position, properties by key — in a [`Meta`], boxed so a slot without any pays one word. A
+//! scope keeps its bindings' secrets the same way (see `environment.rs`). A secret is never an
+//! allocation, but its bytes count towards the memory meter: they are part of the slot's
+//! [`footprint`], charged when a secret is attached or added and credited when the slot is
+//! released. Nothing about a secret is reachable from a value: the key `__secret` is never stored
+//! in an object, so no read, `for … in` or detached result can meet it.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,7 +57,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use indexmap::IndexMap;
 
 use crate::environment::ScopeRecord;
-use crate::value::{Array, Object, Value};
+use crate::value::{Array, Object, SECRET_KEY, Secret, Value};
 
 /// A handle to one heap slot. Meaningful only within the heap that issued it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -178,13 +190,127 @@ pub(crate) const BINDING: usize = size_of::<String>() + size_of::<RtValue>() + s
 fn footprint(slot: &Slot) -> usize {
     match slot {
         Slot::Free => 0,
-        Slot::Array { items, .. } => SLOT + items.len() * ELEMENT,
-        Slot::Object { entries, .. } => {
-            SLOT + entries.keys().map(|key| ENTRY + key.len()).sum::<usize>()
+        Slot::Array { items, meta, .. } => SLOT + items.len() * ELEMENT + meta.bytes(),
+        Slot::Object { entries, meta, .. } => {
+            SLOT + entries.keys().map(|key| ENTRY + key.len()).sum::<usize>() + meta.bytes()
         }
         Slot::Scope(record) => SLOT + record.footprint(),
         Slot::Function(_) => SLOT,
     }
+}
+
+/// The Value Secrets of one collection or scope: the collection's own, and those of its scalar
+/// locations, keyed by `K` — an element's position, a property's or binding's name. Boxed, and
+/// absent until the first secret arrives, so a slot with none costs one word.
+pub(crate) struct Meta<K>(Option<Box<Secrets<K>>>);
+
+struct Secrets<K> {
+    own: Option<Secret>,
+    locations: HashMap<K, Secret>,
+}
+
+impl<K> Default for Meta<K> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<K: Hash + Eq> Meta<K> {
+    /// A record holding `own` and `locations`, or none when both are empty.
+    pub(crate) fn with(own: Option<Secret>, locations: HashMap<K, Secret>) -> Self {
+        if own.is_none() && locations.is_empty() {
+            return Self(None);
+        }
+        Self(Some(Box::new(Secrets { own, locations })))
+    }
+
+    fn secrets(&mut self) -> &mut Secrets<K> {
+        self.0.get_or_insert_with(|| {
+            Box::new(Secrets {
+                own: None,
+                locations: HashMap::new(),
+            })
+        })
+    }
+
+    /// Whether any location has a secret.
+    pub(crate) fn has_locations(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|secrets| !secrets.locations.is_empty())
+    }
+
+    pub(crate) fn own(&self) -> Option<&Secret> {
+        self.0.as_ref().and_then(|secrets| secrets.own.as_ref())
+    }
+
+    pub(crate) fn location<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> Option<&Secret>
+    where
+        K: Borrow<Q>,
+    {
+        self.0
+            .as_ref()
+            .and_then(|secrets| secrets.locations.get(key))
+    }
+
+    /// Give the collection `secret` unless it has one; the bytes this added.
+    fn set_own(&mut self, secret: Secret) -> usize {
+        let secrets = self.secrets();
+        if secrets.own.is_some() {
+            return 0;
+        }
+        let bytes = secret.footprint();
+        secrets.own = Some(secret);
+        bytes
+    }
+
+    /// Give the location `key` the secret `secret` unless it has one; the bytes this added.
+    pub(crate) fn set_location(&mut self, key: K, secret: Secret) -> usize {
+        let secrets = self.secrets();
+        if secrets.locations.contains_key(&key) {
+            return 0;
+        }
+        let bytes = secret.footprint() + size_of::<K>();
+        secrets.locations.insert(key, secret);
+        bytes
+    }
+
+    /// Forget the location `key`'s secret — a fresh binding under a name already used.
+    pub(crate) fn clear_location<Q: Hash + Eq + ?Sized>(&mut self, key: &Q) -> usize
+    where
+        K: Borrow<Q>,
+    {
+        let Some(secrets) = self.0.as_mut() else {
+            return 0;
+        };
+        secrets
+            .locations
+            .remove(key)
+            .map_or(0, |secret| secret.footprint() + size_of::<K>())
+    }
+
+    /// What the secrets cost the memory meter (see [`Secret::footprint`]).
+    pub(crate) fn bytes(&self) -> usize {
+        self.0.as_ref().map_or(0, |secrets| {
+            secrets.own.as_ref().map_or(0, Secret::footprint)
+                + secrets
+                    .locations
+                    .values()
+                    .map(|secret| secret.footprint() + size_of::<K>())
+                    .sum::<usize>()
+        })
+    }
+}
+
+/// A place a string, number, bool or `null` can sit in, which a Reference ID may name (§3): a
+/// scope's binding, an array's element or an object's property. Recorded when the Script reads
+/// one, so a host call's argument or the Script result written as that read carries its secret.
+#[derive(Clone, Debug)]
+pub(crate) enum Location {
+    /// The binding `name` in the scope that declares it.
+    Binding(SlotId, String),
+    Element(SlotId, usize),
+    Property(SlotId, Arc<str>),
 }
 
 /// What a function value points at: which `Function` of the program (an index into the
@@ -213,10 +339,12 @@ pub(crate) enum Slot {
     Array {
         items: Vec<RtValue>,
         version: u64,
+        meta: Meta<usize>,
     },
     Object {
         entries: IndexMap<Arc<str>, RtValue>,
         version: u64,
+        meta: Meta<Arc<str>>,
     },
     Scope(ScopeRecord),
     Function(FunctionRecord),
@@ -262,6 +390,11 @@ impl Heap {
     /// Record that a live slot grew by `bytes`.
     pub(crate) fn grow(&mut self, bytes: usize) {
         self.slot_bytes = self.slot_bytes.saturating_add(bytes);
+    }
+
+    /// Record that a live slot shrank by `bytes`.
+    pub(crate) fn shrink(&mut self, bytes: usize) {
+        self.slot_bytes = self.slot_bytes.saturating_sub(bytes);
     }
 
     /// A new string holding `text`, charged in full: its bytes are new to this execution.
@@ -314,14 +447,123 @@ impl Heap {
     }
 
     pub(crate) fn new_array(&mut self, items: Vec<RtValue>) -> RtValue {
-        RtValue::Array(self.alloc(Slot::Array { items, version: 0 }))
+        RtValue::Array(self.alloc(Slot::Array {
+            items,
+            version: 0,
+            meta: Meta::default(),
+        }))
     }
 
-    pub(crate) fn new_object(&mut self, entries: IndexMap<Arc<str>, RtValue>) -> RtValue {
+    /// A new object. A `__secret` key is dropped: it never exists in a Script's view (§3).
+    pub(crate) fn new_object(&mut self, mut entries: IndexMap<Arc<str>, RtValue>) -> RtValue {
+        entries.shift_remove(SECRET_KEY);
         RtValue::Object(self.alloc(Slot::Object {
             entries,
             version: 0,
+            meta: Meta::default(),
         }))
+    }
+
+    /// The Value Secret of the array or object at `id`.
+    pub(crate) fn collection_secret(&self, id: SlotId) -> Option<&Secret> {
+        match self.slot(id) {
+            Some(Slot::Array { meta, .. }) => meta.own(),
+            Some(Slot::Object { meta, .. }) => meta.own(),
+            _ => None,
+        }
+    }
+
+    /// Give the array or object at `id` the secret `secret`, unless it has one.
+    pub(crate) fn set_collection_secret(&mut self, id: SlotId, secret: Secret) {
+        let bytes = match self.slot_mut(id) {
+            Some(Slot::Array { meta, .. }) => meta.set_own(secret),
+            Some(Slot::Object { meta, .. }) => meta.set_own(secret),
+            _ => 0,
+        };
+        self.grow(bytes);
+    }
+
+    /// The secret of the place `at`.
+    pub(crate) fn location_secret(&self, at: &Location) -> Option<&Secret> {
+        match at {
+            Location::Binding(scope, name) => self.binding_secret(*scope, name),
+            Location::Element(id, index) => match self.slot(*id) {
+                Some(Slot::Array { meta, .. }) => meta.location(index),
+                _ => None,
+            },
+            Location::Property(id, key) => match self.slot(*id) {
+                Some(Slot::Object { meta, .. }) => meta.location(&**key),
+                _ => None,
+            },
+        }
+    }
+
+    /// Give the place `at` the secret `secret`, unless it has one — or unless the place no
+    /// longer exists.
+    pub(crate) fn set_location_secret(&mut self, at: &Location, secret: Secret) {
+        let bytes = match at {
+            Location::Binding(scope, name) => self.set_binding_secret(*scope, name, secret),
+            Location::Element(id, index) => match self.slot_mut(*id) {
+                Some(Slot::Array { items, meta, .. }) if *index < items.len() => {
+                    meta.set_location(*index, secret)
+                }
+                _ => 0,
+            },
+            Location::Property(id, key) => match self.slot_mut(*id) {
+                Some(Slot::Object { entries, meta, .. }) if entries.contains_key(&**key) => {
+                    meta.set_location(Arc::clone(key), secret)
+                }
+                _ => 0,
+            },
+        };
+        self.grow(bytes);
+    }
+
+    /// Give every array and object reachable from `root` a secret, and every string, number,
+    /// bool and `null` element or property inside them the secret of its place, drawing each
+    /// missing one from `next` — what a host call's argument needs before it is sent (Story
+    /// 3.11, decision 4). Visits in order, each collection once, so cycles and sharing are fine;
+    /// functions are skipped (the argument is refused for holding one).
+    pub(crate) fn assign_references(&mut self, root: &RtValue, next: &mut dyn FnMut() -> Secret) {
+        let mut pending = vec![root.clone()];
+        let mut seen: std::collections::HashSet<SlotId> = std::collections::HashSet::new();
+        while let Some(value) = pending.pop() {
+            let (RtValue::Array(id) | RtValue::Object(id)) = value else {
+                continue;
+            };
+            if !seen.insert(id) {
+                continue;
+            }
+            if self.collection_secret(id).is_none() {
+                self.set_collection_secret(id, next());
+            }
+            let children: Vec<(Location, RtValue)> = match self.slot(id) {
+                Some(Slot::Array { items, .. }) => items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| (Location::Element(id, index), item.clone()))
+                    .collect(),
+                Some(Slot::Object { entries, .. }) => entries
+                    .iter()
+                    .map(|(key, item)| (Location::Property(id, Arc::clone(key)), item.clone()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let mut nested = Vec::new();
+            for (at, child) in children {
+                match child {
+                    RtValue::Array(_) | RtValue::Object(_) => nested.push(child),
+                    RtValue::Function(_) => {}
+                    _ => {
+                        if self.location_secret(&at).is_none() {
+                            self.set_location_secret(&at, next());
+                        }
+                    }
+                }
+            }
+            // Reversed so the first nested collection is visited next.
+            pending.extend(nested.into_iter().rev());
+        }
     }
 
     /// Allocate a function value closing over `scope`.
@@ -378,7 +620,7 @@ impl Heap {
 
     /// Set `index`, or append when `index` is exactly the length. Returns `false` otherwise.
     pub(crate) fn array_store(&mut self, id: SlotId, index: usize, value: RtValue) -> bool {
-        let Some(Slot::Array { items, version }) = self.slot_mut(id) else {
+        let Some(Slot::Array { items, version, .. }) = self.slot_mut(id) else {
             return false;
         };
         let before = items.len();
@@ -403,9 +645,16 @@ impl Heap {
         self.entries(id)?.get(key).cloned()
     }
 
-    /// Replace an existing key in place, or append a new one at the end.
+    /// Replace an existing key in place, or append a new one at the end. Storing under
+    /// `__secret` does nothing: the key never exists in a Script's view (§3).
     pub(crate) fn object_store(&mut self, id: SlotId, key: &str, value: RtValue) {
-        if let Some(Slot::Object { entries, version }) = self.slot_mut(id) {
+        if key == SECRET_KEY {
+            return;
+        }
+        if let Some(Slot::Object {
+            entries, version, ..
+        }) = self.slot_mut(id)
+        {
             let before = entries.len();
             let grew = if let Some(slot) = entries.get_mut(key) {
                 *slot = value;
@@ -501,16 +750,40 @@ impl Heap {
                     }
                 }
                 Visit::Finish(id) => {
+                    // Secrets travel with the detached form: the collection's own, and each
+                    // scalar location's.
                     let detached = match self.slot(id) {
-                        Some(Slot::Array { items, .. }) => {
+                        Some(Slot::Array { items, meta, .. }) => {
                             let at = out.len().saturating_sub(items.len());
-                            Value::Array(Array::new(out.split_off(at)))
+                            // Nothing to collect, and nothing allocated, for an array with no
+                            // secret places — the common case.
+                            let secrets = if meta.has_locations() {
+                                (0..items.len())
+                                    .map(|index| meta.location(&index).cloned())
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            Value::Array(Array::from_parts(
+                                out.split_off(at),
+                                secrets,
+                                meta.own().cloned(),
+                            ))
                         }
-                        Some(Slot::Object { entries, .. }) => {
+                        Some(Slot::Object { entries, meta, .. }) => {
                             let at = out.len().saturating_sub(entries.len());
                             let values = out.split_off(at);
-                            Value::Object(Object::new(
+                            let secrets = entries
+                                .keys()
+                                .filter_map(|key| {
+                                    meta.location(&**key)
+                                        .map(|secret| (Arc::clone(key), secret.clone()))
+                                })
+                                .collect();
+                            Value::Object(Object::from_parts(
                                 entries.keys().cloned().zip(values).collect(),
+                                secrets,
+                                meta.own().cloned(),
                             ))
                         }
                         _ => Value::Null,
@@ -531,13 +804,17 @@ impl Heap {
     /// the two are distinct collections inside the execution. That is unobservable in the same
     /// way sharing is on the way out: a detached value has no identity (§4.2 identity exists only
     /// within one execution), so nothing could have told the caller they were the same.
+    ///
+    /// Secrets come along (Story 3.11): each collection keeps its own, and each element or
+    /// property its location's. A top-level scalar's location secret is the caller's to place.
     pub(crate) fn attach(&mut self, root: &Value) -> RtValue {
         enum Visit {
             Enter(Value),
-            /// `[e0 … eN-1]` on the output stack → one array handle.
-            FinishArray(usize),
+            /// `[e0 … eN-1]` on the output stack → one array handle, with the array's own secret
+            /// and its elements' location secrets.
+            FinishArray(usize, Meta<usize>),
             /// `[v0 … vN-1]` → one object handle, taking the keys back in order.
-            FinishObject(Vec<Arc<str>>),
+            FinishObject(Vec<Arc<str>>, Meta<Arc<str>>),
         }
         let mut work = vec![Visit::Enter(root.clone())];
         let mut out: Vec<RtValue> = Vec::new();
@@ -550,28 +827,58 @@ impl Heap {
                     Value::String(s) => out.push(self.text(s)),
                     Value::Array(array) => {
                         let items = array.to_vec();
-                        work.push(Visit::FinishArray(items.len()));
+                        let locations = (0..items.len())
+                            .filter_map(|index| {
+                                array.element_secret(index).map(|s| (index, s.clone()))
+                            })
+                            .collect();
+                        let meta = Meta::with(array.secret().cloned(), locations);
+                        work.push(Visit::FinishArray(items.len(), meta));
                         // Reversed so children are entered, and land on `out`, in order.
                         work.extend(items.into_iter().rev().map(Visit::Enter));
                     }
                     Value::Object(object) => {
-                        let entries = object.entries();
+                        // `__secret` is never a key (§3): an object built outside this crate
+                        // cannot smuggle one in.
+                        let entries: Vec<(Arc<str>, Value)> = object
+                            .entries()
+                            .into_iter()
+                            .filter(|(key, _)| &**key != SECRET_KEY)
+                            .collect();
+                        let locations = entries
+                            .iter()
+                            .filter_map(|(key, _)| {
+                                object
+                                    .entry_secret(key)
+                                    .map(|s| (Arc::clone(key), s.clone()))
+                            })
+                            .collect();
+                        let meta = Meta::with(object.secret().cloned(), locations);
                         work.push(Visit::FinishObject(
                             entries.iter().map(|(key, _)| Arc::clone(key)).collect(),
+                            meta,
                         ));
                         work.extend(entries.into_iter().rev().map(|(_, v)| Visit::Enter(v)));
                     }
                 },
-                Visit::FinishArray(len) => {
+                Visit::FinishArray(len, meta) => {
                     let at = out.len().saturating_sub(len);
                     let items = out.split_off(at);
-                    let array = self.new_array(items);
+                    let array = RtValue::Array(self.alloc(Slot::Array {
+                        items,
+                        version: 0,
+                        meta,
+                    }));
                     out.push(array);
                 }
-                Visit::FinishObject(keys) => {
+                Visit::FinishObject(keys, meta) => {
                     let at = out.len().saturating_sub(keys.len());
                     let values = out.split_off(at);
-                    let object = self.new_object(keys.into_iter().zip(values).collect());
+                    let object = RtValue::Object(self.alloc(Slot::Object {
+                        entries: keys.into_iter().zip(values).collect(),
+                        version: 0,
+                        meta,
+                    }));
                     out.push(object);
                 }
             }

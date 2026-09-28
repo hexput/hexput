@@ -41,6 +41,12 @@
 //! charges nothing — it is not Script code, so it is not charged to the CPU budget — and its
 //! findings are never cached.
 //!
+//! Value Secrets (Story 3.11) cross here too: a starting variable may be a holder
+//! (`{__secret: {ref, key?, …}, value}`, anywhere inside it as well), decoded by
+//! `hexput_exec::wire` — a malformed one is `protocol.invalid_payload` naming its path — and the
+//! result carries every secret it holds back out as holders, unchanged. A result with none is
+//! exactly the payload it always was.
+//!
 //! Not yet: the AST Cache and Cached Execution (Epic 4), which will run the check once at
 //! `CodeRegister`.
 //!
@@ -52,7 +58,7 @@ use std::sync::Arc;
 use hexput_check::{Environment, Policy, Severity};
 use hexput_exec::wire;
 use hexput_exec::{Caller, Host, Limits};
-use hexput_interpreter::{Category, Code, Diagnostic, Program, Span, Value as Hexput};
+use hexput_interpreter::{Category, Code, Diagnostic, Held, Program, Span};
 use hexput_port::{
     CheckMode, ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, Settings, Value,
     decode_settings, findings_value,
@@ -154,13 +160,9 @@ pub async fn direct_execution(
         }
     };
     let limits = Limits::from_settings(&effective);
-    let result = hexput_exec::execute_with_limits(
-        program,
-        variables,
-        Host::new(registrations, caller),
-        limits,
-    )
-    .await;
+    let result =
+        hexput_exec::execute_held(program, variables, Host::new(registrations, caller), limits)
+            .await;
     blocking(move || match result {
         Ok(result) => reply(&result, findings),
         // The findings accompany a runtime failure too: the pass ran, so the Backend is owed them.
@@ -207,7 +209,7 @@ fn encoded_len(value: &Value) -> usize {
 /// finding under `findings`.
 fn static_check(
     program: &Program,
-    variables: &[(Arc<str>, Hexput)],
+    variables: &[(Arc<str>, Held)],
     callables: Vec<String>,
     effective: &Settings,
 ) -> Result<Vec<ErrorBody>, Rejection> {
@@ -261,7 +263,7 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 }
 
 /// A parsed Script, its starting variables and its overrides, ready for the Executor.
-type Prepared = (Arc<Program>, Vec<(Arc<str>, Hexput)>, Settings);
+type Prepared = (Arc<Program>, Vec<(Arc<str>, Held)>, Settings);
 
 /// Decode the payload and parse its source.
 fn prepare(payload: &Value) -> Result<Prepared, Box<ErrorBody>> {
@@ -280,17 +282,18 @@ fn prepare(payload: &Value) -> Result<Prepared, Box<ErrorBody>> {
 ///
 /// The findings are left out when with them the reply would not fit a frame, and they go with the
 /// refusal when the result cannot be sent.
-fn reply(result: &Hexput, findings: Vec<ErrorBody>) -> Result<Value, Box<ErrorBody>> {
+fn reply(result: &Held, findings: Vec<ErrorBody>) -> Result<Value, Box<ErrorBody>> {
     let refused = |error: ProtocolError| with_findings(ErrorBody::from(&error), findings.clone());
-    match wire::check_result(result) {
-        Ok(()) => {
-            let mut fields = vec![(Value::from(VALUE), wire::to_wire(result))];
+    match wire::result_to_wire(result) {
+        Ok(value) => {
+            let mut fields = vec![(Value::from(VALUE), value)];
             if !findings.is_empty() {
                 let listed = findings_value(&findings);
                 // The `findings` key and value, beside the `{value}` payload.
-                let size = wire::payload_size(result, MAX_FRAME_LEN)
-                    .saturating_add(FINDINGS.len() + 1)
-                    .saturating_add(encoded_len(&listed));
+                let size =
+                    wire::payload_size_held(&result.value, result.secret.as_ref(), MAX_FRAME_LEN)
+                        .saturating_add(FINDINGS.len() + 1)
+                        .saturating_add(encoded_len(&listed));
                 if size <= MAX_FRAME_LEN - ENVELOPE_ROOM {
                     fields.push((Value::from(FINDINGS), listed));
                 }
@@ -300,8 +303,8 @@ fn reply(result: &Hexput, findings: Vec<ErrorBody>) -> Result<Value, Box<ErrorBo
         Err(wire::Unsendable::TooDeep) => Err(refused(ProtocolError::new(
             ProtocolCode::ResultTooDeep,
             format!(
-                "the Script's result nests more than {MAX_RESULT_DEPTH} arrays or objects deep, \
-                 past what a frame may carry"
+                "the Script's result nests more than {MAX_RESULT_DEPTH} arrays or objects deep \
+                 (counting its Value Secret holders), past what a frame may carry"
             ),
         ))),
         Err(wire::Unsendable::TooLarge) => Err(refused(ProtocolError::new(
@@ -325,7 +328,7 @@ fn reply(result: &Hexput, findings: Vec<ErrorBody>) -> Result<Value, Box<ErrorBo
 
 /// A decoded `ExecutionStart`: the source, the starting variables in the order given, and the
 /// overrides (none set when the payload has none).
-type Decoded<'a> = (&'a str, Vec<(Arc<str>, Hexput)>, Settings);
+type Decoded<'a> = (&'a str, Vec<(Arc<str>, Held)>, Settings);
 
 /// Decode an `ExecutionStart` payload by hand, like `Init`'s: a Backend is owed the exact key,
 /// name or path that was wrong.

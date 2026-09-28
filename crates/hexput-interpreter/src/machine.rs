@@ -49,6 +49,25 @@
 //! (`array_literals`, `object_literals`), and a host call, before its arguments are evaluated
 //! (`rpc_calls`). The Script's top-level functions are hoisted when the machine is built, so their
 //! check runs when it first executes, before any statement.
+//!
+//! # Value Secrets (Story 3.11)
+//!
+//! The machine carries Value Secrets without ever letting the Script see one (LANGUAGE-REFERENCE
+//! §3). `__secret` reads as `null` by `.`, `[]` and `?.` on every value, writing it does nothing,
+//! and an object literal's `__secret` key is dropped, so the key never exists and `for … in`
+//! cannot meet it; `==`, truthiness and conversions work on [`RtValue`]s, which carry none.
+//!
+//! A collection's secret lives on its slot; a scalar's on the place holding it (a binding,
+//! element or property — a `heap::Location`). A copy (`let m = n;`, `[n]`, a parameter) is a
+//! fresh place with no secret; writing a new value into a place keeps the place's. The machine
+//! remembers the place the last read came from, so that an expression written directly as a
+//! place can be tied back to it: a host call's argument (`f(n)`, `f(o.p)`, `f(a[0])`) and the
+//! Script's top-level `return`. A host call's value that arrives with a secret keeps it only when
+//! the statement making the call stores it directly (`let x = f();`, `x = f();`, `o.p = f();`).
+//!
+//! Every value a host call sends carries a secret: one without is given a Reference ID
+//! (`<prefix>:<counter>`, the counter from 1, the prefix set by the Executor), stored back on its
+//! collection or place so the same one sent again carries the same ID.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -62,8 +81,12 @@ use hexput_ast::{
 use indexmap::IndexMap;
 
 use crate::convert::{number_to_string, to_number, to_string};
-use crate::heap::{DetachFailure, Heap, RtValue, SlotId, TEXT_OVERHEAD};
+use crate::heap::{DetachFailure, Heap, Location, RtValue, SlotId, TEXT_OVERHEAD, Text};
+use crate::value::{Held, SECRET_KEY, Secret};
 use crate::{CALL_DEPTH_LIMIT, Meter, Value};
+
+/// The Reference ID prefix of an execution whose driver set none.
+pub(crate) const DEFAULT_REFERENCE_PREFIX: &str = "hx:0000000000000000";
 
 /// How many bytes a string operation reads or writes per unit of slice work.
 const BYTES_PER_UNIT: usize = 256;
@@ -144,12 +167,22 @@ enum Frame {
         index: usize,
         in_target: bool,
     },
-    /// `[value]` → `[]`, assigning the identifier expression with this id.
-    AssignName(ExprId),
+    /// `[value]` → `[]`, assigning the identifier expression `target` the value of the
+    /// expression `value`.
+    AssignName {
+        target: ExprId,
+        value: ExprId,
+    },
     /// `[receiver, value]` or `[receiver, key, value]` → `[]`, for the assignment whose target is
-    /// the access expression with this id. Its last link is the one assigned; the links before it
-    /// name a `null` receiver.
-    AssignMember(ExprId),
+    /// the access expression `target` and whose value is the expression `value`. Its last link is
+    /// the one assigned; the links before it name a `null` receiver.
+    AssignMember {
+        target: ExprId,
+        value: ExprId,
+    },
+    /// `[]` → `[]`: the host-call argument with this id has just been evaluated; note the place it
+    /// was read from, if it was written directly as one.
+    Located(ExprId),
     /// `[condition]` → runs the `if` statement's `branches[index]` body, tests the next branch,
     /// or takes the `else`. Only the taken branch's body is ever scheduled.
     Branch {
@@ -230,18 +263,25 @@ impl LoopKind {
 
 /// One argument of a host call: its detached value and the span of the expression that
 /// produced it, which an error about that argument points at.
+///
+/// Every value in it carries a Value Secret (Story 3.11): an array or object its own, and every
+/// string, number, bool or `null` inside one the secret of its place. `secret` is the argument's
+/// own place's — the variable, element or property it was written as, or a fresh one for a
+/// computed value — and is set whenever the argument is not an array or object.
 #[derive(Debug, Clone)]
 pub struct Argument {
     /// The argument, detached from the execution like a Script result.
     pub value: Value,
     /// The argument expression's span.
     pub span: Span,
+    /// The secret of the place the argument was passed from (see the type's documentation).
+    pub secret: Option<Secret>,
 }
 
 /// Why the machine stopped.
 pub(crate) enum Stop {
     /// The Script ended with this result.
-    Finished(Value),
+    Finished(Held),
     /// The Script called a host function and waits for its value.
     HostCall(PendingCall),
     /// The slice of work the [`Meter`] allows is done; running the machine again carries on.
@@ -265,6 +305,32 @@ enum Site {
     Link(Chain, usize),
     /// A frame that allocates nothing and ends nothing a user wrote (scope exit, discard).
     Unknown,
+}
+
+/// The place a read took its value from, cheaply: resolved into a [`Location`] only when an
+/// argument or the Script result needs it.
+#[derive(Clone)]
+enum Read {
+    /// An identifier, read with this scope current.
+    Name(SlotId),
+    Element(SlotId, usize),
+    /// An object's property named by the access expression's last link.
+    Property(SlotId),
+    /// An object's property under a computed key.
+    Key(SlotId, Text),
+}
+
+/// Where the machine's Reference IDs come from: `<prefix>:<counter>`, the counter from 1.
+struct References {
+    prefix: Arc<str>,
+    issued: u64,
+}
+
+impl References {
+    fn next(&mut self) -> Secret {
+        self.issued += 1;
+        Secret::generated(format!("{}:{}", self.prefix, self.issued))
+    }
 }
 
 /// A host call the machine is suspended on.
@@ -303,12 +369,21 @@ pub(crate) struct Machine<P> {
     /// Whether the top-level functions' hoisting has been checked against [`Machine::features`]:
     /// they are hoisted when the machine is built, before its toggles are known.
     started: bool,
+    /// The place the last read took its value from, and the expression that read it.
+    located: Option<(ExprId, Read)>,
+    /// The places of the host-call arguments evaluated so far, innermost call last.
+    argument_places: Vec<Option<Location>>,
+    /// A host call's value that arrived with a place secret, and the call expression it answers:
+    /// kept only if the statement making the call stores it directly.
+    reply_secret: Option<(ExprId, Secret)>,
+    /// Where generated Reference IDs come from.
+    references: References,
 }
 
 impl<P: Deref<Target = Program> + Clone> Machine<P> {
     #[cfg(test)]
     pub(crate) fn new(program: P) -> Self {
-        Self::with_variables(program, Vec::<(&str, Value)>::new())
+        Self::with_variables(program, Vec::<(&str, Held)>::new())
     }
 
     /// A machine whose root scope already binds `variables`, each attached into the fresh heap.
@@ -320,7 +395,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// source would be rejected outright.
     pub(crate) fn with_variables<N: AsRef<str>>(
         program: P,
-        variables: impl IntoIterator<Item = (N, Value)>,
+        variables: impl IntoIterator<Item = (N, Held)>,
     ) -> Self {
         let mut heap = Heap::default();
         let scope = heap.push_scope(None);
@@ -341,10 +416,21 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             site: Site::Unknown,
             features: Features::ALL_ENABLED,
             started: false,
+            located: None,
+            argument_places: Vec::new(),
+            reply_secret: None,
+            references: References {
+                prefix: Arc::from(DEFAULT_REFERENCE_PREFIX),
+                issued: 0,
+            },
         };
-        for (name, value) in variables {
-            let attached = machine.heap.attach(&value);
-            machine.heap.declare(scope, name.as_ref(), attached);
+        for (name, held) in variables {
+            let attached = machine.heap.attach(&held.value);
+            // A scalar's secret names the variable it arrived in; a collection carries its own.
+            let secret = held.secret.filter(|_| !held.value.is_collection());
+            machine
+                .heap
+                .declare_held(scope, name.as_ref(), attached, secret);
         }
         machine.hoist(&tree, None);
         machine
@@ -394,6 +480,11 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// Meter the rest of the run against `meter`.
     pub(crate) fn set_meter(&mut self, meter: Meter) {
         self.meter = meter;
+    }
+
+    /// Generate Reference IDs as `<prefix>:<counter>` from here on.
+    pub(crate) fn set_reference_prefix(&mut self, prefix: Arc<str>) {
+        self.references.prefix = prefix;
     }
 
     /// How many allocations the Script has made (see the module documentation).
@@ -453,7 +544,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 return Ok(Stop::Paused(site_span(tree, site)));
             }
         }
-        Ok(Stop::Finished(Value::Null))
+        Ok(Stop::Finished(Held::plain(Value::Null)))
     }
 
     /// Whether the heap holds more than the memory ceiling.
@@ -500,8 +591,8 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             | Frame::Return(id)
             | Frame::BuildArray { array: id, .. }
             | Frame::BuildObject(id)
-            | Frame::AssignName(id)
-            | Frame::AssignMember(id) => Site::Expression(*id),
+            | Frame::AssignName { target: id, .. }
+            | Frame::AssignMember { target: id, .. } => Site::Expression(*id),
             Frame::Unary { operator, .. } => Site::Span(operator.span),
             Frame::BinaryRight { operator, .. } | Frame::Binary { operator, .. } => {
                 Site::Span(operator.span)
@@ -511,6 +602,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             | Frame::Invoke { chain, index, .. }
             | Frame::CallEnd { chain, index, .. } => Site::Link(*chain, *index),
             Frame::HostCall { chain, .. } => Site::Link(*chain, 0),
+            Frame::Located(_) => Site::Unknown,
             Frame::Loop(state) | Frame::LoopTest(state) => match &state.kind {
                 LoopKind::While { keyword, .. } | LoopKind::For { keyword, .. } => {
                     Site::Span(*keyword)
@@ -523,9 +615,25 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// Answer the host call the machine stopped on with `value`, which becomes the call's value
     /// exactly as if an ordinary call had returned it. Without a pending host call, does
     /// nothing.
-    pub(crate) fn resume(&mut self, value: &Value) {
+    ///
+    /// A collection's secret comes with it. A string, number, bool or `null` arriving with a
+    /// secret keeps it only when the call is the whole value a statement stores (decision 2);
+    /// otherwise it is a computed value and plain.
+    pub(crate) fn resume(&mut self, held: &Held) {
         if let Some((chain, in_target)) = self.suspended.take() {
-            let value = self.heap.attach(value);
+            let value = self.heap.attach(&held.value);
+            let whole_call = !in_target
+                && chain.end == 1
+                && matches!(
+                    &self.program.expression(chain.access).kind,
+                    ExpressionKind::Access { links, .. } if links.len() == 1
+                );
+            self.reply_secret = match &held.secret {
+                Some(secret) if whole_call && !held.value.is_collection() => {
+                    Some((chain.access, secret.clone()))
+                }
+                _ => None,
+            };
             self.values.push(value);
             self.frames.push(Frame::Link {
                 chain,
@@ -606,7 +714,9 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     fn step(&mut self, tree: &Program, frame: Frame) -> Result<Option<Stop>, Diagnostic> {
         match frame {
             Frame::Statement(at) => {
-                return Ok(self.statement(tree, at)?.map(Stop::Finished));
+                return Ok(self
+                    .statement(tree, at)?
+                    .map(|result| Stop::Finished(Held::plain(result))));
             }
             // A scope a closure captured is skipped here and lives until the execution ends,
             // like any other heap garbage; see `environment.rs`.
@@ -617,20 +727,40 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             }
             Frame::Declare(at) => {
                 let value = self.pop();
-                if let StatementKind::Let { name, .. } = &statement(tree, at).kind {
-                    self.heap.declare(self.scope, &name.name, value);
+                if let StatementKind::Let {
+                    name, initializer, ..
+                } = &statement(tree, at).kind
+                {
+                    // A fresh place: plain, unless it stores a host call's value that came with
+                    // a secret.
+                    let secret = self.take_reply_secret(*initializer);
+                    self.heap
+                        .declare_held(self.scope, &name.name, value, secret);
                 }
+            }
+            Frame::Located(id) => {
+                let read = self.located.take().filter(|(at, _)| *at == id);
+                let place = read.and_then(|(_, read)| self.resolve_read(tree, id, read));
+                self.argument_places.push(place);
             }
             Frame::Return(expression) => {
                 let value = self.pop();
+                let read = self.located.take().filter(|(at, _)| *at == expression);
                 if self.depth > 0 {
                     // Inside a call: this returns from the innermost function, not the Script.
                     self.return_from_call(value);
                     return Ok(None);
                 }
-                return self
-                    .script_result(tree, &value, expression)
-                    .map(|result| Some(Stop::Finished(result)));
+                let result = self.script_result(tree, &value, expression)?;
+                // Decision 6: a scalar result carries a secret only when the return expression
+                // is directly a place that has one. Nothing is generated for a result.
+                let secret = if result.is_collection() {
+                    None
+                } else {
+                    read.and_then(|(_, read)| self.resolve_read(tree, expression, read))
+                        .and_then(|place| self.heap.location_secret(&place).cloned())
+                };
+                return Ok(Some(Stop::Finished(Held::new(result, secret))));
             }
             Frame::Unary { operator, operand } => {
                 let value = self.pop();
@@ -695,14 +825,47 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 let key = self.pop();
                 let receiver = self.pop();
                 self.burn_text(&key);
-                let (_, links) = chain_links(tree, chain);
+                let (base, links) = chain_links(tree, chain);
                 let Some(link) = links.get(index) else {
                     return Err(internal(tree.expression(chain.access).span));
                 };
                 let AccessKind::Index { expression, .. } = &link.kind else {
                     return Err(internal(link.span));
                 };
+                // §3: `null["__secret"]` reads as null; any other key on `null` is the ordinary
+                // null access, raised once the key is evaluated.
+                if receiver.is_null()
+                    && !matches!(&key, RtValue::String(k) if k.as_str() == SECRET_KEY)
+                {
+                    return Err(null_access(
+                        tree,
+                        base,
+                        &links[..index],
+                        link,
+                        "read",
+                        !in_target,
+                    ));
+                }
                 let element = self.read_index(tree, &receiver, &key, link, *expression)?;
+                // The last link of a read: the whole expression is this element or property,
+                // when it exists.
+                if !in_target && index + 1 == links.len() {
+                    let read = match (&receiver, &key) {
+                        (RtValue::Array(array), RtValue::Number(n)) => array_slot(*n)
+                            .filter(|i| *i < self.heap.array_len(*array))
+                            .map(|i| Read::Element(*array, i)),
+                        (RtValue::Object(object), RtValue::String(k))
+                            if k.as_str() != SECRET_KEY
+                                && self.heap.object_get(*object, k).is_some() =>
+                        {
+                            Some(Read::Key(*object, k.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some(read) = read {
+                        self.located = Some((chain.access, read));
+                    }
+                }
                 self.values.push(element);
                 self.frames.push(Frame::Link {
                     chain,
@@ -710,12 +873,22 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     in_target,
                 });
             }
-            Frame::AssignName(target) => {
+            Frame::AssignName {
+                target,
+                value: stored,
+            } => {
                 let value = self.pop();
                 let expression = tree.expression(target);
                 let ExpressionKind::Identifier(name) = &expression.kind else {
                     return Err(internal(expression.span));
                 };
+                // The place keeps its own secret; a host call's value brings one only to a place
+                // that has none.
+                if let Some(secret) = self.take_reply_secret(stored)
+                    && let Some(place) = self.heap.binding_location(self.scope, &name.name)
+                {
+                    self.heap.set_location_secret(&place, secret);
+                }
                 if self.heap.assign(self.scope, &name.name, value).is_err() {
                     return Err(Diagnostic::new(
                         Category::Reference,
@@ -728,7 +901,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     ));
                 }
             }
-            Frame::AssignMember(target) => self.assign_member(tree, target)?,
+            Frame::AssignMember { target, value } => self.assign_member(tree, target, value)?,
             Frame::Branch { at, index } => {
                 let taken = self.pop();
                 if self.heap.is_truthy(&taken) {
@@ -840,12 +1013,32 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             return Err(internal(link.span));
         };
         let values = self.pop_many(arguments.len());
+        let at = self.argument_places.len().saturating_sub(arguments.len());
+        let mut places = self.argument_places.split_off(at);
+        places.resize(values.len(), None);
         let mut detached = Vec::with_capacity(values.len());
-        for (value, argument) in values.iter().zip(arguments) {
+        for ((value, argument), place) in values.iter().zip(arguments).zip(places) {
             let span = tree.expression(*argument).span;
+            // Decision 4: everything sent carries a secret. A collection and everything in it get
+            // one stored back on them; a scalar written as a place gets the place's, stored back
+            // too; a computed scalar gets a fresh one.
+            let secret = match value {
+                RtValue::Array(_) | RtValue::Object(_) => {
+                    let references = &mut self.references;
+                    self.heap
+                        .assign_references(value, &mut || references.next());
+                    None
+                }
+                RtValue::Function(_) => None,
+                _ => Some(self.place_secret(place.as_ref())),
+            };
             let (code, reason) = match self.heap.detach(value) {
                 Ok(value) => {
-                    detached.push(Argument { value, span });
+                    detached.push(Argument {
+                        value,
+                        span,
+                        secret,
+                    });
                     continue;
                 }
                 Err(DetachFailure::Cycle) => (
@@ -883,6 +1076,50 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             arguments: detached,
             span: through(name.span, link.span),
         }))
+    }
+
+    /// The secret of `place`, given a fresh Reference ID first when it has none; a fresh one
+    /// when there is no place.
+    fn place_secret(&mut self, place: Option<&Location>) -> Secret {
+        let Some(place) = place else {
+            return self.references.next();
+        };
+        if let Some(secret) = self.heap.location_secret(place) {
+            return secret.clone();
+        }
+        let secret = self.references.next();
+        self.heap.set_location_secret(place, secret.clone());
+        secret
+    }
+
+    /// The secret a host call's value brought for the expression `stored`, when that expression
+    /// is the call itself. Consumed either way.
+    fn take_reply_secret(&mut self, stored: ExprId) -> Option<Secret> {
+        match self.reply_secret.take() {
+            Some((call, secret)) if call == stored => Some(secret),
+            _ => None,
+        }
+    }
+
+    /// The place `read` names, for the expression `id` that made it.
+    fn resolve_read(&self, tree: &Program, id: ExprId, read: Read) -> Option<Location> {
+        match read {
+            Read::Name(scope) => match &tree.expression(id).kind {
+                ExpressionKind::Identifier(name) => self.heap.binding_location(scope, &name.name),
+                _ => None,
+            },
+            Read::Element(array, index) => Some(Location::Element(array, index)),
+            Read::Property(object) => match &tree.expression(id).kind {
+                ExpressionKind::Access { links, .. } => match links.last().map(|link| &link.kind) {
+                    Some(AccessKind::Property(name)) => {
+                        Some(Location::Property(object, Arc::from(name.name.as_str())))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            Read::Key(object, key) => Some(Location::Property(object, key.shared())),
+        }
     }
 
     /// Test the `if` statement's `branches[index]`, or fall through to its `else` body when there
@@ -1207,7 +1444,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         let target_expression = tree.expression(target);
         match &target_expression.kind {
             ExpressionKind::Identifier(_) => {
-                self.frames.push(Frame::AssignName(target));
+                self.frames.push(Frame::AssignName { target, value });
                 self.frames.push(Frame::Eval(value));
             }
             ExpressionKind::Access { links, .. } => {
@@ -1218,7 +1455,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     return Err(invalid_target(target_expression.span));
                 }
                 // Order: receiver, then index key, then the assigned value.
-                self.frames.push(Frame::AssignMember(target));
+                self.frames.push(Frame::AssignMember { target, value });
                 self.frames.push(Frame::Eval(value));
                 match &link.kind {
                     AccessKind::Property(_) => {}
@@ -1257,6 +1494,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                         name.span,
                     ));
                 };
+                self.located = Some((id, Read::Name(self.scope)));
                 self.values.push(value);
             }
             ExpressionKind::Group { expression, .. } => self.frames.push(Frame::Eval(*expression)),
@@ -1342,8 +1580,13 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 )?;
             }
             self.frames.push(Frame::HostCall { chain, in_target });
-            self.frames
-                .extend(arguments.iter().rev().map(|a| Frame::Eval(*a)));
+            // Each argument is followed by a note of the place it was read from, if any.
+            self.frames.extend(
+                arguments
+                    .iter()
+                    .rev()
+                    .flat_map(|a| [Frame::Located(*a), Frame::Eval(*a)]),
+            );
             return Ok(());
         }
         self.frames.push(Frame::Link {
@@ -1386,7 +1629,22 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 .extend(arguments.iter().rev().map(|a| Frame::Eval(*a)));
             return Ok(());
         }
-        if receiver_is_null {
+        // §3: `__secret` reads as null on every value, `null` included — never an error.
+        if let AccessKind::Property(name) = &link.kind
+            && name.name == SECRET_KEY
+        {
+            self.pop();
+            self.values.push(RtValue::Null);
+            self.frames.push(Frame::Link {
+                chain,
+                index: index + 1,
+                in_target,
+            });
+            return Ok(());
+        }
+        // An index on `null` is refused once its key is known (`Frame::IndexRead`): the key
+        // `__secret` reads as null there too.
+        if receiver_is_null && !matches!(link.kind, AccessKind::Index { .. }) {
             // `?.` is not allowed in an assignment target, so only suggest it for plain reads.
             return Err(null_access(
                 tree,
@@ -1401,6 +1659,14 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             AccessKind::Property(name) => {
                 let receiver = self.pop();
                 let value = self.read_property(&receiver, name, link)?;
+                // The last link of a read: the whole expression is this property, when it exists.
+                if let RtValue::Object(object) = receiver
+                    && !in_target
+                    && index + 1 == links.len()
+                    && self.heap.object_get(object, &name.name).is_some()
+                {
+                    self.located = Some((chain.access, Read::Property(object)));
+                }
                 self.values.push(value);
                 self.frames.push(Frame::Link {
                     chain,
@@ -1431,6 +1697,10 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         key_expression: ExprId,
     ) -> Result<RtValue, Diagnostic> {
         let key_span = tree.expression(key_expression).span;
+        // §3: `["__secret"]` reads as null on every value — never an error.
+        if matches!(key, RtValue::String(k) if k.as_str() == SECRET_KEY) {
+            return Ok(RtValue::Null);
+        }
         match (receiver, key) {
             (RtValue::Array(array), RtValue::Number(n)) => {
                 // §7: anything that is not an in-range whole index reads as absent.
@@ -1447,8 +1717,17 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     }
 
     /// Store the assigned value through the last link of the access expression `target`.
-    fn assign_member(&mut self, tree: &Program, target: ExprId) -> Result<(), Diagnostic> {
+    ///
+    /// `stored` is the assigned expression: a host call's value that came with a secret gives
+    /// it to the place, when the place has none. Writing `__secret` does nothing (§3).
+    fn assign_member(
+        &mut self,
+        tree: &Program,
+        target: ExprId,
+        stored: ExprId,
+    ) -> Result<(), Diagnostic> {
         let value = self.pop();
+        let secret = self.take_reply_secret(stored);
         let expression = tree.expression(target);
         let ExpressionKind::Access { base, links } = &expression.kind else {
             return Err(internal(expression.span));
@@ -1459,9 +1738,16 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         match &link.kind {
             AccessKind::Property(name) => {
                 let receiver = self.pop();
+                if name.name == SECRET_KEY {
+                    return Ok(());
+                }
                 match &receiver {
                     RtValue::Object(object) => {
                         self.heap.object_store(*object, &name.name, value);
+                        if let Some(secret) = secret {
+                            let place = Location::Property(*object, Arc::from(name.name.as_str()));
+                            self.heap.set_location_secret(&place, secret);
+                        }
                         Ok(())
                     }
                     RtValue::Null => Err(null_access(tree, *base, prefix, link, "assign", false)),
@@ -1472,13 +1758,21 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 let key = self.pop();
                 let receiver = self.pop();
                 self.burn_text(&key);
+                if matches!(&key, RtValue::String(k) if k.as_str() == SECRET_KEY) {
+                    return Ok(());
+                }
                 let key_span = tree.expression(*expression).span;
                 match (&receiver, &key) {
                     (RtValue::Null, _) => {
                         Err(null_access(tree, *base, prefix, link, "assign", false))
                     }
                     (RtValue::Array(array), RtValue::Number(n)) => {
-                        if array_slot(*n).is_some_and(|i| self.heap.array_store(*array, i, value)) {
+                        let slot = array_slot(*n);
+                        if slot.is_some_and(|i| self.heap.array_store(*array, i, value)) {
+                            if let (Some(secret), Some(i)) = (secret, slot) {
+                                self.heap
+                                    .set_location_secret(&Location::Element(*array, i), secret);
+                            }
                             Ok(())
                         } else {
                             Err(Diagnostic::new(
@@ -1496,6 +1790,12 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     }
                     (RtValue::Object(object), RtValue::String(k)) => {
                         self.heap.object_store(*object, k, value);
+                        if let Some(secret) = secret {
+                            self.heap.set_location_secret(
+                                &Location::Property(*object, k.shared()),
+                                secret,
+                            );
+                        }
                         Ok(())
                     }
                     (RtValue::Array(_) | RtValue::Object(_), _) => {
@@ -2083,7 +2383,7 @@ mod tests {
     /// Run `machine` to its result; these trees make no host call.
     fn finish(machine: &mut Machine<&Program>) -> Result<Value, Diagnostic> {
         match machine.execute()? {
-            Stop::Finished(value) => Ok(value),
+            Stop::Finished(result) => Ok(result.value),
             Stop::HostCall(call) => panic!("unexpected host call to `{}`", call.name),
             Stop::Paused(_) | Stop::OutOfMemory(_) | Stop::AllocationsExceeded(_) => {
                 panic!("these machines are unmetered")

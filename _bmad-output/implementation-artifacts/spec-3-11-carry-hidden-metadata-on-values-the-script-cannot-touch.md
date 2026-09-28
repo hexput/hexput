@@ -2,7 +2,7 @@
 title: 'Story 3.11: Carry hidden metadata on values the script cannot touch'
 type: 'feature'
 created: '2026-09-28'
-status: 'in-progress'
+status: 'done'
 baseline_commit: 'bb507c7e4df71e5ed29dcf1b0dd9e92a4eda2b22'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -128,11 +128,11 @@ This is the trust boundary (Epic 3): any path that lets a Script see, forge or s
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `hexput-interpreter`: `Secret`, its carriers, invisibility, ref generation.
-- [ ] `hexput-exec`: holder decode and encode, size and depth accounting, nonce.
-- [ ] `hexput-script`: starting variables and result.
-- [ ] Tests for every matrix row.
-- [ ] Docs.
+- [x] `hexput-interpreter`: `Secret`, its carriers, invisibility, ref generation.
+- [x] `hexput-exec`: holder decode and encode, size and depth accounting, nonce.
+- [x] `hexput-script`: starting variables and result.
+- [x] Tests for every matrix row.
+- [x] Docs.
 
 **Acceptance Criteria:**
 - Given any Script and any holder input, when it runs, then no expression evaluates to anything containing a secret's `ref`, `key` or extra fields, and the Script's results equal those of the same Script over the plain values.
@@ -140,6 +140,28 @@ This is the trust boundary (Epic 3): any path that lets a Script see, forge or s
 - Given no holders anywhere, when a Script runs, then its wire output is byte-identical to the output before this story.
 
 ## Spec Change Log
+
+## Review Triage Log
+
+| # | Layer | Finding | Verdict | Evidence / route |
+|---|-------|---------|---------|------------------|
+| 1 | blind + edge-case + verification-gap | A place/collection given a generated `hx:` ref by a `Call` returns as a holder, so a secret-unaware Backend's result changes (AC 3), and gains output size and wire depth | medium | Real: decisions 4 and 6 combined contradict AC 3. Resolved under Erdem's delegation (2026-09-28): generated secrets are never emitted in the result; they still travel in later `Call`s. **patch**; the four `unheld` result adaptations reverted |
+| 2 | blind + edge-case | `__secret` through a computed key on `null` errors on read, silently succeeds on write, unlike the literal key | medium | Real (machine.rs ~1631, assign_member). **patch**: every read yields `null`, every write a no-op, on every value, key evaluated first |
+| 3 | blind + edge-case | AC 2 "byte-identical secret" not met: `ref`/`key` reordered, further fields re-encoded canonically; the test normalizes before comparing | low | Real; semantic identity is what a Backend needs. **patch** (LANGUAGE-REFERENCE states canonical form; test renamed) |
+| 4 | verification-gap | Holder-induced `result_too_deep` never exercised | low | Pre-verified. **patch** (test at and past the limit) |
+| 5 | verification-gap | Output-size charge on a top-level held scalar unpinned | low | Pre-verified. **patch** (test) |
+| 6 | verification-gap | Memory charge for generated/cleared secrets untested | low | Pre-verified; approximate by design. **defer** |
+| 7 | blind + edge-case | `wire::check_result` no longer matches production; tests assert through it | low | Real. **patch**: delegate to `result_to_wire`; tests use the production path |
+| 8 | blind | `Authorize` carrying holders untested | low | Real; cheap. **patch** (test) |
+| 9 | blind | Nonce doc claims no collisions | low | Real; 64-bit `RandomState`. **patch** (doc) |
+| 10 | blind | `return (n);` plain vs `return n;` held undocumented | low | Real. **patch** (doc: parentheses make a computed value) |
+| 11 | blind | A reply's secret is dropped when the place already has a ref | low | Real; keep-the-place's-ID is the rule Story 3.13 routes by. **patch** (doc) + **defer** (revisit key loss with Story 3.12/3.13) |
+| 12 | blind | Backend refs may collide with `hx:` or be reused across places | medium | Real, matters once Story 3.13 routes modifications by ref. **defer** to 3.13 |
+| 13 | blind | Holders amplify `Call` argument size, memory and wire depth (~62 effective nesting) undocumented | low | Real, by design of FR-28. **defer** (document with 3.13's cost notes) |
+| 14 | blind | `Secret::new` accepts malformed `extra` and loses it silently; hand-parsed map headers | low | Rejected: unreachable from the wire; a validating constructor adds surface for a test-only path |
+| 15 | blind | Spec deviations (`x = f();`, `a[i] = f();` also keep reply secrets; null/`__secret` rules) not logged | low | Real; accepted as the consistent reading of decision 2 — recorded here |
+| 16 | blind | Spine `updated:` not bumped | low | Real; direct. **patch** |
+| 17 | blind | Status disagreement across files | false | Step 5 syncs the sprint status |
 
 ## Verification
 

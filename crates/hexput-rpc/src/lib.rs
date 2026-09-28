@@ -59,6 +59,9 @@ use std::collections::HashMap;
 
 use tokio::sync::{mpsc, oneshot};
 
+/// The MessagePack codec behind [`Value`], re-exported so the Executor can encode and decode a
+/// Value Secret's further fields (Story 3.11) with the same pinned `rmpv` the wire uses.
+pub use hexput_port::rmpv;
 use hexput_port::{CorrelationId, Envelope, MessageType};
 /// The wire vocabulary a call is expressed in: its arguments and the Backend's reply value are
 /// MessagePack values, and a `Call` travels in one frame. Re-exported because they are this

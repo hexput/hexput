@@ -258,6 +258,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-8-change-execution-policy-without-reconnecting.md`
   summary: Whether a Value Secret's hidden metadata counts toward the allocation (or memory) budget is unstated; the recompiled epic-3-context dropped the old open note.
   evidence: Review finding (blind, low). LANGUAGE-REFERENCE §7 defines allocations without Value Secrets, which do not exist yet. Decide in Story 3.11's spec.
+  status: RESOLVED 2026-09-28 by `spec-3-11-carry-hidden-metadata-on-values-the-script-cannot-touch.md` decision 7 — a Value Secret is never an allocation (nothing a Script constructs), but its bytes count towards the memory budget: the interpreter charges each secret it holds (its record, Reference ID, key and further fields) to the slot or scope that holds it, and credits it when that slot is released. The output size budget counts every holder in the result exactly (`hexput_exec::wire::payload_size_held`, pinned against `rmp_serde`). LANGUAGE-REFERENCE §3 records it.
 
 - source_spec: `spec-3-9-switch-off-language-constructs-by-policy.md`
   summary: The runtime and `hexput-check` report `policy.construct_disabled` with different messages and spans (host call: `name(args)` vs `name`; named function: `fn name` vs `fn`), and `hexput-check::Policy` still has six hand-written booleans instead of `hexput_shared::policy::Features`.
@@ -271,3 +272,15 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-10-turn-the-static-check-on-or-off.md`
   summary: The Daemon-side static check pass runs on the blocking pool with no time bound or cancellation; it is not charged to the Script's CPU budget.
   evidence: Review finding (blind, low). The pass is linear in the source, which one frame (16 MiB) bounds, so the cost is bounded but not metered. Revisit with Cached Execution (Epic 4), where the pass runs once at registration, or if profiling shows large sources dominating.
+
+- source_spec: `spec-3-11-carry-hidden-metadata-on-values-the-script-cannot-touch.md`
+  summary: A Backend-supplied Reference ID may start with `hx:` or be reused on two places; nothing reserves the Daemon's namespace or defines duplicates.
+  evidence: Review finding (blind, medium). Harmless until Story 3.13 routes modifications by `ref`; decide there (reserve `hx:` for Daemon IDs the Backend did not receive, and refuse or define duplicate refs).
+
+- source_spec: `spec-3-11-carry-hidden-metadata-on-values-the-script-cannot-touch.md`
+  summary: A `Call` reply's secret stored into a place that already has a Reference ID is dropped, losing its `key` and further fields.
+  evidence: Review finding (blind, low). The place keeps its own ID by rule (LANGUAGE-REFERENCE §3). Revisit with Story 3.12 (keys) and 3.13 (modifications) whether the reply's key/fields should merge.
+
+- source_spec: `spec-3-11-carry-hidden-metadata-on-values-the-script-cannot-touch.md`
+  summary: Holders multiply a `Call` argument's wire size (every nested scalar becomes a holder) and roughly halve its usable nesting; each generated secret is charged to memory; none of this cost is documented or benchmarked, and the memory charge for generated/cleared secrets is untested.
+  evidence: Review findings (blind low, verification-gap low). By design of FR-28; document and test with Story 3.13 or the Epic 5 benchmarks.

@@ -63,6 +63,22 @@
 //! refuses a host call before its arguments are evaluated. [`evaluate`] and
 //! [`evaluate_with_variables`] run with every construct enabled.
 //!
+//! # Value Secrets (Story 3.11)
+//!
+//! A value crossing between the Script and the Backend may carry a hidden [`Secret`] (FR-28,
+//! LANGUAGE-REFERENCE §3): a Reference ID, an optional key and the Backend's further fields, held
+//! as an opaque blob this crate never reads. A starting variable, a host call's value and the
+//! Script result cross as a [`Held`] — the value and the secret of its place — and arrays and
+//! objects carry their own ([`Array::secret`], [`Object::secret`]) and their elements' and
+//! properties' ([`Array::element_secret`], [`Object::entry_secret`]). No Script can see, forge
+//! or strip one: `__secret` reads as `null` by `.`, `[]` and `?.` on every value, writing it does
+//! nothing, an object literal's `__secret` key is dropped and `for … in` never yields it. A copy
+//! is plain; writing a place keeps its secret. Every value a host call sends carries one — the
+//! place's or the collection's, or a Reference ID generated from the prefix
+//! [`Execution::with_reference_prefix`] sets — and a generated one sticks, so the same collection
+//! or place sent again carries the same ID. [`evaluate`] and [`evaluate_with_variables`] take no
+//! secrets and return none.
+//!
 //! # Starting variables
 //!
 //! [`evaluate`] runs a Script with nothing but what its own source declares. [`evaluate_with_variables`]
@@ -89,7 +105,7 @@ use std::sync::Arc;
 use hexput_ast::StatementKind;
 
 pub use machine::Argument;
-pub use value::{Array, Object, Value};
+pub use value::{Array, Held, Object, Secret, Value};
 
 /// The diagnostics shape and its rendering, re-exported so a consumer of the evaluator — the CLI
 /// in particular — can report what [`evaluate`] returns without a `hexput-shared` or `hexput-ast`
@@ -204,7 +220,10 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
     program: &Program,
     variables: impl IntoIterator<Item = (N, Value)>,
 ) -> Result<Value, Diagnostic> {
-    let variables: Vec<(N, Value)> = variables.into_iter().collect();
+    let variables: Vec<(N, Held)> = variables
+        .into_iter()
+        .map(|(name, value)| (name, Held::plain(value)))
+        .collect();
     check_starting_variables(program, &variables)?;
     let mut machine = machine::Machine::with_variables(program, variables);
     // Consuming the machine on every path is the memory contract: the heap is dropped here and
@@ -217,7 +236,7 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
         }
     };
     match stop {
-        machine::Stop::Finished(result) => Ok(result),
+        machine::Stop::Finished(result) => Ok(result.value),
         // Unreachable: an unmetered machine has no ceiling to stop at, and pauses are looped
         // over above. Limits and their errors are the Executor's, so this is no budget error.
         machine::Stop::Paused(span)
@@ -237,9 +256,9 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
 }
 
 /// Reject a starting variable whose name the Script's own top level also declares.
-fn check_starting_variables<N: AsRef<str>>(
+fn check_starting_variables<N: AsRef<str>, V>(
     program: &Program,
-    variables: &[(N, Value)],
+    variables: &[(N, V)],
 ) -> Result<(), Diagnostic> {
     for statement in &program.statements {
         let (StatementKind::Let { name, .. } | StatementKind::Function { name, .. }) =
@@ -282,14 +301,20 @@ impl Execution {
     /// [`evaluate_with_variables`] binds them — with the same caller obligations. Nothing runs
     /// until [`Execution::run`].
     ///
+    /// Each value may come [`Held`], with the secret of the variable it arrives in (Story 3.11):
+    /// a plain [`Value`] is a variable with none.
+    ///
     /// # Errors
     /// A supplied name that the Script's own top level also declares, as
     /// `syntax.duplicate_declaration` (see [`evaluate_with_variables`]).
-    pub fn with_variables<N: AsRef<str>>(
+    pub fn with_variables<N: AsRef<str>, V: Into<Held>>(
         program: Arc<Program>,
-        variables: impl IntoIterator<Item = (N, Value)>,
+        variables: impl IntoIterator<Item = (N, V)>,
     ) -> Result<Self, Diagnostic> {
-        let variables: Vec<(N, Value)> = variables.into_iter().collect();
+        let variables: Vec<(N, Held)> = variables
+            .into_iter()
+            .map(|(name, value)| (name, value.into()))
+            .collect();
         check_starting_variables(&program, &variables)?;
         Ok(Self {
             machine: Box::new(machine::Machine::with_variables(program, variables)),
@@ -323,6 +348,15 @@ impl Execution {
     #[must_use]
     pub fn with_features(mut self, features: Features) -> Self {
         self.machine.set_features(features);
+        self
+    }
+
+    /// Generate this execution's Reference IDs as `<prefix>:<counter>`, the counter from 1
+    /// (Story 3.11). The Executor passes `hx:` and a per-execution nonce; a new execution uses
+    /// `hx:0000000000000000`. Reference IDs already issued keep their spelling.
+    #[must_use]
+    pub fn with_reference_prefix(mut self, prefix: impl Into<Arc<str>>) -> Self {
+        self.machine.set_reference_prefix(prefix.into());
         self
     }
 
@@ -380,8 +414,9 @@ impl Execution {
 
 /// Where an [`Execution::run`] stopped.
 pub enum Outcome {
-    /// The Script ended with this result, detached from the execution.
-    Finished(Value),
+    /// The Script ended with this result, detached from the execution — beside the secret of the
+    /// place it was returned from, when the `return` names a place that has one (Story 3.11).
+    Finished(Held),
     /// The Script called the host and waits for the value.
     HostCall(HostCall),
     /// The slice its [`Meter`] allows is done; [`Paused::resume`] hands the execution back.
@@ -497,8 +532,17 @@ impl HostCall {
     /// The caller obligation of [`evaluate_with_variables`] applies: every number must be finite.
     #[must_use]
     pub fn resume(self, value: &Value) -> Execution {
+        self.resume_held(&Held::plain(value.clone()))
+    }
+
+    /// [`HostCall::resume`] with a value that may carry Value Secrets (Story 3.11). An array's or
+    /// object's secrets come along; a scalar's place secret is kept only when the statement
+    /// making the call stores its value directly — `let x = f();`, `x = f();`, `o.p = f();` —
+    /// and otherwise the value is plain.
+    #[must_use]
+    pub fn resume_held(self, held: &Held) -> Execution {
         let mut execution = self.execution;
-        execution.machine.resume(value);
+        execution.machine.resume(held);
         execution
     }
 }

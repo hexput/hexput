@@ -329,13 +329,21 @@ fn null_access_is_a_reference_error_naming_the_null_link() {
         ".b",
     );
     assert!(e.message.contains("`a`"));
+    // The key is evaluated first (Story 3.11: `null["__secret"]` reads as null whatever spells the
+    // key), so an undeclared key is its own error and a declared one reaches the null access.
     let e = assert_error(
-        "let a = null; return a[nope];",
+        "let a = null; let nope = 1; return a[nope];",
         Category::Reference,
         Code::NULL_ACCESS,
         "[nope]",
     );
     assert!(e.message.contains("`a`"));
+    assert_error(
+        "let a = null; return a[nope];",
+        Category::Reference,
+        Code::UNDECLARED_IDENTIFIER,
+        "nope",
+    );
     let e = assert_error(
         "let o = {c: null}; o.c.name = 1;",
         Category::Reference,
@@ -1701,7 +1709,7 @@ mod host_calls {
         let mut execution = execution;
         loop {
             match execution.run().unwrap() {
-                Outcome::Finished(result) => return (calls, result),
+                Outcome::Finished(result) => return (calls, result.value),
                 Outcome::HostCall(call) => {
                     let arguments: Vec<Value> =
                         call.arguments().iter().map(|a| a.value.clone()).collect();
@@ -1744,7 +1752,7 @@ mod host_calls {
         let Outcome::Finished(result) = call.resume(&order).run().unwrap() else {
             panic!("one call only");
         };
-        assert_eq!(result.as_number(), Some(4.0));
+        assert_eq!(result.value.as_number(), Some(4.0));
     }
 
     #[test]
@@ -1911,7 +1919,7 @@ mod metering {
                     pauses += 1;
                     execution = paused.resume();
                 }
-                Outcome::Finished(result) => return (pauses, result),
+                Outcome::Finished(result) => return (pauses, result.value),
                 _ => panic!("no host call and no ceiling here"),
             }
         }
@@ -2024,7 +2032,7 @@ mod metering {
         let Outcome::Finished(result) = execution.run().unwrap() else {
             panic!("sharing a string allocates nothing");
         };
-        assert_eq!(result.as_number(), Some(1000.0));
+        assert_eq!(result.value.as_number(), Some(1000.0));
     }
 
     #[test]
@@ -2036,7 +2044,7 @@ mod metering {
         let Outcome::Finished(result) = execution.run().unwrap() else {
             panic!("only one copy lives at a time");
         };
-        assert_eq!(result.as_number(), Some(500.0));
+        assert_eq!(result.value.as_number(), Some(500.0));
     }
 
     #[test]
@@ -2291,7 +2299,7 @@ mod features {
         loop {
             match execution.run() {
                 Err(error) => return (Err(error), calls),
-                Ok(Outcome::Finished(value)) => return (Ok(value), calls),
+                Ok(Outcome::Finished(value)) => return (Ok(value.value), calls),
                 Ok(Outcome::HostCall(call)) => {
                     calls.push(call.name().to_owned());
                     execution = call.resume(&Value::Null);
@@ -2507,5 +2515,376 @@ mod features {
             hexput_interpreter::evaluate(&program).unwrap().as_number(),
             Some(2.0)
         );
+    }
+}
+
+// --- Story 3.11: Value Secrets the Script cannot touch ---
+
+mod value_secrets {
+    use std::sync::Arc;
+
+    use hexput_interpreter::{
+        Argument, Array, Execution, Held, Object, Outcome, Secret, Value, evaluate,
+    };
+
+    fn secret(reference: &str) -> Secret {
+        Secret::new(reference, None, Vec::new())
+    }
+
+    /// `r1`, keyed `User`, with further fields the interpreter only carries.
+    fn user_secret() -> Secret {
+        Secret::new(
+            "r1",
+            Some(Arc::from("User")),
+            vec![0x81, 0xa4, b't', b'i', b'e', b'r', 3],
+        )
+    }
+
+    /// `{name: "a"}` carrying [`user_secret`].
+    fn user() -> Held {
+        Held::plain(Value::Object(Object::from_held_entries(
+            [("name", Held::plain(Value::String(Arc::from("a"))))],
+            Some(user_secret()),
+        )))
+    }
+
+    fn held(value: Value, reference: &str) -> Held {
+        Held::new(value, Some(secret(reference)))
+    }
+
+    /// One host call the Script made: its name and arguments.
+    type Made = (String, Vec<Argument>);
+
+    /// Run `source` with `variables`, answering each host call with `answer(name)`; the result
+    /// and the calls made.
+    fn drive(
+        source: &str,
+        variables: Vec<(&str, Held)>,
+        answer: impl Fn(&str) -> Held,
+    ) -> (Held, Vec<Made>) {
+        let program = Arc::new(hexput_parser::parse(source).unwrap());
+        let mut execution = Execution::with_variables(program, variables).unwrap();
+        let mut calls = Vec::new();
+        loop {
+            match execution.run().unwrap() {
+                Outcome::Finished(result) => return (result, calls),
+                Outcome::HostCall(call) => {
+                    let reply = answer(call.name());
+                    calls.push((call.name().to_owned(), call.arguments().to_vec()));
+                    execution = call.resume_held(&reply);
+                }
+                _ => panic!("an unmetered execution never stops at a meter"),
+            }
+        }
+    }
+
+    fn run(source: &str, variables: Vec<(&str, Held)>) -> Held {
+        drive(source, variables, |_| Held::plain(Value::Null)).0
+    }
+
+    /// The Reference ID `argument` travels with: its own place's, or its collection's.
+    fn reference(argument: &Argument) -> String {
+        argument
+            .value
+            .secret()
+            .or(argument.secret.as_ref())
+            .expect("every argument carries a Value Secret")
+            .reference()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_held_starting_variable_reads_like_the_plain_value() {
+        let result = run("return u.name;", vec![("u", user())]);
+        assert_eq!(result.value.as_str(), Some("a"));
+        assert!(result.secret.is_none(), "a property read is a copy");
+    }
+
+    #[test]
+    fn a_collection_returned_keeps_its_secret_byte_for_byte() {
+        let result = run("return u;", vec![("u", user())]);
+        let object = result.value.as_object().expect("an object");
+        assert_eq!(object.secret(), Some(&user_secret()));
+        assert_eq!(object.secret().unwrap().extra(), user_secret().extra());
+        assert_eq!(object.get("name").and_then(Value::as_str), Some("a"));
+        assert_eq!(object.len(), 1);
+    }
+
+    #[test]
+    fn reading_the_secret_yields_null_on_every_value() {
+        let result = run(
+            "let k = \"__secret\"; \
+             return [u.__secret, u[\"__secret\"], u?.__secret, 5 .__secret, \"s\".__secret, \
+                     [1][\"__secret\"], null.__secret, null[\"__secret\"], true.__secret, u[k], \
+                     n.__secret, fn() {}.__secret];",
+            vec![("u", user()), ("n", held(Value::Number(1.0), "r2"))],
+        );
+        let array = result.value.as_array().expect("an array");
+        assert_eq!(array.len(), 12);
+        assert!(array.iter().all(Value::is_null), "{:?}", array.to_vec());
+    }
+
+    #[test]
+    fn the_secret_through_a_computed_key_is_null_on_null_and_a_write_is_a_no_op() {
+        let result = run(
+            "let k = \"__secret\"; let z = null; z[k] = 1; z.__secret = 2; z[\"__secret\"] = 3; \
+             5[k] = 4; return [null[k], z[k], z?.[k], z[\"__secret\"], z.__secret];",
+            vec![],
+        );
+        let array = result.value.as_array().unwrap();
+        assert_eq!(array.len(), 5);
+        assert!(array.iter().all(Value::is_null));
+    }
+
+    #[test]
+    fn any_other_key_on_null_is_still_a_null_access() {
+        let program = hexput_parser::parse("let k = \"a\"; let z = null; return z[k];").unwrap();
+        let error = evaluate(&program).unwrap_err();
+        assert_eq!(error.code.as_str(), "reference.null_access");
+        let program = hexput_parser::parse("let z = null; z[\"a\"] = 1;").unwrap();
+        let error = evaluate(&program).unwrap_err();
+        assert_eq!(error.code.as_str(), "reference.null_access");
+    }
+
+    #[test]
+    fn writing_the_secret_is_ignored_and_the_key_never_exists() {
+        let result = run(
+            "u.__secret = 1; u[\"__secret\"] = 2; let n = 5; n.__secret = 3; \
+             let o = {__secret: 3, a: 1}; let keys = []; let i = 0; \
+             for (k in o) { keys[i] = k; i = i + 1; }; \
+             for (k in u) { keys[i] = k; i = i + 1; }; \
+             return [keys, o, u];",
+            vec![("u", user())],
+        );
+        let parts = result.value.as_array().unwrap();
+        let keys: Vec<&str> = parts
+            .get(0)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap())
+            .collect();
+        assert_eq!(keys, ["a", "name"]);
+        let o = parts.get(1).unwrap().as_object().unwrap();
+        assert_eq!(o.len(), 1, "only `a`");
+        assert!(o.secret().is_none());
+        let u = parts.get(2).unwrap().as_object().unwrap();
+        assert_eq!(u.secret(), Some(&user_secret()), "unchanged");
+        assert_eq!(u.len(), 1);
+    }
+
+    #[test]
+    fn equality_truthiness_and_conversion_ignore_the_secret() {
+        let result = run(
+            "let t = 0; if (s) { t = t + 1; }; if (z) { t = t + 10; }; \
+             return [u == u, s == \"x\", s + \"!\", !z, z == 0, t, e == null];",
+            vec![
+                ("u", user()),
+                ("s", held(Value::String(Arc::from("x")), "r9")),
+                ("z", held(Value::Number(0.0), "r8")),
+                ("e", held(Value::Null, "r7")),
+            ],
+        );
+        let plain = run(
+            "let t = 0; if (s) { t = t + 1; }; if (z) { t = t + 10; }; \
+             return [u == u, s == \"x\", s + \"!\", !z, z == 0, t, e == null];",
+            vec![
+                ("u", Held::plain(user().value)),
+                ("s", Held::plain(Value::String(Arc::from("x")))),
+                ("z", Held::plain(Value::Number(0.0))),
+                ("e", Held::plain(Value::Null)),
+            ],
+        );
+        let shown = |held: &Held| format!("{:?}", held.value.as_array().unwrap().to_vec());
+        assert_eq!(shown(&result), shown(&plain));
+        let parts = result.value.as_array().unwrap();
+        assert_eq!(parts.get(0).unwrap().as_bool(), Some(true));
+        assert_eq!(parts.get(1).unwrap().as_bool(), Some(true));
+        assert_eq!(parts.get(2).unwrap().as_str(), Some("x!"));
+        assert_eq!(parts.get(5).unwrap().as_number(), Some(1.0));
+    }
+
+    #[test]
+    fn a_collection_sent_twice_carries_one_generated_reference_and_so_does_its_property() {
+        let (_, calls) = drive("let o = {a: 1}; f(o); f(o); f(o.a);", vec![], |_| {
+            Held::plain(Value::Null)
+        });
+        assert_eq!(calls.len(), 3);
+        let first = &calls[0].1[0];
+        let second = &calls[1].1[0];
+        assert!(reference(first).starts_with("hx:0000000000000000:"));
+        assert_eq!(reference(first), reference(second));
+        let object = first.value.as_object().unwrap();
+        let property = object
+            .entry_secret("a")
+            .expect("a nested scalar is held too");
+        assert_ne!(property.reference(), reference(first));
+        let again = second.value.as_object().unwrap().entry_secret("a").unwrap();
+        assert_eq!(property, again, "stable for the rest of the execution");
+        // Sent on its own, the property is the same place, with the same Reference ID.
+        assert_eq!(reference(&calls[2].1[0]), property.reference());
+    }
+
+    #[test]
+    fn a_backend_secret_is_sent_as_it_arrived() {
+        let (_, calls) = drive("f(u);", vec![("u", user())], |_| Held::plain(Value::Null));
+        let sent = calls[0].1[0].value.as_object().unwrap();
+        assert_eq!(sent.secret(), Some(&user_secret()));
+        assert!(
+            sent.entry_secret("name")
+                .unwrap()
+                .reference()
+                .starts_with("hx:")
+        );
+    }
+
+    #[test]
+    fn a_place_keeps_its_reference_and_a_copy_is_a_new_place() {
+        let (_, calls) = drive(
+            "f(n); let m = n; f(m); f(m); f(n + 0); f(n + 0); n = 9; f(n);",
+            vec![("n", held(Value::Number(5.0), "r2"))],
+            |_| Held::plain(Value::Null),
+        );
+        let references: Vec<String> = calls.iter().map(|(_, a)| reference(&a[0])).collect();
+        assert_eq!(references[0], "r2");
+        assert!(references[1].starts_with("hx:"));
+        assert_eq!(
+            references[1], references[2],
+            "the copy's place keeps its generated ID"
+        );
+        assert_ne!(
+            references[3], references[4],
+            "a computed value is fresh each time"
+        );
+        assert_eq!(
+            references[5], "r2",
+            "writing a place keeps its Reference ID"
+        );
+        assert_eq!(calls[5].1[0].value.as_number(), Some(9.0));
+    }
+
+    #[test]
+    fn generated_references_count_from_one_under_the_prefix() {
+        let program = Arc::new(hexput_parser::parse("f(1); f(2);").unwrap());
+        let mut execution = Execution::with_variables(program, Vec::<(&str, Value)>::new())
+            .unwrap()
+            .with_reference_prefix("hx:00000000000000ab");
+        let mut seen = Vec::new();
+        loop {
+            match execution.run().unwrap() {
+                Outcome::HostCall(call) => {
+                    seen.push(reference(&call.arguments()[0]));
+                    execution = call.resume(&Value::Null);
+                }
+                Outcome::Finished(_) => break,
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(seen, ["hx:00000000000000ab:1", "hx:00000000000000ab:2"]);
+    }
+
+    #[test]
+    fn a_call_value_stored_directly_keeps_its_secret_and_otherwise_is_plain() {
+        let (result, calls) = drive(
+            "let x = f(); g(x); let o = {}; o.p = f(); g(o.p); let a = [0]; a[0] = f(); g(a[0]); \
+             let y = 0; y = f(); g(y); g(f()); let z = [f()]; g(z[0]); return x;",
+            vec![],
+            |name| match name {
+                "f" => held(Value::Number(7.0), "r3"),
+                _ => Held::plain(Value::Null),
+            },
+        );
+        let sent: Vec<String> = calls
+            .iter()
+            .filter(|(name, _)| name == "g")
+            .map(|(_, a)| reference(&a[0]))
+            .collect();
+        assert_eq!(sent[..4], ["r3", "r3", "r3", "r3"]);
+        assert!(
+            sent[4].starts_with("hx:"),
+            "a call's value passed on is computed"
+        );
+        assert!(
+            sent[5].starts_with("hx:"),
+            "an element of a new literal is a copy"
+        );
+        assert_eq!(result.secret, Some(secret("r3")), "returned from its place");
+    }
+
+    #[test]
+    fn a_top_level_result_carries_a_secret_only_from_a_place() {
+        let n = || vec![("n", held(Value::Number(5.0), "r2"))];
+        assert_eq!(run("return n;", n()).secret, Some(secret("r2")));
+        assert_eq!(run("let m = n; return m;", n()).secret, None);
+        assert_eq!(run("return n + 0;", n()).secret, None);
+        assert_eq!(run("return (n);", n()).secret, None);
+        assert_eq!(
+            run("return [n];", n())
+                .value
+                .as_array()
+                .unwrap()
+                .element_secret(0),
+            None
+        );
+        let inside = run(
+            "return o;",
+            vec![(
+                "o",
+                Held::plain(Value::Array(Array::from_held(
+                    vec![held(Value::Bool(true), "r5")],
+                    None,
+                ))),
+            )],
+        );
+        let array = inside.value.as_array().unwrap();
+        assert_eq!(array.element_secret(0), Some(&secret("r5")));
+        assert!(
+            array.secret().is_none(),
+            "nothing is generated for a result"
+        );
+    }
+
+    #[test]
+    fn a_function_parameter_is_a_copy() {
+        let (_, calls) = drive(
+            "fn pass(v) { f(v); }; pass(n);",
+            vec![("n", held(Value::Number(5.0), "r2"))],
+            |_| Held::plain(Value::Null),
+        );
+        assert!(reference(&calls[0].1[0]).starts_with("hx:"));
+    }
+
+    #[test]
+    fn secrets_cost_memory_but_are_not_allocations() {
+        let program = Arc::new(hexput_parser::parse("return 1;").unwrap());
+        let bare = Value::Object(Object::from_entries([(
+            "name",
+            Value::String(Arc::from("a")),
+        )]));
+        let plain = Execution::with_variables(Arc::clone(&program), vec![("u", bare)]).unwrap();
+        let secret = Execution::with_variables(program, vec![("u", user())]).unwrap();
+        assert!(secret.memory_used() > plain.memory_used());
+        assert_eq!(secret.allocations(), plain.allocations());
+    }
+
+    #[test]
+    fn an_object_built_outside_cannot_smuggle_the_key_in() {
+        let object = Object::from_entries([("__secret", Value::Number(1.0)), ("a", Value::Null)]);
+        assert_eq!(object.len(), 1);
+        let result = run(
+            "let n = 0; for (k in o) { n = n + 1; }; return n;",
+            vec![("o", Held::plain(Value::Object(object)))],
+        );
+        assert_eq!(result.value.as_number(), Some(1.0));
+    }
+
+    #[test]
+    fn evaluate_takes_and_returns_no_secrets() {
+        let program = hexput_parser::parse("let o = {__secret: 1, a: 2}; return o;").unwrap();
+        let result = evaluate(&program).unwrap();
+        let object = result.as_object().unwrap();
+        assert!(object.secret().is_none());
+        assert_eq!(object.len(), 1);
     }
 }

@@ -53,6 +53,11 @@
 //! result carries every secret it holds back out as holders, unchanged. A result with none is
 //! exactly the payload it always was.
 //!
+//! Modifications flow back too (Story 3.13): a successful `Result` is `{value, modifications}`
+//! when the Script wrote any referenced place or collection — each `{ref, value}` once, with its
+//! final value — and exactly the payload it always was when it wrote none. `findings` follows
+//! them. The frame checks cover the whole payload, and an `Error` never carries modifications.
+//!
 //! Not yet: the AST Cache and Cached Execution (Epic 4), which will run the check once at
 //! `CodeRegister`.
 //!
@@ -67,14 +72,14 @@ use hexput_check::{Environment, Policy, Severity};
 /// reads the Session's registrations, can hand them over without an edge to the Executor.
 pub use hexput_exec::Registration;
 use hexput_exec::wire;
-use hexput_exec::{Caller, Host, Limits};
+use hexput_exec::{Caller, Finished, Host, Limits};
 use hexput_interpreter::{Category, Code, Diagnostic, Held, Program, Span};
 use hexput_port::{
     CheckMode, ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, Settings, Value,
     decode_settings, findings_value,
 };
 
-pub use hexput_exec::wire::MAX_RESULT_DEPTH;
+pub use hexput_exec::wire::{MAX_MODIFICATION_DEPTH, MAX_RESULT_DEPTH};
 
 const SOURCE: &str = "source";
 const VARIABLES: &str = "variables";
@@ -108,7 +113,9 @@ const ENVELOPE_ROOM: usize = 64;
 /// (Story 3.10) and it found anything, the payload is `{value, findings: [ … ]}`, each finding
 /// in the [`ErrorBody`] shape, in source order, at most [`MAX_FINDINGS`] of them — and every
 /// `Error` below that follows a pass carries them too. Findings that would not fit a frame are
-/// left out.
+/// left out. When the Script wrote a referenced place or collection (Story 3.13), the payload has
+/// `modifications` after `value` — `[{ref, value}, …]`, each Reference ID once, in the order of its
+/// first write, with its final value — and before `findings`; an `Error` never has them.
 ///
 /// Must run inside a Tokio runtime: the work runs on its blocking pool. Its timers must be enabled
 /// when a registration lacks a blanket grant, since the Executor waits for a per-call handler's
@@ -132,8 +139,10 @@ const ENVELOPE_ROOM: usize = 64;
 /// * Under check mode `error`, the first error-severity static check finding's body, with every
 ///   finding (warnings included, [`MAX_FINDINGS`] at most, the rejection's own among them) under
 ///   `findings`; nothing runs and no host call is made. Logged at `debug`.
-/// * `protocol.result_too_deep` — the result nests past [`MAX_RESULT_DEPTH`].
-/// * `protocol.response_too_large` — the result is certain to encode past the maximum frame.
+/// * `protocol.result_too_deep` — the result nests past [`MAX_RESULT_DEPTH`], or a modification's
+///   value past [`MAX_MODIFICATION_DEPTH`] (holders counted).
+/// * `protocol.response_too_large` — the result and its modifications are certain to encode past
+///   the maximum frame.
 ///   Under the default Resource Budget the Executor refuses any such result first, as
 ///   `budget.output_size_exceeded` (Story 3.6): the output size budget is far below a frame. Only
 ///   an output size limit raised to the frame itself lets one reach this check.
@@ -317,44 +326,71 @@ fn prepare(payload: &Value) -> Result<Prepared, Box<ErrorBody>> {
     Ok((Arc::new(program), variables, overrides))
 }
 
-/// The `Result` payload for a Script's result and its static check findings (`findings` only
-/// when there are any), or why it cannot be sent.
+/// The `Result` payload for a Script's result, its modifications (`modifications` only when
+/// there are any, Story 3.13) and its static check findings (`findings` only when there are any),
+/// or why it cannot be sent.
 ///
 /// The findings are left out when with them the reply would not fit a frame, and they go with the
 /// refusal when the result cannot be sent.
-fn reply(result: &Held, findings: Vec<ErrorBody>) -> Result<Value, Box<ErrorBody>> {
+fn reply(finished: &Finished, findings: Vec<ErrorBody>) -> Result<Value, Box<ErrorBody>> {
     let refused = |error: ProtocolError| with_findings(ErrorBody::from(&error), findings.clone());
-    match wire::result_to_wire(result) {
-        Ok(value) => {
+    let Finished {
+        result,
+        modifications,
+    } = finished;
+    // The result and its modifications share one frame; `true` marks a failure of the latter.
+    let mut budget = MAX_FRAME_LEN;
+    let converted = wire::result_to_wire_within(result, &mut budget)
+        .map_err(|unsendable| (false, unsendable))
+        .and_then(|value| {
+            if modifications.is_empty() {
+                return Ok((value, None));
+            }
+            wire::modifications_to_wire(modifications, &mut budget)
+                .map(|listed| (value, Some(listed)))
+                .map_err(|unsendable| (true, unsendable))
+        });
+    match converted {
+        Ok((value, listed)) => {
             let mut fields = vec![(Value::from(VALUE), value)];
+            if let Some(listed) = listed {
+                fields.push((Value::from(wire::MODIFICATIONS_KEY), listed));
+            }
             if !findings.is_empty() {
                 let listed = findings_value(&findings);
-                // The `findings` key and value, beside the `{value}` payload.
-                let size =
-                    wire::payload_size_held(&result.value, result.secret.as_ref(), MAX_FRAME_LEN)
-                        .saturating_add(FINDINGS.len() + 1)
-                        .saturating_add(encoded_len(&listed));
+                // The `findings` key and value, beside the `{value, modifications?}` payload.
+                let size = wire::result_payload_size(result, modifications, MAX_FRAME_LEN)
+                    .saturating_add(FINDINGS.len() + 1)
+                    .saturating_add(encoded_len(&listed));
                 if size <= MAX_FRAME_LEN - ENVELOPE_ROOM {
                     fields.push((Value::from(FINDINGS), listed));
                 }
             }
             Ok(Value::Map(fields))
         }
-        Err(wire::Unsendable::TooDeep) => Err(refused(ProtocolError::new(
+        Err((false, wire::Unsendable::TooDeep)) => Err(refused(ProtocolError::new(
             ProtocolCode::ResultTooDeep,
             format!(
                 "the Script's result nests more than {MAX_RESULT_DEPTH} arrays or objects deep \
                  (counting its Value Secret holders), past what a frame may carry"
             ),
         ))),
-        Err(wire::Unsendable::TooLarge) => Err(refused(ProtocolError::new(
-            ProtocolCode::ResponseTooLarge,
+        Err((true, wire::Unsendable::TooDeep)) => Err(refused(ProtocolError::new(
+            ProtocolCode::ResultTooDeep,
             format!(
-                "the Script's result encodes to more than the maximum frame of {MAX_FRAME_LEN} \
-                 bytes"
+                "a value the Script wrote to a referenced place nests more than \
+                 {MAX_MODIFICATION_DEPTH} arrays or objects deep (counting its Value Secret \
+                 holders), past what a frame may carry in `modifications`"
             ),
         ))),
-        Err(wire::Unsendable::Unrepresentable) => Err(with_findings(
+        Err((_, wire::Unsendable::TooLarge)) => Err(refused(ProtocolError::new(
+            ProtocolCode::ResponseTooLarge,
+            format!(
+                "the Script's result and its modifications encode to more than the maximum frame \
+                 of {MAX_FRAME_LEN} bytes"
+            ),
+        ))),
+        Err((_, wire::Unsendable::Unrepresentable)) => Err(with_findings(
             ErrorBody::from(&Diagnostic::new(
                 Category::Type,
                 Code::FUNCTION_RESULT,

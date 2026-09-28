@@ -1709,7 +1709,7 @@ mod host_calls {
         let mut execution = execution;
         loop {
             match execution.run().unwrap() {
-                Outcome::Finished(result) => return (calls, result.value),
+                Outcome::Finished(result) => return (calls, result.result.value),
                 Outcome::HostCall(call) => {
                     let arguments: Vec<Value> =
                         call.arguments().iter().map(|a| a.value.clone()).collect();
@@ -1752,7 +1752,7 @@ mod host_calls {
         let Outcome::Finished(result) = call.resume(&order).run().unwrap() else {
             panic!("one call only");
         };
-        assert_eq!(result.value.as_number(), Some(4.0));
+        assert_eq!(result.result.value.as_number(), Some(4.0));
     }
 
     #[test]
@@ -1919,7 +1919,7 @@ mod metering {
                     pauses += 1;
                     execution = paused.resume();
                 }
-                Outcome::Finished(result) => return (pauses, result.value),
+                Outcome::Finished(result) => return (pauses, result.result.value),
                 _ => panic!("no host call and no ceiling here"),
             }
         }
@@ -2032,7 +2032,7 @@ mod metering {
         let Outcome::Finished(result) = execution.run().unwrap() else {
             panic!("sharing a string allocates nothing");
         };
-        assert_eq!(result.value.as_number(), Some(1000.0));
+        assert_eq!(result.result.value.as_number(), Some(1000.0));
     }
 
     #[test]
@@ -2044,7 +2044,7 @@ mod metering {
         let Outcome::Finished(result) = execution.run().unwrap() else {
             panic!("only one copy lives at a time");
         };
-        assert_eq!(result.value.as_number(), Some(500.0));
+        assert_eq!(result.result.value.as_number(), Some(500.0));
     }
 
     #[test]
@@ -2299,7 +2299,7 @@ mod features {
         loop {
             match execution.run() {
                 Err(error) => return (Err(error), calls),
-                Ok(Outcome::Finished(value)) => return (Ok(value.value), calls),
+                Ok(Outcome::Finished(value)) => return (Ok(value.result.value), calls),
                 Ok(Outcome::HostCall(call)) => {
                     calls.push(call.name().to_owned());
                     execution = call.resume(&Value::Null);
@@ -2567,7 +2567,7 @@ mod value_secrets {
         let mut calls = Vec::new();
         loop {
             match execution.run().unwrap() {
-                Outcome::Finished(result) => return (result, calls),
+                Outcome::Finished(result) => return (result.result, calls),
                 Outcome::HostCall(call) => {
                     let reply = answer(call.name());
                     calls.push((call.name().to_owned(), call.arguments().to_vec()));
@@ -2943,7 +2943,7 @@ mod methods {
         loop {
             match execution.run() {
                 Err(error) => return (Err(error), calls),
-                Ok(Outcome::Finished(result)) => return (Ok(result), calls),
+                Ok(Outcome::Finished(result)) => return (Ok(result.result), calls),
                 Ok(Outcome::HostCall(call)) => {
                     calls.push(Made {
                         name: call.name().to_owned(),
@@ -3333,5 +3333,533 @@ mod methods {
         let program =
             hexput_parser::parse("let o = {save: fn() { return 1; }}; return o.save();").unwrap();
         assert_eq!(evaluate(&program).unwrap().as_number(), Some(1.0));
+    }
+}
+
+// --- Story 3.13: modifications both ways ---
+
+mod modifications {
+    use std::sync::Arc;
+
+    use hexput_interpreter::{
+        Array, Execution, Finished, Held, HostCall, Modification, Object, Outcome, Secret, Value,
+        evaluate,
+    };
+
+    fn secret(reference: &str) -> Secret {
+        Secret::new(reference, None, Vec::new())
+    }
+
+    fn held(value: Value, reference: &str) -> Held {
+        Held::new(value, Some(secret(reference)))
+    }
+
+    fn number(n: f64) -> Value {
+        Value::Number(n)
+    }
+
+    fn string(text: &str) -> Value {
+        Value::String(Arc::from(text))
+    }
+
+    fn object(entries: Vec<(&str, Value)>) -> Value {
+        Value::Object(Object::from_entries(entries))
+    }
+
+    /// An object carrying its own secret `reference`.
+    fn held_object(entries: Vec<(&str, Value)>, reference: &str) -> Held {
+        Held::plain(Value::Object(Object::from_held_entries(
+            entries.into_iter().map(|(k, v)| (k, Held::plain(v))),
+            Some(secret(reference)),
+        )))
+    }
+
+    fn modification(reference: &str, value: Value) -> Modification {
+        Modification::new(reference, value)
+    }
+
+    /// The Reference ID of a host call's first argument: its collection's, or its place's.
+    fn first_reference(call: &HostCall) -> String {
+        let argument = &call.arguments()[0];
+        argument
+            .value
+            .secret()
+            .or(argument.secret.as_ref())
+            .expect("every argument carries a Value Secret")
+            .reference()
+            .to_owned()
+    }
+
+    /// What one host call is answered with: its value, and the modifications to apply first.
+    type Answer = (Held, Vec<Modification>);
+
+    /// Run `source` with `variables`, answering each host call with `answer(call)`.
+    fn drive(
+        source: &str,
+        variables: Vec<(&str, Held)>,
+        answer: impl Fn(&HostCall) -> Answer,
+    ) -> Finished {
+        let program = Arc::new(hexput_parser::parse(source).unwrap());
+        let mut execution = Execution::with_variables(program, variables).unwrap();
+        loop {
+            match execution.run().unwrap() {
+                Outcome::Finished(finished) => return finished,
+                Outcome::HostCall(call) => {
+                    let (value, modifications) = answer(&call);
+                    execution = call
+                        .resume_with(&value, &modifications)
+                        .expect("the modifications apply");
+                }
+                _ => panic!("an unmetered execution never stops at a meter"),
+            }
+        }
+    }
+
+    fn run(source: &str, variables: Vec<(&str, Held)>) -> Finished {
+        drive(source, variables, |_| {
+            (Held::plain(Value::Null), Vec::new())
+        })
+    }
+
+    fn numbers(value: &Value) -> Vec<f64> {
+        value
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|item| item.as_number().expect("a number"))
+            .collect()
+    }
+
+    /// `(ref, value as a number)` for each modification.
+    fn numbered(finished: &Finished) -> Vec<(String, f64)> {
+        finished
+            .modifications
+            .iter()
+            .map(|m| (m.reference.to_string(), m.value.as_number().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn a_collection_changes_in_place_and_every_handle_sees_it() {
+        let finished = drive(
+            "let a = {n: 1}; let b = a; f(a); return [b.n, a.n, a == b];",
+            vec![],
+            |call| {
+                let reference = first_reference(call);
+                (
+                    Held::plain(Value::Null),
+                    vec![modification(&reference, object(vec![("n", number(2.0))]))],
+                )
+            },
+        );
+        let result = finished.result.value.as_array().unwrap().to_vec();
+        assert_eq!(result[0].as_number(), Some(2.0));
+        assert_eq!(result[1].as_number(), Some(2.0));
+        assert_eq!(result[2].as_bool(), Some(true), "same identity");
+        assert!(
+            finished.modifications.is_empty(),
+            "a Backend's change is not a Script write"
+        );
+    }
+
+    #[test]
+    fn a_collection_keeps_its_own_secret_and_key_after_a_modification() {
+        let keyed = Held::plain(Value::Object(Object::from_held_entries(
+            [("name", Held::plain(string("a")))],
+            Some(Secret::new("r1", Some(Arc::from("User")), Vec::new())),
+        )));
+        let mut sent = Vec::new();
+        let program = Arc::new(hexput_parser::parse("f(); g(u); return u.name;").unwrap());
+        let mut execution = Execution::with_variables(program, vec![("u", keyed)]).unwrap();
+        let result = loop {
+            match execution.run().unwrap() {
+                Outcome::Finished(finished) => break finished.result.value,
+                Outcome::HostCall(call) => {
+                    sent.push(call.arguments().to_vec());
+                    let modifications = if call.name() == "f" {
+                        vec![modification("r1", object(vec![("name", string("b"))]))]
+                    } else {
+                        Vec::new()
+                    };
+                    execution = call
+                        .resume_with(&Held::plain(Value::Null), &modifications)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(result.as_str(), Some("b"));
+        let own = sent[1][0].value.secret().expect("its own secret");
+        assert_eq!(own.reference(), "r1");
+        assert_eq!(own.key(), Some("User"));
+    }
+
+    #[test]
+    fn a_scalar_place_is_replaced_there_and_a_copy_is_unchanged() {
+        let finished = drive(
+            "let m = n; f(); return [n, m];",
+            vec![("n", held(number(8.0), "r1"))],
+            |_| {
+                (
+                    Held::plain(Value::Null),
+                    vec![modification("r1", number(9.0))],
+                )
+            },
+        );
+        assert_eq!(numbers(&finished.result.value), [9.0, 8.0]);
+        assert!(finished.modifications.is_empty());
+    }
+
+    #[test]
+    fn an_element_and_a_property_are_places_too() {
+        let array = Held::plain(Value::Array(Array::from_held(
+            vec![held(number(1.0), "e0"), Held::plain(number(2.0))],
+            None,
+        )));
+        let record = Held::plain(Value::Object(Object::from_held_entries(
+            [("p", held(number(3.0), "p0"))],
+            None,
+        )));
+        let finished = drive(
+            "f(); return [a[0], a[1], o.p];",
+            vec![("a", array), ("o", record)],
+            |_| {
+                (
+                    Held::plain(Value::Null),
+                    vec![
+                        modification("e0", number(10.0)),
+                        modification("p0", number(30.0)),
+                    ],
+                )
+            },
+        );
+        assert_eq!(numbers(&finished.result.value), [10.0, 2.0, 30.0]);
+    }
+
+    #[test]
+    fn a_later_modification_of_the_same_reference_wins() {
+        let finished = drive(
+            "f(); return n;",
+            vec![("n", held(number(1.0), "r1"))],
+            |_| {
+                (
+                    Held::plain(Value::Null),
+                    vec![
+                        modification("r1", number(2.0)),
+                        modification("r1", number(3.0)),
+                    ],
+                )
+            },
+        );
+        assert_eq!(finished.result.value.as_number(), Some(3.0));
+    }
+
+    #[test]
+    fn an_unknown_reference_is_ignored() {
+        let finished = drive(
+            "f(); return n;",
+            vec![("n", held(number(1.0), "r1"))],
+            |_| {
+                (
+                    Held::plain(number(5.0)),
+                    vec![modification("nope", number(2.0))],
+                )
+            },
+        );
+        assert_eq!(finished.result.value.as_number(), Some(1.0));
+    }
+
+    #[test]
+    fn a_collection_given_another_kind_is_a_mismatch() {
+        let program = Arc::new(hexput_parser::parse("f(); return 0;").unwrap());
+        let execution = Execution::with_variables(
+            program,
+            vec![(
+                "a",
+                Held::plain(Value::Array(Array::from_held(vec![], Some(secret("r1"))))),
+            )],
+        )
+        .unwrap();
+        let Outcome::HostCall(call) = execution.run().unwrap() else {
+            panic!("stops at the call");
+        };
+        let Err(mismatch) = call.resume_with(
+            &Held::plain(Value::Null),
+            &[
+                modification("nope", number(1.0)),
+                modification("r1", number(5.0)),
+            ],
+        ) else {
+            panic!("an array cannot become a number");
+        };
+        assert_eq!(mismatch.index(), 1);
+        assert_eq!(mismatch.reference(), "r1");
+        assert_eq!(mismatch.expected(), "array");
+        assert_eq!(mismatch.found(), "number");
+    }
+
+    #[test]
+    fn a_scalar_place_may_become_a_collection_and_keeps_its_reference() {
+        let finished = drive(
+            "f(); let x = n.x; n = 7; return x;",
+            vec![("n", held(number(1.0), "r1"))],
+            |_| {
+                (
+                    Held::plain(Value::Null),
+                    vec![modification("r1", object(vec![("x", number(5.0))]))],
+                )
+            },
+        );
+        assert_eq!(finished.result.value.as_number(), Some(5.0));
+        assert_eq!(numbered(&finished), [("r1".to_owned(), 7.0)]);
+    }
+
+    #[test]
+    fn nested_holders_in_a_modification_set_their_secrets() {
+        let replacement = Value::Object(Object::from_held_entries(
+            [("p", held(number(1.0), "r7"))],
+            None,
+        ));
+        let finished = drive(
+            "f(); u.p = 3; return 0;",
+            vec![("u", held_object(vec![], "r2"))],
+            move |_| {
+                (
+                    Held::plain(Value::Null),
+                    vec![modification("r2", replacement.clone())],
+                )
+            },
+        );
+        let references: Vec<&str> = finished
+            .modifications
+            .iter()
+            .map(|m| &*m.reference)
+            .collect();
+        assert_eq!(references, ["r2", "r7"]);
+        assert_eq!(finished.modifications[1].value.as_number(), Some(3.0));
+        let written = finished.modifications[0].value.as_object().unwrap();
+        assert_eq!(written.get("p").and_then(Value::as_number), Some(3.0));
+        assert_eq!(written.entry_secret("p").map(Secret::reference), Some("r7"));
+    }
+
+    #[test]
+    fn a_script_write_to_a_referenced_scalar_is_reported() {
+        let finished = run(
+            "n = 9; return {ok: true};",
+            vec![("n", held(number(8.0), "r1"))],
+        );
+        assert_eq!(numbered(&finished), [("r1".to_owned(), 9.0)]);
+        let result = finished.result.value.as_object().unwrap();
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn a_collection_written_twice_is_reported_once_with_its_final_value() {
+        let finished = run(
+            "u.x = 1; u.x = 2; return 0;",
+            vec![("u", held_object(vec![("a", number(0.0))], "r2"))],
+        );
+        assert_eq!(finished.modifications.len(), 1);
+        assert_eq!(&*finished.modifications[0].reference, "r2");
+        let value = finished.modifications[0].value.as_object().unwrap();
+        let entries: Vec<(&str, f64)> = value
+            .iter()
+            .map(|(k, v)| (k, v.as_number().unwrap()))
+            .collect();
+        assert_eq!(entries, [("a", 0.0), ("x", 2.0)]);
+    }
+
+    #[test]
+    fn every_store_site_records_its_write() {
+        let array = Held::plain(Value::Array(Array::from_held(
+            vec![held(number(1.0), "e0")],
+            Some(secret("a0")),
+        )));
+        let record = Held::plain(Value::Object(Object::from_held_entries(
+            [("p", held(number(1.0), "p0"))],
+            Some(secret("o0")),
+        )));
+        let finished = run(
+            "a[0] = 5; a[1] = 6; o[\"p\"] = 7; o.q = 8; return 0;",
+            vec![("a", array), ("o", record)],
+        );
+        let references: Vec<&str> = finished
+            .modifications
+            .iter()
+            .map(|m| &*m.reference)
+            .collect();
+        assert_eq!(references, ["a0", "e0", "o0", "p0"]);
+        assert_eq!(finished.modifications[1].value.as_number(), Some(5.0));
+        assert_eq!(finished.modifications[3].value.as_number(), Some(7.0));
+    }
+
+    #[test]
+    fn writes_are_listed_in_the_order_of_their_first_write() {
+        let finished = run(
+            "b = 1; a = 1; b = 2; return 0;",
+            vec![
+                ("a", held(number(0.0), "ra")),
+                ("b", held(number(0.0), "rb")),
+            ],
+        );
+        assert_eq!(
+            numbered(&finished),
+            [("rb".to_owned(), 2.0), ("ra".to_owned(), 1.0)]
+        );
+    }
+
+    #[test]
+    fn a_referenced_value_only_read_reports_nothing() {
+        let finished = run(
+            "let m = n + 1; let k = u.a; return m;",
+            vec![
+                ("n", held(number(8.0), "r1")),
+                ("u", held_object(vec![("a", number(0.0))], "r2")),
+            ],
+        );
+        assert!(finished.modifications.is_empty());
+    }
+
+    #[test]
+    fn a_place_given_a_generated_reference_reports_its_write() {
+        let finished = run("let i = 1; f(i); i = 5; return 0;", vec![]);
+        assert_eq!(
+            numbered(&finished),
+            [("hx:0000000000000000:1".to_owned(), 5.0)]
+        );
+    }
+
+    #[test]
+    fn a_write_before_the_place_had_a_reference_is_not_reported() {
+        let finished = run("let i = 1; i = 5; f(i); return 0;", vec![]);
+        assert!(finished.modifications.is_empty());
+    }
+
+    #[test]
+    fn a_backend_modification_is_never_reported_back() {
+        let finished = drive(
+            "f(); return 0;",
+            vec![("n", held(number(1.0), "r1"))],
+            |_| {
+                (
+                    Held::plain(Value::Null),
+                    vec![modification("r1", number(2.0))],
+                )
+            },
+        );
+        assert!(finished.modifications.is_empty());
+    }
+
+    #[test]
+    fn the_first_registration_of_a_duplicate_reference_wins() {
+        let finished = drive(
+            "f(); return [a, b];",
+            vec![
+                ("a", held(number(1.0), "r9")),
+                ("b", held(number(2.0), "r9")),
+            ],
+            |_| {
+                (
+                    Held::plain(Value::Null),
+                    vec![modification("r9", number(5.0))],
+                )
+            },
+        );
+        assert_eq!(numbers(&finished.result.value), [5.0, 2.0]);
+    }
+
+    #[test]
+    fn a_backend_reference_that_looks_generated_is_used_as_given() {
+        let finished = drive(
+            "let i = 1; f(i); return [i, n];",
+            vec![("n", held(number(1.0), "hx:0000000000000000:1"))],
+            |_| {
+                (
+                    Held::plain(Value::Null),
+                    vec![modification("hx:0000000000000000:1", number(2.0))],
+                )
+            },
+        );
+        // `n` registered the ID first; the generated one on `i` is on the wire but not indexed.
+        assert_eq!(numbers(&finished.result.value), [1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_place_gone_by_the_end_is_not_reported() {
+        let answer = |_: &HostCall| (held(number(1.0), "r5"), Vec::new());
+        let finished = drive("{ let x = f(); x = 2; }; return 0;", vec![], answer);
+        assert!(finished.modifications.is_empty());
+        // The same write to a place still there at the end is reported.
+        let finished = drive("let x = f(); x = 2; return 0;", vec![], answer);
+        assert_eq!(numbered(&finished), [("r5".to_owned(), 2.0)]);
+    }
+
+    #[test]
+    fn a_written_value_with_no_wire_form_is_left_out() {
+        let finished = run(
+            "u.g = fn() { return 1; }; n = 3; return u.g();",
+            vec![
+                ("u", held_object(vec![], "r2")),
+                ("n", held(number(0.0), "r1")),
+            ],
+        );
+        assert_eq!(finished.result.value.as_number(), Some(1.0));
+        assert_eq!(numbered(&finished), [("r1".to_owned(), 3.0)]);
+    }
+
+    #[test]
+    fn a_modification_counts_no_allocations() {
+        let program = Arc::new(hexput_parser::parse("f(); return u;").unwrap());
+        let execution =
+            Execution::with_variables(program, vec![("u", held_object(vec![], "r2"))]).unwrap();
+        let Outcome::HostCall(call) = execution.run().unwrap() else {
+            panic!("stops at the call");
+        };
+        let execution = call
+            .resume_with(
+                &Held::plain(Value::Null),
+                &[modification(
+                    "r2",
+                    object(vec![("a", string("x")), ("b", object(vec![]))]),
+                )],
+            )
+            .unwrap();
+        let before = execution.memory_used();
+        assert_eq!(execution.allocations(), 0);
+        let Outcome::Finished(finished) = execution.run().unwrap() else {
+            panic!("finishes");
+        };
+        assert!(before > 0);
+        let result = finished.result.value.as_object().unwrap();
+        assert_eq!(result.get("a").and_then(Value::as_str), Some("x"));
+    }
+
+    #[test]
+    fn a_for_loop_over_a_collection_the_backend_replaces_notices() {
+        let program = Arc::new(hexput_parser::parse("for (x in a) { f(); }; return 0;").unwrap());
+        let array = Held::plain(Value::Array(Array::from_held(
+            vec![Held::plain(number(1.0)), Held::plain(number(2.0))],
+            Some(secret("r1")),
+        )));
+        let execution = Execution::with_variables(program, vec![("a", array)]).unwrap();
+        let Outcome::HostCall(call) = execution.run().unwrap() else {
+            panic!("stops at the call");
+        };
+        let execution = call
+            .resume_with(
+                &Held::plain(Value::Null),
+                &[modification("r1", Value::Array(Array::from_values(vec![])))],
+            )
+            .unwrap();
+        let Err(error) = execution.run() else {
+            panic!("the iterated collection changed");
+        };
+        assert_eq!(error.code.as_str(), "reference.collection_mutated");
+    }
+
+    #[test]
+    fn evaluate_reports_nothing() {
+        let program = hexput_parser::parse("let n = 1; n = 2; return n;").unwrap();
+        assert_eq!(evaluate(&program).unwrap().as_number(), Some(2.0));
     }
 }

@@ -7,8 +7,8 @@
 use std::sync::{Arc, Mutex};
 
 use hexput_exec::{
-    ARGUMENT_DEPTH_LIMIT, Diagnostic, Held, Host, Limits, Registration, Secret, Value, execute,
-    execute_held,
+    ARGUMENT_DEPTH_LIMIT, Diagnostic, Held, Host, Limits, Modification, Registration, Secret,
+    Value, execute, execute_held,
 };
 use hexput_port::{CorrelationId, Envelope, MessageType};
 use hexput_rpc::{Calls, Value as Wire};
@@ -102,6 +102,8 @@ struct Run {
     result: Result<Value, Diagnostic>,
     /// The secret of the place the result was returned from, when it has one (Story 3.11).
     secret: Option<Secret>,
+    /// The referenced places and collections the Script wrote (Story 3.13).
+    modifications: Vec<Modification>,
     /// Every `Call` the stand-in saw, with its arguments' Value Secret holders stripped — each
     /// argument, and everything inside one, is asserted to be a holder first.
     calls: Vec<Made>,
@@ -361,9 +363,13 @@ fn hosted_run_registered(
     });
     let host = Host::new(registrations, caller);
     let result = runtime.block_on(execute_held(program(source), variables, host, limits));
-    let (result, secret) = match result {
-        Ok(held) => (Ok(held.value), held.secret),
-        Err(error) => (Err(error), None),
+    let (result, secret, modifications) = match result {
+        Ok(finished) => (
+            Ok(finished.result.value),
+            finished.result.secret,
+            finished.modifications,
+        ),
+        Err(error) => (Err(error), None, Vec::new()),
     };
     let calls = seen.lock().unwrap().clone();
     let raw_calls = raw.lock().unwrap().clone();
@@ -373,6 +379,7 @@ fn hosted_run_registered(
     Run {
         result,
         secret,
+        modifications,
         calls,
         raw_calls,
         asked,
@@ -2997,5 +3004,400 @@ mod methods {
             &map(vec![("ref", s("r2")), ("key", s("Num"))])
         );
         assert_eq!(super::unheld(receiver), Wire::from(5));
+    }
+}
+
+// --- Story 3.13: modifications both ways ---
+
+mod modifications {
+    use std::sync::Arc;
+
+    use hexput_exec::wire::{self, Path};
+    use hexput_exec::{Finished, Held, Limits, Modification, Value};
+    use hexput_port::MessageType;
+    use hexput_rpc::Value as Wire;
+
+    use super::{Answer, Handler, Reply, Run, denied, hosted_run_held, map, refusing, s};
+
+    fn holder(secret: Vec<(&str, Wire)>, value: Wire) -> Wire {
+        map(vec![("__secret", map(secret)), ("value", value)])
+    }
+
+    /// A scalar held with the Reference ID `reference`.
+    fn held(reference: &str, value: Wire) -> Wire {
+        holder(vec![("ref", s(reference))], value)
+    }
+
+    /// `{ref, value}`.
+    fn entry(reference: &str, value: Wire) -> Wire {
+        map(vec![("ref", s(reference)), ("value", value)])
+    }
+
+    /// A `Result {value: null, modifications}` answer.
+    fn modifying(modifications: Wire) -> Answer {
+        Box::new(move |_, _| {
+            (
+                MessageType::Result,
+                map(vec![
+                    ("value", Wire::Nil),
+                    ("modifications", modifications.clone()),
+                ]),
+            )
+        })
+    }
+
+    fn nothing() -> Answer {
+        Box::new(|_, _| super::value(Wire::Nil))
+    }
+
+    fn run(source: &str, variables: Vec<(&str, Wire)>, answer: Answer) -> Run {
+        run_under(source, variables, answer, Limits::default())
+    }
+
+    fn run_under(
+        source: &str,
+        variables: Vec<(&str, Wire)>,
+        answer: Answer,
+        limits: Limits,
+    ) -> Run {
+        let variables = variables
+            .into_iter()
+            .map(|(name, wire)| {
+                let held = wire::to_hexput(&wire, &mut Path::variable(name)).unwrap();
+                (Arc::from(name), held)
+            })
+            .collect();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            hosted_run_held(
+                source,
+                variables,
+                &[("f", true), ("g", true)],
+                refusing(),
+                answer,
+                limits,
+            )
+        })
+    }
+
+    fn numbers(value: &Value) -> Vec<f64> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_number().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_reply_s_modifications_are_applied_before_the_script_resumes() {
+        let run = run(
+            "let m = n; let b = u; f(); return [n, m, b.x];",
+            vec![
+                ("n", held("r1", Wire::from(8))),
+                ("u", held("r2", map(vec![("x", Wire::from(1))]))),
+            ],
+            modifying(Wire::Array(vec![
+                entry("r1", Wire::from(9)),
+                entry("r2", map(vec![("x", Wire::from(2))])),
+                entry("nope", Wire::from(0)),
+            ])),
+        );
+        assert_eq!(numbers(&run.result.unwrap()), [9.0, 8.0, 2.0]);
+        assert!(
+            run.modifications.is_empty(),
+            "a Backend's modification is never reported back"
+        );
+    }
+
+    #[test]
+    fn a_malformed_modification_list_fails_the_call() {
+        let cases = [
+            (Wire::from(1), "`modifications` must be an array"),
+            (Wire::Nil, "`modifications` must be an array"),
+            (
+                Wire::Array(vec![Wire::from(5)]),
+                "`modifications[0]` must be a map",
+            ),
+            (
+                Wire::Array(vec![map(vec![("value", Wire::from(1))])]),
+                "`modifications[0]` must be a map",
+            ),
+            (
+                Wire::Array(vec![
+                    entry("r1", Wire::from(1)),
+                    map(vec![
+                        ("ref", s("r1")),
+                        ("value", Wire::from(1)),
+                        ("x", Wire::from(2)),
+                    ]),
+                ]),
+                "`modifications[1]` must be a map",
+            ),
+            (
+                Wire::Array(vec![entry("", Wire::from(1))]),
+                "`modifications[0].ref` must be a non-empty string",
+            ),
+            (
+                Wire::Array(vec![map(vec![
+                    ("ref", Wire::from(1)),
+                    ("value", Wire::Nil),
+                ])]),
+                "`modifications[0].ref` must be a non-empty string",
+            ),
+            (
+                Wire::Array(vec![entry(
+                    "r1",
+                    holder(vec![("ref", s("r1"))], Wire::from(1)),
+                )]),
+                "`modifications[0].value` has a `__secret` key",
+            ),
+            (
+                Wire::Array(vec![entry(
+                    "r1",
+                    Wire::Array(vec![map(vec![("__secret", Wire::Map(vec![]))])]),
+                )]),
+                "`modifications[0].value[0]`",
+            ),
+            (
+                Wire::Array(vec![entry("r1", Wire::from(1)), entry("r2", Wire::from(5))]),
+                "`modifications[1].value` is a number, but its `ref` names an array",
+            ),
+        ];
+        for (modifications, message) in cases {
+            let source = "let m = n; f(); return n;";
+            let run = run(
+                source,
+                vec![
+                    ("n", held("r1", Wire::from(8))),
+                    ("a", holder(vec![("ref", s("r2"))], Wire::Array(vec![]))),
+                ],
+                modifying(modifications.clone()),
+            );
+            let error = run.result.unwrap_err();
+            assert_eq!(
+                error.code.as_str(),
+                "host.function_failed",
+                "{modifications:?}"
+            );
+            assert_eq!(super::spanned(source, &error), "f()");
+            assert!(
+                error.message.contains(message),
+                "{modifications:?}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_repeating_its_modifications_is_malformed() {
+        let run = run(
+            "f(); return 0;",
+            vec![],
+            Box::new(|_, _| {
+                (
+                    MessageType::Result,
+                    Wire::Map(vec![
+                        (s("value"), Wire::Nil),
+                        (s("modifications"), Wire::Array(vec![])),
+                        (s("modifications"), Wire::Array(vec![])),
+                    ]),
+                )
+            }),
+        );
+        let error = run.result.unwrap_err();
+        assert_eq!(error.code.as_str(), "host.function_failed");
+        assert!(error.message.contains("repeats the key `modifications`"));
+    }
+
+    #[test]
+    fn an_authorize_answer_carrying_modifications_is_invalid() {
+        let authorize: Handler = Box::new(|_, _| {
+            Reply::Answer(
+                MessageType::Result,
+                map(vec![
+                    ("value", Wire::Boolean(true)),
+                    ("modifications", Wire::Array(vec![])),
+                ]),
+            )
+        });
+        let (denial, reason, asked) = denied(authorize);
+        assert_eq!(denial.code.as_str(), "capability.unknown_function");
+        assert_eq!(reason, "handler_invalid");
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn the_script_s_writes_come_back_once_each_with_their_final_values() {
+        let run = run(
+            "n = 9; u.x = 1; u.x = 2; let k = r; return {ok: true};",
+            vec![
+                ("n", held("r1", Wire::from(8))),
+                ("u", held("r2", map(vec![("a", Wire::from(0))]))),
+                ("r", held("r3", Wire::from(0))),
+            ],
+            nothing(),
+        );
+        assert!(run.result.is_ok());
+        let mut budget = hexput_rpc::MAX_FRAME_LEN;
+        let listed = wire::modifications_to_wire(&run.modifications, &mut budget).unwrap();
+        // Each value itself, never a holder: its `ref` names it.
+        assert_eq!(
+            listed,
+            Wire::Array(vec![
+                entry("r1", Wire::from(9)),
+                entry("r2", map(vec![("a", Wire::from(0)), ("x", Wire::from(2))])),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_failed_execution_reports_no_modifications() {
+        let run = run(
+            "n = 9; return 1 / 0;",
+            vec![("n", held("r1", Wire::from(8)))],
+            nothing(),
+        );
+        assert_eq!(
+            run.result.unwrap_err().code.as_str(),
+            "arithmetic.division_by_zero"
+        );
+        assert!(run.modifications.is_empty());
+    }
+
+    #[test]
+    fn modifications_count_towards_the_output_size_budget() {
+        let text = "x".repeat(100);
+        let source = "n = s; return 0;";
+        let variables = || vec![("n", held("r1", Wire::from(0))), ("s", s(&text))];
+        // `{value: 0}` is 8 bytes; `modifications: [{ref: "r1", value: <100 bytes>}]` adds 14 for
+        // the key, 1 for the array, 1 for the entry's map, 4 + 3 for `ref` and `r1`, 6 for
+        // `value` and 102 for the string: 139.
+        let limited = |limit| Limits::default().with_output_size(limit);
+        let fits = run_under(source, variables(), nothing(), limited(139));
+        assert!(fits.result.is_ok());
+        let over = run_under(source, variables(), nothing(), limited(138));
+        assert_eq!(
+            over.result.unwrap_err().code.as_str(),
+            "budget.output_size_exceeded"
+        );
+    }
+
+    /// The exact bytes of a `{value, modifications?}` payload, as the codec writes it.
+    fn encoded(finished: &Finished) -> Vec<u8> {
+        let mut budget = hexput_rpc::MAX_FRAME_LEN;
+        let mut fields = vec![(
+            s("value"),
+            wire::result_to_wire_within(&finished.result, &mut budget).unwrap(),
+        )];
+        if !finished.modifications.is_empty() {
+            fields.push((
+                s("modifications"),
+                wire::modifications_to_wire(&finished.modifications, &mut budget).unwrap(),
+            ));
+        }
+        rmp_serde::to_vec(&Wire::Map(fields)).unwrap()
+    }
+
+    #[test]
+    fn the_payload_size_with_modifications_is_the_exact_encoded_length() {
+        let decode = |wire: &Wire| wire::to_hexput(wire, &mut Path::reply()).unwrap().value;
+        let long_ref = "r".repeat(40);
+        let mut cases = vec![
+            vec![Modification::new("r1", Value::Number(9.0))],
+            vec![Modification::new(
+                long_ref.as_str(),
+                decode(&map(vec![
+                    ("a", held("r7", s("t"))),
+                    (
+                        "b",
+                        holder(
+                            vec![("ref", s("r8")), ("key", s("K")), ("z", Wire::from(1))],
+                            Wire::Array(vec![Wire::Nil]),
+                        ),
+                    ),
+                ])),
+            )],
+        ];
+        cases.push(
+            (0..17)
+                .map(|i| Modification::new(format!("r{i}"), Value::Number(f64::from(i))))
+                .collect(),
+        );
+        for modifications in cases {
+            let finished = Finished {
+                result: Held::plain(Value::Number(1.0)),
+                modifications,
+            };
+            assert_eq!(
+                wire::result_payload_size(&finished.result, &finished.modifications, usize::MAX),
+                encoded(&finished).len(),
+                "{:?}",
+                finished.modifications
+            );
+        }
+    }
+
+    #[test]
+    fn a_written_value_carries_every_nested_secret_generated_ones_too() {
+        let run = run(
+            "let o = {a: 1}; f(o); o.b = 2; return 0;",
+            vec![],
+            nothing(),
+        );
+        assert!(run.result.is_ok());
+        assert_eq!(run.modifications.len(), 1);
+        let generated = &run.modifications[0].reference;
+        assert!(generated.starts_with("hx:"), "{generated}");
+        let mut budget = hexput_rpc::MAX_FRAME_LEN;
+        let Wire::Array(listed) =
+            wire::modifications_to_wire(&run.modifications, &mut budget).unwrap()
+        else {
+            panic!("an array");
+        };
+        let Wire::Map(fields) = &listed[0] else {
+            panic!("a map");
+        };
+        assert_eq!(fields[0], (s("ref"), s(generated)));
+        // The value itself is bare; `a` travels in the holder its call gave it, `b` plain.
+        let Wire::Map(value) = &fields[1].1 else {
+            panic!("the object itself, not a holder: {:?}", fields[1].1);
+        };
+        assert_eq!(value[0].0, s("a"));
+        assert_eq!(super::unheld(&value[0].1), Wire::from(1));
+        assert_eq!(value[1], (s("b"), Wire::from(2)));
+        // The size charged is the size sent.
+        let finished = Finished {
+            result: Held::plain(Value::Number(0.0)),
+            modifications: run.modifications.clone(),
+        };
+        assert_eq!(
+            wire::result_payload_size(&finished.result, &finished.modifications, usize::MAX),
+            encoded(&finished).len()
+        );
+    }
+
+    #[test]
+    fn a_modification_nested_past_the_frame_is_refused() {
+        let mut value = Value::Null;
+        for _ in 0..wire::MAX_MODIFICATION_DEPTH {
+            value = Value::Array(hexput_interpreter::Array::from_values(vec![value]));
+        }
+        let mut budget = hexput_rpc::MAX_FRAME_LEN;
+        assert!(
+            wire::modifications_to_wire(&[Modification::new("r1", value.clone())], &mut budget)
+                .is_ok()
+        );
+        let deeper = Value::Array(hexput_interpreter::Array::from_values(vec![value]));
+        let mut budget = hexput_rpc::MAX_FRAME_LEN;
+        assert_eq!(
+            wire::modifications_to_wire(&[Modification::new("r1", deeper)], &mut budget),
+            Err(wire::Unsendable::TooDeep)
+        );
     }
 }

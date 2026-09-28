@@ -46,6 +46,19 @@
 //! [`footprint`], charged when a secret is attached or added and credited when the slot is
 //! released. Nothing about a secret is reachable from a value: the key `__secret` is never stored
 //! in an object, so no read, `for … in` or detached result can meet it.
+//!
+//! # Reference IDs (Story 3.13)
+//!
+//! The heap keeps one index from Reference ID to what it names — a collection, or the place a
+//! string, number, bool or `null` sits in ([`Referent`]) — so a Backend's modification can find
+//! it. An entry is added whenever a secret lands on a collection or a place: attached from outside
+//! ([`Heap::attach`]), generated for a host call, or given by a host call's reply. The first
+//! registration of a Reference ID wins: a later collection or place arriving with one already
+//! indexed to a live referent keeps that secret for the wire, but is not indexed. An entry is only
+//! trusted while its referent still carries that very Reference ID ([`Heap::holds`]) — a released
+//! scope, a replaced binding or a collection whose contents were replaced lose theirs — and a
+//! stale entry is replaced by the next registration. The index is not charged to the memory meter:
+//! every entry names a secret the meter already counts.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -204,6 +217,14 @@ fn footprint(slot: &Slot) -> usize {
 /// absent until the first secret arrives, so a slot with none costs one word.
 pub(crate) struct Meta<K>(Option<Box<Secrets<K>>>);
 
+/// What a Reference ID names (Story 3.13): an array or object itself, or the place a string,
+/// number, bool or `null` sits in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Referent {
+    Collection(SlotId),
+    Place(Location),
+}
+
 struct Secrets<K> {
     own: Option<Secret>,
     locations: HashMap<K, Secret>,
@@ -275,6 +296,27 @@ impl<K: Hash + Eq> Meta<K> {
         bytes
     }
 
+    /// Every location's secret, with its key.
+    pub(crate) fn locations(&self) -> impl Iterator<Item = (&K, &Secret)> {
+        self.0.iter().flat_map(|secrets| secrets.locations.iter())
+    }
+
+    /// Take `other`'s location secrets in place of this record's own, keeping this record's own
+    /// secret — a collection whose contents a modification replaced (Story 3.13).
+    fn replace_locations(&mut self, other: Self) {
+        let locations = other.0.map(|secrets| secrets.locations).unwrap_or_default();
+        match self.0.as_mut() {
+            Some(secrets) => secrets.locations = locations,
+            None if locations.is_empty() => {}
+            None => {
+                self.0 = Some(Box::new(Secrets {
+                    own: None,
+                    locations,
+                }));
+            }
+        }
+    }
+
     /// Forget the location `key`'s secret — a fresh binding under a name already used.
     pub(crate) fn clear_location<Q: Hash + Eq + ?Sized>(&mut self, key: &Q) -> usize
     where
@@ -305,7 +347,7 @@ impl<K: Hash + Eq> Meta<K> {
 /// A place a string, number, bool or `null` can sit in, which a Reference ID may name (§3): a
 /// scope's binding, an array's element or an object's property. Recorded when the Script reads
 /// one, so a host call's argument or the Script result written as that read carries its secret.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Location {
     /// The binding `name` in the scope that declares it.
     Binding(SlotId, String),
@@ -360,6 +402,8 @@ pub(crate) struct Heap {
     texts: TextMeter,
     /// Allocations the Script has made (see the module documentation).
     allocations: u64,
+    /// Reference ID → what it names (see the module documentation).
+    references: HashMap<Arc<str>, Referent>,
 }
 
 impl Heap {
@@ -475,12 +519,178 @@ impl Heap {
 
     /// Give the array or object at `id` the secret `secret`, unless it has one.
     pub(crate) fn set_collection_secret(&mut self, id: SlotId, secret: Secret) {
+        let reference = Arc::clone(secret.shared_reference());
         let bytes = match self.slot_mut(id) {
             Some(Slot::Array { meta, .. }) => meta.set_own(secret),
             Some(Slot::Object { meta, .. }) => meta.set_own(secret),
             _ => 0,
         };
+        if bytes > 0 {
+            self.index(&reference, Referent::Collection(id));
+        }
         self.grow(bytes);
+    }
+
+    /// Index `reference` as naming `referent`, unless it already names another live one: the
+    /// first registration wins (Story 3.13, decision 3).
+    pub(crate) fn index(&mut self, reference: &Arc<str>, referent: Referent) {
+        if let Some(existing) = self.references.get(reference)
+            && *existing != referent
+            && self.holds(reference, existing)
+        {
+            return;
+        }
+        self.references.insert(Arc::clone(reference), referent);
+    }
+
+    /// What `reference` names, while it still carries that Reference ID.
+    pub(crate) fn referent(&self, reference: &str) -> Option<&Referent> {
+        self.references
+            .get(reference)
+            .filter(|referent| self.holds(reference, referent))
+    }
+
+    /// Whether `referent` exists and still carries the Reference ID `reference`.
+    pub(crate) fn holds(&self, reference: &str, referent: &Referent) -> bool {
+        let secret = match referent {
+            Referent::Collection(id) => self.collection_secret(*id),
+            Referent::Place(at) => self.location_secret(at),
+        };
+        secret.is_some_and(|secret| secret.reference() == reference)
+    }
+
+    /// The value sitting in the place `at`, when the place exists.
+    pub(crate) fn place_value(&self, at: &Location) -> Option<RtValue> {
+        match at {
+            Location::Binding(owner, name) => self.binding_value(*owner, name),
+            Location::Element(id, index) => self.array_get(*id, *index),
+            Location::Property(id, key) => self.object_get(*id, key),
+        }
+    }
+
+    /// Replace the value in the place `at`, which keeps its secret — a Backend's modification
+    /// (Story 3.13), never a Script write. Returns `false` when the place no longer exists.
+    pub(crate) fn set_place(&mut self, at: &Location, value: RtValue) -> bool {
+        match at {
+            Location::Binding(owner, name) => self.set_binding(*owner, name, value),
+            Location::Element(id, index) => match self.slot_mut(*id) {
+                Some(Slot::Array { items, version, .. }) => match items.get_mut(*index) {
+                    Some(slot) => {
+                        *slot = value;
+                        *version = version.wrapping_add(1);
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            },
+            Location::Property(id, key) => match self.slot_mut(*id) {
+                Some(Slot::Object {
+                    entries, version, ..
+                }) => match entries.get_mut(&**key) {
+                    Some(slot) => {
+                        *slot = value;
+                        *version = version.wrapping_add(1);
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            },
+        }
+    }
+
+    /// Whether the slot at `id` is an array (`Some(true)`), an object (`Some(false)`), or neither.
+    pub(crate) fn is_array(&self, id: SlotId) -> Option<bool> {
+        match self.slot(id) {
+            Some(Slot::Array { .. }) => Some(true),
+            Some(Slot::Object { .. }) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Replace the contents of the collection at `target` with those of the freshly attached
+    /// collection at `source`, of the same kind, which is released (Story 3.13): `target` keeps
+    /// its identity and its own secret, takes `source`'s elements or entries and their places'
+    /// secrets, and counts as mutated, so a `for` loop iterating it notices. Returns `false`, and
+    /// changes nothing, when the two are not an array and an array or an object and an object.
+    pub(crate) fn replace_contents(&mut self, target: SlotId, source: SlotId) -> bool {
+        match (self.is_array(target), self.is_array(source)) {
+            (Some(a), Some(b)) if a == b && target != source => {}
+            _ => return false,
+        }
+        let before = self.slot(target).map_or(0, footprint);
+        let Some(slot) = self.slots.get_mut(source.0) else {
+            return false;
+        };
+        let taken = core::mem::replace(slot, Slot::Free);
+        self.free.push(source);
+        self.shrink(footprint(&taken));
+        let mut moved: Vec<(Arc<str>, Location)> = Vec::new();
+        match (self.slots.get_mut(target.0), taken) {
+            (
+                Some(Slot::Array {
+                    items,
+                    version,
+                    meta,
+                }),
+                Slot::Array {
+                    items: new,
+                    meta: new_meta,
+                    ..
+                },
+            ) => {
+                *items = new;
+                *version = version.wrapping_add(1);
+                meta.replace_locations(new_meta);
+                moved.extend(meta.locations().map(|(index, secret)| {
+                    (
+                        Arc::clone(secret.shared_reference()),
+                        Location::Element(target, *index),
+                    )
+                }));
+            }
+            (
+                Some(Slot::Object {
+                    entries,
+                    version,
+                    meta,
+                }),
+                Slot::Object {
+                    entries: new,
+                    meta: new_meta,
+                    ..
+                },
+            ) => {
+                *entries = new;
+                *version = version.wrapping_add(1);
+                meta.replace_locations(new_meta);
+                moved.extend(meta.locations().map(|(key, secret)| {
+                    (
+                        Arc::clone(secret.shared_reference()),
+                        Location::Property(target, Arc::clone(key)),
+                    )
+                }));
+            }
+            // Ruled out by the kind check above.
+            _ => return false,
+        }
+        let after = self.slot(target).map_or(0, footprint);
+        self.grow(after);
+        self.shrink(before);
+        // The places moved to `target`: what `attach` indexed under `source` is stale now.
+        for (reference, at) in moved {
+            self.index(&reference, Referent::Place(at));
+        }
+        true
+    }
+
+    /// The secret of the property `key` of the object at `id`.
+    pub(crate) fn property_secret(&self, id: SlotId, key: &str) -> Option<&Secret> {
+        match self.slot(id) {
+            Some(Slot::Object { meta, .. }) => meta.location(key),
+            _ => None,
+        }
     }
 
     /// The secret of the place `at`.
@@ -501,6 +711,7 @@ impl Heap {
     /// Give the place `at` the secret `secret`, unless it has one — or unless the place no
     /// longer exists.
     pub(crate) fn set_location_secret(&mut self, at: &Location, secret: Secret) {
+        let reference = Arc::clone(secret.shared_reference());
         let bytes = match at {
             Location::Binding(scope, name) => self.set_binding_secret(*scope, name, secret),
             Location::Element(id, index) => match self.slot_mut(*id) {
@@ -516,6 +727,10 @@ impl Heap {
                 _ => 0,
             },
         };
+        // A binding indexes itself, in `set_binding_secret`.
+        if bytes > 0 && !matches!(at, Location::Binding(..)) {
+            self.index(&reference, Referent::Place(at.clone()));
+        }
         self.grow(bytes);
     }
 
@@ -864,26 +1079,61 @@ impl Heap {
                 Visit::FinishArray(len, meta) => {
                     let at = out.len().saturating_sub(len);
                     let items = out.split_off(at);
-                    let array = RtValue::Array(self.alloc(Slot::Array {
+                    let own = meta
+                        .own()
+                        .map(|secret| Arc::clone(secret.shared_reference()));
+                    let places: Vec<(Arc<str>, usize)> = meta
+                        .locations()
+                        .map(|(index, secret)| (Arc::clone(secret.shared_reference()), *index))
+                        .collect();
+                    let id = self.alloc(Slot::Array {
                         items,
                         version: 0,
                         meta,
-                    }));
-                    out.push(array);
+                    });
+                    self.index_attached(id, own, places, Location::Element);
+                    out.push(RtValue::Array(id));
                 }
                 Visit::FinishObject(keys, meta) => {
                     let at = out.len().saturating_sub(keys.len());
                     let values = out.split_off(at);
-                    let object = RtValue::Object(self.alloc(Slot::Object {
+                    let own = meta
+                        .own()
+                        .map(|secret| Arc::clone(secret.shared_reference()));
+                    let places: Vec<(Arc<str>, Arc<str>)> = meta
+                        .locations()
+                        .map(|(key, secret)| {
+                            (Arc::clone(secret.shared_reference()), Arc::clone(key))
+                        })
+                        .collect();
+                    let id = self.alloc(Slot::Object {
                         entries: keys.into_iter().zip(values).collect(),
                         version: 0,
                         meta,
-                    }));
-                    out.push(object);
+                    });
+                    self.index_attached(id, own, places, Location::Property);
+                    out.push(RtValue::Object(id));
                 }
             }
         }
         out.pop().unwrap_or(RtValue::Null)
+    }
+
+    /// Index a collection [`Heap::attach`] just built at `id`: its own Reference ID, then each of
+    /// its places'.
+    fn index_attached<K>(
+        &mut self,
+        id: SlotId,
+        own: Option<Arc<str>>,
+        places: Vec<(Arc<str>, K)>,
+        place: fn(SlotId, K) -> Location,
+    ) {
+        if let Some(reference) = own {
+            self.index(&reference, Referent::Collection(id));
+        }
+        for (reference, key) in places {
+            self.index(&reference, Referent::Place(place(id, key)));
+        }
     }
 
     /// Number of slots ever allocated (live or free).

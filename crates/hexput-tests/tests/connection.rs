@@ -2222,8 +2222,10 @@ async fn answer_calls(backend: &mut Backend, count: usize) {
 }
 
 /// A Script making `n` host calls in a row.
+/// A Script making `n` calls. Each passes a computed value, so writing `i` afterwards is no write
+/// to a referenced place and the result stays exactly `{value}` (Story 3.13).
 fn calls(n: usize) -> String {
-    format!("let i = 0; while (i < {n}) {{ getOrder(i); i = i + 1; }}; return i;")
+    format!("let i = 0; while (i < {n}) {{ getOrder(i + 0); i = i + 1; }}; return i;")
 }
 
 #[test]
@@ -3846,4 +3848,154 @@ fn a_bad_method_registration_creates_no_session() {
         });
         assert_eq!(code_of(&sent[0]), "protocol.invalid_payload");
     }
+}
+
+// --- Story 3.13: modifications both ways over the wire ---
+
+/// `{ref, value}`.
+fn modification_entry(reference: &str, value: Value) -> Value {
+    Value::Map(vec![
+        (string("ref"), string(reference)),
+        (string("value"), value),
+    ])
+}
+
+/// The MessagePack bytes of `value`.
+fn wire_bytes(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    hexput_port::rmpv::encode::write_value(&mut out, value).unwrap();
+    out
+}
+
+#[test]
+fn a_script_s_write_to_a_referenced_value_comes_back_in_its_result() {
+    let reply = execute_once(
+        "n = 9; return {ok: true};",
+        vec![("n", holder(vec![("ref", string("r1"))], Value::from(8)))],
+    );
+    let expected = Value::Map(vec![
+        (
+            string("value"),
+            Value::Map(vec![(string("ok"), Value::Boolean(true))]),
+        ),
+        (
+            string("modifications"),
+            Value::Array(vec![modification_entry("r1", Value::from(9))]),
+        ),
+    ]);
+    assert_eq!(reply.message_type, MessageType::Result);
+    assert_eq!(wire_bytes(&reply.payload), wire_bytes(&expected));
+}
+
+#[test]
+fn a_referenced_value_only_read_leaves_the_result_exactly_value() {
+    let reply = execute_once(
+        "let m = n; return u.name;",
+        vec![
+            ("n", holder(vec![("ref", string("r1"))], Value::from(8))),
+            ("u", held_user()),
+        ],
+    );
+    assert_eq!(
+        reply.payload,
+        Value::Map(vec![(string("value"), string("a"))])
+    );
+}
+
+#[test]
+fn a_failed_script_reports_no_modifications() {
+    let reply = execute_once(
+        "n = 9; return 1 / 0;",
+        vec![("n", holder(vec![("ref", string("r1"))], Value::from(8)))],
+    );
+    assert_eq!(code_of(&reply), "arithmetic.division_by_zero");
+    let Value::Map(fields) = &reply.payload else {
+        panic!("an error payload is a map");
+    };
+    assert!(
+        fields
+            .iter()
+            .all(|(key, _)| key.as_str() != Some("modifications"))
+    );
+}
+
+#[test]
+fn modifications_come_before_the_static_check_s_findings() {
+    let reply = {
+        let (sent, _) = serve(
+            vec![
+                init(1, init_payload(&[])),
+                execution_with(
+                    2,
+                    "let unused = 1; n = 9; return 0;",
+                    vec![("n", holder(vec![("ref", string("r1"))], Value::from(8)))],
+                    Some(Value::Map(vec![(string("check"), string("warn"))])),
+                ),
+            ],
+            None,
+        );
+        sent[1].clone()
+    };
+    let Value::Map(fields) = &reply.payload else {
+        panic!("a Result payload is a map: {:?}", reply.payload);
+    };
+    let keys: Vec<&str> = fields
+        .iter()
+        .map(|(key, _)| key.as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["value", "modifications", "findings"]);
+}
+
+#[test]
+fn a_backend_modification_reaches_the_script_and_its_own_write_comes_back() {
+    hosted(
+        &wired_runtime(),
+        &[("f", true)],
+        false,
+        |mut backend| async move {
+            backend.send(execution_with(
+                1,
+                "let m = n; let a = {n: 1}; let b = a; let i = 1; f(a, i); i = i + 1; \
+                 return [b.n, n, m];",
+                vec![("n", holder(vec![("ref", string("r1"))], Value::from(8)))],
+                None,
+            ));
+            let (id, _, arguments, _) = backend.request_from(MessageType::Call).await;
+            let a = reference_of(&arguments[0]);
+            let i = reference_of(&arguments[1]);
+            assert!(a.starts_with("hx:") && i.starts_with("hx:"));
+            backend.reply(
+                id,
+                MessageType::Result,
+                Value::Map(vec![
+                    (string("value"), Value::Nil),
+                    (
+                        string("modifications"),
+                        Value::Array(vec![
+                            modification_entry(&a, Value::Map(vec![(string("n"), Value::from(2))])),
+                            modification_entry("r1", Value::from(9)),
+                        ]),
+                    ),
+                ]),
+            );
+            let reply = backend.next().await;
+            assert_eq!(reply.message_type, MessageType::Result, "{reply:?}");
+            let Value::Map(fields) = &reply.payload else {
+                panic!("a Result payload is a map");
+            };
+            assert_eq!(
+                fields[0].1,
+                Value::Array(vec![Value::from(2), Value::from(9), Value::from(8)])
+            );
+            // Only the Script's own write comes back: `i`, under the ID its call gave it.
+            assert_eq!(
+                fields[1],
+                (
+                    string("modifications"),
+                    Value::Array(vec![modification_entry(&i, Value::from(2))])
+                )
+            );
+            backend.close();
+        },
+    );
 }

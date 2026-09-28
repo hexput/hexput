@@ -29,6 +29,10 @@
 //!   but `hexput-exec` and this one, or a `Call` envelope is built outside this crate. A sealed
 //!   token the compiler enforces is still open.
 //!
+//! A `Result` reply is `{value}` or `{value, modifications}` (Story 3.13): the Backend's changes to
+//! referenced values, handed to the Executor raw as a [`Reply`]'s `modifications` — what they must
+//! look like and what they mean are its to decide, never this crate's.
+//!
 //! A Registered Method (Story 3.12) travels in the same generic `Call`: its payload adds
 //! `receiver`, the value the method is called on, as a holder carrying its Value Secret — from
 //! which the Backend learns the object key. A function's payload has no `receiver` key at all.
@@ -75,6 +79,7 @@ pub use hexput_port::{MAX_FRAME_LEN, MAX_NESTING_DEPTH, Value};
 const NAME: &str = "name";
 const ARGUMENTS: &str = "arguments";
 const VALUE: &str = "value";
+const MODIFICATIONS: &str = "modifications";
 const MESSAGE: &str = "message";
 const EXECUTION: &str = "execution";
 const RECEIVER: &str = "receiver";
@@ -100,6 +105,27 @@ fn payload(
         fields.push((Value::from(RECEIVER), receiver));
     }
     Value::Map(fields)
+}
+
+/// A Backend's `Result` answer to a `Call` or an `Authorize`: its `value`, and its
+/// `modifications` when the payload has that key (Story 3.13) — exactly as sent, unchecked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reply {
+    /// The reply's `value`.
+    pub value: Value,
+    /// The reply's `modifications`, when it has the key.
+    pub modifications: Option<Value>,
+}
+
+impl Reply {
+    /// A reply with `value` and no `modifications`.
+    #[must_use]
+    pub const fn value(value: Value) -> Self {
+        Self {
+            value,
+            modifications: None,
+        }
+    }
 }
 
 /// Why a host call produced no value.
@@ -133,7 +159,7 @@ pub struct Call {
     name: String,
     arguments: Vec<Value>,
     receiver: Option<Value>,
-    reply: oneshot::Sender<Result<Value, CallFailure>>,
+    reply: oneshot::Sender<Result<Reply, CallFailure>>,
 }
 
 /// An execution's handle for making host calls on the connection that submitted it. Cheap to
@@ -162,8 +188,9 @@ impl Caller {
 
     /// Call the Registered Function `name` with `arguments` — or, with a `receiver`, the
     /// Registered Method `name` on that value (Story 3.12) — and wait for the Backend's answer:
-    /// the reply's `value`, or why there is none. `receiver` travels as the payload's `receiver`,
-    /// exactly as given; without one the payload has no such key.
+    /// the reply's `value` and `modifications` (Story 3.13), or why there is none. `receiver`
+    /// travels as the payload's `receiver`, exactly as given; without one the payload has no such
+    /// key.
     ///
     /// Only for a call `hexput-enforce` has already allowed: this sends whatever it is given.
     /// `hexput-exec` is its one caller (AD-3), kept so by a source-text guard in
@@ -179,15 +206,15 @@ impl Caller {
         name: impl Into<String>,
         arguments: Vec<Value>,
         receiver: Option<Value>,
-    ) -> Result<Value, CallFailure> {
+    ) -> Result<Reply, CallFailure> {
         self.submit(Request::Call, name.into(), arguments, receiver)
             .await
     }
 
     /// Ask the Backend's per-call handler whether the Script may call the Registered Function
     /// `name` with `arguments` — or, with a `receiver`, the Registered Method `name` on that value
-    /// — and wait for its answer: the reply's `value`, or why there is none. Sends an
-    /// `Authorize`, never a `Call`: nothing runs on the Backend but its handler.
+    /// — and wait for its answer: the reply, or why there is none. Sends an `Authorize`, never a
+    /// `Call`: nothing runs on the Backend but its handler.
     ///
     /// Returns the answer as the Backend gave it — any value; deciding what it means is
     /// `hexput-enforce`'s. Only for `hexput-exec`, kept so by the same source-text guard as
@@ -203,7 +230,7 @@ impl Caller {
         name: impl Into<String>,
         arguments: Vec<Value>,
         receiver: Option<Value>,
-    ) -> Result<Value, CallFailure> {
+    ) -> Result<Reply, CallFailure> {
         self.submit(Request::Authorize, name.into(), arguments, receiver)
             .await
     }
@@ -215,7 +242,7 @@ impl Caller {
         name: String,
         arguments: Vec<Value>,
         receiver: Option<Value>,
-    ) -> Result<Value, CallFailure> {
+    ) -> Result<Reply, CallFailure> {
         let (reply, answer) = oneshot::channel();
         let call = Call {
             request,
@@ -239,7 +266,7 @@ impl Caller {
 #[derive(Debug)]
 pub struct Calls {
     queue: mpsc::UnboundedReceiver<Call>,
-    pending: HashMap<CorrelationId, oneshot::Sender<Result<Value, CallFailure>>>,
+    pending: HashMap<CorrelationId, oneshot::Sender<Result<Reply, CallFailure>>>,
     next: u64,
 }
 
@@ -353,22 +380,25 @@ impl Calls {
     }
 }
 
-/// A `Result` reply's `value`: the payload must be a map with exactly the key `value` (nil is the
-/// value `null`; absent is malformed).
-fn value_of(payload: Value) -> Result<Value, CallFailure> {
+/// A `Result` reply's `value` and `modifications`: the payload must be a map with the key `value`
+/// (nil is the value `null`; absent is malformed) and optionally `modifications` (Story 3.13), each
+/// once, and nothing else.
+fn value_of(payload: Value) -> Result<Reply, CallFailure> {
     let Value::Map(fields) = payload else {
         return Err(CallFailure::Malformed(
             "the reply is not a map with `value`".to_owned(),
         ));
     };
     let mut value = None;
+    let mut modifications = None;
     for (key, field) in fields {
         match key.as_str() {
             Some(VALUE) if value.is_none() => value = Some(field),
-            Some(VALUE) => {
-                return Err(CallFailure::Malformed(
-                    "the reply repeats the key `value`".to_owned(),
-                ));
+            Some(MODIFICATIONS) if modifications.is_none() => modifications = Some(field),
+            Some(name @ (VALUE | MODIFICATIONS)) => {
+                return Err(CallFailure::Malformed(format!(
+                    "the reply repeats the key `{name}`"
+                )));
             }
             Some(other) => {
                 return Err(CallFailure::Malformed(format!(
@@ -383,7 +413,12 @@ fn value_of(payload: Value) -> Result<Value, CallFailure> {
             }
         }
     }
-    value.ok_or_else(|| CallFailure::Malformed("the reply has no `value`".to_owned()))
+    let value =
+        value.ok_or_else(|| CallFailure::Malformed("the reply has no `value`".to_owned()))?;
+    Ok(Reply {
+        value,
+        modifications,
+    })
 }
 
 /// An `Error` reply's `message`, when its payload is a map carrying a string one.

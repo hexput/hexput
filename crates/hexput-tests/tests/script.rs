@@ -5,7 +5,7 @@ use hexput_port::{
     CorrelationId, Envelope, ErrorBody, MAX_FRAME_LEN, MAX_NESTING_DEPTH, MessageType, Setting,
     Settings, Value, decode, encode, encode_frame,
 };
-use hexput_script::{MAX_RESULT_DEPTH, Registration};
+use hexput_script::{MAX_MODIFICATION_DEPTH, MAX_RESULT_DEPTH, Registration};
 use rmpv::Integer;
 
 /// Serve one Direct Execution with no Registered Functions, on a runtime of its own.
@@ -902,15 +902,29 @@ fn the_check_rejects_overriding_a_method_of_a_keyed_starting_variable() {
     .expect_err("rejected at submission");
     assert_eq!(body.code, "capability.method_override");
     assert_eq!(codes(&body.findings), ["capability.method_override"]);
-    // A method under another key, or a plain starting variable, is nothing to override.
-    for (variable, key) in [(keyed_user(), "Order"), (map(vec![]), "User")] {
+    // A method under another key, or a plain starting variable, is nothing to override. Writing
+    // the Backend's `r1` object is reported back (Story 3.13); the plain one has no Reference ID.
+    let written = map(vec![
+        ("value", int(1)),
+        (
+            "modifications",
+            Value::Array(vec![map(vec![
+                ("ref", s("r1")),
+                ("value", map(vec![("name", s("a")), ("save", int(1))])),
+            ])]),
+        ),
+    ]);
+    for (variable, key, expected) in [
+        (keyed_user(), "Order", written),
+        (map(vec![]), "User", map(vec![("value", int(1))])),
+    ] {
         let reply = direct_execution_with(
             &payload("u.save = 1; return u.save;", vec![("u", variable)]),
             vec![Registration::method(key, "save", true)],
             checked(CheckMode::Error),
         )
         .unwrap();
-        assert_eq!(reply, map(vec![("value", int(1))]));
+        assert_eq!(reply, expected);
     }
     // With the check off, the runtime refuses it all the same.
     let body = *direct_execution_with(
@@ -961,4 +975,43 @@ fn a_keyed_scalar_starting_variable_is_no_override_finding() {
     .expect_err("the runtime refuses it");
     assert_eq!(body.code, "type.invalid_property_access");
     assert!(body.findings.is_empty(), "{:?}", body.findings);
+}
+
+// --- Story 3.13: a result's modifications ---
+
+#[test]
+fn a_modification_nested_past_the_frame_makes_the_result_too_deep() {
+    let n = map(vec![
+        ("__secret", map(vec![("ref", s("r1"))])),
+        ("value", Value::from(0)),
+    ]);
+    let body = failure(&payload(
+        "n = v; return 0;",
+        vec![
+            ("n", n.clone()),
+            ("v", nested_held(MAX_MODIFICATION_DEPTH + 1, 0)),
+        ],
+    ));
+    assert_eq!(body.code, "protocol.result_too_deep");
+    assert!(body.message.contains("modifications"), "{}", body.message);
+    // At the limit it is sent, and a peer applying the same frame limit reads it back.
+    let at = nested_held(MAX_MODIFICATION_DEPTH, 0);
+    let reply = direct_execution(&payload(
+        "n = v; return 0;",
+        vec![("n", n), ("v", at.clone())],
+    ))
+    .unwrap();
+    assert_eq!(
+        reply,
+        map(vec![
+            ("value", Value::from(0)),
+            (
+                "modifications",
+                Value::Array(vec![map(vec![("ref", s("r1")), ("value", at)])]),
+            ),
+        ])
+    );
+    let envelope = Envelope::new(CorrelationId(1), MessageType::Result, reply);
+    let bytes = encode(&envelope).unwrap();
+    assert_eq!(decode(&bytes).unwrap(), envelope);
 }

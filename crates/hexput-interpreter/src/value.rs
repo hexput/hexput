@@ -255,6 +255,11 @@ impl Secret {
         self.key.as_ref()
     }
 
+    /// The Reference ID, shared.
+    pub(crate) const fn shared_reference(&self) -> &Arc<str> {
+        &self.reference
+    }
+
     /// The further fields, exactly as they were handed to [`Secret::new`].
     #[must_use]
     pub fn extra(&self) -> &[u8] {
@@ -318,6 +323,52 @@ impl Held {
     pub fn effective_secret(&self) -> Option<&Secret> {
         effective(&self.value, self.secret.as_ref())
     }
+}
+
+/// One modification of a referenced value (Story 3.13, LANGUAGE-REFERENCE §8): the Reference ID
+/// it names and the whole new value.
+///
+/// Both directions use it. A host call's reply may carry some ([`crate::HostCall::resume_with`]):
+/// a Reference ID naming an array or object replaces that collection's contents in place, keeping
+/// its identity and its own secret; one naming the place a string, number, bool or `null` sits in
+/// replaces the value there, and the place keeps its secret. A finished Script reports the
+/// referenced places and collections it wrote ([`Finished::modifications`]), each once, with its
+/// final value.
+///
+/// `value` is the value itself, never a holder: the Reference ID names the place, and a secret
+/// beside a top-level array or object here is ignored inbound. Everything nested inside it
+/// carries its secrets as usual.
+#[derive(Clone, Debug)]
+pub struct Modification {
+    /// The Reference ID the modification names.
+    pub reference: Arc<str>,
+    /// The whole new value.
+    pub value: Value,
+}
+
+impl Modification {
+    /// A modification of whatever `reference` names to `value`.
+    #[must_use]
+    pub fn new(reference: impl Into<Arc<str>>, value: Value) -> Self {
+        Self {
+            reference: reference.into(),
+            value,
+        }
+    }
+}
+
+/// How a Script ended (Story 3.13): its result, and every referenced place or collection it
+/// wrote.
+#[derive(Clone, Debug)]
+pub struct Finished {
+    /// The result, beside the secret of the place it was returned from when the `return` names a
+    /// place that has one (Story 3.11).
+    pub result: Held,
+    /// Each Reference ID whose place or collection the Script wrote, once, in the order of its
+    /// first write, with the value there when the Script ended. A write by a Backend's
+    /// modification is never among them, nor a place or collection gone by the end (a block's
+    /// variable after the block exited). Empty when the Script wrote none.
+    pub modifications: Vec<Modification>,
 }
 
 impl From<Value> for Held {

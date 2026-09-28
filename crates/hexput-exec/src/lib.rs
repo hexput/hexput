@@ -120,6 +120,20 @@
 //! carry `receiver`, a holder with the receiver's secret unchanged. A refusal is logged with the
 //! method's `key` beside `function` and `reason`.
 //!
+//! # Modifications (Story 3.13)
+//!
+//! Changes to referenced values flow both ways by Reference ID, as whole values. A `Call` reply
+//! may carry `modifications` — an array of `{ref, value}` maps ([`wire::modifications_to_hexput`])
+//! — which are validated whole, then applied in order before the Script resumes
+//! ([`HostCall::resume_with`]); anything malformed, or a modification giving an array or object a
+//! value of another kind, fails the call with `host.function_failed`, spanned on it. Decoding and
+//! applying them is charged to CPU time like the reply's value, and their values to memory; they
+//! count no allocations. An `Authorize` answer carrying `modifications` is not a boolean answer
+//! (`reason = handler_invalid`). The other way, a finished Script's [`Finished::modifications`]
+//! list every referenced place and collection it wrote, once each with its final value, and the
+//! output size budget charges the whole `{value, modifications}` payload
+//! ([`wire::result_payload_size`]). A failed execution reports none.
+//!
 //! Binds: AD-3, AD-6.
 
 pub mod wire;
@@ -134,9 +148,9 @@ use hexput_enforce::{Budget, Capabilities, Decision, Exceeded, HandlerAnswer, Qu
 /// [`execute_with_limits`] can state them. Only `hexput-enforce` decides anything from them.
 pub use hexput_enforce::Limits;
 use hexput_interpreter::{Category, Code, Execution, HostCall, Meter, Outcome, Span};
-use hexput_rpc::CallFailure;
+use hexput_rpc::{CallFailure, Reply};
 
-pub use hexput_interpreter::{Diagnostic, Held, Program, Secret, Value};
+pub use hexput_interpreter::{Diagnostic, Finished, Held, Modification, Program, Secret, Value};
 /// The handle a connection gives an execution for its host calls. Re-exported so
 /// `hexput-script`, which takes one and passes it on, can name it; the connection, which creates
 /// it, depends on `hexput-rpc` itself.
@@ -281,8 +295,8 @@ impl Halt {
 
 /// Where one segment of an execution left it.
 enum Step {
-    /// The Script ended with this result.
-    Finished(Held),
+    /// The Script ended with this result and these modifications.
+    Finished(Finished),
     /// The Script waits on this host call, whose arguments (and receiver) are ready to send; when
     /// the call is granted per call, the question for the Backend's handler comes first.
     Call(Box<HostCall>, Sent, Option<Question>),
@@ -348,13 +362,14 @@ pub async fn execute_with_limits(
         .collect();
     execute_held(program, variables, host, limits)
         .await
-        .map(|result| result.value)
+        .map(|finished| finished.result.value)
 }
 
 /// [`execute_with_limits`] with Value Secrets (Story 3.11): each starting variable may arrive
 /// [`Held`], with the secret of the variable it lands in, and the result comes back `Held`, with
 /// the secret of the place the Script returned it from when the `return` names one (an array's or
-/// object's own secrets are inside the value either way). What Direct Execution calls.
+/// object's own secrets are inside the value either way) — beside the referenced places and
+/// collections the Script wrote (Story 3.13). What Direct Execution calls.
 ///
 /// # Errors
 /// As [`execute`].
@@ -366,7 +381,7 @@ pub async fn execute_held(
     variables: Vec<(Arc<str>, Held)>,
     host: Host,
     limits: Limits,
-) -> Result<Held, Diagnostic> {
+) -> Result<Finished, Diagnostic> {
     let Host {
         capabilities,
         caller,
@@ -449,8 +464,8 @@ pub async fn execute_held(
             // Converting and binding the reply is charged with the next slice, so a limit it
             // helps cross is reported before the next call is sent.
             let started = Instant::now();
-            let value = received(&call, reply)?;
-            let execution = call.resume_held(&value);
+            let (value, modifications) = received(&call, reply)?;
+            let execution = resume(*call, &value, &modifications)?;
             let step = segment(execution, &mut budget, &capabilities, whole, started)?;
             Ok((step, budget))
         })
@@ -486,15 +501,17 @@ fn segment(
                 return Err(Halt::Exceeded(budget.allocations_exceeded(stopped.span())));
             }
             // The last slice is charged like any other: crossing the limit in it fails the
-            // Script even though it finished. Measuring the result is charged with it.
-            Outcome::Finished(result) => {
+            // Script even though it finished. Measuring the result is charged with it: the whole
+            // payload, its modifications included (Story 3.13).
+            Outcome::Finished(finished) => {
                 budget
                     .charge_cpu(started.elapsed(), whole)
                     .map_err(Halt::Exceeded)?;
                 let limit = budget.limits().output_size();
-                let size = wire::payload_size_held(&result.value, result.secret.as_ref(), limit);
+                let size =
+                    wire::result_payload_size(&finished.result, &finished.modifications, limit);
                 budget.charge_output(size, whole).map_err(Halt::Exceeded)?;
-                return Ok(Step::Finished(result));
+                return Ok(Step::Finished(finished));
             }
             Outcome::HostCall(call) => {
                 // The slice, then the argument work and the call itself — one RPC call and one
@@ -545,7 +562,11 @@ async fn ask(
     let answer = caller.ask_authorization(question.name(), arguments, receiver);
     match tokio::time::timeout(timeout, answer).await {
         Err(_elapsed) => HandlerAnswer::TimedOut,
-        Ok(Ok(hexput_rpc::Value::Boolean(allowed))) => HandlerAnswer::Boolean(allowed),
+        // An answer is `{value}` alone: one carrying `modifications` is no answer (Story 3.13).
+        Ok(Ok(Reply {
+            value: hexput_rpc::Value::Boolean(allowed),
+            modifications: None,
+        })) => HandlerAnswer::Boolean(allowed),
         // Any other value, or a `Result` that is not a well-formed `{value}`.
         Ok(Ok(_) | Err(CallFailure::Malformed(_))) => HandlerAnswer::NotBoolean,
         // An `Error`, or a question that could not be written: the handler gave no answer.
@@ -700,20 +721,71 @@ fn arguments(call: &HostCall, depth: usize) -> Result<Sent, Diagnostic> {
     })
 }
 
-/// The value a host call resumes the Script with, or the `host` error that ends it.
+/// Hand `call` its value back after applying its `modifications`, or end the Script with
+/// `host.function_failed` when one gives an array or object a value of another kind (Story 3.13).
+fn resume(
+    call: HostCall,
+    value: &Held,
+    modifications: &[Modification],
+) -> Result<Execution, Diagnostic> {
+    let name = call.name().to_owned();
+    let span = call.span();
+    call.resume_with(value, modifications).map_err(|mismatch| {
+        Diagnostic::new(
+            Category::Host,
+            Code::FUNCTION_FAILED,
+            format!(
+                "the Backend's reply to `{name}` is malformed: `{}[{}].value` is {} {}, but its \
+                 `ref` names {} {}",
+                wire::MODIFICATIONS_KEY,
+                mismatch.index(),
+                article(mismatch.found()),
+                mismatch.found(),
+                article(mismatch.expected()),
+                mismatch.expected(),
+            ),
+            span,
+        )
+    })
+}
+
+/// `a` or `an`, for a type name.
+fn article(type_name: &str) -> &'static str {
+    if type_name.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    }
+}
+
+/// The value a host call resumes the Script with and the modifications to apply first, or the
+/// `host` error that ends it. Both are converted before anything is applied, so a malformed
+/// modification changes nothing (Story 3.13).
 fn received(
     call: &HostCall,
-    reply: Result<hexput_rpc::Value, CallFailure>,
-) -> Result<Held, Diagnostic> {
+    reply: Result<Reply, CallFailure>,
+) -> Result<(Held, Vec<Modification>), Diagnostic> {
     let name = call.name();
     let (code, message) = match reply {
-        Ok(value) => match wire::to_hexput(&value, &mut wire::Path::reply()) {
-            Ok(value) => return Ok(value),
-            Err(reason) => (
-                Code::FUNCTION_FAILED,
-                format!("the Backend's reply to `{name}` is malformed: {reason}"),
-            ),
-        },
+        Ok(Reply {
+            value,
+            modifications,
+        }) => {
+            let converted = wire::to_hexput(&value, &mut wire::Path::reply()).and_then(|value| {
+                let modifications = match &modifications {
+                    Some(modifications) => wire::modifications_to_hexput(modifications)?,
+                    None => Vec::new(),
+                };
+                Ok((value, modifications))
+            });
+            match converted {
+                Ok(converted) => return Ok(converted),
+                Err(reason) => (
+                    Code::FUNCTION_FAILED,
+                    format!("the Backend's reply to `{name}` is malformed: {reason}"),
+                ),
+            }
+        }
         Err(CallFailure::Failed(Some(message))) => (
             Code::FUNCTION_FAILED,
             format!("`{name}` failed on the Backend: {message}"),

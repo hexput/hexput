@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-18-2026 11:43
-last_updated: 09-28-2026 07:10
+last_updated: 09-28-2026 08:20
 project: hexput
 project_key: NOKEY
 tracking_system: file-system
@@ -72,7 +72,7 @@ development_status:
   3-10-turn-the-static-check-on-or-off: review
   3-11-carry-hidden-metadata-on-values-the-script-cannot-touch: review
   3-12-call-a-backend-method-on-a-keyed-object: review
-  3-13-keep-referenced-values-in-step-between-backend-and-script: in-progress
+  3-13-keep-referenced-values-in-step-between-backend-and-script: review
   epic-3-retrospective: optional
 
   epic-4: backlog

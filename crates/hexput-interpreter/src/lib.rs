@@ -95,6 +95,20 @@
 //! Writing a property that is a method under the value's key — `v.name = x`, `v["name"] = x` —
 //! is `capability.method_override`, spanned on the assignment target, and changes nothing.
 //!
+//! # Modifications (Story 3.13)
+//!
+//! Changes to referenced values flow both ways by Reference ID, always as the whole new value
+//! (LANGUAGE-REFERENCE §8). [`HostCall::resume_with`] applies a reply's [`Modification`]s before
+//! the Script resumes: an array or object has its contents replaced in place, keeping its identity
+//! and its own secret, and a place — a variable, property or element holding a string, number,
+//! bool or `null` — has its value replaced there alone, so a copy is unchanged. The execution
+//! keeps one index from Reference ID to what it names, the first registration winning; a
+//! Reference ID it does not hold is ignored. The other way, [`Outcome::Finished`] carries a
+//! [`Finished`] whose [`Finished::modifications`] list every place and collection with a Reference
+//! ID that the Script wrote, once each, in the order of the first write, with its final value. A
+//! Backend's modification is never a Script write. [`evaluate`] and [`evaluate_with_variables`]
+//! have no Reference IDs, so they report none.
+//!
 //! # Starting variables
 //!
 //! [`evaluate`] runs a Script with nothing but what its own source declares. [`evaluate_with_variables`]
@@ -120,8 +134,8 @@ use std::sync::Arc;
 
 use hexput_ast::StatementKind;
 
-pub use machine::Argument;
-pub use value::{Array, Held, Object, Secret, Value};
+pub use machine::{Argument, ModificationMismatch};
+pub use value::{Array, Finished, Held, Modification, Object, Secret, Value};
 
 /// The diagnostics shape and its rendering, re-exported so a consumer of the evaluator — the CLI
 /// in particular — can report what [`evaluate`] returns without a `hexput-shared` or `hexput-ast`
@@ -252,7 +266,7 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
         }
     };
     match stop {
-        machine::Stop::Finished(result) => Ok(result.value),
+        machine::Stop::Finished(finished) => Ok(finished.result.value),
         // Unreachable: an unmetered machine has no ceiling to stop at, and pauses are looped
         // over above. Limits and their errors are the Executor's, so this is no budget error.
         machine::Stop::Paused(span)
@@ -461,8 +475,9 @@ impl Execution {
 /// Where an [`Execution::run`] stopped.
 pub enum Outcome {
     /// The Script ended with this result, detached from the execution — beside the secret of the
-    /// place it was returned from, when the `return` names a place that has one (Story 3.11).
-    Finished(Held),
+    /// place it was returned from, when the `return` names a place that has one (Story 3.11) —
+    /// and the referenced places and collections it wrote (Story 3.13).
+    Finished(Finished),
     /// The Script called the host and waits for the value.
     HostCall(HostCall),
     /// The slice its [`Meter`] allows is done; [`Paused::resume`] hands the execution back.
@@ -609,6 +624,31 @@ impl HostCall {
         let mut execution = self.execution;
         execution.machine.resume(held);
         execution
+    }
+
+    /// [`HostCall::resume_held`], after applying the reply's `modifications` in order (Story
+    /// 3.13, LANGUAGE-REFERENCE §8): a Reference ID naming an array or object replaces its
+    /// contents in place — every handle to it sees them, and it keeps its identity and its own
+    /// secret — and one naming the place a string, number, bool or `null` sits in replaces the
+    /// value there alone, the place keeping its secret. A Reference ID this execution does not
+    /// hold, or whose collection or place is gone, is ignored; a later modification for the same
+    /// one wins. Values nested in a modification come in as a reply's value does: their secrets
+    /// along, their collections new. None of it is a Script write, so none is reported back, and
+    /// none counts as an allocation.
+    ///
+    /// The caller obligation of [`evaluate_with_variables`] applies to every value.
+    ///
+    /// # Errors
+    /// A modification giving an array or object a value of another kind, checked before any is
+    /// applied. The execution is dropped.
+    pub fn resume_with(
+        self,
+        held: &Held,
+        modifications: &[Modification],
+    ) -> Result<Execution, ModificationMismatch> {
+        let mut execution = self.execution;
+        execution.machine.resume_with(held, modifications)?;
+        Ok(execution)
     }
 }
 

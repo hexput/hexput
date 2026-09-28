@@ -68,6 +68,19 @@
 //! Every value a host call sends carries a secret: one without is given a Reference ID
 //! (`<prefix>:<counter>`, the counter from 1, the prefix set by the Executor), stored back on its
 //! collection or place so the same one sent again carries the same ID.
+//!
+//! # Modifications (Story 3.13)
+//!
+//! Changes flow both ways by Reference ID, always as the whole new value (LANGUAGE-REFERENCE §8).
+//! A host call's reply may carry modifications, applied in order before the Script resumes
+//! ([`Machine::resume_with`]): a Reference ID naming an array or object replaces its contents in
+//! place, so every handle to it sees them; one naming a place replaces the value there and only
+//! there, so a copy (`let m = n;`) is unchanged. A Reference ID the heap's index does not hold is
+//! ignored. The other way, the machine records every place and collection with a secret that the
+//! Script writes — a variable, property or element whose place has one, and an array or object
+//! with its own that it stores into or appends to — by Reference ID, in the order of the first
+//! write, and a finished Script reports each once with its final value. A Backend's modification is
+//! never recorded, and recording costs the Script nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -81,8 +94,8 @@ use hexput_ast::{
 use indexmap::IndexMap;
 
 use crate::convert::{number_to_string, to_number, to_string};
-use crate::heap::{DetachFailure, Heap, Location, RtValue, SlotId, TEXT_OVERHEAD, Text};
-use crate::value::{Held, SECRET_KEY, Secret};
+use crate::heap::{DetachFailure, Heap, Location, Referent, RtValue, SlotId, TEXT_OVERHEAD, Text};
+use crate::value::{Finished, Held, Modification, SECRET_KEY, Secret};
 use crate::{CALL_DEPTH_LIMIT, Meter, Value};
 
 /// The Reference ID prefix of an execution whose driver set none.
@@ -305,8 +318,8 @@ pub struct Argument {
 
 /// Why the machine stopped.
 pub(crate) enum Stop {
-    /// The Script ended with this result.
-    Finished(Held),
+    /// The Script ended with this result and these modifications.
+    Finished(Finished),
     /// The Script called a host function and waits for its value.
     HostCall(PendingCall),
     /// The slice of work the [`Meter`] allows is done; running the machine again carries on.
@@ -421,6 +434,45 @@ pub(crate) struct Machine<P> {
     /// run; `Machine::link` takes the slot first thing, whatever that link turns out to be. So a
     /// place noted for one link is never seen by any other.
     chain_place: Option<(ExprId, usize, Location)>,
+    /// Every referenced place and collection the Script wrote, by Reference ID, in the order of
+    /// the first write (Story 3.13): what its result reports.
+    written: IndexMap<Arc<str>, Referent>,
+}
+
+/// Why a host call's modifications cannot be applied (Story 3.13): one names an array or object
+/// and gives it a value of another kind. Nothing is applied, and the execution is over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModificationMismatch {
+    index: usize,
+    reference: Arc<str>,
+    expected: &'static str,
+    found: &'static str,
+}
+
+impl ModificationMismatch {
+    /// The modification's position in the list it came in.
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The Reference ID it names.
+    #[must_use]
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    /// The kind of what the Reference ID names: `array` or `object`.
+    #[must_use]
+    pub const fn expected(&self) -> &'static str {
+        self.expected
+    }
+
+    /// The kind of the value the modification gives it.
+    #[must_use]
+    pub const fn found(&self) -> &'static str {
+        self.found
+    }
 }
 
 impl<P: Deref<Target = Program> + Clone> Machine<P> {
@@ -468,6 +520,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             },
             methods: HashMap::new(),
             chain_place: None,
+            written: IndexMap::new(),
         };
         for (name, held) in variables {
             let attached = machine.heap.attach(&held.value);
@@ -603,7 +656,127 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 return Ok(Stop::Paused(site_span(tree, site)));
             }
         }
-        Ok(Stop::Finished(Held::plain(Value::Null)))
+        Ok(self.finished(Held::plain(Value::Null)))
+    }
+
+    /// The Script ended with `result`: add every referenced place and collection it wrote, with
+    /// the value there now (Story 3.13).
+    ///
+    /// A written value that is, or holds, a function or a value referring back to itself has no
+    /// form the Backend can receive, and is left out: storing a function on a Backend's object is
+    /// a Script's own business (Story 3.12), never a reason to fail it after it succeeded.
+    fn finished(&self, result: Held) -> Stop {
+        let mut modifications = Vec::with_capacity(self.written.len());
+        for (reference, referent) in &self.written {
+            // Gone by the end — a block's variable once the block exited — or carrying another
+            // Reference ID now: nothing left to report.
+            if !self.heap.holds(reference, referent) {
+                continue;
+            }
+            let value = match referent {
+                Referent::Collection(id) => match self.heap.is_array(*id) {
+                    Some(true) => RtValue::Array(*id),
+                    Some(false) => RtValue::Object(*id),
+                    None => continue,
+                },
+                Referent::Place(at) => match self.heap.place_value(at) {
+                    Some(value) => value,
+                    None => continue,
+                },
+            };
+            if let Ok(value) = self.heap.detach(&value) {
+                modifications.push(Modification {
+                    reference: Arc::clone(reference),
+                    value,
+                });
+            }
+        }
+        Stop::Finished(Finished {
+            result,
+            modifications,
+        })
+    }
+
+    /// Record that the Script wrote `referent`, when it carries a Reference ID (Story 3.13).
+    fn wrote(&mut self, referent: Referent) {
+        let secret = match &referent {
+            Referent::Collection(id) => self.heap.collection_secret(*id),
+            Referent::Place(at) => self.heap.location_secret(at),
+        };
+        if let Some(secret) = secret {
+            let reference = Arc::clone(secret.shared_reference());
+            self.written.entry(reference).or_insert(referent);
+        }
+    }
+
+    /// Record that the Script wrote the property `key` of `object`, when that place carries a
+    /// Reference ID — checked before the place is built, so a plain property costs nothing.
+    fn wrote_property(&mut self, object: SlotId, key: &str) {
+        if self.heap.property_secret(object, key).is_some() {
+            self.wrote(Referent::Place(Location::Property(object, Arc::from(key))));
+        }
+    }
+
+    /// Apply a host call's `modifications`, in order (Story 3.13, decision 2): each names a
+    /// collection, whose contents are replaced in place, or a place, whose value is replaced there
+    /// alone; one naming nothing this execution holds is ignored. A later one for the same
+    /// Reference ID wins. Nothing is recorded as a Script write, and nothing is counted as an
+    /// allocation; the values' memory is charged as a reply's is.
+    ///
+    /// # Errors
+    /// A modification giving an array or object a value of another kind — checked for every
+    /// modification before any is applied.
+    fn apply(&mut self, modifications: &[Modification]) -> Result<(), ModificationMismatch> {
+        for (index, modification) in modifications.iter().enumerate() {
+            self.check_kind(index, modification)?;
+        }
+        for (index, modification) in modifications.iter().enumerate() {
+            // Checked again: an earlier modification may have changed what this one names.
+            self.check_kind(index, modification)?;
+            let Some(referent) = self.heap.referent(&modification.reference).cloned() else {
+                continue;
+            };
+            let value = self.heap.attach(&modification.value);
+            match (referent, value) {
+                (
+                    Referent::Collection(target),
+                    RtValue::Array(source) | RtValue::Object(source),
+                ) => {
+                    self.heap.replace_contents(target, source);
+                }
+                (Referent::Collection(_), _) => {}
+                (Referent::Place(at), value) => {
+                    self.heap.set_place(&at, value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse the modification at `index` when it names an array or object and gives it a value
+    /// of another kind.
+    fn check_kind(
+        &self,
+        index: usize,
+        modification: &Modification,
+    ) -> Result<(), ModificationMismatch> {
+        let Some(Referent::Collection(id)) = self.heap.referent(&modification.reference) else {
+            return Ok(());
+        };
+        let (expected, fits) = match self.heap.is_array(*id) {
+            Some(true) => ("array", modification.value.as_array().is_some()),
+            Some(false) => ("object", modification.value.as_object().is_some()),
+            None => return Ok(()),
+        };
+        if fits {
+            return Ok(());
+        }
+        Err(ModificationMismatch {
+            index,
+            reference: Arc::clone(&modification.reference),
+            expected,
+            found: modification.value.type_name(),
+        })
     }
 
     /// Whether the heap holds more than the memory ceiling.
@@ -680,6 +853,24 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
     /// secret keeps it only when the call is the whole value a statement stores (decision 2);
     /// otherwise it is a computed value and plain.
     pub(crate) fn resume(&mut self, held: &Held) {
+        // Cannot fail: there is nothing to apply.
+        let _ = self.resume_with(held, &[]);
+    }
+
+    /// [`Machine::resume`], applying the host call's `modifications` first (Story 3.13).
+    ///
+    /// # Errors
+    /// A modification giving an array or object a value of another kind; the machine must then
+    /// be dropped.
+    pub(crate) fn resume_with(
+        &mut self,
+        held: &Held,
+        modifications: &[Modification],
+    ) -> Result<(), ModificationMismatch> {
+        if self.suspended.is_none() {
+            return Ok(());
+        }
+        self.apply(modifications)?;
         if let Some((chain, next, in_target)) = self.suspended.take() {
             let value = self.heap.attach(&held.value);
             let whole_call = !in_target
@@ -701,6 +892,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 in_target,
             });
         }
+        Ok(())
     }
 
     /// The names bound in the root scope: the starting variables, the top-level named functions,
@@ -776,7 +968,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             Frame::Statement(at) => {
                 return Ok(self
                     .statement(tree, at)?
-                    .map(|result| Stop::Finished(Held::plain(result))));
+                    .map(|result| self.finished(Held::plain(result))));
             }
             // A scope a closure captured is skipped here and lives until the execution ends,
             // like any other heap garbage; see `environment.rs`.
@@ -820,7 +1012,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     read.and_then(|(_, read)| self.resolve_read(tree, expression, read))
                         .and_then(|place| self.heap.location_secret(&place).cloned())
                 };
-                return Ok(Some(Stop::Finished(Held::new(result, secret))));
+                return Ok(Some(self.finished(Held::new(result, secret))));
             }
             Frame::Unary { operator, operand } => {
                 let value = self.pop();
@@ -964,6 +1156,14 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 let ExpressionKind::Identifier(name) = &expression.kind else {
                     return Err(internal(expression.span));
                 };
+                // A referenced variable the Script writes is reported (Story 3.13) — by the secret
+                // it had before this write, never one this call's value brings. Checked before a
+                // place is built, so writing a plain variable allocates nothing.
+                if let Some(owner) = self.heap.binding_owner(self.scope, &name.name)
+                    && self.heap.binding_secret(owner, &name.name).is_some()
+                {
+                    self.wrote(Referent::Place(Location::Binding(owner, name.name.clone())));
+                }
                 // The place keeps its own secret; a host call's value brings one only to a place
                 // that has none.
                 if let Some(secret) = self.take_reply_secret(stored)
@@ -2076,6 +2276,8 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 self.refuse_override(&receiver, &name.name, expression.span)?;
                 match &receiver {
                     RtValue::Object(object) => {
+                        self.wrote(Referent::Collection(*object));
+                        self.wrote_property(*object, &name.name);
                         self.heap.object_store(*object, &name.name, value);
                         if let Some(secret) = secret {
                             let place = Location::Property(*object, Arc::from(name.name.as_str()));
@@ -2104,6 +2306,11 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     }
                     (RtValue::Array(array), RtValue::Number(n)) => {
                         let slot = array_slot(*n);
+                        // Recorded before the store; a store that fails ends the Script anyway.
+                        if let Some(i) = slot {
+                            self.wrote(Referent::Collection(*array));
+                            self.wrote(Referent::Place(Location::Element(*array, i)));
+                        }
                         if slot.is_some_and(|i| self.heap.array_store(*array, i, value)) {
                             if let (Some(secret), Some(i)) = (secret, slot) {
                                 self.heap
@@ -2125,6 +2332,8 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                         }
                     }
                     (RtValue::Object(object), RtValue::String(k)) => {
+                        self.wrote(Referent::Collection(*object));
+                        self.wrote_property(*object, k);
                         self.heap.object_store(*object, k, value);
                         if let Some(secret) = secret {
                             self.heap.set_location_secret(
@@ -2753,7 +2962,7 @@ mod tests {
     /// Run `machine` to its result; these trees make no host call.
     fn finish(machine: &mut Machine<&Program>) -> Result<Value, Diagnostic> {
         match machine.execute()? {
-            Stop::Finished(result) => Ok(result.value),
+            Stop::Finished(result) => Ok(result.result.value),
             Stop::HostCall(call) => panic!("unexpected host call to `{}`", call.name),
             Stop::Paused(_) | Stop::OutOfMemory(_) | Stop::AllocationsExceeded(_) => {
                 panic!("these machines are unmetered")

@@ -22,12 +22,22 @@
 //! encoded MessagePack, which it carries and never reads. Outbound, [`to_wire_held`] emits a
 //! holder for every value that carries a secret — `ref`, then `key`, then the further fields —
 //! and a value without one exactly as before.
+//!
+//! # Modifications (Story 3.13)
+//!
+//! A `Call` reply's `modifications` and a Script result's are both an array of maps with exactly
+//! the keys `ref` (a Reference ID) and `value` (the whole new value). The value is the value
+//! itself — never a holder, since the Reference ID names the place — and everything nested inside
+//! it travels as anywhere else. Inbound, [`modifications_to_hexput`] refuses, with the path,
+//! anything else. Outbound, [`modifications_to_wire`] emits every nested secret, a generated one
+//! included (the Backend saw it in a `Call`), and [`result_payload_size`] counts the whole
+//! `{value, modifications}` payload exactly.
 
 use core::fmt::Write as _;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use hexput_interpreter::{Array, Held, Object, Secret, Value as Hexput};
+use hexput_interpreter::{Array, Held, Modification, Object, Secret, Value as Hexput};
 use hexput_rpc::{MAX_FRAME_LEN, MAX_NESTING_DEPTH, Value as Wire, rmpv};
 
 /// The deepest container nesting a Script result may have. The Daemon's decoder accepts
@@ -41,6 +51,11 @@ pub const MAX_RESULT_DEPTH: usize = MAX_NESTING_DEPTH - 2;
 /// [`MAX_NESTING_DEPTH`] levels.
 pub const MAX_ARGUMENT_WIRE_DEPTH: usize = MAX_NESTING_DEPTH - 3;
 
+/// The deepest wire nesting — holders included — one modification's value in a Script result may
+/// have (Story 3.13): the envelope, the payload map, its `modifications` array and the entry's map
+/// take four of the frame's [`MAX_NESTING_DEPTH`] levels.
+pub const MAX_MODIFICATION_DEPTH: usize = MAX_NESTING_DEPTH - 4;
+
 /// The longest Reference ID a Backend may supply, in bytes.
 pub const MAX_REFERENCE_LEN: usize = 256;
 
@@ -52,6 +67,8 @@ const HOLDER_VALUE_KEY: &str = "value";
 const REF_KEY: &str = "ref";
 /// The object key's key inside `__secret`.
 const KEY_KEY: &str = "key";
+/// The payload key a reply's or a result's modifications travel under.
+pub const MODIFICATIONS_KEY: &str = "modifications";
 
 /// The largest magnitude an integer may have to be a Hexput `number` exactly: 2^53.
 const EXACT_INTEGER: u64 = 1 << 53;
@@ -91,6 +108,14 @@ impl<'a> Path<'a> {
         Self {
             root: "value",
             segments: Vec::new(),
+        }
+    }
+
+    /// The path of a reply's modification at `index`, `modifications[<index>]`.
+    fn modification(index: usize) -> Self {
+        Self {
+            root: MODIFICATIONS_KEY,
+            segments: vec![Segment::Index(index)],
         }
     }
 
@@ -274,6 +299,76 @@ fn convert<'a>(
     }
 }
 
+/// A `Call` reply's `modifications` as Hexput modifications (Story 3.13, decision 1): an array of
+/// maps with exactly the keys `ref` — a non-empty string of at most [`MAX_REFERENCE_LEN`] bytes —
+/// and `value`, any wire value but a holder at its top (holders may nest inside it). Converted as
+/// a reply's value is.
+///
+/// # Errors
+/// A message naming the path to the first thing wrong; nothing is converted past it.
+pub fn modifications_to_hexput(value: &Wire) -> Result<Vec<Modification>, String> {
+    let Wire::Array(entries) = value else {
+        return Err(format!(
+            "`{MODIFICATIONS_KEY}` must be an array of maps with exactly the keys `{REF_KEY}` and \
+             `{HOLDER_VALUE_KEY}`"
+        ));
+    };
+    let mut modifications = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let mut path = Path::modification(index);
+        let shape = |path: &Path<'_>| {
+            format!(
+                "{} must be a map with exactly the keys `{REF_KEY}` and `{HOLDER_VALUE_KEY}`",
+                path.render()
+            )
+        };
+        let Wire::Map(fields) = entry else {
+            return Err(shape(&path));
+        };
+        let mut reference = None;
+        let mut new = None;
+        for (key, field) in fields {
+            let slot = match key.as_str() {
+                Some(REF_KEY) => &mut reference,
+                Some(HOLDER_VALUE_KEY) => &mut new,
+                _ => return Err(shape(&path)),
+            };
+            if slot.is_some() {
+                return Err(shape(&path));
+            }
+            *slot = Some(field);
+        }
+        let (Some(reference), Some(new)) = (reference, new) else {
+            return Err(shape(&path));
+        };
+        let reference = match reference.as_str() {
+            Some(text) if !text.is_empty() && text.len() <= MAX_REFERENCE_LEN => text,
+            _ => {
+                path.segments.push(Segment::Key(REF_KEY));
+                return Err(format!(
+                    "{} must be a non-empty string of at most {MAX_REFERENCE_LEN} bytes",
+                    path.render()
+                ));
+            }
+        };
+        path.segments.push(Segment::Key(HOLDER_VALUE_KEY));
+        if let Wire::Map(fields) = new
+            && fields
+                .iter()
+                .any(|(key, _)| key.as_str() == Some(SECRET_KEY))
+        {
+            return Err(format!(
+                "{} has a `__secret` key: a modification carries the value itself, never a Value \
+                 Secret holder, and its `{REF_KEY}` names the place",
+                path.render()
+            ));
+        }
+        let held = convert(new, &mut path, None)?;
+        modifications.push(Modification::new(reference, held.value));
+    }
+    Ok(modifications)
+}
+
 /// A holder's `__secret`, at `path`: a map with a string `ref` (non-empty, at most
 /// [`MAX_REFERENCE_LEN`] bytes), an optional string `key` and any further fields, every key a
 /// string appearing once. The further fields are kept in order, encoded as one MessagePack map.
@@ -376,7 +471,7 @@ pub fn measure_held(
     max_depth: usize,
     budget: &mut usize,
 ) -> Result<(), Unsendable> {
-    measure_as(value, secret, max_depth, budget, Leaving::Call)
+    measure_as(value, secret, max_depth, budget, Leaving::Call, false)
 }
 
 /// Where a value is going: a secret the execution generated travels in a `Call`, never in the
@@ -387,17 +482,22 @@ enum Leaving {
     Result,
 }
 
+/// `bare`: the value itself travels with no holder around it, whatever it carries — a
+/// modification's value (Story 3.13).
 fn measure_as(
     value: &Hexput,
     secret: Option<&Secret>,
     max_depth: usize,
     budget: &mut usize,
     leaving: Leaving,
+    bare: bool,
 ) -> Result<(), Unsendable> {
     let mut pending: Vec<(&Hexput, Option<&Secret>, usize)> = vec![(value, secret, 0)];
     while let Some((value, secret, depth)) = pending.pop() {
         let mut bytes: usize = 1;
-        if let Some(secret) = shown(value, secret, leaving) {
+        // Only the value itself sits at depth 0: everything inside it is at least one deeper.
+        let top = bare && depth == 0;
+        if !top && let Some(secret) = shown(value, secret, leaving) {
             bytes = bytes.saturating_add(holder_size(secret));
         }
         match value {
@@ -460,18 +560,69 @@ pub fn check_result(result: &Hexput) -> Result<(), Unsendable> {
 /// Which limit the result breaks.
 pub fn result_to_wire(result: &Held) -> Result<Wire, Unsendable> {
     let mut budget = MAX_FRAME_LEN;
+    result_to_wire_within(result, &mut budget)
+}
+
+/// [`result_to_wire`], counting the result's bytes against `budget` — what is left of one frame —
+/// and reducing it by them, so the result and its modifications share a frame
+/// ([`modifications_to_wire`]).
+///
+/// # Errors
+/// As [`result_to_wire`].
+pub fn result_to_wire_within(result: &Held, budget: &mut usize) -> Result<Wire, Unsendable> {
     measure_as(
         &result.value,
         result.secret.as_ref(),
         MAX_RESULT_DEPTH,
-        &mut budget,
+        budget,
         Leaving::Result,
+        false,
     )?;
     let wire = encode(&result.value, result.secret.as_ref(), Leaving::Result);
     if wire_depth(&wire) > MAX_RESULT_DEPTH {
         return Err(Unsendable::TooDeep);
     }
     Ok(wire)
+}
+
+/// A finished Script's modifications as the result payload's `modifications` (Story 3.13,
+/// decision 5): an array of `{ref, value}` maps, in order, each value the value itself with every
+/// secret nested in it emitted as a holder — a generated one too, since the Backend saw it in a
+/// `Call` — or why they cannot be sent: a value whose nesting, holders counted, passes
+/// [`MAX_MODIFICATION_DEPTH`] ([`Unsendable::TooDeep`]), or values certain to take more than the
+/// `budget` bytes left of the frame ([`Unsendable::TooLarge`]), which is reduced by what they take.
+///
+/// # Errors
+/// Which limit the modifications break.
+pub fn modifications_to_wire(
+    modifications: &[Modification],
+    budget: &mut usize,
+) -> Result<Wire, Unsendable> {
+    for modification in modifications {
+        measure_as(
+            &modification.value,
+            None,
+            MAX_MODIFICATION_DEPTH,
+            budget,
+            Leaving::Call,
+            true,
+        )?;
+        *budget = budget
+            .checked_sub(modification.reference.len())
+            .ok_or(Unsendable::TooLarge)?;
+    }
+    let mut entries = Vec::with_capacity(modifications.len());
+    for modification in modifications {
+        let value = plain(&modification.value, Leaving::Call);
+        if wire_depth(&value) > MAX_MODIFICATION_DEPTH {
+            return Err(Unsendable::TooDeep);
+        }
+        entries.push(Wire::Map(vec![
+            (Wire::from(REF_KEY), Wire::from(&*modification.reference)),
+            (Wire::from(HOLDER_VALUE_KEY), value),
+        ]));
+    }
+    Ok(Wire::Array(entries))
 }
 
 /// How many arrays, maps and extension values deep `value` nests (a scalar is `0`) — what a
@@ -519,21 +670,85 @@ pub fn payload_size(value: &Hexput, limit: usize) -> usize {
 /// never emits, not at all (Story 3.11).
 #[must_use]
 pub fn payload_size_held(value: &Hexput, secret: Option<&Secret>, limit: usize) -> usize {
+    result_payload_size(&Held::new(value.clone(), secret.cloned()), &[], limit)
+}
+
+/// The exact number of bytes a finished Script's `Result` payload takes on the wire — `{value}`,
+/// or `{value, modifications}` when there are modifications (Story 3.13), each as
+/// [`result_to_wire`] and [`modifications_to_wire`] convert them — or, once the count passes
+/// `limit` or [`MAX_FRAME_LEN`], whichever is smaller, some count past it, exactly as
+/// [`payload_size`]. What the output size budget charges; `findings` (Story 3.10) are outside it.
+#[must_use]
+pub fn result_payload_size(result: &Held, modifications: &[Modification], limit: usize) -> usize {
     let limit = limit.min(MAX_FRAME_LEN);
-    // A one-entry map (1 byte), its key `value` (a 5-byte fixstr: 6 bytes), then the value.
+    // A map of one or two entries (1 byte), its key `value` (a 5-byte fixstr: 6 bytes), then the
+    // value.
     let mut size: usize = 1 + str_size(VALUE_KEY.len());
-    let mut pending: Vec<(&Hexput, Option<&Secret>)> = vec![(value, secret)];
-    while let Some((value, secret)) = pending.pop() {
-        if size > limit {
+    walk_size(
+        &result.value,
+        result.secret.as_ref(),
+        Leaving::Result,
+        false,
+        limit,
+        &mut size,
+    );
+    if !modifications.is_empty() {
+        size = size
+            .saturating_add(str_size(MODIFICATIONS_KEY.len()))
+            .saturating_add(container_size(modifications.len()));
+        for modification in modifications {
+            if size > limit {
+                break;
+            }
+            // A two-entry map, its `ref` key and the Reference ID, its `value` key, the value.
+            size = size
+                .saturating_add(1 + str_size(REF_KEY.len()))
+                .saturating_add(str_size(modification.reference.len()))
+                .saturating_add(str_size(HOLDER_VALUE_KEY.len()));
+            walk_size(
+                &modification.value,
+                None,
+                Leaving::Call,
+                true,
+                limit,
+                &mut size,
+            );
+        }
+    }
+    size
+}
+
+/// Add the exact encoded size of `value`, in a place with `secret`, to `size` — its holders as
+/// they leave for `leaving`, none around the value itself when `bare` — stopping once `size`
+/// passes `limit`.
+fn walk_size(
+    value: &Hexput,
+    secret: Option<&Secret>,
+    leaving: Leaving,
+    bare: bool,
+    limit: usize,
+    size: &mut usize,
+) {
+    let mut pending: Vec<(&Hexput, Option<&Secret>, bool)> = vec![(value, secret, bare)];
+    while let Some((value, secret, bare)) = pending.pop() {
+        if *size > limit {
             break;
         }
-        let holder = shown(value, secret, Leaving::Result).map_or(0, holder_size);
+        let holder = if bare {
+            0
+        } else {
+            shown(value, secret, leaving).map_or(0, holder_size)
+        };
         let bytes = match value {
             Hexput::Number(number) => number_size(*number),
             Hexput::String(text) => str_size(text.len()),
             Hexput::Array(array) => {
                 let before = pending.len();
-                pending.extend(array.iter_with_secrets());
+                pending.extend(
+                    array
+                        .iter_with_secrets()
+                        .map(|(item, secret)| (item, secret, false)),
+                );
                 container_size(pending.len() - before)
             }
             Hexput::Object(object) => {
@@ -542,16 +757,15 @@ pub fn payload_size_held(value: &Hexput, secret: Option<&Secret>, limit: usize) 
                 for (key, item, secret) in object.iter_with_secrets() {
                     bytes = bytes.saturating_add(str_size(key.len()));
                     entries += 1;
-                    pending.push((item, secret));
+                    pending.push((item, secret, false));
                 }
                 bytes.saturating_add(container_size(entries))
             }
             // `null`, a bool — and any kind with no wire form, which `to_wire` sends as nil.
             _ => 1,
         };
-        size = size.saturating_add(bytes).saturating_add(holder);
+        *size = size.saturating_add(bytes).saturating_add(holder);
     }
-    size
 }
 
 /// What a holder adds around its value on the wire, exactly as [`to_wire_held`] writes it: the
@@ -688,7 +902,19 @@ pub fn to_wire_held(value: &Hexput, secret: Option<&Secret>) -> Wire {
 }
 
 fn encode(value: &Hexput, secret: Option<&Secret>, leaving: Leaving) -> Wire {
-    let plain = match value {
+    let plain = plain(value, leaving);
+    match shown(value, secret, leaving) {
+        Some(secret) => Wire::Map(vec![
+            (Wire::from(SECRET_KEY), secret_to_wire(secret)),
+            (Wire::from(HOLDER_VALUE_KEY), plain),
+        ]),
+        None => plain,
+    }
+}
+
+/// `value` with no holder around it — everything inside it with theirs.
+fn plain(value: &Hexput, leaving: Leaving) -> Wire {
+    match value {
         Hexput::Null => Wire::Nil,
         Hexput::Bool(b) => Wire::Boolean(*b),
         Hexput::Number(number) => number_to_wire(*number),
@@ -707,13 +933,6 @@ fn encode(value: &Hexput, secret: Option<&Secret>, leaving: Leaving) -> Wire {
         ),
         // `measure` refuses every kind it does not know, so this is never reached.
         _ => Wire::Nil,
-    };
-    match shown(value, secret, leaving) {
-        Some(secret) => Wire::Map(vec![
-            (Wire::from(SECRET_KEY), secret_to_wire(secret)),
-            (Wire::from(HOLDER_VALUE_KEY), plain),
-        ]),
-        None => plain,
     }
 }
 

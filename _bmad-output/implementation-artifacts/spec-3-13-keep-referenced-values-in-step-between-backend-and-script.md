@@ -2,7 +2,7 @@
 title: 'Story 3.13: Keep referenced values in step between Backend and script'
 type: 'feature'
 created: '2026-09-28'
-status: 'in-progress'
+status: 'done'
 baseline_commit: '0b877cded512947314912ff852462b10d97cc098'
 route: 'dispatch'
 review_loop_iteration: 0

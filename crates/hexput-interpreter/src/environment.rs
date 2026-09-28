@@ -18,8 +18,9 @@
 //! reclaimed exactly as before.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::heap::{BINDING, Heap, Location, Meta, RtValue, Slot, SlotId};
+use crate::heap::{BINDING, Heap, Location, Meta, Referent, RtValue, Slot, SlotId};
 use crate::value::Secret;
 
 pub(crate) struct ScopeRecord {
@@ -135,6 +136,11 @@ impl Heap {
         }
     }
 
+    /// The scope, starting at `scope` and walking outward, that binds `name`.
+    pub(crate) fn binding_owner(&self, scope: SlotId, name: &str) -> Option<SlotId> {
+        self.resolve(scope, name)
+    }
+
     /// The place `name` is bound in, seen from `scope`.
     pub(crate) fn binding_location(&self, scope: SlotId, name: &str) -> Option<Location> {
         self.resolve(scope, name)
@@ -148,17 +154,48 @@ impl Heap {
 
     /// Give the binding `name` in `owner` itself the secret `secret`, unless it has one or is not
     /// bound there; the bytes this added, which the caller charges.
+    ///
+    /// A secret it sets is indexed by its Reference ID (Story 3.13), so a Backend's modification
+    /// can find the binding.
     pub(crate) fn set_binding_secret(
         &mut self,
         owner: SlotId,
         name: &str,
         secret: Secret,
     ) -> usize {
-        match self.scope_mut(owner) {
+        let reference = Arc::clone(secret.shared_reference());
+        let bytes = match self.scope_mut(owner) {
             Some(record) if record.bindings.contains_key(name) => {
                 record.secrets.set_location(name.to_owned(), secret)
             }
             _ => 0,
+        };
+        if bytes > 0 {
+            self.index(
+                &reference,
+                Referent::Place(Location::Binding(owner, name.to_owned())),
+            );
+        }
+        bytes
+    }
+
+    /// The value of the binding `name` in `owner` itself (not its parents).
+    pub(crate) fn binding_value(&self, owner: SlotId, name: &str) -> Option<RtValue> {
+        self.scope(owner)?.bindings.get(name).cloned()
+    }
+
+    /// Overwrite the binding `name` in `owner` itself, keeping its secret — a Backend's
+    /// modification (Story 3.13). Returns `false` when `owner` no longer binds it.
+    pub(crate) fn set_binding(&mut self, owner: SlotId, name: &str, value: RtValue) -> bool {
+        match self
+            .scope_mut(owner)
+            .and_then(|record| record.bindings.get_mut(name))
+        {
+            Some(slot) => {
+                *slot = value;
+                true
+            }
+            None => false,
         }
     }
 

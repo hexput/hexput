@@ -71,7 +71,7 @@ development_status:
   3-9-switch-off-language-constructs-by-policy: review
   3-10-turn-the-static-check-on-or-off: review
   3-11-carry-hidden-metadata-on-values-the-script-cannot-touch: review
-  3-12-call-a-backend-method-on-a-keyed-object: backlog
+  3-12-call-a-backend-method-on-a-keyed-object: in-progress
   3-13-keep-referenced-values-in-step-between-backend-and-script: backlog
   epic-3-retrospective: optional
 

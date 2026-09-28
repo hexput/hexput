@@ -2,8 +2,8 @@
 title: 'Story 3.12: Call a Backend method on a keyed object'
 type: 'feature'
 created: '2026-09-28'
-status: 'ready-for-dev'
-baseline_commit: ''
+status: 'in-progress'
+baseline_commit: '67c6182607dd98e9ecc5d242fc03686ccffbd081'
 route: 'dispatch'
 review_loop_iteration: 0
 context:

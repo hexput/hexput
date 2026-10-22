@@ -18,31 +18,32 @@
 //!   supplied it, and later shut down cleanly on SIGINT/SIGTERM (Ctrl-C on Windows); or help or
 //!   the version was explicitly requested (printed to stdout).
 //! * `2` — the invocation was wrong (an unknown flag, `--config` without a value).
-//! * `1` — the System Config could not be loaded (missing, unreadable, malformed, invalid), it
-//!   names a transport no adapter serves yet, the TLS certificate or key could not be loaded
-//!   (missing, unreadable, malformed, or a key that does not match the certificate), a listener
-//!   could not be bound, or the runtime could not start. The reason is one line on stderr naming
-//!   the file, the socket path or the TCP address; nothing is left listening or on disk.
+//! * `1` — the System Config could not be loaded (missing, unreadable, malformed, invalid —
+//!   including a TCP or WebSocket section without `tls_cert`/`tls_key`), a TLS certificate or key
+//!   could not be loaded (missing, unreadable, malformed, or a key that does not match the
+//!   certificate), a listener could not be bound, or the runtime could not start. The reason is
+//!   one line on stderr naming the file, the socket path or the TCP/WebSocket address; nothing is
+//!   left listening or on disk.
 //!
 //! # Serving
 //!
-//! The Daemon serves every configured transport an adapter exists for (`hexput-transport`): the
-//! Unix Domain Socket and TCP with mandatory TLS (Story 5.1). Startup runs in a fixed order —
-//! load the TLS identity, bind the socket, bind the TCP listener — so a bad certificate binds
-//! nothing, and a TCP bind failure closes the socket bound before it. Everything is bound
-//! before the Daemon announces that it started; the TCP listener's actual address is logged
-//! (`"listening on TCP with TLS"`, field `address`). Each accepted connection is its own Tokio
-//! task running `hexput_connection::serve`, which is generic over the Port and never learns the
-//! transport (AD-1); a connection that fails, disconnects abruptly or panics ends only its own
-//! task. A TCP connection's TLS handshake runs inside that task, bounded by
+//! The Daemon serves every configured transport from one accept loop (`hexput-transport`): the
+//! Unix Domain Socket, TCP with mandatory TLS (Story 5.1) and WebSocket with mandatory TLS
+//! (Story 5.2). Startup runs in a fixed order — load the TCP TLS identity, load the WebSocket
+//! TLS identity (separately, even when it names the same files), bind the socket, bind the TCP
+//! listener, bind the WebSocket listener — so a bad certificate binds nothing, and a bind
+//! failure closes every listener bound before it. Everything is bound before the Daemon
+//! announces that it started; each network listener's actual address is logged
+//! (`"listening on TCP with TLS"` / `"listening on WebSocket with TLS"`, field `address`). Each
+//! accepted connection is its own Tokio task running `hexput_connection::serve`, which is generic
+//! over the Port and never learns the transport (AD-1); a connection that fails, disconnects
+//! abruptly or panics ends only its own task. A TCP connection's TLS handshake, and a WebSocket
+//! connection's TLS handshake and upgrade, run inside that task, bounded by
 //! `hexput_transport::tcp_tls::HANDSHAKE_TIMEOUT`, so a slow peer never stalls the accept loop;
 //! a failed handshake closes that socket and is logged at `debug` with the peer's address
-//! (`"TLS handshake failed"`). Every connection shares the run's one Session registry
-//! (`hexput-session`), which is where an `Init` creates a Session. On shutdown the Daemon stops
-//! accepting on every listener and removes the socket file it created.
-//!
-//! WebSocket has no adapter until Story 5.2: a System Config naming it is refused at startup, so
-//! the Daemon never appears to listen where it does not.
+//! (`"TLS handshake failed"` / `"WebSocket handshake failed"`). Every connection shares the run's
+//! one Session registry (`hexput-session`), which is where an `Init` creates a Session. On
+//! shutdown the Daemon stops accepting on every listener and removes the socket file it created.
 
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
@@ -64,6 +65,8 @@ use hexput_session::Sessions;
 use hexput_transport::tcp_tls::{TcpTlsListener, TlsIdentity};
 #[cfg(unix)]
 use hexput_transport::uds::UdsListener;
+#[cfg(unix)]
+use hexput_transport::websocket::WebSocketListener;
 use tracing_subscriber::filter::LevelFilter;
 
 // Re-exported so a caller of `run_with` (and `hexput-bin`) can name these without a direct
@@ -305,6 +308,25 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                         tokio::time::sleep(ACCEPT_BACKOFF).await;
                     }
                 },
+                accepted = accept(listeners.websocket.as_ref(), WebSocketListener::accept) => match accepted {
+                    Ok(handshake) => {
+                        let (sessions, cache) = (Arc::clone(&sessions), Arc::clone(&cache));
+                        // The TLS handshake and the upgrade run in the connection's own task.
+                        connections.spawn(async move {
+                            let peer = handshake.peer_addr();
+                            match handshake.finish().await {
+                                Ok(port) => hexput_connection::serve(port, sessions, cache).await,
+                                Err(error) => {
+                                    tracing::debug!(%peer, %error, "WebSocket handshake failed");
+                                }
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(transport = "websocket", %error, "cannot accept a connection");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    }
+                },
             }
         }
         // Aborted connection tasks never reach their detach, so no Session is torn down one by
@@ -346,12 +368,14 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, _shutdown: S) -> Result<
 struct Listeners {
     uds: Option<UdsListener>,
     tcp: Option<TcpTlsListener>,
+    websocket: Option<WebSocketListener>,
 }
 
 #[cfg(unix)]
 impl Listeners {
     /// Stop accepting on every listener and remove the socket file.
     fn close(self) {
+        drop(self.websocket);
         drop(self.tcp);
         if let Some(uds) = self.uds {
             close_uds(uds);
@@ -367,21 +391,15 @@ fn close_uds(listener: UdsListener) {
     }
 }
 
-/// Bind every configured listener, in the fixed startup order: load the TLS identity, bind the
-/// Unix Domain Socket, bind the TCP listener. A System Config naming a transport no adapter
-/// serves yet is refused before anything is bound, and a failure after the socket is bound
-/// closes it again, so a failed start leaves nothing listening or on disk.
+/// Bind every configured listener, in the fixed startup order: load the TCP TLS identity, load
+/// the WebSocket TLS identity, bind the Unix Domain Socket, bind the TCP listener, bind the
+/// WebSocket listener. A failure after a listener is bound closes every listener bound before
+/// it, so a failed start leaves nothing listening or on disk.
 #[cfg(unix)]
 async fn listen(loaded: &Loaded) -> Result<Listeners, String> {
     let transports = &loaded.config.transports;
-    if transports.websocket.is_some() {
-        return Err(format!(
-            "{}: [transport.websocket] not supported yet; only [transport.uds] and \
-             [transport.tcp] are served in this version",
-            loaded.path.display(),
-        ));
-    }
-    // 1. The TLS identity, before anything is bound: a bad certificate binds nothing.
+    // 1–2. The TLS identities, before anything is bound: a bad certificate binds nothing. The
+    // WebSocket identity is loaded on its own even when it names the TCP files.
     let tcp = match transports.tcp.as_ref() {
         None => None,
         Some(tcp) => Some((
@@ -389,7 +407,15 @@ async fn listen(loaded: &Loaded) -> Result<Listeners, String> {
             TlsIdentity::load(&tcp.tls.cert, &tcp.tls.key).map_err(|error| error.to_string())?,
         )),
     };
-    // 2. The Unix Domain Socket.
+    let websocket = match transports.websocket.as_ref() {
+        None => None,
+        Some(websocket) => Some((
+            websocket.bind,
+            TlsIdentity::load(&websocket.tls.cert, &websocket.tls.key)
+                .map_err(|error| error.to_string())?,
+        )),
+    };
+    // 3. The Unix Domain Socket.
     let uds = match transports.uds.as_ref() {
         None => None,
         Some(uds) => {
@@ -404,7 +430,7 @@ async fn listen(loaded: &Loaded) -> Result<Listeners, String> {
             Some(listener)
         }
     };
-    // 3. The TCP listener.
+    // 4. The TCP listener.
     let tcp = match tcp {
         None => None,
         Some((bind, identity)) => match TcpTlsListener::bind(bind, identity).await {
@@ -421,7 +447,31 @@ async fn listen(loaded: &Loaded) -> Result<Listeners, String> {
             }
         },
     };
-    Ok(Listeners { uds, tcp })
+    // 5. The WebSocket listener.
+    let websocket = match websocket {
+        None => None,
+        Some((bind, identity)) => match WebSocketListener::bind(bind, identity).await {
+            Ok(listener) => {
+                let address = listener.local_addr().unwrap_or(bind);
+                tracing::info!(%address, "listening on WebSocket with TLS");
+                Some(listener)
+            }
+            Err(error) => {
+                Listeners {
+                    uds,
+                    tcp,
+                    websocket: None,
+                }
+                .close();
+                return Err(format!("{bind}: cannot listen for WebSocket: {error}"));
+            }
+        },
+    };
+    Ok(Listeners {
+        uds,
+        tcp,
+        websocket,
+    })
 }
 
 /// A `fmt` subscriber writing to `log` in the System Config's `log_format`, filtered at its

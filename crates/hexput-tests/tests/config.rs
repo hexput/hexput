@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use hexput_config::{
-    ConfigError, ConfigSource, DEFAULT_AST_CACHE_CAPACITY, DEFAULT_SESSION_TTL, ENV_VAR, Location,
-    LogFormat, LogLevel, Problem, parse, resolve,
+    ConfigError, ConfigSource, DEFAULT_AST_CACHE_CAPACITY, DEFAULT_SESSION_TTL,
+    DEFAULT_WEBSOCKET_PORT, ENV_VAR, Location, LogFormat, LogLevel, Problem, parse, resolve,
 };
 
 /// A temporary directory, removed when the test ends.
@@ -108,7 +108,8 @@ tls_key = "/tls/ws-key.pem"
     assert_eq!(tcp.tls.key, Path::new("/tls/tcp-key.pem"));
     let websocket = config.transports.websocket.expect("a WebSocket transport");
     assert_eq!(websocket.bind, "[::1]:7401".parse::<SocketAddr>().unwrap());
-    let tls = websocket.tls.expect("WebSocket TLS");
+    // Story 5.2: TLS is required for WebSocket, so the pair is always present.
+    let tls = websocket.tls;
     assert_eq!(tls.cert, Path::new("/tls/ws-cert.pem"));
     assert_eq!(tls.key, Path::new("/tls/ws-key.pem"));
 }
@@ -153,10 +154,36 @@ fn every_log_format_is_accepted() {
 }
 
 #[test]
-fn a_websocket_transport_may_omit_tls() {
-    let config = parse("[transport.websocket]\nbind = \"127.0.0.1:7401\"\n").expect("valid");
-    let websocket = config.transports.websocket.expect("a WebSocket transport");
-    assert!(websocket.tls.is_none());
+fn a_websocket_transport_must_give_tls_and_a_missing_pair_is_refused() {
+    // Story 5.2: `tls_cert` and `tls_key` are required, as for TCP. Leaving the pair out is
+    // refused at parse time, never listened on in cleartext.
+    for (text, field) in [
+        (
+            "[transport.websocket]\nbind = \"127.0.0.1:7401\"\n",
+            "tls_cert",
+        ),
+        (
+            "[transport.websocket]\nbind = \"127.0.0.1:7401\"\ntls_cert = \"c\"\n",
+            "tls_key",
+        ),
+        (
+            "[transport.websocket]\nbind = \"127.0.0.1:7401\"\ntls_key = \"k\"\n",
+            "tls_cert",
+        ),
+    ] {
+        match parse_err(text) {
+            Problem::Parse {
+                message, location, ..
+            } => {
+                assert!(
+                    message.contains(&format!("missing field `{field}`")),
+                    "{text:?}: {message}"
+                );
+                assert!(location.is_some(), "{text:?} gives its position");
+            }
+            other => panic!("{text:?}: expected a missing-field error, got {other:?}"),
+        }
+    }
 }
 
 /// The documentation cannot drift from the parser: the shipped example must parse, set every
@@ -174,7 +201,13 @@ fn the_example_file_parses_and_documents_every_field() {
         .transports
         .websocket
         .expect("the example sets WebSocket");
-    assert!(websocket.tls.is_some(), "the example sets WebSocket TLS");
+    assert_eq!(
+        websocket.bind,
+        "0.0.0.0:7478".parse::<std::net::SocketAddr>().unwrap(),
+        "the example's bare-IP WebSocket bind takes the default port"
+    );
+    assert_eq!(websocket.tls.cert, Path::new("/etc/hexput/tls/cert.pem"));
+    assert_eq!(websocket.tls.key, Path::new("/etc/hexput/tls/key.pem"));
     assert_eq!(config.log_level, LogLevel::Info);
     assert_eq!(config.session_ttl, DEFAULT_SESSION_TTL);
     assert!(text.contains("defaults to \"info\""));
@@ -397,6 +430,14 @@ fn every_field_of_a_present_transport_is_required() {
             "tls_key",
         ),
         ("[transport.websocket]\n", "bind"),
+        (
+            "[transport.websocket]\nbind = \"127.0.0.1:7401\"\ntls_key = \"k\"\n",
+            "tls_cert",
+        ),
+        (
+            "[transport.websocket]\nbind = \"127.0.0.1:7401\"\ntls_cert = \"c\"\n",
+            "tls_key",
+        ),
     ] {
         match parse_err(text) {
             Problem::Parse { message, .. } => assert!(
@@ -409,23 +450,20 @@ fn every_field_of_a_present_transport_is_required() {
 }
 
 #[test]
-fn half_a_websocket_tls_pair_is_rejected_naming_the_missing_half() {
+fn a_websocket_section_without_its_tls_pair_is_rejected_with_the_field_and_its_position() {
+    // Story 5.2: the half-pair check is gone; serde's missing-field error names the field and
+    // gives the line and column, as every other System Config error does.
     let (path, text) = rendered_error(
         "log_level = \"info\"\n[transport.websocket]\nbind = \"127.0.0.1:1\"\ntls_cert = \"c\"\n",
     );
-    assert_eq!(
-        text,
-        format!(
-            "{}:2:1: invalid value for `transport.websocket`: tls_cert and tls_key must be \
-             given together or not at all; `tls_cert` is set but `tls_key` is missing",
-            path.display()
-        )
+    assert!(
+        text.starts_with(&format!("{}:", path.display())),
+        "names the file: {text}"
     );
+    assert!(text.contains("missing field `tls_key`"), "{text}");
     match parse_err("[transport.websocket]\nbind = \"127.0.0.1:1\"\ntls_key = \"k\"\n") {
-        Problem::InvalidValue { message, .. } => {
-            assert!(message.ends_with("`tls_key` is set but `tls_cert` is missing"))
-        }
-        other => panic!("expected an invalid value, got {other:?}"),
+        Problem::Parse { message, .. } => assert!(message.contains("missing field `tls_cert`")),
+        other => panic!("expected a missing-field error, got {other:?}"),
     }
 }
 
@@ -489,7 +527,9 @@ fn a_session_ttl_of_the_wrong_type_is_rejected() {
 
 #[test]
 fn a_bind_that_is_not_an_address_and_port_is_rejected() {
-    match parse_err("[transport.websocket]\nbind = \"localhost\"\n") {
+    match parse_err(
+        "[transport.websocket]\nbind = \"localhost\"\ntls_cert = \"c\"\ntls_key = \"k\"\n",
+    ) {
         Problem::InvalidValue {
             field,
             location,
@@ -601,7 +641,7 @@ fn unknown_keys_are_rejected_at_every_level() {
         ),
         ("[transport.pipe]\nname = \"x\"\n", "pipe"),
         (
-            "[transport.websocket]\nbind = \"127.0.0.1:1\"\ntls = true\n",
+            "[transport.websocket]\nbind = \"127.0.0.1:1\"\ntls_cert = \"c\"\ntls_key = \"k\"\ntls = true\n",
             "tls",
         ),
     ] {
@@ -778,14 +818,28 @@ fn an_unparsable_tcp_bind_names_the_field_and_says_the_port_is_optional() {
 }
 
 #[test]
-fn a_bare_ip_websocket_bind_still_needs_a_port() {
-    // Story 5.2 owns the WebSocket default (7478); until then the port stays required.
-    for bind in ["127.0.0.1", "::1"] {
-        match parse_err(&format!("[transport.websocket]\nbind = \"{bind}\"\n")) {
-            Problem::InvalidValue { field, .. } => {
-                assert_eq!(field, "transport.websocket.bind", "{bind}");
-            }
-            other => panic!("{bind}: expected an invalid bind, got {other:?}"),
-        }
+fn a_bare_ip_websocket_bind_listens_on_the_default_port_7478() {
+    // Story 5.2: the WebSocket default port is 7478, as FR-29 fixes it.
+    assert_eq!(DEFAULT_WEBSOCKET_PORT, 7478);
+    for (bind, expected) in [("127.0.0.1", "127.0.0.1:7478"), ("::1", "[::1]:7478")] {
+        let config = parse(&format!(
+            "[transport.websocket]\nbind = \"{bind}\"\ntls_cert = \"c\"\ntls_key = \"k\"\n"
+        ))
+        .unwrap_or_else(|error| panic!("{bind}: {error:?}"));
+        let websocket = config.transports.websocket.expect("a WebSocket transport");
+        assert_eq!(
+            websocket.bind,
+            expected.parse::<SocketAddr>().unwrap(),
+            "{bind}"
+        );
     }
+    // A port given explicitly still wins over the default.
+    let config = parse(
+        "[transport.websocket]\nbind = \"127.0.0.1:7401\"\ntls_cert = \"c\"\ntls_key = \"k\"\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        config.transports.websocket.unwrap().bind,
+        "127.0.0.1:7401".parse::<SocketAddr>().unwrap()
+    );
 }

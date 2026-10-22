@@ -1062,25 +1062,8 @@ fn every_startup_failure_exits_one_naming_the_cause_and_touches_nothing() {
         run.stderr
     );
 
-    // Transports no adapter serves yet, alone or beside UDS. (TCP+TLS is served: Story 5.1.)
-    for (name, extra, expected) in [(
-        "ws.toml",
-        "[transport.websocket]\nbind = \"127.0.0.1:7401\"\n",
-        "[transport.websocket] not supported yet",
-    )] {
-        for text in [extra.to_owned(), format!("{}{extra}", sandbox.valid())] {
-            let config = sandbox.file(name, &text);
-            let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
-            run.exit(1);
-            assert!(
-                run.stderr
-                    .starts_with(&format!("error: {}: {expected}", config.display())),
-                "{}",
-                run.stderr
-            );
-            assert!(!socket.exists(), "nothing is bound: {text}");
-        }
-    }
+    // Story 5.2: WebSocket is served now, so it no longer has a "not supported yet" refusal;
+    // its startup failures are tested beside the other TLS ones in `mod tls_serving`.
 
     // An invalid mode is a System Config error, before anything is bound.
     let config = sandbox.file("mode.toml", &format!("{}mode = \"rw\"\n", sandbox.valid()));
@@ -2664,6 +2647,19 @@ mod tls_serving {
         )
     }
 
+    /// The `[transport.websocket]` section for `bind`, with the fixture leaf identity (Story 5.2).
+    fn websocket_section(bind: &str) -> String {
+        websocket_section_with(bind, &fixture("server.pem"), &fixture("server.key"))
+    }
+
+    fn websocket_section_with(bind: &str, cert: &Path, key: &Path) -> String {
+        format!(
+            "[transport.websocket]\nbind = {bind:?}\ntls_cert = {:?}\ntls_key = {:?}\n",
+            cert.to_str().unwrap(),
+            key.to_str().unwrap()
+        )
+    }
+
     /// A Daemon running on its own thread until `stop`.
     pub struct Daemon {
         stop: tokio::sync::oneshot::Sender<()>,
@@ -2720,10 +2716,17 @@ mod tls_serving {
 
         /// The TCP listener's actual address, read from the startup log line.
         pub fn tcp_address(&self) -> SocketAddr {
-            let text = self.log_with("listening on TCP with TLS");
+            self.bound_address("TCP")
+        }
+
+        /// The actual address of the `transport` listener (`TCP`, `WebSocket`), read from its
+        /// `listening on <transport> with TLS` startup line.
+        pub fn bound_address(&self, transport: &str) -> SocketAddr {
+            let needle = format!("listening on {transport} with TLS");
+            let text = self.log_with(&needle);
             let line = text
                 .lines()
-                .find(|line| line.contains("listening on TCP with TLS"))
+                .find(|line| line.contains(&needle))
                 .expect("the line");
             let field = line
                 .split("address=")
@@ -3130,6 +3133,430 @@ mod tls_serving {
             run.stderr
         );
         assert!(!sandbox.socket().exists(), "the UDS socket is removed");
+        drop(holder);
+    }
+
+    // --- Story 5.2: WebSocket ---
+
+    /// A blocking WebSocket client: a current-thread runtime drives tokio-tungstenite over
+    /// tokio-rustls, trusting only the fixture CA, for the name `localhost`.
+    pub struct Wss {
+        runtime: tokio::runtime::Runtime,
+        socket: tokio_tungstenite::WebSocketStream<
+            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        >,
+    }
+
+    impl Wss {
+        pub fn connect(addr: SocketAddr) -> Self {
+            let mut roots = rustls::RootCertStore::empty();
+            for certificate in rustls::pki_types::CertificateDer::pem_file_iter(fixture("ca.pem"))
+                .expect("the CA file")
+            {
+                roots.add(certificate.unwrap()).unwrap();
+            }
+            let config = Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            let socket = runtime.block_on(async {
+                let tcp = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .expect("connects");
+                let tls = tokio_rustls::TlsConnector::from(config)
+                    .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                    .await
+                    .expect("the TLS handshake succeeds");
+                let (socket, _response) = tokio_tungstenite::client_async("wss://localhost/", tls)
+                    .await
+                    .expect("the WebSocket upgrade succeeds");
+                socket
+            });
+            Self { runtime, socket }
+        }
+
+        /// Send one envelope as one binary message.
+        pub fn send(&mut self, envelope: &Envelope<Value>) {
+            use futures_util::SinkExt;
+            let bytes = encode(envelope).unwrap();
+            let socket = &mut self.socket;
+            self.runtime
+                .block_on(socket.send(tokio_tungstenite::tungstenite::Message::Binary(
+                    bytes.into(),
+                )))
+                .expect("the message is sent");
+        }
+
+        /// The next reply, decoded, or `None` once the Daemon has closed.
+        pub fn reply(&mut self) -> Option<Envelope<Value>> {
+            use futures_util::StreamExt;
+            use tokio_tungstenite::tungstenite::Message;
+            let socket = &mut self.socket;
+            self.runtime.block_on(async {
+                loop {
+                    match socket.next().await {
+                        None | Some(Err(_)) => return None,
+                        Some(Ok(Message::Binary(bytes))) => return Some(decode(&bytes).unwrap()),
+                        Some(Ok(Message::Close(_))) => return None,
+                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                        Some(Ok(other)) => panic!("expected a binary message, got {other:?}"),
+                    }
+                }
+            })
+        }
+
+        /// Send `text` as one WebSocket text message, which Hexput never accepts as a frame.
+        pub fn send_text(&mut self, text: &str) {
+            use futures_util::SinkExt;
+            let socket = &mut self.socket;
+            self.runtime
+                .block_on(socket.send(tokio_tungstenite::tungstenite::Message::Text(text.into())))
+                .expect("the message is sent");
+        }
+
+        /// Drop the TCP stream with no Close frame and no `close_notify` (an intermediary
+        /// dropping the connection).
+        pub fn vanish(self) {
+            let Self { runtime, socket } = self;
+            drop(socket);
+            drop(runtime);
+        }
+    }
+
+    /// Init, then `return 1 + 2;`, over a WebSocket client.
+    fn wss_init_and_run(client: &mut Wss) -> (Envelope<Value>, Envelope<Value>) {
+        client.send(&frames::init(1));
+        let init = client.reply().expect("an Init reply");
+        client.send(&frames::request(2, "return 1 + 2;"));
+        let run = client.reply().expect("an execution reply");
+        (init, run)
+    }
+
+    #[test]
+    fn a_wss_client_gets_the_same_replies_as_a_uds_client() {
+        let sandbox = Sandbox::new();
+        let config = format!("{}{}", sandbox.valid(), websocket_section("127.0.0.1:0"));
+        let daemon = Daemon::start(&sandbox, &config);
+        let addr = daemon.bound_address("WebSocket");
+        assert_ne!(addr.port(), 0, "the actual bound address is logged");
+
+        let (uds_init, uds_run) = init_and_run(&mut daemon.uds(&sandbox.socket()));
+        let (wss_init, wss_run) = wss_init_and_run(&mut Wss::connect(addr));
+
+        assert_eq!(value_of(&uds_run), 3);
+        assert_eq!(value_of(&wss_run), 3);
+        assert_eq!(wss_run.id, Some(CorrelationId(2)));
+        assert_eq!(wss_run.id, uds_run.id);
+        assert_eq!(wss_run.message_type, uds_run.message_type);
+        assert_eq!(wss_run.payload, uds_run.payload, "identical to UDS");
+        assert_eq!(wss_init.message_type, uds_init.message_type);
+        assert_eq!(client_id(&wss_init).len(), 32);
+        assert_ne!(
+            client_id(&wss_init),
+            client_id(&uds_init),
+            "one Session each"
+        );
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn uds_tcp_and_websocket_are_served_by_one_daemon_each_answering() {
+        let sandbox = Sandbox::new();
+        let config = format!(
+            "{}{}{}",
+            sandbox.valid(),
+            tcp_section("127.0.0.1:0"),
+            websocket_section("127.0.0.1:0")
+        );
+        let daemon = Daemon::start(&sandbox, &config);
+        let tcp = daemon.tcp_address();
+        let websocket = daemon.bound_address("WebSocket");
+        assert_ne!(tcp, websocket, "two listeners, two ports");
+
+        let (uds_init, uds_run) = init_and_run(&mut daemon.uds(&sandbox.socket()));
+        let (tcp_init, tcp_run) = init_and_run(&mut tls(tcp));
+        let (wss_init, wss_run) = wss_init_and_run(&mut Wss::connect(websocket));
+
+        for run in [&uds_run, &tcp_run, &wss_run] {
+            assert_eq!(value_of(run), 3);
+            assert_eq!(
+                run.payload, uds_run.payload,
+                "the same reply on every transport"
+            );
+        }
+        let ids = [&uds_init, &tcp_init, &wss_init].map(client_id);
+        assert!(
+            ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2],
+            "{ids:?}"
+        );
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn a_bare_ip_websocket_bind_listens_on_the_default_port_7478() {
+        // The one test that needs the fixed WebSocket port: skipped, not failed, when something
+        // else on the machine already holds it.
+        if let Err(error) = TcpListener::bind(("127.0.0.1", 7478)) {
+            eprintln!("skipped: 127.0.0.1:7478 is unavailable: {error}");
+            return;
+        }
+        let sandbox = Sandbox::new();
+        let daemon = Daemon::start(&sandbox, &websocket_section("127.0.0.1"));
+        let addr = daemon.bound_address("WebSocket");
+        assert_eq!(addr.port(), 7478, "{addr}");
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert!(
+            daemon
+                .log_with("listening on WebSocket with TLS")
+                .lines()
+                .any(|line| line.contains("address=127.0.0.1:7478")),
+            "the log names the default port"
+        );
+
+        let (init, run) =
+            wss_init_and_run(&mut Wss::connect(SocketAddr::from(([127, 0, 0, 1], 7478))));
+        assert_eq!(client_id(&init).len(), 32);
+        assert_eq!(value_of(&run), 3);
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn a_plaintext_websocket_probe_is_never_upgraded_is_logged_at_debug_and_disturbs_no_wss_client()
+    {
+        let sandbox = Sandbox::new();
+        let config = format!(
+            "log_level = \"debug\"\n{}",
+            websocket_section("127.0.0.1:0")
+        );
+        let daemon = Daemon::start(&sandbox, &config);
+        let addr = daemon.bound_address("WebSocket");
+
+        // A cleartext HTTP upgrade request, exactly what a browser or proxy would send.
+        let mut plain = TcpStream::connect(addr).unwrap();
+        plain
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let probe_addr = plain.local_addr().unwrap();
+        plain
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            )
+            .unwrap();
+
+        // No upgrade response and no frame ever come back; the socket is closed. At most a TLS
+        // alert record (content type 0x15) is sent.
+        let mut bytes = Vec::new();
+        match plain.read_to_end(&mut bytes) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("the socket was not closed: {error}"),
+        }
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("101"),
+            "{bytes:02x?}"
+        );
+        assert!(bytes.is_empty() || bytes[0] == 0x15, "{bytes:02x?}");
+
+        let log = daemon.log_with("WebSocket handshake failed");
+        let line = log
+            .lines()
+            .find(|line| line.contains("WebSocket handshake failed"))
+            .unwrap();
+        assert!(line.contains(" DEBUG "), "{line}");
+        assert!(
+            line.contains(&probe_addr.to_string()),
+            "the peer address is logged: {line}"
+        );
+
+        // The Daemon is unaffected: a WSS client still completes Init and a run.
+        let (init, run) = wss_init_and_run(&mut Wss::connect(addr));
+        assert_eq!(init.message_type, MessageType::Result);
+        assert_eq!(value_of(&run), 3);
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn a_text_message_is_answered_with_a_malformed_frame_error_and_reading_continues() {
+        let sandbox = Sandbox::new();
+        let daemon = Daemon::start(&sandbox, &websocket_section("127.0.0.1:0"));
+        let mut client = Wss::connect(daemon.bound_address("WebSocket"));
+
+        client.send_text("hello");
+        let refused = client.reply().expect("an Error reply");
+        assert_eq!(refused.id, None, "a text message names no request");
+        assert_eq!(super::error_code_of(&refused), "protocol.malformed_frame");
+
+        // The connection is still read: a binary request after it is answered normally.
+        let (init, run) = wss_init_and_run(&mut client);
+        assert_eq!(init.message_type, MessageType::Result);
+        assert_eq!(value_of(&run), 3);
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn an_intermediary_drop_detaches_the_connection_and_the_daemon_keeps_serving() {
+        let sandbox = Sandbox::new();
+        let config = format!(
+            "log_level = \"debug\"\n{}{}",
+            sandbox.valid(),
+            websocket_section("127.0.0.1:0")
+        );
+        let daemon = Daemon::start(&sandbox, &config);
+        let addr = daemon.bound_address("WebSocket");
+
+        // Init, then the TCP stream vanishes with no Close frame and no `close_notify`.
+        let mut dropped = Wss::connect(addr);
+        dropped.send(&frames::init(1));
+        assert_eq!(
+            dropped.reply().expect("an Init reply").message_type,
+            MessageType::Result
+        );
+        dropped.vanish();
+        daemon.log_with("connection detached from its Session");
+
+        // A new WSS client and a UDS client are still served.
+        let (_, wss_run) = wss_init_and_run(&mut Wss::connect(addr));
+        let (_, uds_run) = init_and_run(&mut daemon.uds(&sandbox.socket()));
+        assert_eq!(value_of(&wss_run), 3);
+        assert_eq!(value_of(&uds_run), 3);
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn shutdown_stops_the_websocket_listener_too() {
+        let sandbox = Sandbox::new();
+        let daemon = Daemon::start(&sandbox, &websocket_section("127.0.0.1:0"));
+        let addr = daemon.bound_address("WebSocket");
+        let (_, run) = wss_init_and_run(&mut Wss::connect(addr));
+        assert_eq!(value_of(&run), 3);
+
+        daemon.stop().exit(0);
+        assert!(
+            TcpStream::connect(addr).is_err(),
+            "no longer listening on WebSocket"
+        );
+    }
+
+    #[test]
+    fn every_websocket_startup_failure_exits_one_naming_the_file_and_leaves_nothing_behind() {
+        let sandbox = Sandbox::new();
+        let (cert, key) = (fixture("server.pem"), fixture("server.key"));
+        let key_text = std::fs::read_to_string(&key).unwrap();
+        let cert_text = std::fs::read_to_string(&cert).unwrap();
+        let no_certificate = sandbox.file("ws-no-certificate.pem", &key_text);
+        let no_key = sandbox.file("ws-no-key.key", &cert_text);
+        let malformed = sandbox.file(
+            "ws-malformed.pem",
+            "-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n",
+        );
+        let absent_cert = sandbox.dir.join("ws-absent.pem");
+        let absent_key = sandbox.dir.join("ws-absent.key");
+        let other_key = fixture("other.key");
+
+        // (certificate, key, the file the error must name)
+        let cases = [
+            (absent_cert.clone(), key.clone(), absent_cert.clone()),
+            (cert.clone(), absent_key.clone(), absent_key.clone()),
+            (sandbox.dir.clone(), key.clone(), sandbox.dir.clone()),
+            (no_certificate.clone(), key.clone(), no_certificate.clone()),
+            (cert.clone(), no_key.clone(), no_key.clone()),
+            (malformed.clone(), key.clone(), malformed.clone()),
+            (cert.clone(), other_key.clone(), other_key.clone()),
+        ];
+        for (cert_path, key_path, named) in cases {
+            let config = sandbox.file(
+                "ws-tls.toml",
+                &format!(
+                    "{}{}",
+                    sandbox.valid(),
+                    websocket_section_with("127.0.0.1:0", &cert_path, &key_path)
+                ),
+            );
+            let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+            run.exit(1);
+            assert!(
+                run.stderr
+                    .starts_with(&format!("error: {}: ", named.display())),
+                "{}: {}",
+                named.display(),
+                run.stderr
+            );
+            assert_eq!(run.stderr.lines().count(), 1, "one line: {}", run.stderr);
+            assert!(!run.log.contains("listening on"), "{}", run.log);
+            assert!(
+                !sandbox.socket().exists(),
+                "nothing is bound: {}",
+                named.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_websocket_section_without_its_tls_pair_exits_one_naming_the_field() {
+        let sandbox = Sandbox::new();
+        for text in [
+            "[transport.websocket]\nbind = \"127.0.0.1:0\"\n",
+            "[transport.websocket]\nbind = \"127.0.0.1:0\"\ntls_cert = \"c\"\n",
+            "[transport.websocket]\nbind = \"127.0.0.1:0\"\ntls_key = \"k\"\n",
+        ] {
+            let config = sandbox.file("ws-no-tls.toml", &format!("{}{text}", sandbox.valid()));
+            let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+            run.exit(1);
+            assert!(
+                run.stderr
+                    .starts_with(&format!("error: {}:", config.display())),
+                "{}",
+                run.stderr
+            );
+            assert!(run.stderr.contains("missing field `tls_"), "{}", run.stderr);
+            assert!(!run.log.contains("listening on"), "{}", run.log);
+            assert!(!sandbox.socket().exists(), "nothing is bound: {text}");
+        }
+    }
+
+    #[test]
+    fn a_websocket_address_in_use_exits_one_and_unbinds_the_listeners_before_it() {
+        let sandbox = Sandbox::new();
+        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = holder.local_addr().unwrap();
+        // A free TCP port, bound by the Daemon before WebSocket is tried.
+        let tcp = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let config = sandbox.file(
+            "config.toml",
+            &format!(
+                "{}{}{}",
+                sandbox.valid(),
+                tcp_section(&tcp.to_string()),
+                websocket_section(&taken.to_string())
+            ),
+        );
+        let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+        run.exit(1);
+        assert!(
+            run.stderr
+                .starts_with(&format!("error: {taken}: cannot listen for WebSocket: ")),
+            "{}",
+            run.stderr
+        );
+        assert!(!sandbox.socket().exists(), "the UDS socket is removed");
+        assert!(
+            TcpStream::connect(tcp).is_err(),
+            "the TCP listener is unbound"
+        );
         drop(holder);
     }
 }

@@ -37,15 +37,18 @@
 //! tls_cert = "/etc/hexput/tls/cert.pem"
 //! tls_key = "/etc/hexput/tls/key.pem"
 //!
-//! [transport.websocket]       # TLS optional, but tls_cert and tls_key come together or not at all
-//! bind = "0.0.0.0:7478"
+//! [transport.websocket]       # WebSocket always uses TLS too: both paths are required
+//! bind = "0.0.0.0"            # an IP, with an optional port — default port 7478
+//! tls_cert = "/etc/hexput/tls/cert.pem"
+//! tls_key = "/etc/hexput/tls/key.pem"
 //! ```
 //!
 //! `crates/hexput-config/config.example.toml` documents every field, and a test parses it so the
 //! example cannot drift from this parser. Every field inside a present transport section is
-//! required, except that a TCP `bind` may leave out its port, which is then
-//! [`DEFAULT_TCP_PORT`]; only `log_level`, `log_format`, `session_ttl_secs` and
-//! `ast_cache_capacity` have defaults, and all four are stated above.
+//! required, except that a `bind` may leave out its port, which is then
+//! [`DEFAULT_TCP_PORT`] for TCP and [`DEFAULT_WEBSOCKET_PORT`] for WebSocket; only `log_level`,
+//! `log_format`, `session_ttl_secs` and `ast_cache_capacity` have defaults, and all four are
+//! stated above.
 //! Unknown keys are rejected, so a typo cannot silently drop a setting. Paths are kept exactly as
 //! written; a relative path is relative to the Daemon's working directory, not to the file.
 //!
@@ -91,6 +94,10 @@ pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
 /// The port `[transport.tcp]` listens on when its `bind` names an IP without a port (FR-29,
 /// Story 5.1). Fixed and documented, so a Backend can rely on it.
 pub const DEFAULT_TCP_PORT: u16 = 7476;
+
+/// The port `[transport.websocket]` listens on when its `bind` names an IP without a port
+/// (FR-29, Story 5.2). Fixed and documented, so a Backend can rely on it.
+pub const DEFAULT_WEBSOCKET_PORT: u16 = 7478;
 
 /// `ast_cache_capacity` when the file does not set it: the most registered Scripts the AST Cache
 /// holds at once, across every Session (Story 4.3).
@@ -138,7 +145,7 @@ pub struct Transports {
     pub uds: Option<UdsTransport>,
     /// `[transport.tcp]`: TCP, always with TLS.
     pub tcp: Option<TcpTransport>,
-    /// `[transport.websocket]`: WebSocket, with or without TLS.
+    /// `[transport.websocket]`: WebSocket, always with TLS.
     pub websocket: Option<WebSocketTransport>,
 }
 
@@ -168,10 +175,11 @@ pub struct TcpTransport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WebSocketTransport {
-    /// The address and port to listen on.
+    /// The address and port to listen on. The file may give an IP alone; the port is then
+    /// [`DEFAULT_WEBSOCKET_PORT`].
     pub bind: SocketAddr,
-    /// The certificate and key, when the WebSocket listener uses TLS.
-    pub tls: Option<Tls>,
+    /// The certificate and key. Required: WebSocket is never plaintext (Story 5.2).
+    pub tls: Tls,
 }
 
 /// A TLS certificate and private key, always given together.

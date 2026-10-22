@@ -47,6 +47,11 @@ tokio = { workspace = true }
 # blocking rustls stream for the Daemon tests), trusting the checked-in fixture CA.
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+# Story 5.2: the WebSocket adapter and Daemon tests drive a real tokio-tungstenite client (the
+# `handshake` feature only) over the same tokio-rustls TLS stream, and read its binary messages
+# with `futures-util`'s stream and sink halves.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 # Story 4.4: the `cache` bench's cold/warm/direct figures.
 criterion = { workspace = true }

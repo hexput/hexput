@@ -94,6 +94,12 @@ impl TlsIdentity {
             config: Arc::new(config),
         })
     }
+
+    /// The TLS server configuration, shared with the WebSocket adapter (Story 5.2), which serves
+    /// the very same TLS before its upgrade.
+    pub(crate) fn server_config(self) -> Arc<ServerConfig> {
+        self.config
+    }
 }
 
 /// The whole file at `path`, or why it could not be read.

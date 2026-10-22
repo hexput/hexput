@@ -16,6 +16,9 @@ tokio = { workspace = true }
 # Story 5.1: the TCP+TLS adapter (`tcp_tls`). External crates, no workspace edge.
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+# Story 5.2: the WebSocket adapter (`websocket`), over the same TLS. External crates, no edge.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 [lints]
 workspace = true

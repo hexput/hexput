@@ -14,9 +14,9 @@ use serde::Deserialize;
 use toml::Spanned;
 
 use crate::{
-    DEFAULT_AST_CACHE_CAPACITY, DEFAULT_SESSION_TTL, DEFAULT_TCP_PORT, Location, LogFormat,
-    LogLevel, Problem, SystemConfig, TcpTransport, Tls, Transports, UdsTransport,
-    WebSocketTransport,
+    DEFAULT_AST_CACHE_CAPACITY, DEFAULT_SESSION_TTL, DEFAULT_TCP_PORT, DEFAULT_WEBSOCKET_PORT,
+    Location, LogFormat, LogLevel, Problem, SystemConfig, TcpTransport, Tls, Transports,
+    UdsTransport, WebSocketTransport,
 };
 
 #[derive(Deserialize)]
@@ -34,7 +34,7 @@ struct RawFile {
 struct RawTransports {
     uds: Option<RawUds>,
     tcp: Option<RawTcp>,
-    websocket: Option<Spanned<RawWebSocket>>,
+    websocket: Option<RawWebSocket>,
 }
 
 #[derive(Deserialize)]
@@ -56,8 +56,8 @@ struct RawTcp {
 #[serde(deny_unknown_fields)]
 struct RawWebSocket {
     bind: Spanned<String>,
-    tls_cert: Option<Spanned<String>>,
-    tls_key: Option<Spanned<String>>,
+    tls_cert: Spanned<String>,
+    tls_key: Spanned<String>,
 }
 
 /// Parse System Config text. Pure: no I/O, no environment. [`crate::resolve`] is this plus
@@ -187,16 +187,28 @@ impl Validator<'_> {
         let tcp = match raw.tcp {
             None => None,
             Some(tcp) => Some(TcpTransport {
-                bind: self.bind("transport.tcp.bind", &tcp.bind, Some(DEFAULT_TCP_PORT))?,
+                bind: self.bind("transport.tcp.bind", &tcp.bind, DEFAULT_TCP_PORT)?,
                 tls: Tls {
                     cert: self.path("transport.tcp.tls_cert", &tcp.tls_cert)?,
                     key: self.path("transport.tcp.tls_key", &tcp.tls_key)?,
                 },
             }),
         };
+        // Story 5.2: WebSocket always uses TLS too, so both paths are required, and its port
+        // defaults to 7478 (FR-29).
         let websocket = match raw.websocket {
             None => None,
-            Some(websocket) => Some(self.websocket(websocket)?),
+            Some(websocket) => Some(WebSocketTransport {
+                bind: self.bind(
+                    "transport.websocket.bind",
+                    &websocket.bind,
+                    DEFAULT_WEBSOCKET_PORT,
+                )?,
+                tls: Tls {
+                    cert: self.path("transport.websocket.tls_cert", &websocket.tls_cert)?,
+                    key: self.path("transport.websocket.tls_key", &websocket.tls_key)?,
+                },
+            }),
         };
         Ok(Transports {
             uds,
@@ -205,71 +217,34 @@ impl Validator<'_> {
         })
     }
 
-    fn websocket(&self, raw: Spanned<RawWebSocket>) -> Result<WebSocketTransport, Problem> {
-        let table = raw.span();
-        let raw = raw.into_inner();
-        let tls = match (raw.tls_cert, raw.tls_key) {
-            (None, None) => None,
-            (Some(cert), Some(key)) => Some(Tls {
-                cert: self.path("transport.websocket.tls_cert", &cert)?,
-                key: self.path("transport.websocket.tls_key", &key)?,
-            }),
-            (Some(_), None) => return Err(self.half_tls_pair(table.start, "tls_cert", "tls_key")),
-            (None, Some(_)) => return Err(self.half_tls_pair(table.start, "tls_key", "tls_cert")),
-        };
-        Ok(WebSocketTransport {
-            bind: self.bind("transport.websocket.bind", &raw.bind, None)?,
-            tls,
-        })
-    }
-
-    fn half_tls_pair(&self, table_start: usize, given: &str, missing: &str) -> Problem {
-        Problem::InvalidValue {
-            field: "transport.websocket".to_owned(),
-            location: Some(locate(self.text, table_start)),
-            message: format!(
-                "tls_cert and tls_key must be given together or not at all; \
-                 `{given}` is set but `{missing}` is missing"
-            ),
-        }
-    }
-
-    /// A listener's address. With a `default_port`, the port may be left out — a bare IP
-    /// (`0.0.0.0`, `::`, `::1` or `[::1]`) listens on that port; without one, `IP:port` is
-    /// required. Port `0` (an ephemeral port) is valid either way.
+    /// A listener's address. The port may be left out — a bare IP (`0.0.0.0`, `::`, `::1` or
+    /// `[::1]`) listens on `default_port`. Port `0` (an ephemeral port) is valid.
     fn bind(
         &self,
         field: &str,
         bind: &Spanned<String>,
-        default_port: Option<u16>,
+        default_port: u16,
     ) -> Result<SocketAddr, Problem> {
         let text = bind.get_ref();
         if let Ok(addr) = text.parse::<SocketAddr>() {
             return Ok(addr);
         }
-        if let Some(port) = default_port {
-            let bare = text
-                .strip_prefix('[')
-                .and_then(|inner| inner.strip_suffix(']'))
-                .unwrap_or(text);
-            if let Ok(ip) = bare.parse::<IpAddr>() {
-                // `[...]` brackets only an IPv6 address.
-                if ip.is_ipv6() || bare.len() == text.len() {
-                    return Ok(SocketAddr::new(ip, port));
-                }
+        let bare = text
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(text);
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            // `[...]` brackets only an IPv6 address.
+            if ip.is_ipv6() || bare.len() == text.len() {
+                return Ok(SocketAddr::new(ip, default_port));
             }
         }
-        let message = match default_port {
-            Some(port) => format!(
-                "expected an IP address with an optional port such as \"0.0.0.0\", \
-                 \"127.0.0.1:{port}\" or \"[::1]:{port}\" (the port is optional and defaults \
-                 to {port}), got {text:?}"
-            ),
-            None => format!(
-                "expected an IP address and port such as \"127.0.0.1:7478\" or \
-                 \"[::1]:7478\", got {text:?}"
-            ),
-        };
+        let port = default_port;
+        let message = format!(
+            "expected an IP address with an optional port such as \"0.0.0.0\", \
+             \"127.0.0.1:{port}\" or \"[::1]:{port}\" (the port is optional and defaults \
+             to {port}), got {text:?}"
+        );
         Err(self.invalid(field, bind, message))
     }
 

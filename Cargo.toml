@@ -40,7 +40,12 @@ tokio = { version = "1.53.1", features = [
     "time",
     "sync",
 ] }
-tokio-tungstenite = "0.30.0"
+# Story 5.2: the WebSocket adapter. `handshake` alone (the server upgrade): the TLS is our own
+# tokio-rustls, so neither tungstenite's TLS features nor its `connect` client are taken.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+# Story 5.2: `StreamExt::split` and `SinkExt::send` over the WebSocket stream, into the Port's
+# halves. The version already in `Cargo.lock`; `sink` + `std` only.
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 # Story 5.1: TLS for the TCP adapter. The `ring` provider rather than rustls's default `aws-lc-rs`:
 # a much smaller build (no cmake, no large C library) and no FIPS ambition. `std` for the PEM
 # loader and the `ServerConfig`, `tls12` so TLS 1.2 clients are served alongside TLS 1.3.

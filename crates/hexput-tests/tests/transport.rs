@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use futures_util::{SinkExt, StreamExt};
 use hexput_port::{
     CorrelationId, Envelope, Inbound, MAX_FRAME_LEN, MessageType, Outbound, Port, ProtocolCode,
     Received, Value, decode, encode, encode_frame,
@@ -18,12 +19,17 @@ use hexput_transport::tcp_tls::{
     HANDSHAKE_TIMEOUT, TcpTlsListener, TcpTlsPort, TlsError, TlsIdentity,
 };
 use hexput_transport::uds::{BindErrorKind, UdsListener, UdsPort};
+use hexput_transport::websocket::{WebSocketListener, WebSocketPort};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data as OpData, OpCode};
 
 struct Sandbox {
     dir: PathBuf,
@@ -794,4 +800,462 @@ async fn frames_larger_than_a_tls_record_and_back_to_back_cross_tls_whole() {
         assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(11)));
     };
     tokio::join!(write, receive);
+}
+
+// --- Story 5.2: the WebSocket adapter ---
+//
+// Every WebSocket test runs over the same fixture identity as the TCP adapter above. The client is
+// a real tokio-tungstenite client over a tokio-rustls stream that trusts only the fixture CA, so
+// each test proves the TLS handshake happened before the upgrade (FR-9).
+
+/// A WebSocket listener on an ephemeral loopback port.
+async fn websocket_listen() -> WebSocketListener {
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    WebSocketListener::bind(addr, identity())
+        .await
+        .expect("binds")
+}
+
+/// A tokio-tungstenite client, over TLS that trusts the fixture CA, past the WebSocket upgrade.
+async fn wss_connect(addr: SocketAddr) -> WebSocketStream<TlsStream<TcpStream>> {
+    let tls = tls_connect(addr).await;
+    let (ws, _response) = tokio_tungstenite::client_async("wss://localhost/", tls)
+        .await
+        .expect("the upgrade succeeds");
+    ws
+}
+
+/// A WebSocket client and the server-side Port for it, both past the upgrade.
+async fn ws_pair(
+    listener: &WebSocketListener,
+) -> (WebSocketStream<TlsStream<TcpStream>>, WebSocketPort) {
+    let addr = listener.local_addr().unwrap();
+    tokio::join!(wss_connect(addr), async {
+        listener.accept().await.unwrap().finish().await.unwrap()
+    })
+}
+
+/// The next binary message from the Daemon, decoded. Control frames are skipped.
+async fn next_envelope(ws: &mut WebSocketStream<TlsStream<TcpStream>>) -> Envelope<Value> {
+    loop {
+        match ws
+            .next()
+            .await
+            .expect("a message")
+            .expect("no transport error")
+        {
+            Message::Binary(bytes) => return decode(&bytes).unwrap(),
+            Message::Ping(_) | Message::Pong(_) => {}
+            other => panic!("expected a binary message, got {other:?}"),
+        }
+    }
+}
+
+/// A WebSocket binary message holding exactly `envelope`'s encoding, with no length prefix.
+fn binary(envelope: &Envelope<Value>) -> Message {
+    Message::Binary(encode(envelope).unwrap().into())
+}
+
+#[tokio::test]
+async fn a_binary_message_crosses_tls_and_the_reply_comes_back_as_one_binary_message() {
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, mut outbound) = server.split();
+
+    client.send(binary(&request(1))).await.unwrap();
+    match inbound.recv().await {
+        Received::Message(envelope) => assert_eq!(envelope, request(1)),
+        other => panic!("{other:?}"),
+    }
+
+    let reply = Envelope::new(CorrelationId(1), MessageType::Result, Value::from(3));
+    outbound.send(reply.clone()).await.unwrap();
+    assert_eq!(next_envelope(&mut client).await, reply);
+}
+
+#[tokio::test]
+async fn a_text_message_is_malformed_and_reading_continues() {
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, _outbound) = server.split();
+
+    client.send(Message::Text("hello".into())).await.unwrap();
+    client.send(binary(&request(5))).await.unwrap();
+
+    match inbound.recv().await {
+        Received::Malformed(failure) => {
+            assert_eq!(failure.id, None, "a text message names no request");
+            assert_eq!(failure.error.code, ProtocolCode::MalformedFrame);
+            assert_eq!(
+                failure.error.message,
+                "a WebSocket text message; Hexput frames are binary messages"
+            );
+            assert!(!failure.error.is_fatal(), "reading continues");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(5)));
+}
+
+#[tokio::test]
+async fn a_malformed_binary_message_is_not_fatal_and_the_next_one_still_arrives() {
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, _outbound) = server.split();
+
+    // 0xc1 is never valid MessagePack; an empty message is not an envelope either.
+    client
+        .send(Message::Binary(vec![0xc1].into()))
+        .await
+        .unwrap();
+    client
+        .send(Message::Binary(Vec::new().into()))
+        .await
+        .unwrap();
+    client.send(binary(&request(5))).await.unwrap();
+
+    for _ in 0..2 {
+        match inbound.recv().await {
+            Received::Malformed(failure) => {
+                assert_eq!(failure.error.code, ProtocolCode::MalformedFrame);
+                assert!(!failure.error.is_fatal());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(5)));
+}
+
+#[tokio::test]
+async fn pings_are_answered_by_the_transport_and_yield_nothing() {
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, _outbound) = server.split();
+
+    client
+        .send(Message::Ping(vec![1, 2, 3].into()))
+        .await
+        .unwrap();
+    client.send(binary(&request(1))).await.unwrap();
+
+    // The first thing the core sees is the request: the ping was never surfaced.
+    assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(1)));
+}
+
+#[tokio::test]
+async fn a_cleartext_upgrade_is_never_answered_and_its_socket_is_closed() {
+    let listener = websocket_listen().await;
+    let addr = listener.local_addr().unwrap();
+    let mut plain = TcpStream::connect(addr).await.unwrap();
+    plain
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    // The TLS handshake fails; no Port is ever handed to the core.
+    let handshake = listener.accept().await.unwrap();
+    assert!(handshake.finish().await.is_err(), "cleartext is refused");
+
+    // The socket is closed without a 101 upgrade. At most a TLS alert record (0x15) is sent.
+    let mut bytes = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(10), plain.read_to_end(&mut bytes)).await;
+    assert!(read.is_ok(), "the server closes the socket");
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("101"),
+        "{bytes:02x?}"
+    );
+    assert!(bytes.is_empty() || bytes[0] == 0x15, "{bytes:02x?}");
+
+    // Other connections are unaffected.
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, _outbound) = server.split();
+    client.send(binary(&request(2))).await.unwrap();
+    assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(2)));
+}
+
+#[tokio::test]
+async fn a_tls_client_that_sends_no_upgrade_gets_no_session() {
+    // Two shapes: a plain HTTP request without upgrade headers, and a length-prefixed Hexput
+    // frame. Neither is an upgrade, so neither becomes a Session.
+    let listener = websocket_listen().await;
+    let addr = listener.local_addr().unwrap();
+    let shapes: [Vec<u8>; 2] = [
+        b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+        framed(&request(1)),
+    ];
+    for bytes in shapes {
+        let client = async {
+            let mut tls = tls_connect(addr).await;
+            tls.write_all(&bytes).await.unwrap();
+            let mut received = Vec::new();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut received)).await;
+            received
+        };
+        let server = async { listener.accept().await.unwrap().finish().await };
+        let (received, handshake) = tokio::join!(client, server);
+        assert!(handshake.is_err(), "no upgrade, no Session");
+        assert!(
+            !String::from_utf8_lossy(&received).contains("101"),
+            "{received:02x?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_silent_websocket_peer_times_out_with_timed_out() {
+    let listener = websocket_listen()
+        .await
+        .with_handshake_timeout(Duration::from_millis(200));
+    let addr = listener.local_addr().unwrap();
+    // Connected, sending nothing: neither TLS nor the upgrade ever begins.
+    let _silent = TcpStream::connect(addr).await.unwrap();
+
+    let handshake = listener.accept().await.unwrap();
+    let started = Instant::now();
+    let error = handshake
+        .finish()
+        .await
+        .expect_err("the handshake times out");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    assert!(started.elapsed() < Duration::from_secs(5), "bounded");
+}
+
+#[tokio::test]
+async fn a_silent_websocket_peer_never_stalls_the_next_accept() {
+    // `accept` returns before any handshake; the handshake belongs to the connection's task.
+    let listener = websocket_listen().await;
+    let addr = listener.local_addr().unwrap();
+    let _silent = TcpStream::connect(addr).await.unwrap();
+    let _pending = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("accepted without a handshake")
+        .unwrap();
+
+    let (mut client, server) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(wss_connect(addr), async {
+            listener.accept().await.unwrap().finish().await.unwrap()
+        })
+    })
+    .await
+    .expect("the next peer is served while the silent one is pending");
+    let (mut inbound, _outbound) = server.split();
+    client.send(binary(&request(3))).await.unwrap();
+    assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(3)));
+}
+
+#[tokio::test]
+async fn the_handshake_reports_the_peers_address() {
+    let listener = websocket_listen().await;
+    let addr = listener.local_addr().unwrap();
+    // Only the TCP connection is needed: the handshake itself is `finish`'s job.
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let client_addr = tcp.local_addr().unwrap();
+    let handshake = listener.accept().await.unwrap();
+    assert_eq!(handshake.peer_addr(), client_addr);
+}
+
+#[tokio::test]
+async fn a_peer_close_frame_is_a_clean_close_and_the_reply_it_is_owed_is_delivered() {
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, mut outbound) = server.split();
+
+    client.send(binary(&request(1))).await.unwrap();
+    assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(1)));
+    let reply = Envelope::new(CorrelationId(1), MessageType::Result, Value::from(3));
+    outbound.send(reply.clone()).await.unwrap();
+    assert_eq!(next_envelope(&mut client).await, reply);
+
+    // The client sends Close after its last reply. The server's half is `Closed(None)`, and the
+    // close reply is flushed, so the client reads it back without any error.
+    let (closed, received) = tokio::join!(client.close(None), inbound.recv());
+    closed.expect("the client's close is sent");
+    assert!(matches!(received, Received::Closed(None)), "{received:?}");
+
+    // The next thing the client reads is that close reply. Reading on past it would wait for the
+    // TCP end, which comes only when the core drops the Port, and then without a TLS
+    // `close_notify` (deferred-work: the Port has no close hook), so the reply is the whole check.
+    let reply = tokio::time::timeout(Duration::from_secs(10), client.next())
+        .await
+        .expect("the close reply arrives")
+        .expect("a message");
+    match reply.expect("the close reply is not an error") {
+        Message::Close(_) => {}
+        other => panic!("only the close reply is owed: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_websocket_dropped_without_a_close_frame_is_a_clean_close() {
+    // An intermediary drops the TCP stream: no Close frame and no `close_notify`. Like a Unix
+    // Domain Socket peer that vanishes, this is `Closed(None)`, never a lost stream (AD-1).
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, _outbound) = server.split();
+
+    client.send(binary(&request(1))).await.unwrap();
+    assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(1)));
+
+    drop(client);
+    assert!(matches!(inbound.recv().await, Received::Closed(None)));
+    assert!(matches!(inbound.recv().await, Received::Closed(None)));
+}
+
+#[tokio::test]
+async fn an_oversized_message_is_fatal_and_the_half_stays_closed() {
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, outbound) = server.split();
+
+    // One byte over the limit: the server refuses the message before reading its payload.
+    let oversized = Message::Binary(vec![0u8; MAX_FRAME_LEN + 1].into());
+    let send = async {
+        // The peer may see its write fail once the server has dropped the socket.
+        let _ = client.send(oversized).await;
+    };
+    let receive = async move {
+        match inbound.recv().await {
+            Received::Malformed(failure) => {
+                assert_eq!(failure.id, None);
+                assert_eq!(failure.error.code, ProtocolCode::FrameTooLarge);
+                assert!(failure.error.is_fatal());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(inbound.recv().await, Received::Closed(_)));
+        assert!(matches!(inbound.recv().await, Received::Closed(_)));
+        drop(inbound);
+        drop(outbound);
+    };
+    tokio::join!(send, receive);
+}
+
+#[tokio::test]
+async fn a_fragmented_message_over_the_limit_is_fatal() {
+    // Every frame is far under the limit, but the message they assemble is one byte over it:
+    // the adapter's message bound, not tungstenite's default frame bound, refuses it.
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, outbound) = server.split();
+
+    let piece = MAX_FRAME_LEN / 4;
+    let send = async {
+        let frames = [
+            Frame::message(vec![0u8; piece], OpCode::Data(OpData::Binary), false),
+            Frame::message(vec![0u8; piece], OpCode::Data(OpData::Continue), false),
+            Frame::message(vec![0u8; piece], OpCode::Data(OpData::Continue), false),
+            Frame::message(vec![0u8; piece], OpCode::Data(OpData::Continue), false),
+            Frame::message(vec![0u8; 1], OpCode::Data(OpData::Continue), true),
+        ];
+        for frame in frames {
+            // The peer may see its write fail once the server has dropped the socket.
+            if client.send(Message::Frame(frame)).await.is_err() {
+                break;
+            }
+        }
+    };
+    let receive = async move {
+        match inbound.recv().await {
+            Received::Malformed(failure) => {
+                assert_eq!(failure.id, None);
+                assert_eq!(failure.error.code, ProtocolCode::FrameTooLarge);
+                assert!(failure.error.is_fatal());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(inbound.recv().await, Received::Closed(_)));
+        drop(inbound);
+        drop(outbound);
+    };
+    tokio::join!(send, receive);
+}
+
+#[tokio::test]
+async fn a_message_of_exactly_the_limit_is_read_and_reading_continues() {
+    // `MAX_FRAME_LEN` bytes is within the bound: the message reaches `decode` (and, being zeros,
+    // is malformed there, which is not fatal), and the next message still arrives.
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, _outbound) = server.split();
+
+    let send = async {
+        client
+            .send(Message::Binary(vec![0u8; MAX_FRAME_LEN].into()))
+            .await
+            .unwrap();
+        client.send(binary(&request(2))).await.unwrap();
+    };
+    let receive = async {
+        match inbound.recv().await {
+            Received::Malformed(failure) => {
+                assert_ne!(failure.error.code, ProtocolCode::FrameTooLarge);
+                assert!(!failure.error.is_fatal(), "{failure:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(2)));
+    };
+    tokio::join!(send, receive);
+}
+
+#[tokio::test]
+async fn a_text_message_that_is_not_utf8_fails_the_connection() {
+    // RFC 6455 fails a connection over invalid UTF-8 text: a lost stream, not a malformed frame.
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, _outbound) = server.split();
+
+    let invalid = Frame::message(vec![0xff, 0xfe], OpCode::Data(OpData::Text), true);
+    client.send(Message::Frame(invalid)).await.unwrap();
+    assert!(
+        matches!(inbound.recv().await, Received::Closed(Some(_))),
+        "a lost stream"
+    );
+    assert!(matches!(inbound.recv().await, Received::Closed(None)));
+}
+
+#[tokio::test]
+async fn a_reply_still_owed_after_the_peers_close_frame_cannot_be_sent() {
+    // WebSocket ends both directions together: once the peer's Close is answered, no data
+    // message may follow (RFC 6455), so the reply to a request still in flight is lost.
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (mut inbound, mut outbound) = server.split();
+
+    client.send(binary(&request(1))).await.unwrap();
+    assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(1)));
+    let (closed, received) = tokio::join!(client.close(None), inbound.recv());
+    closed.expect("the client's close is sent");
+    assert!(matches!(received, Received::Closed(None)), "{received:?}");
+
+    let reply = Envelope::new(CorrelationId(1), MessageType::Result, Value::from(3));
+    outbound
+        .send(reply)
+        .await
+        .expect_err("no data message after the close handshake");
+}
+
+#[tokio::test]
+async fn a_websocket_envelope_too_large_to_frame_is_refused_without_writing() {
+    let listener = websocket_listen().await;
+    let (mut client, server) = ws_pair(&listener).await;
+    let (_inbound, mut outbound) = server.split();
+
+    let huge = Envelope::new(
+        CorrelationId(7),
+        MessageType::Result,
+        Value::from("x".repeat(MAX_FRAME_LEN)),
+    );
+    let error = outbound.send(huge).await.expect_err("too large to frame");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+
+    // Nothing was written, so the next message the client reads is the small reply, whole.
+    let reply = Envelope::new(CorrelationId(8), MessageType::Result, Value::from(8));
+    outbound.send(reply.clone()).await.unwrap();
+    assert_eq!(next_envelope(&mut client).await, reply);
 }

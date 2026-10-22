@@ -63,12 +63,13 @@ bind = "0.0.0.0"
 tls_cert = "/etc/hexput/tls/cert.pem"
 tls_key = "/etc/hexput/tls/key.pem"
 
-# WebSocket is not served yet: its adapter arrives with Story 5.2, and until then the Daemon
-# refuses to start when this section is present rather than silently not listening.
-#
-# WebSocket. TLS is optional here, but tls_cert and tls_key are given together or not at all.
-# 7478 is WebSocket's fixed port; until Story 5.2 makes it the default, `bind` names it.
+# WebSocket, for Backends behind HTTP-only proxies and gateways. It always uses TLS, exactly as
+# TCP does: there is no `ws://` mode, so `tls_cert` and `tls_key` are both required. Every
+# connection completes the TLS handshake before its WebSocket upgrade, and each binary message
+# carries one request or reply. `bind` is an IP address with an optional port: "0.0.0.0", "::"
+# or "[::1]" listen on the default port 7478, "0.0.0.0:7400" on the port given. The certificate
+# and key may be the same files as TCP's; they are loaded and checked the same way.
 [transport.websocket]
-bind = "0.0.0.0:7478"
+bind = "0.0.0.0"
 tls_cert = "/etc/hexput/tls/cert.pem"
 tls_key = "/etc/hexput/tls/key.pem"

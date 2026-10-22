@@ -45,6 +45,9 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 # Story 4.4: the `cache` bench's cold/warm/direct figures.
 criterion = { workspace = true }
+# Story 4.5: the `cache` bench's Rhai comparator (server over UDS and in-process engine). Dev-only:
+# Rhai is a measuring stick, never part of the Daemon.
+rhai = { workspace = true }
 
 # Story 4.4: the cache benchmark (`cargo bench -p hexput-tests --bench cache`). `harness = false`
 # hands `main` to Criterion; `test = true` makes `cargo test --workspace` run it once in quick

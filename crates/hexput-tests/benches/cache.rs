@@ -1,4 +1,6 @@
 //! Story 4.4: measure the cache win (FR-5, SM-1) — parse a Script once, execute it many times.
+//! Story 4.5: compare that hot path against Rhai, and report the Resource Budget's cost as its
+//! own line (SM-1, NFR3).
 //!
 //! The bench starts a real Daemon in-process (`hexput_daemon::run_with` on its own thread and
 //! its own Tokio runtime) over a real Unix Domain Socket, and drives it as a Backend would: each
@@ -26,7 +28,27 @@
 //!   (nearest-rank, from sending `CachedExecutionStart` to its final `Result`) and throughput
 //!   (runs ÷ the round's wall time); the summary is the median of the rounds.
 //!
-//! The three Criterion figures use one connection with one execution in flight.
+//! - `rhai_compare/{hexput,rhai}_cold_first_run` and `rhai_compare/{hexput,rhai}_warm_cache_hit`
+//!   (Criterion, Story 4.5): the same cold and warm figures on the Daemon and on a Rhai server
+//!   inside the bench ([`rhai::RhaiServer`]) that speaks the same wire over a UDS — the same
+//!   framing, `CodeRegister` (Rhai compiles once into an `AST`), `CachedExecutionStart` and a
+//!   `Call` round trip per host call — driven by the same client, students and verification. The
+//!   rule is [`rhai::RHAI_RULE`], the same steps with every number an f64. One wire difference
+//!   remains: the Daemon sends each `Call` argument in a Value Secret holder (FR-28), which the
+//!   client unwraps, while the Rhai server sends plain values — so Hexput's frames are larger.
+//! - `steady_state` also runs the same closed loops against the Rhai server, right after
+//!   Hexput's, and prints the two summaries side by side (p50, p99, throughput; Hexput, Rhai and
+//!   the Hexput/Rhai ratio).
+//! - `engine` (hand-timed, Story 4.5): the rule in-process on three drivers over the same 16
+//!   students, host calls answered natively — `hexput_unmetered` (the interpreter alone),
+//!   `hexput_enforced` (the same with the Executor's synchronous enforcement: CPU slicing and
+//!   charges, the memory and allocation ceilings, the RPC-call/side-effect count, the output
+//!   size) and `rhai_engine`. [`ENGINE_ROUNDS`] rounds of [`ENGINE_RUNS`] runs per driver; the
+//!   median of the rounds' mean ns/run gives the line "budget enforcement overhead". The UDS
+//!   headline figures above all run with the full default budget and are never adjusted by it.
+//!
+//! The Criterion figures use one connection with one execution in flight. Rhai runs at
+//! `Engine::new()`'s defaults, one thread per connection, as a Rhai user would embed it.
 //!
 //! **Stated variance:** p50 and throughput within ±10%, p99 within ±20%. The bench prints whether
 //! this run's spread across rounds is within it, and — when the previous report was made on a
@@ -35,14 +57,18 @@
 //! with a 10% noise threshold. All of this is informational: no figure is a gate.
 //!
 //! The machine and workload conditions are printed before any figure and, after a full run,
-//! written with the steady-state figures to `<target>/hexput-bench/cache-win.json`.
+//! written with both steady states and the engine figures (`null` when that section was filtered
+//! out) to `<target>/hexput-bench/cache-win.json`. The comparison with the previous run covers
+//! Hexput's and Rhai's steady-state summaries.
 //!
 //! **Quick mode:** without `--bench` (that is, under `cargo test`), Criterion runs each figure
-//! once and `steady_state` runs one round of 20 runs per connection with no warm-up. Every result
-//! is still checked, the report module's own checks run, and no report is written or compared.
+//! once, each steady state runs one round of 20 runs per connection with no warm-up, and the
+//! engine section one round of 20 runs. Every result is still checked, the report module's own
+//! checks run, and no report is written or compared.
 //!
-//! A positional filter goes to Criterion; `steady_state` runs only with no filter or a filter
-//! that is a substring of `steady_state`.
+//! A positional filter goes to Criterion; `steady_state` and `engine` each run only with no
+//! filter or a filter that is a substring of their name. The report is read, compared and
+//! written only when `steady_state` ran (so `-- engine` writes none).
 
 /// Connections in the steady-state section.
 #[cfg(unix)]
@@ -59,6 +85,25 @@ const WARM_UP_RUNS: usize = 100;
 /// Quick mode's shortened steady state: one round of this many runs, no warm-up.
 #[cfg(unix)]
 const QUICK_RUNS_PER_CONNECTION: usize = 20;
+/// Rounds in the `engine` section.
+#[cfg(unix)]
+const ENGINE_ROUNDS: usize = 5;
+/// Runs of each driver per `engine` round.
+#[cfg(unix)]
+const ENGINE_RUNS: usize = 10_000;
+/// Untimed runs of each driver before the first `engine` round.
+#[cfg(unix)]
+const ENGINE_WARM_UP_RUNS: usize = 1000;
+/// Quick mode's shortened `engine` section: one round of this many runs, no warm-up.
+#[cfg(unix)]
+const QUICK_ENGINE_RUNS: usize = 20;
+
+/// The Rhai comparator: the server over UDS, the in-process engine and the conversion. A crate
+/// root's modules resolve beside it (`benches/`), so the path names `benches/cache/`, where Cargo
+/// discovers no bench target (it has no `main.rs`).
+#[cfg(unix)]
+#[path = "cache/rhai.rs"]
+mod rhai;
 
 #[cfg(not(unix))]
 fn main() {
@@ -67,9 +112,12 @@ fn main() {
 
 #[cfg(unix)]
 fn main() {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use criterion::Criterion;
+
+    use crate::wire::Client;
+    use crate::workload::Student;
 
     let args: Vec<String> = std::env::args().collect();
     let quick = report::is_quick(&args);
@@ -89,7 +137,36 @@ fn main() {
     println!("{}", conditions.render());
 
     let daemon = daemon::Daemon::start();
+    let rhai_server = rhai::RhaiServer::start();
     let students = workload::students();
+
+    // A Script never seen before: `CodeRegister` plus its first run, timed together; the
+    // unregister is untimed, so the cache stays bounded.
+    let cold = |client: &mut Client, source: &str, iters: u64, next: &mut usize| {
+        let mut total = Duration::ZERO;
+        for _ in 0..iters {
+            let student: &Student = &students[*next % students.len()];
+            *next += 1;
+            let started = Instant::now();
+            let handle = workload::register_source(client, source);
+            let registered = started.elapsed();
+            let payload = workload::cached_payload(&handle, student);
+            total += registered + workload::run_cached(client, payload, student);
+            workload::unregister(client, &handle);
+        }
+        total
+    };
+    // A cache hit: `CachedExecutionStart` on one registered handle.
+    let warm = |client: &mut Client, handle: &str, iters: u64, next: &mut usize| {
+        let mut total = Duration::ZERO;
+        for _ in 0..iters {
+            let student = &students[*next % students.len()];
+            *next += 1;
+            let payload = workload::cached_payload(handle, student);
+            total += workload::run_cached(client, payload, student);
+        }
+        total
+    };
 
     let mut criterion = Criterion::default().without_plots().configure_from_args();
     {
@@ -102,36 +179,14 @@ fn main() {
 
         let mut next = 0usize;
         group.bench_function("cold_first_run", |bencher| {
-            bencher.iter_custom(|iters| {
-                let mut total = std::time::Duration::ZERO;
-                for _ in 0..iters {
-                    let student = &students[next % students.len()];
-                    next += 1;
-                    let started = Instant::now();
-                    let handle = workload::register(&mut client);
-                    let registered = started.elapsed();
-                    let payload = workload::cached_payload(&handle, student);
-                    total += registered + workload::run_cached(&mut client, payload, student);
-                    workload::unregister(&mut client, &handle);
-                }
-                total
-            });
+            bencher.iter_custom(|iters| cold(&mut client, workload::RULE, iters, &mut next));
         });
         group.bench_function("warm_cache_hit", |bencher| {
-            bencher.iter_custom(|iters| {
-                let mut total = std::time::Duration::ZERO;
-                for _ in 0..iters {
-                    let student = &students[next % students.len()];
-                    next += 1;
-                    let payload = workload::cached_payload(&handle, student);
-                    total += workload::run_cached(&mut client, payload, student);
-                }
-                total
-            });
+            bencher.iter_custom(|iters| warm(&mut client, &handle, iters, &mut next));
         });
         group.bench_function("direct_execution", |bencher| {
             bencher.iter_custom(|iters| {
-                let mut total = std::time::Duration::ZERO;
+                let mut total = Duration::ZERO;
                 for _ in 0..iters {
                     let student = &students[next % students.len()];
                     next += 1;
@@ -143,31 +198,110 @@ fn main() {
         });
         group.finish();
     }
+    {
+        // Story 4.5: the same figures on the Rhai server, through the same client — one
+        // connection each, one execution in flight, the same student rotation.
+        let mut hexput = daemon.connect();
+        workload::init(&mut hexput);
+        let hexput_handle = workload::register_source(&mut hexput, workload::RULE);
+        let mut rhai_client = rhai_server.connect();
+        workload::init(&mut rhai_client);
+        let rhai_handle = workload::register_source(&mut rhai_client, rhai::RHAI_RULE);
+
+        let mut group = criterion.benchmark_group("rhai_compare");
+        group.noise_threshold(report::VARIANCE.p50);
+
+        let mut next = 0usize;
+        group.bench_function("hexput_cold_first_run", |bencher| {
+            bencher.iter_custom(|iters| cold(&mut hexput, workload::RULE, iters, &mut next));
+        });
+        group.bench_function("rhai_cold_first_run", |bencher| {
+            bencher.iter_custom(|iters| cold(&mut rhai_client, rhai::RHAI_RULE, iters, &mut next));
+        });
+        group.bench_function("hexput_warm_cache_hit", |bencher| {
+            bencher.iter_custom(|iters| warm(&mut hexput, &hexput_handle, iters, &mut next));
+        });
+        group.bench_function("rhai_warm_cache_hit", |bencher| {
+            bencher.iter_custom(|iters| warm(&mut rhai_client, &rhai_handle, iters, &mut next));
+        });
+        group.finish();
+    }
     criterion.final_summary();
 
-    if report::runs_steady_state(filter.as_deref(), &args) {
+    let steady = if report::runs_steady_state(filter.as_deref(), &args) {
         let (rounds, runs, warm_up) = if quick {
             (1, QUICK_RUNS_PER_CONNECTION, 0)
         } else {
             (ROUNDS, RUNS_PER_CONNECTION, WARM_UP_RUNS)
         };
-        let measured = steady::measure(&daemon, rounds, runs, warm_up);
-        let summary = report::Summary::of(&measured);
-        println!("{}", report::render_steady_state(&measured, &summary));
-        if !quick {
-            let comparison = report::compare(previous.as_deref(), &conditions, &summary);
-            println!("{}", comparison.render());
-            let json = report::to_json(&conditions, &measured, &summary);
-            match report::write(&path, &json) {
-                Ok(()) => println!("report written to {}", path.display()),
-                Err(error) => eprintln!("could not write {}: {error}", path.display()),
-            }
-        }
+        let hexput = steady::measure(|| daemon.connect(), workload::RULE, rounds, runs, warm_up);
+        let hexput_summary = report::Summary::of(&hexput);
+        println!(
+            "{}",
+            report::render_steady_state(report::HEXPUT_SIDE, &hexput, &hexput_summary)
+        );
+        let rhai = steady::measure(
+            || rhai_server.connect(),
+            rhai::RHAI_RULE,
+            rounds,
+            runs,
+            warm_up,
+        );
+        let rhai_summary = report::Summary::of(&rhai);
+        println!(
+            "{}",
+            report::render_steady_state(report::RHAI_SIDE, &rhai, &rhai_summary)
+        );
+        println!(
+            "{}",
+            report::render_side_by_side(&hexput_summary.median, &rhai_summary.median)
+        );
+        Some(report::Steady {
+            hexput,
+            hexput_summary,
+            rhai,
+            rhai_summary,
+        })
     } else {
         println!("steady_state skipped by the filter");
+        None
+    };
+
+    let engine = if report::runs_engine(filter.as_deref(), &args) {
+        let (rounds, runs, warm_up) = if quick {
+            (1, QUICK_ENGINE_RUNS, 0)
+        } else {
+            (ENGINE_ROUNDS, ENGINE_RUNS, ENGINE_WARM_UP_RUNS)
+        };
+        let measured = engine::measure(&students, rounds, runs, warm_up);
+        let summary = report::EngineFigures::median(&measured);
+        println!("{}", report::render_engine(&measured, &summary));
+        Some(summary)
+    } else {
+        println!("engine skipped by the filter");
+        None
+    };
+
+    // The report is read, compared and written only after a full steady state.
+    if let Some(steady) = &steady
+        && !quick
+    {
+        let comparison = report::compare(
+            previous.as_deref(),
+            &conditions,
+            &steady.hexput_summary,
+            &steady.rhai_summary,
+        );
+        println!("{}", comparison.render());
+        let json = report::to_json(&conditions, steady, engine.as_ref());
+        match report::write(&path, &json) {
+            Ok(()) => println!("report written to {}", path.display()),
+            Err(error) => eprintln!("could not write {}: {error}", path.display()),
+        }
     }
 
     daemon.stop();
+    rhai_server.stop();
 }
 
 /// The Daemon under measurement: in-process, on its own thread, over a socket in a fresh temp dir.
@@ -374,16 +508,18 @@ mod workload {
     ];
 
     pub struct Student {
-        id: String,
-        program: &'static str,
-        grades: Vec<(&'static str, i64)>,
+        pub id: String,
+        pub program: &'static str,
+        pub grades: Vec<(&'static str, i64)>,
         /// The starting variables, built once; each run sends a copy.
-        variables: Value,
+        pub variables: Value,
+        /// The verdict Rust computes.
+        pub passes: bool,
         /// The verdict Rust computes, as the exact `Result` payload expected.
         expected: Value,
     }
 
-    fn course_weight(course: &str) -> i64 {
+    pub fn course_weight(course: &str) -> i64 {
         COURSES
             .iter()
             .find(|(name, _)| *name == course)
@@ -391,7 +527,7 @@ mod workload {
             .unwrap_or_else(|| panic!("an unknown course `{course}`"))
     }
 
-    fn pass_mark(program: &str) -> i64 {
+    pub fn pass_mark(program: &str) -> i64 {
         match program {
             "science" => 50,
             "engineering" => 60,
@@ -411,13 +547,13 @@ mod workload {
                         .map(|j| (COURSES[((i + j) % 8) as usize].0, (i * 37 + j * 11) % 101))
                         .collect(),
                     variables: Value::Nil,
+                    passes: false,
                     expected: Value::Nil,
                 };
                 student.variables = variables(&student);
-                student.expected = Value::Map(vec![(
-                    Value::from("value"),
-                    Value::Boolean(verdict(&student)),
-                )]);
+                student.passes = verdict(&student);
+                student.expected =
+                    Value::Map(vec![(Value::from("value"), Value::Boolean(student.passes))]);
                 student
             })
             .collect()
@@ -481,9 +617,15 @@ mod workload {
 
     /// `CodeRegister` of the rule; returns its handle.
     pub fn register(client: &mut Client) -> String {
+        register_source(client, RULE)
+    }
+
+    /// `CodeRegister` of `source` — [`RULE`] on the Daemon, `RHAI_RULE` on the Rhai server;
+    /// returns its handle.
+    pub fn register_source(client: &mut Client, source: &str) -> String {
         let payload = client.request(
             MessageType::CodeRegister,
-            Value::Map(vec![(Value::from("source"), Value::from(RULE))]),
+            Value::Map(vec![(Value::from("source"), Value::from(source))]),
         );
         field(&payload, "handle")
             .as_str()
@@ -540,7 +682,7 @@ mod workload {
             match message.message_type {
                 MessageType::Call => {
                     calls += 1;
-                    let value = answer(&message);
+                    let value = answer(&message, student);
                     let call_id = message.id.expect("a Call carries its id");
                     client.send(&Envelope::new(
                         CorrelationId(call_id.get()),
@@ -572,8 +714,9 @@ mod workload {
 
     /// The Backend's answer to one `Call` of the rule's three host functions. Each argument
     /// arrives as a Value Secret holder (`{__secret, value}`, FR-28) because it was read from a
-    /// place — the Backend reads the value inside.
-    fn answer(call: &Envelope<Value>) -> Value {
+    /// place — the Backend reads the value inside; the Rhai server sends plain values. `record`
+    /// must name this student and its verdict.
+    fn answer(call: &Envelope<Value>, student: &Student) -> Value {
         let name = field(&call.payload, "name")
             .as_str()
             .expect("a function name");
@@ -590,7 +733,11 @@ mod workload {
             ("passMark", [program]) => {
                 Value::from(pass_mark(program.as_str().expect("a program name")))
             }
-            ("record", [id, Value::Boolean(_)]) if id.as_str().is_some() => Value::Nil,
+            ("record", [id, Value::Boolean(passed)])
+                if id.as_str() == Some(student.id.as_str()) && *passed == student.passes =>
+            {
+                Value::Nil
+            }
             (name, arguments) => panic!("an unexpected Call to `{name}` with {arguments:?}"),
         }
     }
@@ -617,15 +764,22 @@ mod steady {
     use std::sync::Barrier;
     use std::time::{Duration, Instant};
 
-    use crate::daemon::Daemon;
     use crate::report::Round;
+    use crate::wire::Client;
     use crate::{CONCURRENCY, workload};
 
-    /// Runs `rounds` rounds of `runs` timed runs on each of [`CONCURRENCY`] connections, after
-    /// `warm_up` untimed runs each, and returns each round's figures.
-    pub fn measure(daemon: &Daemon, rounds: usize, runs: usize, warm_up: usize) -> Vec<Round> {
+    /// Runs `rounds` rounds of `runs` timed runs on each of [`CONCURRENCY`] connections opened
+    /// by `connect`, after `warm_up` untimed runs each, with `source` registered on each, and
+    /// returns each round's figures. The Daemon and the Rhai server are measured alike.
+    pub fn measure(
+        connect: impl Fn() -> Client,
+        source: &str,
+        rounds: usize,
+        runs: usize,
+        warm_up: usize,
+    ) -> Vec<Round> {
         let students = workload::students();
-        let clients: Vec<_> = (0..CONCURRENCY).map(|_| daemon.connect()).collect();
+        let clients: Vec<_> = (0..CONCURRENCY).map(|_| connect()).collect();
         // The connections and the main thread meet before and after every round, so the main
         // thread's clock spans exactly the round's runs.
         let barrier = Barrier::new(CONCURRENCY + 1);
@@ -648,7 +802,7 @@ mod steady {
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 workload::init(&mut client);
-                                let handle = workload::register(&mut client);
+                                let handle = workload::register_source(&mut client, source);
                                 let mut turn = index;
                                 let mut next = || {
                                     turn += 1;
@@ -709,6 +863,270 @@ mod steady {
     }
 }
 
+/// The `engine` section: the rule in-process on three drivers, hand-timed, so the Resource
+/// Budget's cost shows as its own line beside Rhai's engine.
+#[cfg(unix)]
+mod engine {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use hexput_enforce::{Budget, Exceeded, Limits};
+    use hexput_exec::wire::{Path, measure_held, result_payload_size, to_hexput};
+    use hexput_interpreter::{Argument, Execution, Held, Meter, Outcome, Program, Value};
+    use hexput_shared::diagnostics::Span;
+
+    use crate::report::EngineFigures;
+    use crate::rhai::EngineDriver;
+    use crate::workload::{self, HOST_CALLS_PER_RUN, Student};
+
+    /// One Hexput run's result: its verdict, its host calls and its `record` calls (each checked
+    /// against the student as it is made).
+    struct Driven {
+        verdict: bool,
+        calls: usize,
+        records: usize,
+    }
+
+    /// The rule's host calls answered natively — no wire. `record` must name this student and
+    /// its verdict.
+    fn answer(name: &str, arguments: &[Argument], student: &Student, records: &mut usize) -> Value {
+        match (name, arguments) {
+            ("weight", [course]) => match &course.value {
+                Value::String(course) => Value::Number(workload::course_weight(course) as f64),
+                other => panic!("`weight` of {other:?}"),
+            },
+            ("passMark", [program]) => match &program.value {
+                Value::String(program) => Value::Number(workload::pass_mark(program) as f64),
+                other => panic!("`passMark` of {other:?}"),
+            },
+            ("record", [id, passed]) => {
+                assert!(
+                    matches!(&id.value, Value::String(id) if **id == *student.id)
+                        && passed.value.as_bool() == Some(student.passes),
+                    "{}: a wrong `record`",
+                    student.id
+                );
+                *records += 1;
+                Value::Null
+            }
+            (name, arguments) => panic!(
+                "an unexpected host call to `{name}` with {} argument(s)",
+                arguments.len()
+            ),
+        }
+    }
+
+    /// A refused charge is a panic: the enforced figure never comes from a run the Executor
+    /// would have stopped.
+    fn within(result: Result<(), Exceeded>) {
+        if let Err(exceeded) = result {
+            panic!(
+                "an enforced run exceeded its {} budget",
+                exceeded.dimension().as_str()
+            );
+        }
+    }
+
+    /// One in-process run of the rule. Unmetered: `Execution` with `Meter::UNMETERED`, each host
+    /// call resumed at once. Enforced: the Executor's synchronous enforcement, in the order
+    /// `hexput_exec::execute_held` applies it — the same slice and ceilings from
+    /// `Budget::with_limits(Limits::default())`, CPU charged with an `Instant`-timed elapsed at
+    /// every pause, host call and finish, each host call's arguments measured against the
+    /// argument depth limit and the frame (that work charged as CPU too), one RPC call (and side
+    /// effect) per host call, and the exact output size at the finish. Not mirrored, as it is not
+    /// budgeting: converting the arguments to wire values (there is no wire here), the feature
+    /// toggles, the method table and the capability decision.
+    fn drive(
+        program: &Arc<Program>,
+        variables: &[(String, Held)],
+        enforced: bool,
+        student: &Student,
+    ) -> Driven {
+        let mut budget = enforced.then(|| Budget::with_limits(Limits::default()));
+        let meter = match &budget {
+            Some(budget) => Meter {
+                slice: Some(hexput_exec::SLICE),
+                memory_ceiling: Some(budget.memory_ceiling()),
+                allocation_ceiling: Some(budget.allocation_ceiling()),
+            },
+            None => Meter::UNMETERED,
+        };
+        let whole = program.span;
+        let mut started = Instant::now();
+        let mut execution =
+            Execution::with_variables(Arc::clone(program), variables.iter().cloned())
+                .expect("the starting variables bind")
+                .metered(meter);
+        let charge_cpu = |budget: &mut Option<Budget>, started: Instant, span: Span| {
+            if let Some(budget) = budget {
+                within(budget.charge_cpu(started.elapsed(), span));
+            }
+        };
+        let (mut calls, mut records) = (0, 0);
+        loop {
+            match execution.run().expect("the rule runs") {
+                Outcome::Paused(paused) => {
+                    charge_cpu(&mut budget, started, paused.span());
+                    started = Instant::now();
+                    execution = paused.resume();
+                }
+                Outcome::HostCall(call) => {
+                    charge_cpu(&mut budget, started, call.span());
+                    if let Some(budget) = budget.as_mut() {
+                        // `advance`: the arguments measured, the call counted, the work charged.
+                        let measuring = Instant::now();
+                        let depth = budget.limits().argument_depth();
+                        let mut frame = hexput_port::MAX_FRAME_LEN;
+                        for argument in call.arguments() {
+                            measure_held(
+                                &argument.value,
+                                argument.secret.as_ref(),
+                                depth,
+                                &mut frame,
+                            )
+                            .unwrap_or_else(|_| panic!("{}: an unsendable argument", student.id));
+                        }
+                        within(budget.charge_rpc_call(call.span()));
+                        within(budget.charge_cpu(measuring.elapsed(), call.span()));
+                    }
+                    calls += 1;
+                    let value = answer(call.name(), call.arguments(), student, &mut records);
+                    started = Instant::now();
+                    execution = call.resume(&value);
+                }
+                Outcome::Finished(finished) => {
+                    charge_cpu(&mut budget, started, whole);
+                    if let Some(budget) = &budget {
+                        let limit = budget.limits().output_size();
+                        let size =
+                            result_payload_size(&finished.result, &finished.modifications, limit);
+                        within(budget.charge_output(size, whole));
+                    }
+                    let verdict = finished
+                        .result
+                        .value
+                        .as_bool()
+                        .expect("the rule returns a bool");
+                    return Driven {
+                        verdict,
+                        calls,
+                        records,
+                    };
+                }
+                Outcome::OutOfMemory(_) => panic!("{}: the rule ran out of memory", student.id),
+                Outcome::AllocationsExceeded(_) => {
+                    panic!("{}: the rule made too many allocations", student.id)
+                }
+            }
+        }
+    }
+
+    /// Panics unless a run returned the student's verdict after exactly the rule's host calls,
+    /// one of them a `record`.
+    fn verify(student: &Student, driver: &str, verdict: bool, calls: usize, records: usize) {
+        assert_eq!(
+            verdict, student.passes,
+            "{driver} {}: a wrong verdict; no number is published",
+            student.id
+        );
+        assert_eq!(
+            (calls, records),
+            (HOST_CALLS_PER_RUN, 1),
+            "{driver} {}: a wrong number of host calls",
+            student.id
+        );
+    }
+
+    /// Runs `warm_up` untimed runs of each driver, then `rounds` rounds; each runs `runs` runs of
+    /// each driver in turn over the students — the round's first driver rotating — and gives each
+    /// driver's mean ns/run. Every run is verified.
+    pub fn measure(
+        students: &[Student],
+        rounds: usize,
+        runs: usize,
+        warm_up: usize,
+    ) -> Vec<EngineFigures> {
+        let program = Arc::new(hexput_parser::parse(workload::RULE).expect("the rule parses"));
+        // The variables are converted once per student and cloned per run.
+        let hexput: Vec<Vec<(String, Held)>> = students
+            .iter()
+            .map(|student| {
+                student
+                    .variables
+                    .as_map()
+                    .expect("a variables map")
+                    .iter()
+                    .map(|(name, value)| {
+                        let name = name.as_str().expect("a variable name");
+                        let held = to_hexput(value, &mut Path::variable(name))
+                            .expect("a convertible variable");
+                        (name.to_owned(), held)
+                    })
+                    .collect()
+            })
+            .collect();
+        let rhai_engine = EngineDriver::new();
+        let rhai: Vec<_> = students
+            .iter()
+            .map(|student| EngineDriver::variables(&student.variables))
+            .collect();
+
+        let (program, hexput) = (&program, &hexput);
+        let hexput_driver = |enforced: bool, name: &'static str| {
+            move |index: usize| {
+                let student = &students[index];
+                let driven = drive(program, &hexput[index], enforced, student);
+                verify(student, name, driven.verdict, driven.calls, driven.records);
+            }
+        };
+        let mut hexput_unmetered = hexput_driver(false, "hexput_unmetered");
+        let mut hexput_enforced = hexput_driver(true, "hexput_enforced");
+        let mut rhai_engine_driver = |index: usize| {
+            let student = &students[index];
+            let run = rhai_engine.run(&rhai[index]);
+            assert!(
+                run.recorded.as_ref().is_some_and(
+                    |(id, passed)| id.as_str() == student.id && *passed == student.passes
+                ),
+                "rhai_engine {}: a wrong `record`",
+                student.id
+            );
+            verify(student, "rhai_engine", run.verdict, run.calls, run.records);
+        };
+        // In `EngineFigures` order: unmetered, enforced, Rhai.
+        let mut drivers: [&mut dyn FnMut(usize); 3] = [
+            &mut hexput_unmetered,
+            &mut hexput_enforced,
+            &mut rhai_engine_driver,
+        ];
+        // Untimed warm-up runs of every driver, so no driver pays for cold caches.
+        for driver in drivers.iter_mut() {
+            for index in 0..warm_up {
+                (*driver)(index % students.len());
+            }
+        }
+        (0..rounds)
+            .map(|round| {
+                // Each round starts with the next driver, so no driver always runs first.
+                let mut mean_ns = [0.0_f64; 3];
+                for offset in 0..drivers.len() {
+                    let which = (round + offset) % drivers.len();
+                    let started = Instant::now();
+                    for index in 0..runs {
+                        (drivers[which])(index % students.len());
+                    }
+                    mean_ns[which] = started.elapsed().as_secs_f64() * 1e9 / runs as f64;
+                }
+                EngineFigures {
+                    hexput_unmetered: mean_ns[0],
+                    hexput_enforced: mean_ns[1],
+                    rhai_engine: mean_ns[2],
+                }
+            })
+            .collect()
+    }
+}
+
 /// The conditions, the steady-state figures and their reproducibility — pure apart from
 /// gathering the conditions and writing the file, so quick mode checks it with [`self_check`].
 #[cfg(unix)]
@@ -719,8 +1137,17 @@ mod report {
     use serde_json::{Value as Json, json};
 
     use crate::{
-        CONCURRENCY, QUICK_RUNS_PER_CONNECTION, ROUNDS, RUNS_PER_CONNECTION, WARM_UP_RUNS,
+        CONCURRENCY, ENGINE_ROUNDS, ENGINE_RUNS, ENGINE_WARM_UP_RUNS, QUICK_ENGINE_RUNS,
+        QUICK_RUNS_PER_CONNECTION, ROUNDS, RUNS_PER_CONNECTION, WARM_UP_RUNS,
     };
+
+    /// What the Rhai side is, recorded in the conditions.
+    pub const COMPARATOR: &str =
+        "rhai 1.26.1, Engine::new() defaults, thread-per-connection UDS server in the bench";
+
+    /// The steady-state sides' labels.
+    pub const HEXPUT_SIDE: &str = "Hexput Daemon, Cached Execution";
+    pub const RHAI_SIDE: &str = "Rhai server, compiled AST";
 
     /// The stated variance, as fractions.
     pub struct Variance {
@@ -782,13 +1209,23 @@ mod report {
         None
     }
 
-    /// `steady_state` runs with no filter, or a filter that is a substring of its name, and not
-    /// when Criterion only lists or profiles its benchmarks.
-    pub fn runs_steady_state(filter: Option<&str>, args: &[String]) -> bool {
+    /// A hand-timed section runs with no filter, or a filter that is a substring of its name,
+    /// and not when Criterion only lists or profiles its benchmarks.
+    fn runs_section(name: &str, filter: Option<&str>, args: &[String]) -> bool {
         !args
             .iter()
             .any(|arg| arg == "--list" || arg.split('=').next() == Some("--profile-time"))
-            && filter.is_none_or(|filter| "steady_state".contains(filter))
+            && filter.is_none_or(|filter| name.contains(filter))
+    }
+
+    /// Whether the `steady_state` section (Hexput's and Rhai's) runs.
+    pub fn runs_steady_state(filter: Option<&str>, args: &[String]) -> bool {
+        runs_section("steady_state", filter, args)
+    }
+
+    /// Whether the `engine` section runs.
+    pub fn runs_engine(filter: Option<&str>, args: &[String]) -> bool {
+        runs_section("engine", filter, args)
     }
 
     /// `<target>/hexput-bench/cache-win.json`: `CARGO_TARGET_DIR`, else the workspace's `target`.
@@ -828,6 +1265,9 @@ mod report {
         pub rounds: usize,
         pub runs_per_connection: usize,
         pub warm_up_runs: usize,
+        pub engine_rounds: usize,
+        pub engine_runs: usize,
+        pub engine_warm_up_runs: usize,
         /// The build actually measured, never assumed.
         pub profile: &'static str,
     }
@@ -843,6 +1283,11 @@ mod report {
             } else {
                 (ROUNDS, RUNS_PER_CONNECTION, WARM_UP_RUNS)
             };
+            let (engine_rounds, engine_runs, engine_warm_up_runs) = if quick {
+                (1, QUICK_ENGINE_RUNS, 0)
+            } else {
+                (ENGINE_ROUNDS, ENGINE_RUNS, ENGINE_WARM_UP_RUNS)
+            };
             Self {
                 cpu,
                 parallelism: std::thread::available_parallelism()
@@ -857,6 +1302,9 @@ mod report {
                 rounds,
                 runs_per_connection,
                 warm_up_runs,
+                engine_rounds,
+                engine_runs,
+                engine_warm_up_runs,
                 profile: profile(quick, cfg!(debug_assertions)),
             }
         }
@@ -886,12 +1334,17 @@ mod report {
         pub fn workload(&self) -> Json {
             json!({
                 "script": crate::workload::RULE,
+                "rhai_source": crate::rhai::RHAI_RULE,
+                "comparator": COMPARATOR,
                 "host_calls_per_run": crate::workload::HOST_CALLS_PER_RUN,
                 "students": crate::workload::STUDENTS,
                 "concurrency": CONCURRENCY,
                 "rounds": self.rounds,
                 "runs_per_connection": self.runs_per_connection,
                 "warm_up_runs": self.warm_up_runs,
+                "engine_rounds": self.engine_rounds,
+                "engine_runs": self.engine_runs,
+                "engine_warm_up_runs": self.engine_warm_up_runs,
                 "budget": "default Resource Budget",
                 "transport": "UDS, Daemon in-process on its own runtime",
                 "profile": self.profile,
@@ -907,8 +1360,13 @@ mod report {
                  timestamp: {}\n\
                  workload: the pass/fail rule, {} host calls per run, {} students rotating\n\
                  steady state: {} connections, {} round(s) of {} runs each, {} warm-up runs\n\
-                 budget:   default Resource Budget, no overrides\n\
+                 budget:   default Resource Budget, no overrides — every UDS headline figure runs \
+                 with all six dimensions enforced, unadjusted\n\
                  transport: UDS, Daemon in-process on its own runtime (clients share the machine)\n\
+                 comparator: {} (same client, students and verification; the Daemon's `Call` \
+                 arguments carry Value Secret holders, the Rhai server's plain values)\n\
+                 engine:   {} round(s) of {} in-process runs per driver (the first driver \
+                 rotating), {} warm-up runs each\n\
                  profile:  {}\n\
                  variance: p50 and throughput ±{:.0}%, p99 ±{:.0}% (informational, never a gate)",
                 self.cpu,
@@ -924,6 +1382,10 @@ mod report {
                 self.rounds,
                 self.runs_per_connection,
                 self.warm_up_runs,
+                COMPARATOR,
+                self.engine_rounds,
+                self.engine_runs,
+                self.engine_warm_up_runs,
                 self.profile,
                 VARIANCE.p50 * 100.0,
                 VARIANCE.p99 * 100.0,
@@ -1070,9 +1532,9 @@ mod report {
         }
     }
 
-    pub fn render_steady_state(rounds: &[Round], summary: &Summary) -> String {
+    pub fn render_steady_state(label: &str, rounds: &[Round], summary: &Summary) -> String {
         let mut text =
-            format!("== steady_state: {CONCURRENCY} concurrent connections, Cached Execution ==\n");
+            format!("== steady_state: {label}, {CONCURRENCY} concurrent connections ==\n");
         for (index, round) in rounds.iter().enumerate() {
             text += &format!(
                 "round {}/{}: p50 {:.1} µs  p99 {:.1} µs  throughput {:.0} runs/s\n",
@@ -1105,16 +1567,209 @@ mod report {
         text
     }
 
+    /// Hexput over Rhai: how many times Rhai's figure Hexput's is.
+    pub fn ratio(hexput: f64, rhai: f64) -> f64 {
+        if rhai == 0.0 {
+            if hexput == 0.0 { 1.0 } else { f64::INFINITY }
+        } else {
+            hexput / rhai
+        }
+    }
+
+    /// The two steady-state summaries side by side: rows p50, p99 and throughput; columns
+    /// Hexput, Rhai and the Hexput/Rhai ratio (below 1 is a lower latency or throughput).
+    pub fn render_side_by_side(hexput: &Round, rhai: &Round) -> String {
+        let units = ["µs", "µs", "runs/s"];
+        let mut text = format!(
+            "== steady_state: side by side (median of rounds, same client and concurrency) ==\n\
+             {:<12}{:>16}{:>16}{:>14}\n",
+            "", "Hexput", "Rhai", "Hexput/Rhai"
+        );
+        let (left, right) = (hexput.figures(), rhai.figures());
+        for index in 0..3 {
+            text += &format!(
+                "{:<12}{:>16}{:>16}{:>14}\n",
+                NAMES[index],
+                format!("{:.1} {}", left[index], units[index]),
+                format!("{:.1} {}", right[index], units[index]),
+                format!("{:.2}x", ratio(left[index], right[index])),
+            );
+        }
+        text += "Hexput/Rhai below 1x: a lower p50/p99 (better) but a lower throughput (worse)";
+        text
+    }
+
+    /// Both steady states of one run.
+    pub struct Steady {
+        pub hexput: Vec<Round>,
+        pub hexput_summary: Summary,
+        pub rhai: Vec<Round>,
+        pub rhai_summary: Summary,
+    }
+
+    /// The `engine` section's figures: each driver's mean ns/run (one round's, or the median of
+    /// the rounds).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct EngineFigures {
+        pub hexput_unmetered: f64,
+        pub hexput_enforced: f64,
+        pub rhai_engine: f64,
+    }
+
+    impl EngineFigures {
+        /// Each driver's median across the rounds.
+        pub fn median(rounds: &[Self]) -> Self {
+            Self {
+                hexput_unmetered: median(rounds.iter().map(|r| r.hexput_unmetered).collect()),
+                hexput_enforced: median(rounds.iter().map(|r| r.hexput_enforced).collect()),
+                rhai_engine: median(rounds.iter().map(|r| r.rhai_engine).collect()),
+            }
+        }
+
+        /// Each driver's largest relative deviation across `rounds` from `self` (their median),
+        /// as fractions, in field order — this section's own spread, beside the steady state's.
+        pub fn spread(&self, rounds: &[Self]) -> [f64; 3] {
+            let central = [
+                self.hexput_unmetered,
+                self.hexput_enforced,
+                self.rhai_engine,
+            ];
+            let mut spread = [0.0_f64; 3];
+            for round in rounds {
+                let figures = [
+                    round.hexput_unmetered,
+                    round.hexput_enforced,
+                    round.rhai_engine,
+                ];
+                for index in 0..3 {
+                    spread[index] =
+                        spread[index].max(relative(central[index], figures[index]).abs());
+                }
+            }
+            spread
+        }
+
+        /// The budget enforcement overhead: enforced − unmetered in ns/run, and that relative to
+        /// unmetered in percent.
+        pub fn overhead(&self) -> (f64, f64) {
+            let ns = self.hexput_enforced - self.hexput_unmetered;
+            (
+                ns,
+                relative(self.hexput_unmetered, self.hexput_enforced) * 100.0,
+            )
+        }
+
+        /// The overhead line.
+        pub fn overhead_line(&self) -> String {
+            let (ns, pct) = self.overhead();
+            if ns >= 0.0 {
+                format!("budget enforcement overhead: +{ns:.1} ns/run (+{pct:.1}%)")
+            } else {
+                // Enforcement cannot make a run faster; a negative difference is noise.
+                format!(
+                    "budget enforcement overhead: -{:.1} ns/run (-{:.1}%), within measurement noise",
+                    -ns, -pct
+                )
+            }
+        }
+
+        fn json(&self) -> Json {
+            let (ns, pct) = self.overhead();
+            json!({
+                "hexput_unmetered_ns": self.hexput_unmetered,
+                "hexput_enforced_ns": self.hexput_enforced,
+                "rhai_engine_ns": self.rhai_engine,
+                "budget_overhead_ns": ns,
+                "budget_overhead_pct": pct,
+            })
+        }
+    }
+
+    pub fn render_engine(rounds: &[EngineFigures], summary: &EngineFigures) -> String {
+        let mut text = String::from(
+            "== engine: the rule in-process, host calls answered natively (no wire) ==\n",
+        );
+        for (index, round) in rounds.iter().enumerate() {
+            text += &format!(
+                "round {}/{}: hexput_unmetered {:.0} ns/run  hexput_enforced {:.0} ns/run  \
+                 rhai_engine {:.0} ns/run\n",
+                index + 1,
+                rounds.len(),
+                round.hexput_unmetered,
+                round.hexput_enforced,
+                round.rhai_engine
+            );
+        }
+        text += &format!(
+            "summary (median of {} round(s)): hexput_unmetered {:.0} ns/run  hexput_enforced \
+             {:.0} ns/run  rhai_engine {:.0} ns/run\n",
+            rounds.len(),
+            summary.hexput_unmetered,
+            summary.hexput_enforced,
+            summary.rhai_engine
+        );
+        let [unmetered, enforced, rhai] = summary.spread(rounds);
+        text += &format!(
+            "spread across rounds: hexput_unmetered ±{:.1}%, hexput_enforced ±{:.1}%, \
+             rhai_engine ±{:.1}% (an overhead smaller than these is within the noise)\n",
+            unmetered * 100.0,
+            enforced * 100.0,
+            rhai * 100.0
+        );
+        text += &summary.overhead_line();
+        text += "\n  covers: the Executor's synchronous enforcement — CPU-time slicing and \
+                 charging, the memory and allocation ceilings, the argument depth and frame \
+                 measure, the RPC-call/side-effect count and the output-size measure; not the \
+                 async hops, the arguments' wire conversion or the capability lookups, which are \
+                 not budgeting\n  the UDS headline figures above run with the full default \
+                 budget and are not adjusted by this line";
+        text
+    }
+
+    /// One side's figures against the previous run's.
+    #[derive(Debug, PartialEq)]
+    pub struct Delta {
+        /// The previous run's median figures.
+        pub previous: Round,
+        /// Each figure's relative change from the previous run.
+        pub change: [f64; 3],
+    }
+
+    impl Delta {
+        fn of(previous: Round, summary: &Summary) -> Self {
+            let (before, after) = (previous.figures(), summary.median.figures());
+            Self {
+                previous,
+                change: [0, 1, 2].map(|index| relative(before[index], after[index])),
+            }
+        }
+
+        fn render(&self, label: &str) -> String {
+            let figures = self.previous.figures();
+            let lines: Vec<String> = (0..3)
+                .map(|index| {
+                    format!(
+                        "  {}: previous {:.1}, change {:+.1}% ({} ±{:.0}%)",
+                        NAMES[index],
+                        figures[index],
+                        self.change[index] * 100.0,
+                        verdict(self.change[index], limits()[index]),
+                        limits()[index] * 100.0
+                    )
+                })
+                .collect();
+            format!("{label}:\n{}", lines.join("\n"))
+        }
+    }
+
     /// This run against the previous report.
     #[derive(Debug, PartialEq)]
     pub enum Comparison {
         /// No previous file, an unreadable one, or one from another machine or workload.
         NoPrevious,
         Previous {
-            /// The previous run's median figures.
-            previous: Round,
-            /// Each figure's relative change from the previous run.
-            change: [f64; 3],
+            hexput: Delta,
+            rhai: Delta,
         },
     }
 
@@ -1122,35 +1777,22 @@ mod report {
         pub fn render(&self) -> String {
             match self {
                 Self::NoPrevious => "against the previous run: no comparable previous run".into(),
-                Self::Previous { previous, change } => {
-                    let figures = previous.figures();
-                    let lines: Vec<String> = (0..3)
-                        .map(|index| {
-                            format!(
-                                "  {}: previous {:.1}, change {:+.1}% ({} ±{:.0}%)",
-                                NAMES[index],
-                                figures[index],
-                                change[index] * 100.0,
-                                verdict(change[index], limits()[index]),
-                                limits()[index] * 100.0
-                            )
-                        })
-                        .collect();
-                    format!(
-                        "against the previous run on this machine:\n{}",
-                        lines.join("\n")
-                    )
-                }
+                Self::Previous { hexput, rhai } => format!(
+                    "against the previous run on this machine:\n{}\n{}",
+                    hexput.render(HEXPUT_SIDE),
+                    rhai.render(RHAI_SIDE)
+                ),
             }
         }
     }
 
-    /// Compares `summary` with the previous report's text, when it parses and its machine has
-    /// this run's fingerprint.
+    /// Compares both summaries with the previous report's text, when it parses, its machine has
+    /// this run's fingerprint and its workload is this run's.
     pub fn compare(
         previous: Option<&str>,
         conditions: &Conditions,
-        summary: &Summary,
+        hexput: &Summary,
+        rhai: &Summary,
     ) -> Comparison {
         let Some(json) = previous.and_then(|text| serde_json::from_str::<Json>(text).ok()) else {
             return Comparison::NoPrevious;
@@ -1160,25 +1802,44 @@ mod report {
         let same_machine = ["cpu", "parallelism", "os", "arch"]
             .iter()
             .all(|key| machine.and_then(|machine| machine.get(key)) == fingerprint.get(key));
-        // A previous run of another workload (script, concurrency, rounds, runs, profile) is
-        // not comparable either.
+        // A previous run of another workload (script, Rhai source and comparator, concurrency,
+        // rounds, runs, profile) is not comparable either — a Story 4.4 report among them.
         let same_workload = json.get("workload") == Some(&conditions.workload());
-        let Some(previous) = json
-            .get("steady_state")
-            .and_then(|steady| steady.get("summary"))
-            .and_then(Round::from_json)
-            .filter(|_| same_machine && same_workload)
-        else {
-            return Comparison::NoPrevious;
+        let summary = |section: &str| {
+            json.get(section)
+                .and_then(|steady| steady.get("summary"))
+                .and_then(Round::from_json)
         };
-        let (before, after) = (previous.figures(), summary.median.figures());
-        Comparison::Previous {
-            previous,
-            change: [0, 1, 2].map(|index| relative(before[index], after[index])),
+        match (summary("steady_state"), summary("rhai_steady_state")) {
+            (Some(previous_hexput), Some(previous_rhai)) if same_machine && same_workload => {
+                Comparison::Previous {
+                    hexput: Delta::of(previous_hexput, hexput),
+                    rhai: Delta::of(previous_rhai, rhai),
+                }
+            }
+            _ => Comparison::NoPrevious,
         }
     }
 
-    pub fn to_json(conditions: &Conditions, rounds: &[Round], summary: &Summary) -> Json {
+    fn steady_json(rounds: &[Round], summary: &Summary) -> Json {
+        json!({
+            "rounds": rounds.iter().map(Round::json).collect::<Vec<_>>(),
+            "summary": summary.median.json(),
+            "spread": {
+                "p50": summary.spread[0],
+                "p99": summary.spread[1],
+                "throughput": summary.spread[2],
+            },
+        })
+    }
+
+    /// The report: the conditions, both steady states and — `null` when the section was
+    /// filtered out — the engine figures with the overhead.
+    pub fn to_json(
+        conditions: &Conditions,
+        steady: &Steady,
+        engine: Option<&EngineFigures>,
+    ) -> Json {
         json!({
             "machine": conditions.machine(),
             "workload": conditions.workload(),
@@ -1187,15 +1848,9 @@ mod report {
                 "p99": VARIANCE.p99,
                 "throughput": VARIANCE.throughput,
             },
-            "steady_state": {
-                "rounds": rounds.iter().map(Round::json).collect::<Vec<_>>(),
-                "summary": summary.median.json(),
-                "spread": {
-                    "p50": summary.spread[0],
-                    "p99": summary.spread[1],
-                    "throughput": summary.spread[2],
-                },
-            },
+            "steady_state": steady_json(&steady.hexput, &steady.hexput_summary),
+            "rhai_steady_state": steady_json(&steady.rhai, &steady.rhai_summary),
+            "engine": engine.map_or(Json::Null, EngineFigures::json),
         })
     }
 
@@ -1278,24 +1933,55 @@ mod report {
             rounds: ROUNDS,
             runs_per_connection: RUNS_PER_CONNECTION,
             warm_up_runs: WARM_UP_RUNS,
+            engine_rounds: ENGINE_ROUNDS,
+            engine_runs: ENGINE_RUNS,
+            engine_warm_up_runs: ENGINE_WARM_UP_RUNS,
             profile: "bench",
         };
-        let previous = to_json(&conditions, &rounds, &summary).to_string();
+        // Rhai's rounds: half Hexput's latency, twice its throughput.
+        let rhai_rounds = rounds.map(|round| Round {
+            p50_us: round.p50_us / 2.0,
+            p99_us: round.p99_us / 2.0,
+            throughput: round.throughput * 2.0,
+        });
+        let rhai_summary = Summary::of(&rhai_rounds);
+        let steady_of = |hexput: &[Round], rhai: &[Round]| Steady {
+            hexput: hexput.to_vec(),
+            hexput_summary: Summary::of(hexput),
+            rhai: rhai.to_vec(),
+            rhai_summary: Summary::of(rhai),
+        };
+        let steady = steady_of(&rounds, &rhai_rounds);
+        let engine = EngineFigures {
+            hexput_unmetered: 1000.0,
+            hexput_enforced: 1100.0,
+            rhai_engine: 800.0,
+        };
+        let previous = to_json(&conditions, &steady, Some(&engine)).to_string();
         let faster = Summary::of(&rounds.map(|round| Round {
             p50_us: round.p50_us * 1.2,
             ..round
         }));
-        match compare(Some(&previous), &conditions, &faster) {
-            Comparison::Previous {
-                previous: before,
-                change,
-            } => {
-                assert_eq!(before, summary.median);
-                assert!((change[0] - 0.2).abs() < 1e-9);
-                assert_eq!(change[2], 0.0);
-                let text = compare(Some(&previous), &conditions, &faster).render();
+        // Rhai's figures are compared too: its p99 moved by 30% here.
+        let rhai_moved = Summary::of(&rhai_rounds.map(|round| Round {
+            p99_us: round.p99_us * 1.3,
+            ..round
+        }));
+        match compare(Some(&previous), &conditions, &faster, &rhai_moved) {
+            Comparison::Previous { hexput, rhai } => {
+                assert_eq!(hexput.previous, summary.median);
+                assert!((hexput.change[0] - 0.2).abs() < 1e-9);
+                assert_eq!(hexput.change[2], 0.0);
+                assert_eq!(rhai.previous, rhai_summary.median);
+                assert_eq!(rhai.change[0], 0.0);
+                assert!((rhai.change[1] - 0.3).abs() < 1e-9);
+                let text = compare(Some(&previous), &conditions, &faster, &rhai_moved).render();
                 assert!(text.contains("p50: previous 100.0, change +20.0% (outside ±10%)"));
                 assert!(text.contains("throughput: previous 1000.0, change +0.0% (within ±10%)"));
+                assert!(text.contains(&format!(
+                    "{RHAI_SIDE}:\n  p50: previous 50.0, change +0.0% (within ±10%)\n  \
+                     p99: previous 100.0, change +30.0% (outside ±20%)"
+                )));
             }
             Comparison::NoPrevious => panic!("the same machine is comparable"),
         }
@@ -1303,46 +1989,72 @@ mod report {
             cpu: "another cpu".into(),
             ..conditions.clone()
         };
+        let unchanged = |conditions: &Conditions, text: Option<&str>| {
+            compare(text, conditions, &summary, &rhai_summary)
+        };
+        assert_eq!(unchanged(&other, Some(&previous)), Comparison::NoPrevious);
+        assert_eq!(unchanged(&other, None), Comparison::NoPrevious);
+        assert_eq!(unchanged(&other, Some("{not json")), Comparison::NoPrevious);
         assert_eq!(
-            compare(Some(&previous), &other, &summary),
-            Comparison::NoPrevious
-        );
-        assert_eq!(compare(None, &other, &summary), Comparison::NoPrevious);
-        assert_eq!(
-            compare(Some("{not json"), &other, &summary),
-            Comparison::NoPrevious
-        );
-        assert_eq!(
-            compare(Some("{\"machine\": 3}"), &other, &summary),
+            unchanged(&other, Some("{\"machine\": 3}")),
             Comparison::NoPrevious
         );
         // Corrupt or partial reports from this very machine are not comparable either.
         assert_eq!(
-            compare(Some("{\"machine\": 3}"), &conditions, &summary),
+            unchanged(&conditions, Some("{\"machine\": 3}")),
             Comparison::NoPrevious
         );
-        let mut partial = to_json(&conditions, &rounds, &summary);
-        partial["steady_state"]
-            .as_object_mut()
-            .expect("a steady_state object")
-            .remove("summary");
+        for section in ["steady_state", "rhai_steady_state"] {
+            let mut partial = to_json(&conditions, &steady, Some(&engine));
+            partial[section]
+                .as_object_mut()
+                .expect("a steady-state object")
+                .remove("summary");
+            assert_eq!(
+                unchanged(&conditions, Some(&partial.to_string())),
+                Comparison::NoPrevious,
+                "{section} without a summary"
+            );
+            let mut garbled = to_json(&conditions, &steady, Some(&engine));
+            garbled[section]["summary"]["p99_us"] = json!("fast");
+            assert_eq!(
+                unchanged(&conditions, Some(&garbled.to_string())),
+                Comparison::NoPrevious,
+                "{section} with a garbled summary"
+            );
+        }
+        // A Story 4.4 report — no comparator fields, no Rhai summary — is not comparable.
+        let mut old = to_json(&conditions, &steady, None);
+        let workload = old["workload"].as_object_mut().expect("a workload object");
+        for key in ["rhai_source", "comparator", "engine_rounds", "engine_runs"] {
+            workload.remove(key);
+        }
+        old.as_object_mut()
+            .expect("a report object")
+            .remove("rhai_steady_state");
         assert_eq!(
-            compare(Some(&partial.to_string()), &conditions, &summary),
+            unchanged(&conditions, Some(&old.to_string())),
             Comparison::NoPrevious
         );
-        let mut garbled = to_json(&conditions, &rounds, &summary);
-        garbled["steady_state"]["summary"]["p99_us"] = json!("fast");
-        assert_eq!(
-            compare(Some(&garbled.to_string()), &conditions, &summary),
-            Comparison::NoPrevious
-        );
+        // A report whose engine section was filtered out still compares its steady states.
+        let without_engine = to_json(&conditions, &steady, None);
+        assert_eq!(without_engine["engine"], Json::Null);
+        assert!(matches!(
+            unchanged(&conditions, Some(&without_engine.to_string())),
+            Comparison::Previous { .. }
+        ));
         // Nor is a run of another workload on this machine.
         let fewer = Conditions {
             runs_per_connection: 10,
             ..conditions.clone()
         };
+        assert_eq!(unchanged(&fewer, Some(&previous)), Comparison::NoPrevious);
+        let shorter_engine = Conditions {
+            engine_runs: QUICK_ENGINE_RUNS,
+            ..conditions.clone()
+        };
         assert_eq!(
-            compare(Some(&previous), &fewer, &summary),
+            unchanged(&shorter_engine, Some(&previous)),
             Comparison::NoPrevious
         );
         let unoptimised = Conditions {
@@ -1350,9 +2062,121 @@ mod report {
             ..fewer
         };
         assert_eq!(
-            compare(Some(&previous), &unoptimised, &summary),
+            unchanged(&unoptimised, Some(&previous)),
             Comparison::NoPrevious
         );
+
+        // The report's comparator fields and engine figures.
+        let report: Json = serde_json::from_str(&previous).expect("the report parses");
+        assert_eq!(
+            report["workload"]["rhai_source"],
+            json!(crate::rhai::RHAI_RULE)
+        );
+        assert_eq!(report["workload"]["comparator"], json!(COMPARATOR));
+        assert_eq!(report["workload"]["engine_rounds"], json!(ENGINE_ROUNDS));
+        assert_eq!(report["workload"]["engine_runs"], json!(ENGINE_RUNS));
+        assert_eq!(
+            report["rhai_steady_state"]["summary"]["p50_us"],
+            json!(50.0)
+        );
+        assert_eq!(
+            report["rhai_steady_state"]["rounds"]
+                .as_array()
+                .map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            report["engine"],
+            json!({
+                "hexput_unmetered_ns": 1000.0,
+                "hexput_enforced_ns": 1100.0,
+                "rhai_engine_ns": 800.0,
+                "budget_overhead_ns": 100.0,
+                "budget_overhead_pct": 10.0,
+            })
+        );
+
+        // The side-by-side table and its ratio.
+        assert_eq!(ratio(150.0, 100.0), 1.5);
+        assert_eq!(ratio(0.0, 0.0), 1.0);
+        assert_eq!(ratio(1.0, 0.0), f64::INFINITY);
+        let table = render_side_by_side(&summary.median, &rhai_summary.median);
+        assert!(
+            table.contains("Hexput") && table.contains("Rhai") && table.contains("Hexput/Rhai")
+        );
+        assert!(
+            table.ends_with("a lower throughput (worse)"),
+            "the ratio's reading"
+        );
+        let row = |name: &str| {
+            table
+                .lines()
+                .find(|line| line.starts_with(name))
+                .unwrap_or_else(|| panic!("a `{name}` row"))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(row("p50"), "p50 100.0 µs 50.0 µs 2.00x");
+        assert_eq!(row("p99"), "p99 200.0 µs 100.0 µs 2.00x");
+        assert_eq!(
+            row("throughput"),
+            "throughput 1000.0 runs/s 2000.0 runs/s 0.50x"
+        );
+
+        // The overhead arithmetic and its line.
+        assert_eq!(engine.overhead(), (100.0, 10.0));
+        assert_eq!(
+            engine.overhead_line(),
+            "budget enforcement overhead: +100.0 ns/run (+10.0%)"
+        );
+        let noisy = EngineFigures {
+            hexput_enforced: 990.0,
+            ..engine
+        };
+        assert_eq!(noisy.overhead(), (-10.0, -1.0));
+        assert!(
+            noisy
+                .overhead_line()
+                .starts_with("budget enforcement overhead: -10.0 ns/run (-1.0%)")
+        );
+        let engine_rounds = [
+            engine,
+            EngineFigures {
+                hexput_unmetered: 900.0,
+                hexput_enforced: 1300.0,
+                rhai_engine: 700.0,
+            },
+            EngineFigures {
+                hexput_unmetered: 1200.0,
+                hexput_enforced: 1000.0,
+                rhai_engine: 900.0,
+            },
+        ];
+        let median_engine = EngineFigures::median(&engine_rounds);
+        assert_eq!(median_engine, engine, "each driver's own median");
+        let rendered = render_engine(&engine_rounds, &median_engine);
+        assert!(rendered.contains("round 3/3"));
+        // Unmetered 900/1000/1200 around 1000: ±20%; enforced 1100/1300/1000 around 1100.
+        let spread = median_engine.spread(&engine_rounds);
+        assert!((spread[0] - 0.2).abs() < 1e-9, "{spread:?}");
+        assert!((spread[1] - 200.0 / 1100.0).abs() < 1e-9, "{spread:?}");
+        assert!(rendered.contains("spread across rounds: hexput_unmetered ±20.0%"));
+        assert!(rendered.contains("budget enforcement overhead: +100.0 ns/run (+10.0%)"));
+        assert!(rendered.contains("full default budget"));
+
+        // The engine filter rule.
+        assert!(runs_engine(None, &args(&[])));
+        assert!(runs_engine(Some("engine"), &args(&[])));
+        assert!(runs_engine(Some("eng"), &args(&[])));
+        assert!(!runs_engine(Some("steady"), &args(&[])));
+        assert!(!runs_engine(Some("rhai_compare"), &args(&[])));
+        assert!(!runs_engine(None, &args(&["--list"])));
+        assert!(!runs_engine(None, &args(&["--profile-time", "5"])));
+        assert!(!runs_steady_state(Some("engine"), &args(&[])));
+
+        // The wire↔Dynamic conversion and the Rhai rule.
+        crate::rhai::self_check();
 
         // The profile.
         assert_eq!(profile(false, false), "bench");

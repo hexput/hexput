@@ -2048,4 +2048,583 @@ mod cache_win {
         });
         serving.stop().exit(0);
     }
+
+    // --- Story 4.5: the Rhai comparator over the same workload, and the in-process engine drivers ---
+
+    /// Story 4.5: the Rhai comparator (spec `cache` bench, constant `RHAI_RULE`), its native host
+    /// functions, and the in-process Hexput drivers of the `engine` section. Every driver runs the
+    /// same 16 students and must return the verdict Rust computes, with 10 host calls per run.
+    /// Like the 4.4 module, this copies the bench's workload; the drift guards pin the copies.
+    mod rhai_comparator {
+        use super::*;
+        use hexput_enforce::{
+            Budget, DEFAULT_ALLOCATIONS, DEFAULT_OUTPUT_SIZE, DEFAULT_RPC_CALLS,
+            DEFAULT_SIDE_EFFECTS, Exceeded, Limits,
+        };
+        use hexput_exec::{
+            SLICE,
+            wire::{measure_held, result_payload_size},
+        };
+        use hexput_interpreter::{
+            Argument, Array as HexArray, Execution, Meter, Object as HexObject, Outcome, Program,
+            Value as HexValue,
+        };
+        use hexput_shared::diagnostics::Span;
+        use rhai::{AST, Array, Dynamic, Engine, ImmutableString, Map, Scope};
+        use std::path::Path;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        const RHAI_RULE: &str = "let total = 0.0; let weights = 0.0;\nfor grade in grades { let w = weight(grade.course); total = total + grade.score * w; weights = weights + w; }\nlet passed = total / weights >= passMark(student.program);\nrecord(student.id, passed);\npassed\n";
+
+        /// The root manifest's directory, the workspace root.
+        fn workspace_root() -> std::path::PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .expect("the workspace root")
+        }
+
+        /// The `[section]` headers under which a manifest names `dependency` (as `dependency = …`
+        /// or `dependency.workspace = …`).
+        fn sections_naming(manifest: &str, dependency: &str) -> Vec<String> {
+            let mut section = String::new();
+            let mut found = Vec::new();
+            for line in manifest.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('[') {
+                    section = trimmed.to_owned();
+                    continue;
+                }
+                let named = trimmed.strip_prefix(dependency).is_some_and(|rest| {
+                    matches!(rest.trim_start().chars().next(), Some('=') | Some('.'))
+                });
+                if named {
+                    found.push(section.clone());
+                }
+            }
+            found
+        }
+
+        /// Story 4.5: `rhai` is pinned at 1.26.1 in the workspace, reaches `hexput-tests` as a
+        /// dev-dependency only, and no other crate names it at all.
+        #[test]
+        fn rhai_is_pinned_at_one_point_two_six_one_and_is_a_dev_dependency_only() {
+            let root = workspace_root();
+            let workspace =
+                std::fs::read_to_string(root.join("Cargo.toml")).expect("root manifest");
+            assert!(
+                workspace
+                    .lines()
+                    .any(|line| line.trim() == "rhai = \"1.26.1\""),
+                "the workspace pins `rhai = \"1.26.1\"`"
+            );
+            assert_eq!(
+                sections_naming(&workspace, "rhai"),
+                vec!["[workspace.dependencies]".to_owned()]
+            );
+            // The manifest line is a caret requirement, so the lock is what holds 1.26.1: a later
+            // `cargo update` that moved it would measure another Rhai under the "rhai 1.26.1" label.
+            let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock");
+            let locked: Vec<&str> = lock
+                .split("[[package]]")
+                .filter(|package| package.lines().any(|line| line.trim() == "name = \"rhai\""))
+                .filter_map(|package| {
+                    package
+                        .lines()
+                        .find_map(|line| line.trim().strip_prefix("version = "))
+                })
+                .collect();
+            assert_eq!(
+                locked,
+                vec!["\"1.26.1\""],
+                "Cargo.lock resolves rhai at exactly 1.26.1"
+            );
+
+            let tests =
+                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+                    .expect("hexput-tests' manifest");
+            assert_eq!(
+                sections_naming(&tests, "rhai"),
+                vec!["[dev-dependencies]".to_owned()],
+                "hexput-tests reaches rhai as a dev-dependency only"
+            );
+
+            for entry in std::fs::read_dir(root.join("crates")).expect("the crates directory") {
+                let directory = entry.expect("a crate directory").path();
+                if directory.file_name().and_then(|name| name.to_str()) == Some("hexput-tests") {
+                    continue;
+                }
+                let manifest = std::fs::read_to_string(directory.join("Cargo.toml"))
+                    .unwrap_or_else(|error| panic!("{}: {error}", directory.display()));
+                assert!(
+                    sections_naming(&manifest, "rhai").is_empty(),
+                    "{} names rhai; only hexput-tests may, as a dev-dependency",
+                    directory.display()
+                );
+            }
+        }
+
+        /// Story 4.5: the crate-graph check still passes with rhai added. That rhai reaches no
+        /// production crate is the manifest test above (only `hexput-tests` names it, as a
+        /// dev-dependency); this one checks that adding it moved no pinned edge.
+        #[test]
+        fn the_crate_graph_check_still_passes_with_rhai_added() {
+            let output = Command::new("python3")
+                .arg("scripts/check-crate-graph.py")
+                .current_dir(workspace_root())
+                .output()
+                .expect("python3 runs the crate-graph check");
+            assert!(
+                output.status.success(),
+                "check-crate-graph.py failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// Story 4.5: the Rhai rule the bench measures is the one this module runs, and the bench
+        /// wires the Rhai module in with the same workload constants the Hexput copy checks.
+        #[test]
+        fn the_rhai_rule_is_the_one_the_bench_measures() {
+            let rhai = include_str!("../benches/cache/rhai.rs");
+            assert!(
+                rhai.contains(&format!("pub const RHAI_RULE: &str = {RHAI_RULE:?};")),
+                "the bench's `RHAI_RULE` differs from this copy"
+            );
+            assert!(
+                include_str!("../benches/cache.rs").contains("mod rhai;"),
+                "the bench declares the Rhai module"
+            );
+        }
+
+        /// Story 4.5: the comparator suite's text in the bench, the Rhai server's shape and the
+        /// engine section's drivers, pinned by name. This pins names only: the drivers below are
+        /// copies that check the same sequence, and the bench's own drivers and Rhai server are
+        /// verified run by run by the bench's quick mode, which `cargo test` runs.
+        #[test]
+        fn the_bench_declares_the_comparator_group_engine_section_and_report_fields() {
+            let bench = include_str!("../benches/cache.rs");
+            let rhai = include_str!("../benches/cache/rhai.rs");
+            let all = format!("{bench}{rhai}");
+            for needle in [
+                "rhai_compare",
+                "hexput_cold_first_run",
+                "rhai_cold_first_run",
+                "hexput_warm_cache_hit",
+                "rhai_warm_cache_hit",
+                "noise_threshold(report::VARIANCE.p50)",
+                "ENGINE_ROUNDS: usize = 5;",
+                "ENGINE_RUNS: usize = 10_000;",
+                "budget enforcement overhead: +",
+                "rhai 1.26.1, Engine::new() defaults, thread-per-connection UDS server in the bench",
+                "rhai_source",
+                "rhai_steady_state",
+                "engine_rounds",
+                "engine_runs",
+                "hexput_unmetered_ns",
+                "hexput_enforced_ns",
+                "rhai_engine_ns",
+                "budget_overhead_ns",
+                "budget_overhead_pct",
+                "hexput_unmetered",
+                "hexput_enforced",
+                "rhai_engine",
+                "Meter::UNMETERED",
+                "Budget::with_limits(Limits::default())",
+                "memory_ceiling()",
+                "allocation_ceiling()",
+                "charge_cpu",
+                "charge_rpc_call",
+                "charge_output",
+                "result_payload_size",
+                "measure_held",
+                "argument_depth()",
+                "CodeRegister",
+                "CachedExecutionStart",
+                "CodeUnregister",
+                "eval_ast_with_scope",
+                "UnixListener",
+                "Engine::new()",
+                "encode_frame",
+                "MAX_FRAME_LEN",
+            ] {
+                assert!(all.contains(needle), "the bench lacks `{needle}`");
+            }
+            assert!(
+                !rhai.contains("set_max_"),
+                "the Rhai comparator runs at Engine::new()'s defaults, with no limit set"
+            );
+        }
+
+        /// Story 4.5: the Rhai engine of the comparator: native host functions that count their
+        /// calls and log each `record`, with the rule compiled once.
+        struct RhaiEngine {
+            engine: Engine,
+            ast: AST,
+            calls: Arc<AtomicUsize>,
+            recorded: Arc<Mutex<Vec<(String, bool)>>>,
+        }
+
+        /// One Rhai run: its verdict, the `record` calls it made and its host calls.
+        struct RhaiRun {
+            verdict: bool,
+            recorded: Vec<(String, bool)>,
+            calls: usize,
+        }
+
+        impl RhaiEngine {
+            /// `Engine::new()` defaults, the rule compiled once, the three host functions native.
+            fn new() -> Self {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let recorded = Arc::new(Mutex::new(Vec::new()));
+                let mut engine = Engine::new();
+                let counted = Arc::clone(&calls);
+                engine.register_fn("weight", move |course: ImmutableString| -> f64 {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    course_weight(course.as_str()) as f64
+                });
+                let counted = Arc::clone(&calls);
+                engine.register_fn("passMark", move |program: ImmutableString| -> f64 {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    pass_mark(program.as_str()) as f64
+                });
+                let counted = Arc::clone(&calls);
+                let sink = Arc::clone(&recorded);
+                engine.register_fn("record", move |id: ImmutableString, passed: bool| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    sink.lock()
+                        .expect("the record log")
+                        .push((id.to_string(), passed));
+                });
+                let ast = engine.compile(RHAI_RULE).expect("the Rhai rule compiles");
+                Self {
+                    engine,
+                    ast,
+                    calls,
+                    recorded,
+                }
+            }
+
+            /// One run in a fresh `Scope`, with the student's variables cloned in.
+            fn run(&self, grades: &Array, student: &Map) -> RhaiRun {
+                self.calls.store(0, Ordering::SeqCst);
+                self.recorded.lock().expect("the record log").clear();
+                let mut scope = Scope::new();
+                scope.push("grades", grades.clone());
+                scope.push("student", student.clone());
+                let verdict = self
+                    .engine
+                    .eval_ast_with_scope::<bool>(&mut scope, &self.ast)
+                    .expect("the Rhai rule runs");
+                RhaiRun {
+                    verdict,
+                    recorded: std::mem::take(&mut *self.recorded.lock().expect("the record log")),
+                    calls: self.calls.load(Ordering::SeqCst),
+                }
+            }
+        }
+
+        /// A student's variables as Rhai sees them: every number an `f64`, converted once.
+        fn rhai_variables(student: &Student) -> (Array, Map) {
+            let grades: Array = student
+                .grades
+                .iter()
+                .map(|(course, score)| {
+                    let mut grade = Map::new();
+                    grade.insert("course".into(), (*course).into());
+                    grade.insert("score".into(), (*score as f64).into());
+                    Dynamic::from(grade)
+                })
+                .collect();
+            let mut record = Map::new();
+            record.insert("id".into(), student.id.as_str().into());
+            record.insert("program".into(), student.program.into());
+            (grades, record)
+        }
+
+        /// Story 4.5: the Rhai rule returns the verdict Rust computes for every student, makes
+        /// exactly the 10 host calls, records the right verdict under the right id, and shares no
+        /// state between runs (a fresh `Scope` each time, so three rounds agree).
+        #[test]
+        fn the_rhai_rule_gives_the_verified_verdict_and_ten_host_calls_for_every_student() {
+            let engine = RhaiEngine::new();
+            let students = students();
+            let variables: Vec<(Array, Map)> = students.iter().map(rhai_variables).collect();
+            let mut verdicts = Vec::new();
+            for _round in 0..3 {
+                for (student, (grades, record)) in students.iter().zip(&variables) {
+                    let run = engine.run(grades, record);
+                    let expected = expected_verdict(student);
+                    assert_eq!(run.verdict, expected, "rhai {}", student.id);
+                    assert_eq!(run.calls, HOST_CALLS_PER_RUN, "rhai {}", student.id);
+                    assert_eq!(
+                        run.recorded,
+                        vec![(student.id.clone(), expected)],
+                        "rhai {}",
+                        student.id
+                    );
+                    verdicts.push(run.verdict);
+                }
+            }
+            assert!(
+                verdicts.contains(&true) && verdicts.contains(&false),
+                "the workload must exercise both outcomes"
+            );
+        }
+
+        /// Story 4.5: Hexput over the socket (the same client and registration path as the bench)
+        /// and Rhai in-process reach the same verified verdict for every student, each with 10
+        /// calls. The Rhai server over the socket is run by the bench's quick mode.
+        #[test]
+        fn hexput_over_the_socket_and_rhai_in_process_reach_the_same_verified_verdict() {
+            let sandbox = Sandbox::new();
+            let serving = Serving::start(&sandbox, &sandbox.valid());
+            let mut client = serving.connect();
+            init(&mut client, 1);
+            let handle = register(&mut client, 2);
+            let engine = RhaiEngine::new();
+            let students = students();
+            for (id, student) in (3..).zip(&students) {
+                let (payload, calls) =
+                    run_and_serve_calls(&mut client, cached_request(id, &handle, student));
+                assert_eq!(payload, expected_payload(student), "hexput {}", student.id);
+                assert_eq!(calls, HOST_CALLS_PER_RUN, "hexput {}", student.id);
+
+                let (grades, record) = rhai_variables(student);
+                let run = engine.run(&grades, &record);
+                assert_eq!(
+                    run.verdict,
+                    expected_verdict(student),
+                    "rhai {}",
+                    student.id
+                );
+                assert_eq!(run.calls, HOST_CALLS_PER_RUN, "rhai {}", student.id);
+            }
+            serving.stop().exit(0);
+        }
+
+        /// The Hexput side of the `engine` section: one run's result, its host calls, the `record`
+        /// calls it made, and the budget it was charged against when it is enforced.
+        struct Driven {
+            verdict: bool,
+            calls: usize,
+            recorded: Vec<(String, bool)>,
+            budget: Option<Budget>,
+        }
+
+        /// A student's starting variables as the interpreter takes them, converted once.
+        fn hexput_variables(student: &Student) -> Vec<(&'static str, HexValue)> {
+            let grades = HexArray::from_values(
+                student
+                    .grades
+                    .iter()
+                    .map(|(course, score)| {
+                        HexValue::Object(HexObject::from_entries([
+                            ("course", HexValue::String(Arc::from(*course))),
+                            ("score", HexValue::Number(*score as f64)),
+                        ]))
+                    })
+                    .collect(),
+            );
+            let record = HexObject::from_entries([
+                ("id", HexValue::String(Arc::from(student.id.as_str()))),
+                ("program", HexValue::String(Arc::from(student.program))),
+            ]);
+            vec![
+                ("grades", HexValue::Array(grades)),
+                ("student", HexValue::Object(record)),
+            ]
+        }
+
+        /// Answers the rule's three host calls natively, with no wire, recording each `record`.
+        fn answer(
+            name: &str,
+            arguments: &[Argument],
+            recorded: &mut Vec<(String, bool)>,
+        ) -> HexValue {
+            let values: Vec<&HexValue> = arguments.iter().map(|argument| &argument.value).collect();
+            match (name, values.as_slice()) {
+                ("weight", [HexValue::String(course)]) => {
+                    HexValue::Number(course_weight(course) as f64)
+                }
+                ("passMark", [HexValue::String(program)]) => {
+                    HexValue::Number(pass_mark(program) as f64)
+                }
+                ("record", [HexValue::String(id), HexValue::Bool(passed)]) => {
+                    recorded.push((id.to_string(), *passed));
+                    HexValue::Null
+                }
+                _ => panic!(
+                    "an unexpected host call to `{name}` with {} argument(s)",
+                    values.len()
+                ),
+            }
+        }
+
+        /// A budget that refused a charge ends the run, naming the dimension.
+        fn within(result: Result<(), Exceeded>) {
+            if let Err(exceeded) = result {
+                panic!(
+                    "the enforced run exceeded its {} budget",
+                    exceeded.dimension().as_str()
+                );
+            }
+        }
+
+        fn charge_cpu(budget: &mut Option<Budget>, elapsed: Duration, span: Span) {
+            if let Some(budget) = budget {
+                within(budget.charge_cpu(elapsed, span));
+            }
+        }
+
+        /// Runs the rule in-process. Unmetered, it is `Execution` with `Meter::UNMETERED`. Enforced,
+        /// it is the Executor's synchronous enforcement: the same slice and ceilings, CPU charged
+        /// at every pause, host call and finish, one RPC call per host call, output at the finish.
+        fn drive_hexput(
+            program: &Arc<Program>,
+            variables: &[(&'static str, HexValue)],
+            enforced: bool,
+        ) -> Driven {
+            let mut budget = enforced.then(|| Budget::with_limits(Limits::default()));
+            let meter = match &budget {
+                Some(budget) => Meter {
+                    slice: Some(SLICE),
+                    memory_ceiling: Some(budget.memory_ceiling()),
+                    allocation_ceiling: Some(budget.allocation_ceiling()),
+                },
+                None => Meter::UNMETERED,
+            };
+            let mut execution =
+                Execution::with_variables(Arc::clone(program), variables.iter().cloned())
+                    .expect("the starting variables bind")
+                    .metered(meter);
+            let mut recorded = Vec::new();
+            let mut calls = 0;
+            let mut started = Instant::now();
+            loop {
+                match execution.run().expect("the rule runs") {
+                    Outcome::Paused(paused) => {
+                        charge_cpu(&mut budget, started.elapsed(), paused.span());
+                        execution = paused.resume();
+                        started = Instant::now();
+                    }
+                    Outcome::HostCall(call) => {
+                        charge_cpu(&mut budget, started.elapsed(), call.span());
+                        if let Some(budget) = budget.as_mut() {
+                            let measuring = Instant::now();
+                            let depth = budget.limits().argument_depth();
+                            let mut frame = hexput_port::MAX_FRAME_LEN;
+                            for argument in call.arguments() {
+                                assert!(
+                                    measure_held(
+                                        &argument.value,
+                                        argument.secret.as_ref(),
+                                        depth,
+                                        &mut frame
+                                    )
+                                    .is_ok(),
+                                    "a sendable argument"
+                                );
+                            }
+                            within(budget.charge_rpc_call(call.span()));
+                            within(budget.charge_cpu(measuring.elapsed(), call.span()));
+                        }
+                        calls += 1;
+                        let value = answer(call.name(), call.arguments(), &mut recorded);
+                        execution = call.resume(&value);
+                        started = Instant::now();
+                    }
+                    Outcome::Finished(finished) => {
+                        let span = program.span;
+                        charge_cpu(&mut budget, started.elapsed(), span);
+                        if let Some(budget) = &budget {
+                            let bytes = result_payload_size(
+                                &finished.result,
+                                &finished.modifications,
+                                budget.limits().output_size(),
+                            );
+                            within(budget.charge_output(bytes, span));
+                        }
+                        let verdict = finished
+                            .result
+                            .value
+                            .as_bool()
+                            .expect("the rule returns a bool");
+                        return Driven {
+                            verdict,
+                            calls,
+                            recorded,
+                            budget,
+                        };
+                    }
+                    Outcome::OutOfMemory(_) => panic!("the rule ran out of memory"),
+                    Outcome::AllocationsExceeded(_) => panic!("the rule made too many allocations"),
+                }
+            }
+        }
+
+        /// Story 4.5: both in-process Hexput drivers, unmetered and enforced, return the verified
+        /// verdict for all 16 students with 10 host calls and one correct `record` each. The
+        /// enforced driver panics on any `Exceeded`, so a refused charge fails this test.
+        #[test]
+        fn the_in_process_hexput_drivers_verify_every_student_unmetered_and_enforced() {
+            let program = Arc::new(hexput_parser::parse(RULE).expect("the rule parses"));
+            for student in &students() {
+                let variables = hexput_variables(student);
+                for enforced in [false, true] {
+                    let driven = drive_hexput(&program, &variables, enforced);
+                    let expected = expected_verdict(student);
+                    assert_eq!(
+                        driven.verdict, expected,
+                        "{} enforced={enforced}",
+                        student.id
+                    );
+                    assert_eq!(
+                        driven.calls, HOST_CALLS_PER_RUN,
+                        "{} enforced={enforced}",
+                        student.id
+                    );
+                    assert_eq!(
+                        driven.recorded,
+                        vec![(student.id.clone(), expected)],
+                        "{} enforced={enforced}",
+                        student.id
+                    );
+                }
+            }
+        }
+
+        /// Story 4.5: the enforced driver charges its run against the default budget and every
+        /// host call counts once toward the RPC and side-effect dimensions; the defaults in force
+        /// are the ones the headline UDS figures run with, unchanged.
+        #[test]
+        fn the_enforced_driver_charges_ten_calls_against_the_unchanged_default_budget() {
+            let program = Arc::new(hexput_parser::parse(RULE).expect("the rule parses"));
+            let students = students();
+            let variables = hexput_variables(&students[1]);
+            let driven = drive_hexput(&program, &variables, true);
+            let budget = driven.budget.expect("the enforced run keeps its budget");
+            assert_eq!(budget.rpc_calls_used(), HOST_CALLS_PER_RUN as u64);
+            assert_eq!(budget.side_effects_used(), HOST_CALLS_PER_RUN as u64);
+            let limits = budget.limits();
+            assert_eq!(limits.rpc_calls(), DEFAULT_RPC_CALLS);
+            assert_eq!(limits.side_effects(), DEFAULT_SIDE_EFFECTS);
+            assert_eq!(limits.allocations(), DEFAULT_ALLOCATIONS);
+            assert_eq!(limits.output_size(), DEFAULT_OUTPUT_SIZE);
+        }
+
+        /// Story 4.5: the unmetered driver keeps no budget at all, so its figure is the interpreter
+        /// alone and the overhead line is exactly the enforced driver's extra work.
+        #[test]
+        fn the_unmetered_driver_keeps_no_budget() {
+            let program = Arc::new(hexput_parser::parse(RULE).expect("the rule parses"));
+            let students = students();
+            let driven = drive_hexput(&program, &hexput_variables(&students[0]), false);
+            assert!(driven.budget.is_none());
+            assert_eq!(driven.calls, HOST_CALLS_PER_RUN);
+        }
+    }
 }

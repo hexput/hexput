@@ -61,6 +61,11 @@ moka = { version = "0.12.16", features = ["sync"] }
 # `rayon` or `html_reports` — the figures are read from the terminal and the bench's own JSON
 # report, and the plotting stack is heavy to build.
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# Story 4.5's comparator in the same `cache` bench: the same rule on Rhai, over the same UDS
+# framing and in-process. `hexput-tests` takes it as a dev-dependency only, so no production crate
+# can reach it (the graph check's normal-dependency rules never see it). Default features, as a
+# Rhai user would embed it; 1.26.1 is the latest release out for more than a month.
+rhai = "1.26.1"
 tracing = "0.1.44"
 # The daemon's log output (Story 2.1): `fmt` lines filtered at System Config's `log_level`.
 # Story 2.8 adds `json`, System Config's `log_format = "json"`: one JSON object per event, span

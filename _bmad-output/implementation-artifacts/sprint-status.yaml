@@ -80,7 +80,7 @@ development_status:
   4-2-re-run-a-registered-script-with-fresh-variables: review
   4-3-keep-the-cache-bounded-and-clean-it-up-with-the-session: review
   4-4-measure-the-cache-win: review
-  4-5-compare-the-hot-path-against-rhai: backlog
+  4-5-compare-the-hot-path-against-rhai: review
   epic-4-retrospective: optional
 
   epic-5: backlog

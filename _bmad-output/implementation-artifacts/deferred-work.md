@@ -314,3 +314,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-4-4-measure-the-cache-win.md`
   summary: Nothing checks that the cache bench's quick mode neither reads nor writes `target/hexput-bench/cache-win.json`.
   evidence: Review finding (verification-gap, low). `main` guards the read and `report::write` with `quick`, but dropping that guard keeps `cargo test --workspace` green. Covering it means moving the run decisions out of `main` into a function `report::self_check` can call. The review's workload comparison now refuses a quick-mode report as a reference, which narrows the harm.
+
+- source_spec: `spec-4-5-compare-the-hot-path-against-rhai.md`
+  summary: The Story 4.3 test `a_removed_handle_is_unknown_and_its_program_is_released_at_once` failed once in a full release run (tests/script.rs:2136, the program's weak reference still alive right after `CodeUnregister`) and passed on five reruns.
+  evidence: Seen during Story 4.5's review verification; the test and `AstCache` are untouched by Story 4.5. Likely moka maintenance timing under load. Severity medium (unverified) — a stress loop over the test, or confirming every `AstCache` removal path runs pending maintenance before returning, would settle it.

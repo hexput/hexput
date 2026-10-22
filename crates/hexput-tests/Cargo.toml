@@ -43,6 +43,16 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Story 2.3: the Port's halves are async; the adapter and connection tests run them on tokio.
 tokio = { workspace = true }
+# Story 4.4: the `cache` bench's cold/warm/direct figures.
+criterion = { workspace = true }
+
+# Story 4.4: the cache benchmark (`cargo bench -p hexput-tests --bench cache`). `harness = false`
+# hands `main` to Criterion; `test = true` makes `cargo test --workspace` run it once in quick
+# mode, so CI checks every result the bench would measure without timing anything.
+[[bench]]
+name = "cache"
+harness = false
+test = true
 
 [lints]
 workspace = true

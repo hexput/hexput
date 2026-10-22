@@ -1649,3 +1649,403 @@ fn a_capacity_of_one_over_the_socket_keeps_one_script_and_code_unregister_remove
     );
     serving.stop().exit(0);
 }
+
+// --- Story 4.4: the cache benchmark's workload, verified over the real socket ---
+
+/// Story 4.4: the measured workload (spec `cache` bench, constant `RULE`) and its Backend. Each
+/// run makes 10 host calls, every reply is checked against the verdict Rust computes, and the
+/// connections are initialized with blanket grants so no `Authorize` question is ever sent.
+#[cfg(unix)]
+mod cache_win {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    const RULE: &str = "let total = 0;\nlet weights = 0;\nfor (grade in grades) {\n  let w = weight(grade.course);\n  total = total + grade.score * w;\n  weights = weights + w;\n};\nlet passed = total / weights >= passMark(student.program);\nrecord(student.id, passed);\nreturn passed;\n";
+    const COURSES: [(&str, i64); 8] = [
+        ("algebra", 3),
+        ("biology", 4),
+        ("chemistry", 2),
+        ("compsci", 5),
+        ("history", 1),
+        ("literature", 2),
+        ("music", 1),
+        ("physics", 4),
+    ];
+    const STUDENTS: i64 = 16;
+    const HOST_CALLS_PER_RUN: usize = 10;
+    const CONCURRENCY: usize = 8;
+    const RUNS_PER_CONNECTION: usize = 20;
+
+    fn course_weight(course: &str) -> i64 {
+        COURSES
+            .iter()
+            .find(|(name, _)| *name == course)
+            .map(|(_, weight)| *weight)
+            .expect("a known course")
+    }
+
+    fn pass_mark(program: &str) -> i64 {
+        match program {
+            "science" => 50,
+            "engineering" => 60,
+            other => panic!("an unknown program `{other}`"),
+        }
+    }
+
+    struct Student {
+        id: String,
+        program: &'static str,
+        grades: Vec<(&'static str, i64)>,
+    }
+
+    /// Sixteen deterministic students: score `j` of student `i` is `(i*37 + j*11) % 101`, and the
+    /// programs alternate.
+    fn students() -> Vec<Student> {
+        (0..STUDENTS)
+            .map(|i| Student {
+                id: format!("student-{i:02}"),
+                program: if i % 2 == 0 { "science" } else { "engineering" },
+                grades: (0..8i64)
+                    .map(|j| (COURSES[((i + j) % 8) as usize].0, (i * 37 + j * 11) % 101))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The verdict, with the same f64 operations in the same order as the Script.
+    fn expected_verdict(student: &Student) -> bool {
+        let mut total = 0.0_f64;
+        let mut weights = 0.0_f64;
+        for (course, score) in &student.grades {
+            let w = course_weight(course) as f64;
+            total += *score as f64 * w;
+            weights += w;
+        }
+        total / weights >= pass_mark(student.program) as f64
+    }
+
+    fn expected_payload(student: &Student) -> Value {
+        Value::Map(vec![(
+            Value::from("value"),
+            Value::Boolean(expected_verdict(student)),
+        )])
+    }
+
+    fn field<'a>(payload: &'a Value, key: &str) -> &'a Value {
+        payload
+            .as_map()
+            .expect("a map payload")
+            .iter()
+            .find(|(name, _)| name.as_str() == Some(key))
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("a `{key}` field"))
+    }
+
+    fn student_variables(student: &Student) -> Value {
+        let grades: Vec<Value> = student
+            .grades
+            .iter()
+            .map(|(course, score)| {
+                Value::Map(vec![
+                    (Value::from("course"), Value::from(*course)),
+                    (Value::from("score"), Value::from(*score)),
+                ])
+            })
+            .collect();
+        Value::Map(vec![
+            (Value::from("grades"), Value::Array(grades)),
+            (
+                Value::from("student"),
+                Value::Map(vec![
+                    (Value::from("id"), Value::from(student.id.as_str())),
+                    (Value::from("program"), Value::from(student.program)),
+                ]),
+            ),
+        ])
+    }
+
+    fn init(client: &mut UnixStream, id: u64) {
+        let registrations: Vec<Value> = ["weight", "passMark", "record"]
+            .iter()
+            .map(|name| {
+                Value::Map(vec![
+                    (Value::from("name"), Value::from(*name)),
+                    (Value::from("blanket"), Value::from(true)),
+                ])
+            })
+            .collect();
+        wire::send(
+            client,
+            &Envelope::new(
+                CorrelationId(id),
+                MessageType::Init,
+                Value::Map(vec![
+                    (Value::from("config"), Value::Map(vec![])),
+                    (Value::from("registrations"), Value::Array(registrations)),
+                ]),
+            ),
+        );
+        let reply = wire::reply(client).expect("a reply");
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+    }
+
+    /// Registers the rule, returning its 16-character handle.
+    fn register(client: &mut UnixStream, id: u64) -> String {
+        wire::send(
+            client,
+            &Envelope::new(
+                CorrelationId(id),
+                MessageType::CodeRegister,
+                Value::Map(vec![(Value::from("source"), Value::from(RULE))]),
+            ),
+        );
+        let reply = wire::reply(client).expect("a reply");
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        let handle = field(&reply.payload, "handle")
+            .as_str()
+            .expect("a string handle")
+            .to_owned();
+        assert_eq!(handle.len(), 16, "{handle}");
+        handle
+    }
+
+    fn cached_request(id: u64, handle: &str, student: &Student) -> Envelope<Value> {
+        Envelope::new(
+            CorrelationId(id),
+            MessageType::CachedExecutionStart,
+            Value::Map(vec![
+                (Value::from("handle"), Value::from(handle)),
+                (Value::from("variables"), student_variables(student)),
+            ]),
+        )
+    }
+
+    fn direct_request(id: u64, student: &Student) -> Envelope<Value> {
+        Envelope::new(
+            CorrelationId(id),
+            MessageType::ExecutionStart,
+            Value::Map(vec![
+                (Value::from("source"), Value::from(RULE)),
+                (Value::from("variables"), student_variables(student)),
+            ]),
+        )
+    }
+
+    /// The Backend's answer to one `Call` of the rule's three host functions. Each argument
+    /// arrives as a Value Secret holder (`{__secret, value}`, FR-28) because it was read from a
+    /// place — the Backend reads the value inside.
+    fn answer(call: &Envelope<Value>) -> Value {
+        let name = field(&call.payload, "name")
+            .as_str()
+            .expect("a function name");
+        let arguments: Vec<&Value> = field(&call.payload, "arguments")
+            .as_array()
+            .expect("an argument array")
+            .iter()
+            .map(unwrap_holder)
+            .collect();
+        match (name, arguments.as_slice()) {
+            ("weight", [course]) => {
+                Value::from(course_weight(course.as_str().expect("a course name")))
+            }
+            ("passMark", [program]) => {
+                Value::from(pass_mark(program.as_str().expect("a program name")))
+            }
+            ("record", [id, Value::Boolean(_)]) => {
+                assert!(id.as_str().is_some(), "record's id is a string");
+                Value::Nil
+            }
+            (name, arguments) => panic!("an unexpected Call to `{name}` with {arguments:?}"),
+        }
+    }
+
+    /// The value a holder `{__secret, value}` carries, or the value itself when it is no holder.
+    fn unwrap_holder(value: &Value) -> &Value {
+        match value.as_map() {
+            Some(entries)
+                if entries.len() == 2
+                    && entries
+                        .iter()
+                        .any(|(key, _)| key.as_str() == Some("__secret")) =>
+            {
+                field(value, "value")
+            }
+            _ => value,
+        }
+    }
+
+    /// Sends one execution and answers its host calls as a Backend until its own reply arrives.
+    /// Returns the reply's payload and the number of `Call`s it made.
+    fn run_and_serve_calls(client: &mut UnixStream, request: Envelope<Value>) -> (Value, usize) {
+        let expected = request.id.map(CorrelationId::get);
+        wire::send(client, &request);
+        let mut calls = 0;
+        loop {
+            let reply = wire::reply(client).expect("a reply");
+            match reply.message_type {
+                MessageType::Call => {
+                    calls += 1;
+                    let value = answer(&reply);
+                    let call_id = reply.id.expect("a Call carries its id").get();
+                    wire::send(
+                        client,
+                        &Envelope::new(
+                            CorrelationId(call_id),
+                            MessageType::Result,
+                            Value::Map(vec![(Value::from("value"), value)]),
+                        ),
+                    );
+                }
+                MessageType::Result => {
+                    assert_eq!(
+                        reply.id.map(CorrelationId::get),
+                        expected,
+                        "the reply names its execution"
+                    );
+                    return (reply.payload, calls);
+                }
+                other => panic!("the run failed with {other:?}: {:?}", reply.payload),
+            }
+        }
+    }
+
+    /// Story 4.4: the cached path over the socket returns the verdict Rust computes for every
+    /// student, in every rotation, with exactly 10 host calls per run, and both outcomes occur.
+    /// This module verifies a copy of the bench's workload (a test cannot import a bench's
+    /// modules), so the copy must stay the one `benches/cache.rs` measures.
+    #[test]
+    fn this_workload_is_the_one_the_cache_bench_measures() {
+        let bench = include_str!("../benches/cache.rs");
+        assert!(
+            bench.contains(&format!("pub const RULE: &str = {RULE:?};")),
+            "the bench's `RULE` differs from this copy"
+        );
+        for (course, weight) in COURSES {
+            assert!(
+                bench.contains(&format!("(\"{course}\", {weight}),")),
+                "the bench's `weight` table differs for `{course}`"
+            );
+        }
+        assert!(bench.contains(&format!("pub const STUDENTS: usize = {STUDENTS};")));
+        assert!(bench.contains(&format!(
+            "pub const HOST_CALLS_PER_RUN: usize = {HOST_CALLS_PER_RUN};"
+        )));
+        assert!(bench.contains("(i * 37 + j * 11) % 101"));
+    }
+
+    #[test]
+    fn the_rule_over_the_socket_is_verified_for_every_student_with_ten_host_calls() {
+        let sandbox = Sandbox::new();
+        let serving = Serving::start(&sandbox, &sandbox.valid());
+        let mut client = serving.connect();
+        init(&mut client, 1);
+        let handle = register(&mut client, 2);
+        let students = students();
+        let mut id = 3;
+        let mut verdicts = Vec::new();
+        for _round in 0..3 {
+            for student in &students {
+                let (payload, calls) =
+                    run_and_serve_calls(&mut client, cached_request(id, &handle, student));
+                id += 1;
+                assert_eq!(payload, expected_payload(student), "{}", student.id);
+                assert_eq!(calls, HOST_CALLS_PER_RUN, "{}", student.id);
+                verdicts.push(expected_verdict(student));
+            }
+        }
+        assert!(
+            verdicts.contains(&true) && verdicts.contains(&false),
+            "the workload must exercise both outcomes"
+        );
+        serving.stop().exit(0);
+    }
+
+    /// Story 4.4: the cold figure (`CodeRegister` then its first run), the warm figure (a cache
+    /// hit) and the direct figure (`ExecutionStart`) all return the same verified verdict with 10
+    /// host calls each; `CodeUnregister` then frees the handle, as the untimed cleanup requires.
+    #[test]
+    fn cold_warm_and_direct_runs_agree_and_code_unregister_frees_the_handle() {
+        let sandbox = Sandbox::new();
+        let serving = Serving::start(&sandbox, &sandbox.valid());
+        let mut client = serving.connect();
+        init(&mut client, 1);
+        let students = students();
+        let student = &students[1];
+
+        let handle = register(&mut client, 2);
+        let (cold, cold_calls) =
+            run_and_serve_calls(&mut client, cached_request(3, &handle, student));
+        let (warm, warm_calls) =
+            run_and_serve_calls(&mut client, cached_request(4, &handle, student));
+        let (direct, direct_calls) = run_and_serve_calls(&mut client, direct_request(5, student));
+
+        let expected = expected_payload(student);
+        assert_eq!(cold, expected, "cold");
+        assert_eq!(warm, expected, "warm");
+        assert_eq!(direct, expected, "direct");
+        assert_eq!(cold_calls, HOST_CALLS_PER_RUN);
+        assert_eq!(warm_calls, HOST_CALLS_PER_RUN);
+        assert_eq!(direct_calls, HOST_CALLS_PER_RUN);
+
+        wire::send(&mut client, &unregister_request(6, &handle));
+        let reply = wire::reply(&mut client).expect("a reply");
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        assert_eq!(
+            reply.payload,
+            Value::Map(vec![]),
+            "CodeUnregister answers {{}}"
+        );
+
+        wire::send(&mut client, &cached_request(7, &handle, student));
+        assert_eq!(
+            wire::refusal(&mut client),
+            (Some(7), "protocol.unknown_script_handle".to_owned())
+        );
+        serving.stop().exit(0);
+    }
+
+    /// Story 4.4: the steady-state workload's shape: eight connections, each on its own thread,
+    /// all running the rule concurrently, with every reply verified and 10 host calls per run.
+    #[test]
+    fn eight_concurrent_connections_each_verify_every_run_of_the_rule() {
+        let sandbox = Sandbox::new();
+        let serving = Serving::start(&sandbox, &sandbox.valid());
+        let clients: Vec<UnixStream> = (0..CONCURRENCY).map(|_| serving.connect()).collect();
+        std::thread::scope(|scope| {
+            for (index, mut client) in clients.into_iter().enumerate() {
+                scope.spawn(move || {
+                    init(&mut client, 1);
+                    let handle = register(&mut client, 2);
+                    let students = students();
+                    for run in 0..RUNS_PER_CONNECTION {
+                        let student = &students[(index + run) % students.len()];
+                        let (payload, calls) = run_and_serve_calls(
+                            &mut client,
+                            cached_request(3 + run as u64, &handle, student),
+                        );
+                        assert_eq!(payload, expected_payload(student), "{}", student.id);
+                        assert_eq!(calls, HOST_CALLS_PER_RUN, "{}", student.id);
+                    }
+                });
+            }
+        });
+        serving.stop().exit(0);
+    }
+}

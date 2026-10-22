@@ -57,7 +57,10 @@ dashmap = "6.2.1"
 getrandom = "0.4.3"
 # The AST Cache (Story 4.1): `sync::Cache` keyed by `(Client ID, Script handle)`.
 moka = { version = "0.12.16", features = ["sync"] }
-criterion = "0.8.2"
+# Story 4.4's `cache` bench in `hexput-tests`. `cargo_bench_support` alone: no `plotters`,
+# `rayon` or `html_reports` — the figures are read from the terminal and the bench's own JSON
+# report, and the plotting stack is heavy to build.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 tracing = "0.1.44"
 # The daemon's log output (Story 2.1): `fmt` lines filtered at System Config's `log_level`.
 # Story 2.8 adds `json`, System Config's `log_format = "json"`: one JSON object per event, span

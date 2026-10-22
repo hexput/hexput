@@ -311,3 +311,6 @@ Append-only. Each entry is work identified during a build but deliberately not d
   summary: The AST Cache's capacity is one pool shared by every Session, so a Backend that registers heavily can displace other Backends' entries.
   evidence: Review findings (blind and edge, medium). Documented in the `AstCache` doc, the Spine's Story 4.3 amendment and the epic context; a per-Session quota (or share) is a design change left for a later story (Epic 5's multi-tenant hardening or Epic 7's operations work).
 
+- source_spec: `spec-4-4-measure-the-cache-win.md`
+  summary: Nothing checks that the cache bench's quick mode neither reads nor writes `target/hexput-bench/cache-win.json`.
+  evidence: Review finding (verification-gap, low). `main` guards the read and `report::write` with `quick`, but dropping that guard keeps `cargo test --workspace` green. Covering it means moving the run decisions out of `main` into a function `report::self_check` can call. The review's workload comparison now refuses a quick-mode report as a reference, which narrows the harm.

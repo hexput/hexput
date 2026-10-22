@@ -1,10 +1,13 @@
 //! Story 4.4: measure the cache win (FR-5, SM-1) — parse a Script once, execute it many times.
 //! Story 4.5: compare that hot path against Rhai, and report the Resource Budget's cost as its
 //! own line (SM-1, NFR3).
+//! Story 5.9: benchmark the remote path (TCP+TLS) separately from the local one (UDS), so the
+//! transport's latency is never conflated with the runtime's (NFR3).
 //!
 //! The bench starts a real Daemon in-process (`hexput_daemon::run_with` on its own thread and
-//! its own Tokio runtime) over a real Unix Domain Socket, and drives it as a Backend would: each
-//! client is a blocking `UnixStream` that sends `Init` with blanket grants for the rule's three
+//! its own Tokio runtime) serving a real Unix Domain Socket and a real TCP+TLS listener, and
+//! drives it as a Backend would: each client is a blocking stream (a `UnixStream`, or a rustls
+//! client stream over a `TcpStream`) that sends `Init` with blanket grants for the rule's three
 //! host functions and answers every `Call` with `Result {value}`. Every execution runs under the
 //! default Resource Budget and capability checks — nothing is overridden, raised or collapsed.
 //!
@@ -46,6 +49,28 @@
 //!   size) and `rhai_engine`. [`ENGINE_ROUNDS`] rounds of [`ENGINE_RUNS`] runs per driver; the
 //!   median of the rounds' mean ns/run gives the line "budget enforcement overhead". The UDS
 //!   headline figures above all run with the full default budget and are never adjusted by it.
+//! - `remote_path/tcp_tls_cold_first_run` and `remote_path/tcp_tls_warm_cache_hit` (Criterion,
+//!   Story 5.9): the `cache_win/cold_first_run` and `cache_win/warm_cache_hit` figures, defined
+//!   exactly alike, over one TCP+TLS connection to the same Daemon instead of the UDS. The UDS
+//!   counterparts are the `cache_win` figures themselves; they are not repeated in this group.
+//! - `steady_state` also runs the same closed loops over TCP+TLS, between Hexput's UDS loops and
+//!   Rhai's, prints its own rounds and summary, and then a transport table: p50, p99 and
+//!   throughput for `UDS` and `TCP+TLS` side by side with the `TCP+TLS/UDS` ratio. Both legs' raw
+//!   figures are always shown; no figure averages or merges the two, and the report keeps
+//!   `steady_state` (UDS) and `tcp_tls_steady_state` as separate sections.
+//!
+//! **Topology:** every leg runs on one machine. The UDS leg is the Daemon in-process with its
+//! clients on threads of the bench process. The TCP+TLS leg connects to `127.0.0.1` over the
+//! loopback interface — there is no network hop, so its figures are the cost of the TCP and TLS
+//! stacks, not network latency. The client trusts only the fixture CA, verifies the name
+//! `localhost`, uses the `ring` provider with server authentication only, and the negotiated
+//! protocol version and cipher suite are recorded in the conditions. A cross-machine figure is
+//! not measured here; the per-leg topology in the conditions is where one would be recorded.
+//! Every connection, TCP and TLS handshake included, is set up before its figure's clock starts,
+//! so no TCP+TLS figure includes connection setup — a Backend that reconnects often pays that
+//! on top. The legs run one after the other (UDS, then TCP+TLS, then Rhai) against one Daemon
+//! that still holds the earlier legs' Sessions until their TTL, so the `TCP+TLS/UDS` ratio
+//! carries any drift between the two runs as well as the transport's cost.
 //!
 //! The Criterion figures use one connection with one execution in flight. Rhai runs at
 //! `Engine::new()`'s defaults, one thread per connection, as a Rhai user would embed it.
@@ -57,17 +82,17 @@
 //! with a 10% noise threshold. All of this is informational: no figure is a gate.
 //!
 //! The machine and workload conditions are printed before any figure and, after a full run,
-//! written with both steady states and the engine figures (`null` when that section was filtered
-//! out) to `<target>/hexput-bench/cache-win.json`. The comparison with the previous run covers
-//! Hexput's and Rhai's steady-state summaries.
+//! written with the three steady states (UDS, TCP+TLS, Rhai) and the engine figures (`null` when
+//! that section was filtered out) to `<target>/hexput-bench/cache-win.json`. The comparison with
+//! the previous run covers Hexput's UDS and TCP+TLS and Rhai's steady-state summaries.
 //!
 //! **Quick mode:** without `--bench` (that is, under `cargo test`), Criterion runs each figure
 //! once, each steady state runs one round of 20 runs per connection with no warm-up, and the
 //! engine section one round of 20 runs. Every result is still checked, the report module's own
 //! checks run, and no report is written or compared.
 //!
-//! A positional filter goes to Criterion; `steady_state` and `engine` each run only with no
-//! filter or a filter that is a substring of their name. The report is read, compared and
+//! A positional filter goes to Criterion; `steady_state` (all three legs) and `engine` each run
+//! only with no filter or a filter that is a substring of their name. The report is read, compared and
 //! written only when `steady_state` ran (so `-- engine` writes none).
 
 /// Connections in the steady-state section.
@@ -133,11 +158,19 @@ fn main() {
     } else {
         std::fs::read_to_string(&path).ok()
     };
-    let conditions = report::Conditions::gather(quick);
-    println!("{}", conditions.render());
-
     let daemon = daemon::Daemon::start();
     let rhai_server = rhai::RhaiServer::start();
+    // The conditions name the TLS parameters the TCP+TLS leg negotiates, still before any figure.
+    let tls_parameters = daemon.tls_parameters();
+    if quick {
+        // The very string the conditions and `workload.legs` record — the bench's own, not a copy.
+        assert!(
+            tls_parameters.starts_with("TLSv1_3, TLS13_"),
+            "unexpected TLS parameters: {tls_parameters}"
+        );
+    }
+    let conditions = report::Conditions::gather(quick, tls_parameters);
+    println!("{}", conditions.render());
     let students = workload::students();
 
     // A Script never seen before: `CodeRegister` plus its first run, timed together; the
@@ -226,26 +259,56 @@ fn main() {
         });
         group.finish();
     }
+    {
+        // Story 5.9: the remote path — the `cache_win` cold and warm figures, defined exactly
+        // alike, over one TCP+TLS connection to the same Daemon, one execution in flight.
+        let mut client = daemon.connect_tls();
+        workload::init(&mut client);
+        let handle = workload::register(&mut client);
+
+        let mut group = criterion.benchmark_group("remote_path");
+        group.noise_threshold(report::VARIANCE.p50);
+
+        let mut next = 0usize;
+        group.bench_function("tcp_tls_cold_first_run", |bencher| {
+            bencher.iter_custom(|iters| cold(&mut client, workload::RULE, iters, &mut next));
+        });
+        group.bench_function("tcp_tls_warm_cache_hit", |bencher| {
+            bencher.iter_custom(|iters| warm(&mut client, &handle, iters, &mut next));
+        });
+        group.finish();
+    }
     criterion.final_summary();
 
     let steady = if report::runs_steady_state(filter.as_deref(), &args) {
-        let (rounds, runs, warm_up) = if quick {
+        let (rounds, runs, warm) = if quick {
             (1, QUICK_RUNS_PER_CONNECTION, 0)
         } else {
             (ROUNDS, RUNS_PER_CONNECTION, WARM_UP_RUNS)
         };
-        let hexput = steady::measure(|| daemon.connect(), workload::RULE, rounds, runs, warm_up);
+        let hexput = steady::measure(|| daemon.connect(), workload::RULE, rounds, runs, warm);
         let hexput_summary = report::Summary::of(&hexput);
         println!(
             "{}",
             report::render_steady_state(report::HEXPUT_SIDE, &hexput, &hexput_summary)
+        );
+        // Story 5.9: the same closed loops over TCP+TLS, reported on their own.
+        let tls = steady::measure(|| daemon.connect_tls(), workload::RULE, rounds, runs, warm);
+        let tls_summary = report::Summary::of(&tls);
+        println!(
+            "{}",
+            report::render_steady_state(report::TCP_TLS_SIDE, &tls, &tls_summary)
+        );
+        println!(
+            "{}",
+            report::render_transport(&hexput_summary, &tls_summary)
         );
         let rhai = steady::measure(
             || rhai_server.connect(),
             rhai::RHAI_RULE,
             rounds,
             runs,
-            warm_up,
+            warm,
         );
         let rhai_summary = report::Summary::of(&rhai);
         println!(
@@ -254,11 +317,17 @@ fn main() {
         );
         println!(
             "{}",
-            report::render_side_by_side(&hexput_summary.median, &rhai_summary.median)
+            report::render_side_by_side(
+                &report::HEXPUT_RHAI_TABLE,
+                &hexput_summary.median,
+                &rhai_summary.median
+            )
         );
         Some(report::Steady {
             hexput,
             hexput_summary,
+            tcp_tls: tls,
+            tcp_tls_summary: tls_summary,
             rhai,
             rhai_summary,
         })
@@ -282,16 +351,19 @@ fn main() {
         None
     };
 
+    // Quick mode: the report written from this run's steady states must compare each leg with
+    // itself, so `main`'s wiring of the legs is checked, not just the report's functions.
+    if let Some(steady) = &steady
+        && quick
+    {
+        steady.check_round_trip(&conditions);
+    }
+
     // The report is read, compared and written only after a full steady state.
     if let Some(steady) = &steady
         && !quick
     {
-        let comparison = report::compare(
-            previous.as_deref(),
-            &conditions,
-            &steady.hexput_summary,
-            &steady.rhai_summary,
-        );
+        let comparison = steady.compare(previous.as_deref(), &conditions);
         println!("{}", comparison.render());
         let json = report::to_json(&conditions, steady, engine.as_ref());
         match report::write(&path, &json) {
@@ -304,26 +376,76 @@ fn main() {
     rhai_server.stop();
 }
 
-/// The Daemon under measurement: in-process, on its own thread, over a socket in a fresh temp dir.
+/// The Daemon under measurement: in-process, on its own thread, serving a socket in a fresh temp
+/// dir and a TCP+TLS listener on a loopback port.
 #[cfg(unix)]
 mod daemon {
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
     use std::process::ExitCode;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use hexput_daemon::{Discovery, run_with};
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
     use crate::wire::Client;
+
+    /// A blocking TLS client stream over TCP.
+    type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 
     pub struct Daemon {
         stop: tokio::sync::oneshot::Sender<()>,
         thread: std::thread::JoinHandle<(ExitCode, String)>,
         dir: PathBuf,
+        /// The loopback address of the TCP+TLS listener.
+        tcp: SocketAddr,
+        /// The one TLS client configuration every TCP+TLS connection uses.
+        tls: Arc<ClientConfig>,
+    }
+
+    /// A checked-in TLS fixture: the CA, and the `localhost`/`127.0.0.1` leaf with its key.
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("tls")
+            .join(name)
+    }
+
+    /// A loopback port that is free just before the Daemon starts: bound to port 0, read, and
+    /// released. Should another process take it before the Daemon binds, the Daemon exits with
+    /// failure and `connect_tls` panics — never a wrong number.
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free loopback port")
+            .port()
+    }
+
+    /// The client configuration: the `ring` provider, rustls's safe default protocol versions,
+    /// the fixture CA as the only root, and no client authentication.
+    fn client_config() -> Arc<ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in CertificateDer::pem_file_iter(fixture("ca.pem")).expect("the CA file") {
+            roots
+                .add(certificate.expect("a CA certificate"))
+                .expect("a trusted root");
+        }
+        Arc::new(
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("the ring provider's protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
     }
 
     impl Daemon {
-        /// Starts a Daemon whose System Config names a socket inside a fresh temp dir, logging at
+        /// Starts a Daemon whose System Config names a socket inside a fresh temp dir and a
+        /// TCP+TLS listener on a free loopback port with the fixture identity, logging at
         /// `error` so logging stays off the measured path.
         pub fn start() -> Self {
             let nanos = std::time::SystemTime::now()
@@ -332,12 +454,21 @@ mod daemon {
             let dir = std::env::temp_dir()
                 .join(format!("hexput-bench-{}-{nanos:08x}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("a temporary directory");
+            let tcp = SocketAddr::from(([127, 0, 0, 1], free_port()));
             let config = dir.join("config.toml");
             std::fs::write(
                 &config,
                 format!(
-                    "log_level = \"error\"\n\n[transport.uds]\npath = {:?}\n",
-                    dir.join("d.sock").to_str().expect("a UTF-8 temp path")
+                    "log_level = \"error\"\n\n[transport.uds]\npath = {:?}\n\n\
+                     [transport.tcp]\nbind = {:?}\ntls_cert = {:?}\ntls_key = {:?}\n",
+                    dir.join("d.sock").to_str().expect("a UTF-8 temp path"),
+                    tcp.to_string(),
+                    fixture("server.pem")
+                        .to_str()
+                        .expect("a UTF-8 fixture path"),
+                    fixture("server.key")
+                        .to_str()
+                        .expect("a UTF-8 fixture path"),
                 ),
             )
             .expect("a System Config file");
@@ -359,16 +490,21 @@ mod daemon {
                 );
                 (code, String::from_utf8_lossy(&err).into_owned())
             });
-            Self { stop, thread, dir }
+            Self {
+                stop,
+                thread,
+                dir,
+                tcp,
+                tls: client_config(),
+            }
         }
 
-        /// A client connection, waiting until the Daemon listens.
-        pub fn connect(&self) -> Client {
-            let socket = self.dir.join("d.sock");
+        /// Retries `attempt` until the Daemon listens; panics once it has stopped or 10 s passed.
+        fn until_listening<T>(&self, attempt: impl Fn() -> std::io::Result<T>) -> T {
             let started = Instant::now();
             loop {
-                match std::os::unix::net::UnixStream::connect(&socket) {
-                    Ok(stream) => return Client::new(stream),
+                match attempt() {
+                    Ok(connected) => return connected,
                     Err(error) => {
                         assert!(
                             started.elapsed() < Duration::from_secs(10)
@@ -379,6 +515,59 @@ mod daemon {
                     }
                 }
             }
+        }
+
+        /// A UDS client connection, waiting until the Daemon listens.
+        pub fn connect(&self) -> Client {
+            let socket = self.dir.join("d.sock");
+            let stream = self.until_listening(|| std::os::unix::net::UnixStream::connect(&socket));
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("a read timeout");
+            Client::new(stream)
+        }
+
+        /// A TCP+TLS client connection to the loopback listener, waiting until the Daemon
+        /// listens, with its handshake completed.
+        pub fn connect_tls(&self) -> Client {
+            Client::new(self.tls_stream())
+        }
+
+        /// The TLS parameters the TCP+TLS leg negotiates, read off one completed handshake:
+        /// the protocol version and the cipher suite, e.g. `TLSv1_3, TLS13_AES_256_GCM_SHA384`.
+        pub fn tls_parameters(&self) -> String {
+            let stream = self.tls_stream();
+            let version = stream
+                .conn
+                .protocol_version()
+                .expect("a negotiated protocol version");
+            let suite = stream
+                .conn
+                .negotiated_cipher_suite()
+                .expect("a negotiated cipher suite");
+            format!("{version:?}, {:?}", suite.suite())
+        }
+
+        /// A TLS stream to the loopback listener: `TCP_NODELAY`, a 60 s read timeout, the
+        /// server name `localhost`, and the handshake driven to completion before it returns.
+        fn tls_stream(&self) -> TlsStream {
+            let tcp = self.until_listening(|| TcpStream::connect(self.tcp));
+            tcp.set_nodelay(true).expect("TCP_NODELAY");
+            tcp.set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("a read timeout");
+            let connection = ClientConnection::new(
+                Arc::clone(&self.tls),
+                ServerName::try_from("localhost").expect("a server name"),
+            )
+            .expect("a TLS client connection");
+            let mut stream = StreamOwned::new(connection, tcp);
+            while stream.conn.is_handshaking() {
+                stream
+                    .conn
+                    .complete_io(&mut stream.sock)
+                    .expect("a completed TLS handshake");
+            }
+            stream
         }
 
         /// Stops the Daemon, which must exit with success.
@@ -395,30 +584,30 @@ mod daemon {
     }
 }
 
-/// A blocking Backend client: framed MessagePack envelopes over the socket.
+/// A blocking Backend client: framed MessagePack envelopes over any byte stream — a UDS, or TLS
+/// over TCP — so every leg runs the one verified client.
 #[cfg(unix)]
 mod wire {
     use std::io::{BufReader, Read, Write};
-    use std::os::unix::net::UnixStream;
-    use std::time::Duration;
 
     use hexput_port::{CorrelationId, Envelope, MessageType, Value, decode, encode, encode_frame};
 
+    /// A connected byte stream the client reads and writes: a `UnixStream`, or a rustls client
+    /// stream over a `TcpStream`. Read timeouts are set by whoever connects it.
+    pub trait Duplex: Read + Write + Send {}
+
+    impl<T: Read + Write + Send> Duplex for T {}
+
     pub struct Client {
-        reader: BufReader<UnixStream>,
-        writer: UnixStream,
+        /// The stream, read through the buffer and written through `get_mut()`.
+        stream: BufReader<Box<dyn Duplex>>,
         next_id: u64,
     }
 
     impl Client {
-        pub fn new(stream: UnixStream) -> Self {
-            stream
-                .set_read_timeout(Some(Duration::from_secs(60)))
-                .expect("a read timeout");
-            let reader = BufReader::new(stream.try_clone().expect("a second handle"));
+        pub fn new(stream: impl Duplex + 'static) -> Self {
             Self {
-                reader,
-                writer: stream,
+                stream: BufReader::new(Box::new(stream)),
                 next_id: 1,
             }
         }
@@ -430,16 +619,19 @@ mod wire {
             Envelope::new(CorrelationId(id), message_type, payload)
         }
 
+        /// Writes one frame and flushes it, so a TLS record is never held back.
         pub fn send(&mut self, envelope: &Envelope<Value>) {
             let frame = encode_frame(&encode(envelope).expect("an encodable envelope"))
                 .expect("a framable envelope");
-            self.writer.write_all(&frame).expect("a sent frame");
+            let writer = self.stream.get_mut();
+            writer.write_all(&frame).expect("a sent frame");
+            writer.flush().expect("a flushed frame");
         }
 
         /// The next message from the Daemon; the stream must not end.
         pub fn receive(&mut self) -> Envelope<Value> {
             let mut prefix = [0; 4];
-            self.reader
+            self.stream
                 .read_exact(&mut prefix)
                 .expect("a message from the Daemon");
             let len = u32::from_be_bytes(prefix) as usize;
@@ -448,7 +640,7 @@ mod wire {
                 "a frame of {len} bytes is over the limit"
             );
             let mut body = vec![0; len];
-            self.reader.read_exact(&mut body).expect("a whole frame");
+            self.stream.read_exact(&mut body).expect("a whole frame");
             decode(&body).expect("a decodable envelope")
         }
 
@@ -1147,7 +1339,46 @@ mod report {
 
     /// The steady-state sides' labels.
     pub const HEXPUT_SIDE: &str = "Hexput Daemon, Cached Execution";
+    pub const TCP_TLS_SIDE: &str = "Hexput Daemon, Cached Execution over TCP+TLS (loopback)";
     pub const RHAI_SIDE: &str = "Rhai server, compiled AST";
+
+    /// Where the UDS leg (and the Rhai server's) runs.
+    pub const UDS_TOPOLOGY: &str = "same machine: Daemon in-process on its own runtime, clients on threads of the bench process";
+    /// Where the TCP+TLS leg runs: one machine, over loopback, so never network latency.
+    pub const TCP_TLS_TOPOLOGY: &str = "same machine over the loopback interface: no network hop, \
+         so the figure is the TCP and TLS stack cost, not network latency; Daemon in-process, \
+         clients on threads of the bench process";
+    /// The TCP+TLS leg's address.
+    pub const TCP_TLS_ADDRESS: &str = "127.0.0.1 (loopback)";
+
+    /// A two-column table of steady-state medians: its title, its column labels (left, right,
+    /// ratio), which way the ratio divides, and how to read it.
+    pub struct Table {
+        pub title: &'static str,
+        pub columns: [&'static str; 3],
+        /// The ratio is right ÷ left when set, else left ÷ right.
+        pub right_over_left: bool,
+        pub reading: &'static str,
+    }
+
+    /// Hexput (UDS) against Rhai (UDS).
+    pub const HEXPUT_RHAI_TABLE: Table = Table {
+        title: "side by side (median of rounds, same client and concurrency)",
+        columns: ["Hexput", "Rhai", "Hexput/Rhai"],
+        right_over_left: false,
+        reading: "Hexput/Rhai below 1x: a lower p50/p99 (better) but a lower throughput (worse)",
+    };
+
+    /// Hexput over UDS against Hexput over TCP+TLS: both raw figures, never one combined.
+    pub const TRANSPORT_TABLE: Table = Table {
+        title: "transport (Hexput, median of rounds, same client and concurrency; each leg's raw \
+                figures, none combined)",
+        columns: ["UDS", "TCP+TLS", "TCP+TLS/UDS"],
+        right_over_left: true,
+        reading: "TCP+TLS/UDS: above 1x on p50/p99 or below 1x on throughput is the TCP and TLS \
+                  stacks' cost over loopback (worse); connections are set up before timing, so \
+                  no figure includes the TCP connect or the TLS handshake",
+    };
 
     /// The stated variance, as fractions.
     pub struct Variance {
@@ -1270,10 +1501,12 @@ mod report {
         pub engine_warm_up_runs: usize,
         /// The build actually measured, never assumed.
         pub profile: &'static str,
+        /// The TCP+TLS leg's negotiated protocol version and cipher suite.
+        pub tls: String,
     }
 
     impl Conditions {
-        pub fn gather(quick: bool) -> Self {
+        pub fn gather(quick: bool, tls: String) -> Self {
             let cpu = std::fs::read_to_string("/proc/cpuinfo")
                 .ok()
                 .and_then(|text| cpu_model(&text))
@@ -1306,6 +1539,7 @@ mod report {
                 engine_runs,
                 engine_warm_up_runs,
                 profile: profile(quick, cfg!(debug_assertions)),
+                tls,
             }
         }
 
@@ -1346,9 +1580,28 @@ mod report {
                 "engine_runs": self.engine_runs,
                 "engine_warm_up_runs": self.engine_warm_up_runs,
                 "budget": "default Resource Budget",
-                "transport": "UDS, Daemon in-process on its own runtime",
+                "legs": self.legs(),
                 "profile": self.profile,
             })
+        }
+
+        /// Each leg's transport and machine topology, kept apart.
+        pub fn legs(&self) -> Json {
+            json!({
+                "uds": {"transport": "UDS", "topology": UDS_TOPOLOGY},
+                "tcp_tls": {
+                    "transport": "TCP+TLS",
+                    "address": TCP_TLS_ADDRESS,
+                    "tls": self.tls_setup(),
+                    "topology": TCP_TLS_TOPOLOGY,
+                },
+                "rhai": {"transport": "UDS", "topology": UDS_TOPOLOGY},
+            })
+        }
+
+        /// The negotiated parameters and how the client authenticates.
+        fn tls_setup(&self) -> String {
+            format!("{}, ring provider, server authentication only", self.tls)
         }
 
         pub fn render(&self) -> String {
@@ -1359,10 +1612,13 @@ mod report {
                  revision: {}\n\
                  timestamp: {}\n\
                  workload: the pass/fail rule, {} host calls per run, {} students rotating\n\
-                 steady state: {} connections, {} round(s) of {} runs each, {} warm-up runs\n\
+                 steady state: {} connections per leg, {} round(s) of {} runs each, {} warm-up \
+                 runs\n\
                  budget:   default Resource Budget, no overrides — every UDS headline figure runs \
                  with all six dimensions enforced, unadjusted\n\
-                 transport: UDS, Daemon in-process on its own runtime (clients share the machine)\n\
+                 leg uds:     UDS; {}\n\
+                 leg tcp_tls: TCP+TLS to {}, {}; {}\n\
+                 leg rhai:    UDS; {}\n\
                  comparator: {} (same client, students and verification; the Daemon's `Call` \
                  arguments carry Value Secret holders, the Rhai server's plain values)\n\
                  engine:   {} round(s) of {} in-process runs per driver (the first driver \
@@ -1382,6 +1638,11 @@ mod report {
                 self.rounds,
                 self.runs_per_connection,
                 self.warm_up_runs,
+                UDS_TOPOLOGY,
+                TCP_TLS_ADDRESS,
+                self.tls_setup(),
+                TCP_TLS_TOPOLOGY,
+                UDS_TOPOLOGY,
                 COMPARATOR,
                 self.engine_rounds,
                 self.engine_runs,
@@ -1567,44 +1828,98 @@ mod report {
         text
     }
 
-    /// Hexput over Rhai: how many times Rhai's figure Hexput's is.
-    pub fn ratio(hexput: f64, rhai: f64) -> f64 {
-        if rhai == 0.0 {
-            if hexput == 0.0 { 1.0 } else { f64::INFINITY }
+    /// `numerator` over `denominator`: how many times the denominator's figure the numerator's is.
+    pub fn ratio(numerator: f64, denominator: f64) -> f64 {
+        if denominator == 0.0 {
+            if numerator == 0.0 { 1.0 } else { f64::INFINITY }
         } else {
-            hexput / rhai
+            numerator / denominator
         }
     }
 
-    /// The two steady-state summaries side by side: rows p50, p99 and throughput; columns
-    /// Hexput, Rhai and the Hexput/Rhai ratio (below 1 is a lower latency or throughput).
-    pub fn render_side_by_side(hexput: &Round, rhai: &Round) -> String {
+    /// Two steady-state summaries side by side: rows p50, p99 and throughput; columns `left`,
+    /// `right` and their ratio, labelled by `table`. Both raw figures are always shown.
+    pub fn render_side_by_side(table: &Table, left: &Round, right: &Round) -> String {
         let units = ["µs", "µs", "runs/s"];
+        let [left_label, right_label, ratio_label] = table.columns;
         let mut text = format!(
-            "== steady_state: side by side (median of rounds, same client and concurrency) ==\n\
+            "== steady_state: {} ==\n\
              {:<12}{:>16}{:>16}{:>14}\n",
-            "", "Hexput", "Rhai", "Hexput/Rhai"
+            table.title, "", left_label, right_label, ratio_label
         );
-        let (left, right) = (hexput.figures(), rhai.figures());
+        let (left, right) = (left.figures(), right.figures());
         for index in 0..3 {
+            let quotient = if table.right_over_left {
+                ratio(right[index], left[index])
+            } else {
+                ratio(left[index], right[index])
+            };
             text += &format!(
                 "{:<12}{:>16}{:>16}{:>14}\n",
                 NAMES[index],
                 format!("{:.1} {}", left[index], units[index]),
                 format!("{:.1} {}", right[index], units[index]),
-                format!("{:.2}x", ratio(left[index], right[index])),
+                format!("{quotient:.2}x"),
             );
         }
-        text += "Hexput/Rhai below 1x: a lower p50/p99 (better) but a lower throughput (worse)";
+        text += table.reading;
         text
     }
 
-    /// Both steady states of one run.
+    /// The three steady states of one run, each its own: Hexput over UDS, Hexput over TCP+TLS,
+    /// and Rhai over UDS.
     pub struct Steady {
         pub hexput: Vec<Round>,
         pub hexput_summary: Summary,
+        pub tcp_tls: Vec<Round>,
+        pub tcp_tls_summary: Summary,
         pub rhai: Vec<Round>,
         pub rhai_summary: Summary,
+    }
+
+    impl Steady {
+        /// This run's three summaries against the previous report, each against its own leg.
+        pub fn compare(&self, previous: Option<&str>, conditions: &Conditions) -> Comparison {
+            compare(
+                previous,
+                conditions,
+                &self.hexput_summary,
+                &self.tcp_tls_summary,
+                &self.rhai_summary,
+            )
+        }
+
+        /// Checks, in quick mode, that this run's own report compares each leg with itself:
+        /// written by `to_json` and read back by `Steady::compare`, every delta's previous figures
+        /// are that leg's median and no other's.
+        pub fn check_round_trip(&self, conditions: &Conditions) {
+            let json = to_json(conditions, self, None).to_string();
+            let Comparison::Previous {
+                hexput,
+                tcp_tls,
+                rhai,
+            } = self.compare(Some(&json), conditions)
+            else {
+                panic!("this run's own report is not comparable with itself");
+            };
+            // Equal up to the JSON float parse, which may round the last bit.
+            let same = |delta: &Delta, summary: &Summary, leg: &str| {
+                let (read, own) = (delta.previous.figures(), summary.median.figures());
+                assert!(
+                    (0..3)
+                        .all(|index| (read[index] - own[index]).abs() <= own[index].abs() * 1e-12),
+                    "the {leg} leg compared with {read:?}, not its own {own:?}"
+                );
+            };
+            same(&hexput, &self.hexput_summary, "UDS");
+            same(&tcp_tls, &self.tcp_tls_summary, "TCP+TLS");
+            same(&rhai, &self.rhai_summary, "Rhai");
+        }
+    }
+
+    /// The transport table: Hexput over UDS on the left, over TCP+TLS on the right.
+    pub fn render_transport(uds: &Summary, tcp_tls: &Summary) -> String {
+        render_side_by_side(&TRANSPORT_TABLE, &uds.median, &tcp_tls.median)
     }
 
     /// The `engine` section's figures: each driver's mean ns/run (one round's, or the median of
@@ -1769,6 +2084,7 @@ mod report {
         NoPrevious,
         Previous {
             hexput: Delta,
+            tcp_tls: Delta,
             rhai: Delta,
         },
     }
@@ -1777,21 +2093,28 @@ mod report {
         pub fn render(&self) -> String {
             match self {
                 Self::NoPrevious => "against the previous run: no comparable previous run".into(),
-                Self::Previous { hexput, rhai } => format!(
-                    "against the previous run on this machine:\n{}\n{}",
+                Self::Previous {
+                    hexput,
+                    tcp_tls,
+                    rhai,
+                } => format!(
+                    "against the previous run on this machine:\n{}\n{}\n{}",
                     hexput.render(HEXPUT_SIDE),
+                    tcp_tls.render(TCP_TLS_SIDE),
                     rhai.render(RHAI_SIDE)
                 ),
             }
         }
     }
 
-    /// Compares both summaries with the previous report's text, when it parses, its machine has
-    /// this run's fingerprint and its workload is this run's.
+    /// Compares the three summaries with the previous report's text, when it parses, its machine
+    /// has this run's fingerprint, its workload is this run's and it has all three sections — a
+    /// Story 4.5 report, with no `tcp_tls_steady_state`, is not comparable.
     pub fn compare(
         previous: Option<&str>,
         conditions: &Conditions,
         hexput: &Summary,
+        tcp_tls: &Summary,
         rhai: &Summary,
     ) -> Comparison {
         let Some(json) = previous.and_then(|text| serde_json::from_str::<Json>(text).ok()) else {
@@ -1810,10 +2133,17 @@ mod report {
                 .and_then(|steady| steady.get("summary"))
                 .and_then(Round::from_json)
         };
-        match (summary("steady_state"), summary("rhai_steady_state")) {
-            (Some(previous_hexput), Some(previous_rhai)) if same_machine && same_workload => {
+        match (
+            summary("steady_state"),
+            summary("tcp_tls_steady_state"),
+            summary("rhai_steady_state"),
+        ) {
+            (Some(previous_hexput), Some(previous_tcp_tls), Some(previous_rhai))
+                if same_machine && same_workload =>
+            {
                 Comparison::Previous {
                     hexput: Delta::of(previous_hexput, hexput),
+                    tcp_tls: Delta::of(previous_tcp_tls, tcp_tls),
                     rhai: Delta::of(previous_rhai, rhai),
                 }
             }
@@ -1833,7 +2163,7 @@ mod report {
         })
     }
 
-    /// The report: the conditions, both steady states and — `null` when the section was
+    /// The report: the conditions, the three steady states (each its own section) and — `null` when the section was
     /// filtered out — the engine figures with the overhead.
     pub fn to_json(
         conditions: &Conditions,
@@ -1849,6 +2179,7 @@ mod report {
                 "throughput": VARIANCE.throughput,
             },
             "steady_state": steady_json(&steady.hexput, &steady.hexput_summary),
+            "tcp_tls_steady_state": steady_json(&steady.tcp_tls, &steady.tcp_tls_summary),
             "rhai_steady_state": steady_json(&steady.rhai, &steady.rhai_summary),
             "engine": engine.map_or(Json::Null, EngineFigures::json),
         })
@@ -1884,6 +2215,10 @@ mod report {
         assert!(runs_steady_state(Some("steady_state"), &args(&[])));
         assert!(!runs_steady_state(Some("warm"), &args(&[])));
         assert!(!runs_steady_state(Some("cache_win"), &args(&[])));
+        // `-- remote_path` runs only the two TCP+TLS Criterion figures: no hand-timed section.
+        assert!(!runs_steady_state(Some("remote_path"), &args(&[])));
+        assert!(!runs_engine(Some("remote_path"), &args(&[])));
+        assert!(!runs_steady_state(Some("tcp_tls"), &args(&[])));
         assert!(!runs_steady_state(None, &args(&["--list"])));
         assert!(!runs_steady_state(None, &args(&["--profile-time", "5"])));
         assert!(!runs_steady_state(None, &args(&["--profile-time=5"])));
@@ -1937,6 +2272,7 @@ mod report {
             engine_runs: ENGINE_RUNS,
             engine_warm_up_runs: ENGINE_WARM_UP_RUNS,
             profile: "bench",
+            tls: "TLSv1_3, TLS13_AES_256_GCM_SHA384".into(),
         };
         // Rhai's rounds: half Hexput's latency, twice its throughput.
         let rhai_rounds = rounds.map(|round| Round {
@@ -1945,13 +2281,22 @@ mod report {
             throughput: round.throughput * 2.0,
         });
         let rhai_summary = Summary::of(&rhai_rounds);
-        let steady_of = |hexput: &[Round], rhai: &[Round]| Steady {
+        // The TCP+TLS rounds: one and a half times Hexput's UDS latency, 80% of its throughput.
+        let tls_rounds = rounds.map(|round| Round {
+            p50_us: round.p50_us * 1.5,
+            p99_us: round.p99_us * 1.5,
+            throughput: round.throughput * 0.8,
+        });
+        let tls_summary = Summary::of(&tls_rounds);
+        let steady_of = |hexput: &[Round], tcp_tls: &[Round], rhai: &[Round]| Steady {
             hexput: hexput.to_vec(),
             hexput_summary: Summary::of(hexput),
+            tcp_tls: tcp_tls.to_vec(),
+            tcp_tls_summary: Summary::of(tcp_tls),
             rhai: rhai.to_vec(),
             rhai_summary: Summary::of(rhai),
         };
-        let steady = steady_of(&rounds, &rhai_rounds);
+        let steady = steady_of(&rounds, &tls_rounds, &rhai_rounds);
         let engine = EngineFigures {
             hexput_unmetered: 1000.0,
             hexput_enforced: 1100.0,
@@ -1967,21 +2312,55 @@ mod report {
             p99_us: round.p99_us * 1.3,
             ..round
         }));
-        match compare(Some(&previous), &conditions, &faster, &rhai_moved) {
-            Comparison::Previous { hexput, rhai } => {
+        // And the TCP+TLS leg's, on its own: its throughput fell by 25% here.
+        let tls_moved = Summary::of(&tls_rounds.map(|round| Round {
+            throughput: round.throughput * 0.75,
+            ..round
+        }));
+        match compare(
+            Some(&previous),
+            &conditions,
+            &faster,
+            &tls_moved,
+            &rhai_moved,
+        ) {
+            Comparison::Previous {
+                hexput,
+                tcp_tls,
+                rhai,
+            } => {
                 assert_eq!(hexput.previous, summary.median);
                 assert!((hexput.change[0] - 0.2).abs() < 1e-9);
                 assert_eq!(hexput.change[2], 0.0);
                 assert_eq!(rhai.previous, rhai_summary.median);
                 assert_eq!(rhai.change[0], 0.0);
                 assert!((rhai.change[1] - 0.3).abs() < 1e-9);
-                let text = compare(Some(&previous), &conditions, &faster, &rhai_moved).render();
+                // The TCP+TLS delta is against the previous TCP+TLS summary, never the UDS one.
+                assert_eq!(tcp_tls.previous, tls_summary.median);
+                assert_eq!(tcp_tls.change[0], 0.0);
+                assert!((tcp_tls.change[2] + 0.25).abs() < 1e-9);
+                let text = compare(
+                    Some(&previous),
+                    &conditions,
+                    &faster,
+                    &tls_moved,
+                    &rhai_moved,
+                )
+                .render();
                 assert!(text.contains("p50: previous 100.0, change +20.0% (outside ±10%)"));
                 assert!(text.contains("throughput: previous 1000.0, change +0.0% (within ±10%)"));
                 assert!(text.contains(&format!(
                     "{RHAI_SIDE}:\n  p50: previous 50.0, change +0.0% (within ±10%)\n  \
                      p99: previous 100.0, change +30.0% (outside ±20%)"
                 )));
+                assert!(text.contains(&format!(
+                    "{TCP_TLS_SIDE}:\n  p50: previous 150.0, change +0.0% (within ±10%)\n  \
+                     p99: previous 300.0, change +0.0% (within ±20%)\n  \
+                     throughput: previous 800.0, change -25.0% (outside ±10%)"
+                )));
+                // Ordered UDS, TCP+TLS, Rhai — the order the steady states run in.
+                let at = |label: &str| text.find(&format!("{label}:\n")).expect(label);
+                assert!(at(HEXPUT_SIDE) < at(TCP_TLS_SIDE) && at(TCP_TLS_SIDE) < at(RHAI_SIDE));
             }
             Comparison::NoPrevious => panic!("the same machine is comparable"),
         }
@@ -1990,7 +2369,7 @@ mod report {
             ..conditions.clone()
         };
         let unchanged = |conditions: &Conditions, text: Option<&str>| {
-            compare(text, conditions, &summary, &rhai_summary)
+            compare(text, conditions, &summary, &tls_summary, &rhai_summary)
         };
         assert_eq!(unchanged(&other, Some(&previous)), Comparison::NoPrevious);
         assert_eq!(unchanged(&other, None), Comparison::NoPrevious);
@@ -2004,7 +2383,7 @@ mod report {
             unchanged(&conditions, Some("{\"machine\": 3}")),
             Comparison::NoPrevious
         );
-        for section in ["steady_state", "rhai_steady_state"] {
+        for section in ["steady_state", "tcp_tls_steady_state", "rhai_steady_state"] {
             let mut partial = to_json(&conditions, &steady, Some(&engine));
             partial[section]
                 .as_object_mut()
@@ -2034,6 +2413,43 @@ mod report {
             .remove("rhai_steady_state");
         assert_eq!(
             unchanged(&conditions, Some(&old.to_string())),
+            Comparison::NoPrevious
+        );
+        // A Story 4.5 report — one `transport` string instead of `legs`, no TCP+TLS section —
+        // is not comparable either; nor is a report that lacks only the TCP+TLS section.
+        let mut story_4_5 = to_json(&conditions, &steady, Some(&engine));
+        let workload = story_4_5["workload"]
+            .as_object_mut()
+            .expect("a workload object");
+        workload.remove("legs");
+        workload.insert(
+            "transport".into(),
+            json!("UDS, Daemon in-process on its own runtime"),
+        );
+        story_4_5
+            .as_object_mut()
+            .expect("a report object")
+            .remove("tcp_tls_steady_state");
+        assert_eq!(
+            unchanged(&conditions, Some(&story_4_5.to_string())),
+            Comparison::NoPrevious
+        );
+        let mut without_tls = to_json(&conditions, &steady, Some(&engine));
+        without_tls
+            .as_object_mut()
+            .expect("a report object")
+            .remove("tcp_tls_steady_state");
+        assert_eq!(
+            unchanged(&conditions, Some(&without_tls.to_string())),
+            Comparison::NoPrevious
+        );
+        // Another negotiated TLS suite is another workload.
+        let other_suite = Conditions {
+            tls: "TLSv1_3, TLS13_CHACHA20_POLY1305_SHA256".into(),
+            ..conditions.clone()
+        };
+        assert_eq!(
+            unchanged(&other_suite, Some(&previous)),
             Comparison::NoPrevious
         );
         // A report whose engine section was filtered out still compares its steady states.
@@ -2096,11 +2512,66 @@ mod report {
             })
         );
 
+        // The three steady states are separate sections; no figure combines two legs.
+        let sections = report.as_object().expect("a report object");
+        for section in ["steady_state", "tcp_tls_steady_state", "rhai_steady_state"] {
+            assert!(sections.contains_key(section), "{section}");
+        }
+        assert_eq!(report["steady_state"]["summary"]["p50_us"], json!(100.0));
+        assert_eq!(
+            report["tcp_tls_steady_state"]["summary"],
+            json!({"p50_us": 150.0, "p99_us": 300.0, "throughput_per_sec": 800.0})
+        );
+        assert_eq!(
+            report["tcp_tls_steady_state"]["rounds"]
+                .as_array()
+                .map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            report["tcp_tls_steady_state"]["spread"]["throughput"],
+            json!(0.0)
+        );
+
+        // Each leg's transport and topology, in the workload and the rendered conditions.
+        let legs = &report["workload"]["legs"];
+        assert_eq!(
+            report["workload"].get("transport"),
+            None,
+            "`legs` replaces it"
+        );
+        assert_eq!(
+            legs["uds"],
+            json!({"transport": "UDS", "topology": UDS_TOPOLOGY})
+        );
+        assert_eq!(legs["rhai"], legs["uds"]);
+        assert_eq!(
+            legs["tcp_tls"],
+            json!({
+                "transport": "TCP+TLS",
+                "address": "127.0.0.1 (loopback)",
+                "tls": "TLSv1_3, TLS13_AES_256_GCM_SHA384, ring provider, server authentication only",
+                "topology": TCP_TLS_TOPOLOGY,
+            })
+        );
+        assert!(TCP_TLS_TOPOLOGY.contains("not network latency"));
+        let rendered_conditions = conditions.render();
+        assert!(rendered_conditions.contains(&format!("leg uds:     UDS; {UDS_TOPOLOGY}\n")));
+        assert!(rendered_conditions.contains(&format!(
+            "leg tcp_tls: TCP+TLS to 127.0.0.1 (loopback), TLSv1_3, \
+             TLS13_AES_256_GCM_SHA384, ring provider, server authentication only; \
+             {TCP_TLS_TOPOLOGY}\n"
+        )));
+        assert!(rendered_conditions.contains(&format!("leg rhai:    UDS; {UDS_TOPOLOGY}\n")));
+
         // The side-by-side table and its ratio.
         assert_eq!(ratio(150.0, 100.0), 1.5);
         assert_eq!(ratio(0.0, 0.0), 1.0);
         assert_eq!(ratio(1.0, 0.0), f64::INFINITY);
-        let table = render_side_by_side(&summary.median, &rhai_summary.median);
+        let table = render_side_by_side(&HEXPUT_RHAI_TABLE, &summary.median, &rhai_summary.median);
+        assert!(table.starts_with(
+            "== steady_state: side by side (median of rounds, same client and concurrency) ==\n"
+        ));
         assert!(
             table.contains("Hexput") && table.contains("Rhai") && table.contains("Hexput/Rhai")
         );
@@ -2122,6 +2593,33 @@ mod report {
         assert_eq!(
             row("throughput"),
             "throughput 1000.0 runs/s 2000.0 runs/s 0.50x"
+        );
+
+        // The transport table: UDS and TCP+TLS raw, then TCP+TLS over UDS.
+        let transport = render_transport(&summary, &tls_summary);
+        let header = transport
+            .lines()
+            .nth(1)
+            .expect("a header row")
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(header, ["UDS", "TCP+TLS", "TCP+TLS/UDS"]);
+        assert!(transport.starts_with("== steady_state: transport ("));
+        assert!(transport.ends_with("no figure includes the TCP connect or the TLS handshake"));
+        let transport_row = |name: &str| {
+            transport
+                .lines()
+                .find(|line| line.starts_with(name))
+                .unwrap_or_else(|| panic!("a `{name}` row"))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(transport_row("p50"), "p50 100.0 µs 150.0 µs 1.50x");
+        assert_eq!(transport_row("p99"), "p99 200.0 µs 300.0 µs 1.50x");
+        assert_eq!(
+            transport_row("throughput"),
+            "throughput 1000.0 runs/s 800.0 runs/s 0.80x"
         );
 
         // The overhead arithmetic and its line.

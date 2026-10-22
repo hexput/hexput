@@ -2270,6 +2270,512 @@ mod cache_win {
         serving.stop().exit(0);
     }
 
+    /// Story 5.9: the remote path. The TCP+TLS leg of the `cache` bench runs the same rule as the
+    /// UDS leg over a real TLS connection (trusting only the fixture CA, server name `localhost`),
+    /// and the bench's figures are read from `benches/cache.rs`. The stream-generic helpers below
+    /// are copies of `init`, `register` and `run_and_serve_calls`, which take a `UnixStream` only.
+    mod remote_path {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+
+        use rustls::pki_types::pem::PemObject;
+
+        use super::super::conformance::harness::{Daemon, fixture, frames, tcp_section, tls};
+        use super::super::{Run, Sandbox, nothing};
+
+        /// A loopback port that was free just before the call (the bench's pick-then-bind).
+        fn picked_port() -> u16 {
+            TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+
+        /// The bench's `TCP+TLS` System Config: UDS plus `[transport.tcp]` on `port`.
+        fn config_with_tcp(sandbox: &Sandbox, port: u16) -> String {
+            format!(
+                "{}{}",
+                sandbox.valid(),
+                tcp_section(&format!("127.0.0.1:{port}"))
+            )
+        }
+
+        /// `init` over any stream: `Init` with the rule's three blanket grants.
+        fn init_on<S: Read + Write>(stream: &mut S, id: u64) {
+            let registrations: Vec<Value> = ["weight", "passMark", "record"]
+                .iter()
+                .map(|name| {
+                    Value::Map(vec![
+                        (Value::from("name"), Value::from(*name)),
+                        (Value::from("blanket"), Value::from(true)),
+                    ])
+                })
+                .collect();
+            frames::send(
+                stream,
+                &Envelope::new(
+                    CorrelationId(id),
+                    MessageType::Init,
+                    Value::Map(vec![
+                        (Value::from("config"), Value::Map(vec![])),
+                        (Value::from("registrations"), Value::Array(registrations)),
+                    ]),
+                ),
+            );
+            let reply = frames::reply(stream).expect("an Init reply");
+            assert_eq!(
+                reply.message_type,
+                MessageType::Result,
+                "{:?}",
+                reply.payload
+            );
+        }
+
+        /// `register` over any stream: the rule's handle, 16 characters long.
+        fn register_on<S: Read + Write>(stream: &mut S, id: u64) -> String {
+            frames::send(
+                stream,
+                &Envelope::new(
+                    CorrelationId(id),
+                    MessageType::CodeRegister,
+                    Value::Map(vec![(Value::from("source"), Value::from(RULE))]),
+                ),
+            );
+            let reply = frames::reply(stream).expect("a reply");
+            assert_eq!(
+                reply.message_type,
+                MessageType::Result,
+                "{:?}",
+                reply.payload
+            );
+            let handle = field(&reply.payload, "handle")
+                .as_str()
+                .expect("a string handle")
+                .to_owned();
+            assert_eq!(handle.len(), 16, "{handle}");
+            handle
+        }
+
+        /// `run_and_serve_calls` over any stream: answers every `Call` as a Backend and returns the
+        /// execution's payload with its `Call` count.
+        fn serve_run<S: Read + Write>(stream: &mut S, request: Envelope<Value>) -> (Value, usize) {
+            let expected = request.id.map(CorrelationId::get);
+            frames::send(stream, &request);
+            let mut calls = 0;
+            loop {
+                let reply = frames::reply(stream).expect("a reply");
+                match reply.message_type {
+                    MessageType::Call => {
+                        calls += 1;
+                        let value = answer(&reply);
+                        let call_id = reply.id.expect("a Call carries its id").get();
+                        frames::send(
+                            stream,
+                            &Envelope::new(
+                                CorrelationId(call_id),
+                                MessageType::Result,
+                                Value::Map(vec![(Value::from("value"), value)]),
+                            ),
+                        );
+                    }
+                    MessageType::Result => {
+                        assert_eq!(
+                            reply.id.map(CorrelationId::get),
+                            expected,
+                            "the reply names its execution"
+                        );
+                        return (reply.payload, calls);
+                    }
+                    other => panic!("the run failed with {other:?}: {:?}", reply.payload),
+                }
+            }
+        }
+
+        /// Story 5.9, the quick-mode check of the TCP+TLS leg: over a real TLS connection, every
+        /// student's verdict is the one Rust computes, with exactly 10 host calls per run, in
+        /// three rotations.
+        #[test]
+        fn the_rule_over_tls_is_verified_for_every_student_with_ten_host_calls() {
+            let sandbox = Sandbox::new();
+            let daemon = Daemon::start(&sandbox, &config_with_tcp(&sandbox, picked_port()));
+            let mut client = tls(daemon.tcp_address());
+            init_on(&mut client, 1);
+            let handle = register_on(&mut client, 2);
+            let students = students();
+            let mut id = 3;
+            let mut verdicts = Vec::new();
+            for _round in 0..3 {
+                for student in &students {
+                    let (payload, calls) =
+                        serve_run(&mut client, cached_request(id, &handle, student));
+                    id += 1;
+                    assert_eq!(payload, expected_payload(student), "{}", student.id);
+                    assert_eq!(calls, HOST_CALLS_PER_RUN, "{}", student.id);
+                    verdicts.push(expected_verdict(student));
+                }
+            }
+            assert!(
+                verdicts.contains(&true) && verdicts.contains(&false),
+                "the workload must exercise both outcomes"
+            );
+            drop(client);
+            daemon.stop().exit(0);
+        }
+
+        /// Story 5.9: the cold figure over TLS, `CodeRegister` then its first run, then the
+        /// untimed `CodeUnregister` — each run verified, and the handle freed afterwards.
+        #[test]
+        fn cold_and_warm_runs_over_tls_agree_and_code_unregister_frees_the_handle() {
+            let sandbox = Sandbox::new();
+            let daemon = Daemon::start(&sandbox, &config_with_tcp(&sandbox, picked_port()));
+            let mut client = tls(daemon.tcp_address());
+            init_on(&mut client, 1);
+            let students = students();
+            let student = &students[1];
+            let handle = register_on(&mut client, 2);
+            let (cold, cold_calls) = serve_run(&mut client, cached_request(3, &handle, student));
+            let (warm, warm_calls) = serve_run(&mut client, cached_request(4, &handle, student));
+            let expected = expected_payload(student);
+            assert_eq!(cold, expected, "cold over TLS");
+            assert_eq!(warm, expected, "warm over TLS");
+            assert_eq!(cold_calls, HOST_CALLS_PER_RUN);
+            assert_eq!(warm_calls, HOST_CALLS_PER_RUN);
+
+            frames::send(
+                &mut client,
+                &Envelope::new(
+                    CorrelationId(5),
+                    MessageType::CodeUnregister,
+                    Value::Map(vec![(Value::from("handle"), Value::from(handle.as_str()))]),
+                ),
+            );
+            let reply = frames::reply(&mut client).expect("a reply");
+            assert_eq!(
+                reply.message_type,
+                MessageType::Result,
+                "{:?}",
+                reply.payload
+            );
+            assert_eq!(reply.payload, Value::Map(vec![]));
+
+            frames::send(&mut client, &cached_request(6, &handle, student));
+            let refusal = frames::reply(&mut client).expect("a reply");
+            assert_eq!(refusal.message_type, MessageType::Error);
+            assert_eq!(refusal.id, Some(CorrelationId(6)));
+            drop(client);
+            daemon.stop().exit(0);
+        }
+
+        /// Story 5.9, the TCP+TLS steady state in quick mode: eight connections, each on its own
+        /// thread, one TLS connection per thread, every run verified with 10 host calls.
+        #[test]
+        fn eight_concurrent_tls_connections_each_verify_every_run_of_the_rule() {
+            let sandbox = Sandbox::new();
+            let daemon = Daemon::start(&sandbox, &config_with_tcp(&sandbox, picked_port()));
+            let addr = daemon.tcp_address();
+            std::thread::scope(|scope| {
+                for index in 0..CONCURRENCY {
+                    scope.spawn(move || {
+                        let mut client = tls(addr);
+                        init_on(&mut client, 1);
+                        let handle = register_on(&mut client, 2);
+                        let students = students();
+                        for run in 0..RUNS_PER_CONNECTION {
+                            let student = &students[(index + run) % students.len()];
+                            let (payload, calls) = serve_run(
+                                &mut client,
+                                cached_request(3 + run as u64, &handle, student),
+                            );
+                            assert_eq!(payload, expected_payload(student), "{}", student.id);
+                            assert_eq!(calls, HOST_CALLS_PER_RUN, "{}", student.id);
+                        }
+                    });
+                }
+            });
+            daemon.stop().exit(0);
+        }
+
+        /// Story 5.9: both legs of the one Daemon give the same verified verdict for every
+        /// student, so the TCP+TLS figures measure the same work as the UDS ones.
+        #[test]
+        fn the_uds_and_tls_legs_answer_the_same_verified_verdict_for_every_student() {
+            let sandbox = Sandbox::new();
+            let daemon = Daemon::start(&sandbox, &config_with_tcp(&sandbox, picked_port()));
+            let mut uds: UnixStream = daemon.uds(&sandbox.socket());
+            let mut over_tls = tls(daemon.tcp_address());
+            init_on(&mut uds, 1);
+            init_on(&mut over_tls, 1);
+            let uds_handle = register_on(&mut uds, 2);
+            let tls_handle = register_on(&mut over_tls, 2);
+            for (index, student) in students().iter().enumerate() {
+                let id = 3 + index as u64;
+                let (uds_payload, uds_calls) =
+                    serve_run(&mut uds, cached_request(id, &uds_handle, student));
+                let (tls_payload, tls_calls) =
+                    serve_run(&mut over_tls, cached_request(id, &tls_handle, student));
+                assert_eq!(uds_payload, expected_payload(student), "UDS {}", student.id);
+                assert_eq!(tls_payload, uds_payload, "TLS {}", student.id);
+                assert_eq!(uds_calls, HOST_CALLS_PER_RUN);
+                assert_eq!(tls_calls, uds_calls, "{}", student.id);
+            }
+            drop(uds);
+            drop(over_tls);
+            daemon.stop().exit(0);
+        }
+
+        /// Story 5.9: the TCP+TLS leg's port is the one picked just before start, and the Daemon
+        /// listens on it.
+        #[test]
+        fn the_daemon_listens_on_the_port_picked_just_before_start() {
+            let sandbox = Sandbox::new();
+            let port = picked_port();
+            let daemon = Daemon::start(&sandbox, &config_with_tcp(&sandbox, port));
+            assert_eq!(daemon.tcp_address().port(), port);
+            let mut client = tls(daemon.tcp_address());
+            init_on(&mut client, 1);
+            drop(client);
+            daemon.stop().exit(0);
+        }
+
+        /// Story 5.9, the matrix row "Port taken between pick and bind": another process holds
+        /// the port, so the Daemon exits with failure and nothing is published.
+        #[test]
+        fn a_port_taken_between_pick_and_bind_fails_the_daemon_with_exit_one() {
+            let sandbox = Sandbox::new();
+            let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = holder.local_addr().unwrap().port();
+            let run = daemon_with(&sandbox, &config_with_tcp(&sandbox, port));
+            run.exit(1);
+            assert!(
+                run.stderr
+                    .starts_with(&format!("error: 127.0.0.1:{port}: cannot listen for TCP: ")),
+                "{}",
+                run.stderr
+            );
+            drop(holder);
+        }
+
+        /// Runs the Daemon in-process until it stops on its own (a startup failure).
+        fn daemon_with(sandbox: &Sandbox, config_text: &str) -> Run {
+            let config = sandbox.file("config.toml", config_text);
+            super::super::daemon(&["--config", config.to_str().unwrap()], &nothing(sandbox))
+        }
+
+        /// Story 5.9, the bench's TLS parameters: the negotiated protocol version and cipher suite
+        /// read off a completed handshake print as `TLSv1_3, TLS13_…`.
+        #[test]
+        fn a_completed_handshake_names_its_version_and_suite_in_the_bench_format() {
+            let sandbox = Sandbox::new();
+            let daemon = Daemon::start(&sandbox, &config_with_tcp(&sandbox, picked_port()));
+            let mut client = tls(daemon.tcp_address());
+            while client.conn.is_handshaking() {
+                client.conn.complete_io(&mut client.sock).unwrap();
+            }
+            let version = client
+                .conn
+                .protocol_version()
+                .expect("a negotiated version");
+            let suite = client
+                .conn
+                .negotiated_cipher_suite()
+                .expect("a negotiated suite");
+            let text = format!("{version:?}, {:?}", suite.suite());
+            assert!(text.starts_with("TLSv1_3, TLS13_"), "{text}");
+            drop(client);
+            daemon.stop().exit(0);
+        }
+
+        /// Story 5.9: the client trusts only the fixture CA, so an empty root store refuses the
+        /// Daemon's certificate.
+        #[test]
+        fn a_client_that_trusts_no_root_is_refused_by_the_handshake() {
+            let sandbox = Sandbox::new();
+            let daemon = Daemon::start(&sandbox, &config_with_tcp(&sandbox, picked_port()));
+            let config = Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+            );
+            let mut connection = rustls::ClientConnection::new(
+                config,
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap();
+            let mut tcp = TcpStream::connect(daemon.tcp_address()).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            assert!(connection.complete_io(&mut tcp).is_err());
+            drop(tcp);
+            daemon.stop().exit(0);
+        }
+
+        /// Story 5.9: the verification is by name too: the fixture certificate is for `localhost`
+        /// and `127.0.0.1`, so another name is refused even with the fixture CA trusted.
+        #[test]
+        fn a_name_other_than_localhost_is_refused_by_the_handshake() {
+            let sandbox = Sandbox::new();
+            let daemon = Daemon::start(&sandbox, &config_with_tcp(&sandbox, picked_port()));
+            let mut roots = rustls::RootCertStore::empty();
+            for certificate in
+                rustls::pki_types::CertificateDer::pem_file_iter(fixture("ca.pem")).unwrap()
+            {
+                roots.add(certificate.unwrap()).unwrap();
+            }
+            let config = Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            );
+            let mut connection = rustls::ClientConnection::new(
+                config,
+                rustls::pki_types::ServerName::try_from("example.org").unwrap(),
+            )
+            .unwrap();
+            let mut tcp = TcpStream::connect(daemon.tcp_address()).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            assert!(connection.complete_io(&mut tcp).is_err());
+            drop(tcp);
+            daemon.stop().exit(0);
+        }
+
+        /// Story 5.9: the bench's source names what this module pins: the group, its figures, the
+        /// TCP+TLS steady state and its label, the topology text, the TLS client's settings, and the
+        /// JSON and comparison fields. These are names only; the run itself is verified by the
+        /// bench's own quick mode, which `cargo test` runs.
+        #[test]
+        fn the_bench_declares_the_remote_path_legs_steady_state_report_and_topology() {
+            let bench = include_str!("../benches/cache.rs");
+            for needle in [
+                "benchmark_group(\"remote_path\")",
+                "tcp_tls_cold_first_run",
+                "tcp_tls_warm_cache_hit",
+                "noise_threshold(report::VARIANCE.p50)",
+                "daemon.connect_tls()",
+                "steady::measure(|| daemon.connect_tls(), workload::RULE",
+                "report::TCP_TLS_SIDE",
+                "Hexput Daemon, Cached Execution over TCP+TLS (loopback)",
+                "tcp_tls_steady_state",
+                "tcp_tls_summary",
+                "tcp_tls: Delta",
+                "NoPrevious",
+                "TCP+TLS/UDS",
+                "render_side_by_side",
+                "self_check",
+                "legs",
+                "tcp_tls",
+                "127.0.0.1 (loopback)",
+                "ring provider, server authentication only",
+                "same machine over the loopback interface",
+                "no network hop",
+                "same machine: Daemon in-process on its own runtime, clients on threads of the bench process",
+                "the Daemon never listened",
+                "127.0.0.1:0",
+                "TcpListener",
+                "[transport.tcp]",
+                "\"ca.pem\"",
+                "\"server.pem\"",
+                "\"server.key\"",
+                "CARGO_MANIFEST_DIR",
+                "builder_with_provider(",
+                "with_safe_default_protocol_versions",
+                "\"localhost\"",
+                "complete_io",
+                "is_handshaking()",
+                "set_nodelay(true)",
+                "Duration::from_secs(60)",
+                "trait Duplex",
+                "Box<dyn Duplex>",
+                "flush()",
+            ] {
+                assert!(bench.contains(needle), "the bench lacks `{needle}`");
+            }
+        }
+
+        /// Story 5.9: the bench's module doc carries the Story 5.9 figures and the loopback
+        /// topology, and the transport table keeps the two legs apart.
+        #[test]
+        fn the_bench_module_doc_names_the_remote_figures_and_the_loopback_topology() {
+            let bench = include_str!("../benches/cache.rs");
+            let doc: String = bench
+                .lines()
+                .take_while(|line| line.starts_with("//!"))
+                .collect();
+            assert!(doc.contains("Story 5.9"), "the module doc names Story 5.9");
+            assert!(doc.contains("remote_path/tcp_tls_cold_first_run"));
+            assert!(doc.contains("remote_path/tcp_tls_warm_cache_hit"));
+            assert!(doc.contains("127.0.0.1"), "the loopback address is named");
+            assert!(doc.contains("loopback"), "the topology is named loopback");
+        }
+
+        /// Story 5.9: the TCP+TLS steady state runs after Hexput's UDS one and before Rhai's, inside
+        /// the same filter gate as `steady_state`, so a filter that skips the steady state skips it.
+        #[test]
+        fn the_tcp_tls_steady_state_is_ordered_between_the_uds_and_rhai_legs_and_filtered_with_them()
+         {
+            let bench = include_str!("../benches/cache.rs");
+            let gate = bench
+                .find("report::runs_steady_state(")
+                .expect("the steady state gate");
+            let skipped = bench
+                .find("steady_state skipped by the filter")
+                .expect("the skip message");
+            let uds = bench
+                .find("steady::measure(|| daemon.connect(), workload::RULE")
+                .expect("the UDS steady state");
+            let tls = bench
+                .find("steady::measure(|| daemon.connect_tls(), workload::RULE")
+                .expect("the TCP+TLS steady state");
+            let rhai = bench
+                .find("steady::measure(\n            || rhai_server.connect(),")
+                .or_else(|| bench.find("|| rhai_server.connect()"))
+                .expect("the Rhai steady state");
+            assert!(
+                gate < uds && uds < tls && tls < rhai,
+                "the order is UDS, TCP+TLS, Rhai"
+            );
+            assert!(tls < skipped, "the TCP+TLS steady state is inside the gate");
+        }
+
+        /// Story 5.9: the remote figures sit in their own `remote_path` group, not inside
+        /// `cache_win`, and the UDS group is still the one the 4.4 drift guards read.
+        #[test]
+        fn the_remote_figures_are_a_group_of_their_own_beside_the_uds_ones() {
+            let bench = include_str!("../benches/cache.rs");
+            let uds = bench
+                .find("benchmark_group(\"cache_win\")")
+                .expect("cache_win");
+            let remote = bench
+                .find("benchmark_group(\"remote_path\")")
+                .expect("remote_path");
+            let rhai = bench
+                .find("benchmark_group(\"rhai_compare\")")
+                .expect("rhai_compare");
+            assert!(rhai < remote, "remote_path follows rhai_compare");
+            assert!(
+                !bench[uds..rhai].contains("tcp_tls"),
+                "no TCP+TLS figure sits in the UDS group"
+            );
+        }
+
+        /// Story 5.9: the Rhai server still reaches the one boxed `Client` constructor.
+        #[test]
+        fn the_rhai_server_still_builds_its_client_through_client_new() {
+            let rhai = include_str!("../benches/cache/rhai.rs");
+            assert!(rhai.contains("Client::new("));
+        }
+    }
+
     // --- Story 4.5: the Rhai comparator over the same workload, and the in-process engine drivers ---
 
     /// Story 4.5: the Rhai comparator (spec `cache` bench, constant `RHAI_RULE`), its native host

@@ -84,7 +84,11 @@ impl RhaiServer {
 
     /// A client connection; the socket is bound before `start` returns.
     pub fn connect(&self) -> Client {
-        Client::new(UnixStream::connect(&self.socket).expect("a Rhai server connection"))
+        let stream = UnixStream::connect(&self.socket).expect("a Rhai server connection");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .expect("a read timeout");
+        Client::new(stream)
     }
 
     /// Ends the accept thread (woken by one last connection), waits for every connection — each

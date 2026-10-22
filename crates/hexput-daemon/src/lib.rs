@@ -231,6 +231,8 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
         tracing::info!("daemon started; waiting for a shutdown signal");
         // One Session registry per Daemon run, shared by every connection.
         let sessions = Arc::new(Sessions::new());
+        // One AST Cache per Daemon run beside it (Story 4.1): its handles come from one counter.
+        let cache = Arc::new(hexput_script::AstCache::new());
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -246,7 +248,11 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                 accepted = listener.accept() => match accepted {
                     Ok(port) => {
                         // `serve` logs the connection's opening inside its own span.
-                        connections.spawn(hexput_connection::serve(port, Arc::clone(&sessions)));
+                        connections.spawn(hexput_connection::serve(
+                            port,
+                            Arc::clone(&sessions),
+                            Arc::clone(&cache),
+                        ));
                     }
                     Err(error) => {
                         tracing::warn!(%error, "cannot accept a connection");

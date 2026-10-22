@@ -1384,3 +1384,51 @@ fn plain_text_shows_the_client_id_in_span_context_not_in_messages() {
     // Plain text is not JSON.
     assert!(!run.log.trim_start().starts_with('{'), "{}", run.log);
 }
+
+/// Story 4.1: a registration over the real socket is answered with a handle. The handles of one
+/// Daemon run come from one counter, so two connections never share one.
+#[cfg(unix)]
+#[test]
+fn a_registration_over_the_socket_is_answered_with_a_handle_from_one_counter_per_run() {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let mut client = serving.connect();
+        let init = Envelope::new(
+            CorrelationId(1),
+            MessageType::Init,
+            Value::Map(vec![
+                (Value::from("config"), Value::Map(vec![])),
+                (Value::from("registrations"), Value::Array(vec![])),
+            ]),
+        );
+        wire::send(&mut client, &init);
+        assert_eq!(
+            wire::reply(&mut client).expect("a reply").message_type,
+            MessageType::Result
+        );
+        let register = Envelope::new(
+            CorrelationId(2),
+            MessageType::CodeRegister,
+            Value::Map(vec![(Value::from("source"), Value::from("return 1 + x;"))]),
+        );
+        wire::send(&mut client, &register);
+        let reply = wire::reply(&mut client).expect("a reply");
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        let fields = reply.payload.as_map().expect("a map payload");
+        assert_eq!(fields.len(), 1, "exactly `handle`: {fields:?}");
+        assert_eq!(fields[0].0.as_str(), Some("handle"));
+        handles.push(fields[0].1.as_str().expect("a string handle").to_owned());
+    }
+    assert_eq!(handles, ["0000000000000001", "0000000000000002"]);
+    serving.stop().exit(0);
+}

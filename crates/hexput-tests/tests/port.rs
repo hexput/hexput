@@ -1047,3 +1047,38 @@ mod check_mode {
         );
     }
 }
+
+// --- Story 4.1: the Script handle and CodeRegister on the wire ---
+
+#[test]
+fn port_re_exports_the_script_handle_and_the_client_id() {
+    let handle: hexput_port::ScriptHandle = "0000000000000001".parse().unwrap();
+    assert_eq!(handle.to_string(), "0000000000000001");
+    let client: hexput_port::ClientId = "000123456789abcdef1032547698bafe".parse().unwrap();
+    assert_eq!(client.to_string(), "000123456789abcdef1032547698bafe");
+}
+
+#[test]
+fn a_code_register_envelope_is_spelled_code_register_on_the_wire() {
+    let bytes = encode(&Envelope::new(
+        CorrelationId(4),
+        MessageType::CodeRegister,
+        map(vec![("source", s("return 1;"))]),
+    ))
+    .unwrap();
+    let value = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+    assert_eq!(
+        value
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("type"))
+            .unwrap()
+            .1
+            .as_str(),
+        Some("CodeRegister")
+    );
+    let decoded = decode(&bytes).unwrap();
+    assert_eq!(decoded.message_type, MessageType::CodeRegister);
+    assert_eq!(decoded.id, Some(CorrelationId(4)));
+}

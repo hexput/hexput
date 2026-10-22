@@ -288,3 +288,15 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-3-11-carry-hidden-metadata-on-values-the-script-cannot-touch.md`
   summary: Holders multiply a `Call` argument's wire size (every nested scalar becomes a holder) and roughly halve its usable nesting; each generated secret is charged to memory; none of this cost is documented or benchmarked, and the memory charge for generated/cleared secrets is untested.
   evidence: Review findings (blind low, verification-gap low). By design of FR-28; document and test with Story 3.13 or the Epic 5 benchmarks.
+
+- source_spec: `spec-4-1-register-a-script-once-for-repeated-use.md`
+  summary: The AST Cache has no capacity bound and no Session-teardown cleanup, so an initialized Backend can grow Daemon memory without limit by registering repeatedly.
+  evidence: Review finding (blind and edge, medium). `AstCache::insert` stores every registration in an unbounded moka cache and nothing removes an entry until the Daemon exits. Story 4.3 (bounds, unregister, Session cleanup) must close this before a release ships Cached Execution.
+
+- source_spec: `spec-4-1-register-a-script-once-for-repeated-use.md`
+  summary: A registration still parsing when its connection closes or is lost inserts its entry after the Session may be gone, under a handle nobody was told about.
+  evidence: Review finding (blind and edge, medium). `code_register` inserts on the blocking pool once parse and check succeed, whether or not its reply is still awaited. Story 4.3's teardown cleanup (by Client ID) must run after, or guard against, such late inserts.
+
+- source_spec: `spec-4-1-register-a-script-once-for-repeated-use.md`
+  summary: The `variables` names a registration was checked against are not stored; Story 4.2 must decide whether a `CachedExecutionStart`'s variables are validated against them.
+  evidence: Review finding (blind, low). The entry is only `Arc<Program>`; the check's judgement on undeclared names assumed the registered names. Record the choice in Story 4.2's spec.

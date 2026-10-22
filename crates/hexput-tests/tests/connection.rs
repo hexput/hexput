@@ -14,7 +14,9 @@ use hexput_port::{
     CorrelationId, Envelope, Inbound, MessageType, Outbound, Port, ProtocolCode, ProtocolError,
     ProtocolFailure, Received, Value,
 };
+use hexput_script::AstCache;
 use hexput_session::{ClientId, Sessions, Setting, Settings};
+use hexput_shared::ids::ScriptHandle;
 
 /// Everything the core wrote.
 #[derive(Clone, Default)]
@@ -133,6 +135,17 @@ fn run_timed(
     fail: Option<(usize, io::ErrorKind)>,
     probe: Option<Probe>,
 ) -> (Vec<Envelope<Value>>, usize, Duration) {
+    run_timed_with_cache(sessions, &Arc::new(AstCache::new()), script, fail, probe)
+}
+
+/// [`run_timed`] sharing `cache` (Story 4.1), which the test keeps to inspect after the connection.
+fn run_timed_with_cache(
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    script: Vec<Received>,
+    fail: Option<(usize, io::ErrorKind)>,
+    probe: Option<Probe>,
+) -> (Vec<Envelope<Value>>, usize, Duration) {
     let script = Arc::new(Mutex::new(VecDeque::from(script)));
     let sent = Sent::default();
     let port = Scripted {
@@ -151,7 +164,11 @@ fn run_timed(
         .unwrap();
     let started = Instant::now();
     tracing::dispatcher::with_default(&dispatch, || {
-        runtime.block_on(hexput_connection::serve(port, Arc::clone(sessions)));
+        runtime.block_on(hexput_connection::serve(
+            port,
+            Arc::clone(sessions),
+            Arc::clone(cache),
+        ));
     });
     let elapsed = started.elapsed();
     drop(runtime);
@@ -1044,7 +1061,11 @@ fn at_a_quiet_level_a_warning_keeps_its_span_fields() {
         .build()
         .unwrap();
     tracing::dispatcher::with_default(&dispatch, || {
-        runtime.block_on(hexput_connection::serve(port, Arc::clone(&sessions)));
+        runtime.block_on(hexput_connection::serve(
+            port,
+            Arc::clone(&sessions),
+            Arc::new(AstCache::new()),
+        ));
     });
     assert!(sessions.is_empty(), "the connection detached");
 
@@ -1268,7 +1289,11 @@ async fn connect_as(
         to_test,
         refuse_calls,
     };
-    let serving = tokio::spawn(hexput_connection::serve(port, Arc::clone(sessions)));
+    let serving = tokio::spawn(hexput_connection::serve(
+        port,
+        Arc::clone(sessions),
+        Arc::new(AstCache::new()),
+    ));
     let mut backend = Backend {
         to_daemon: Some(to_daemon),
         from_daemon,
@@ -3997,5 +4022,465 @@ fn a_backend_modification_reaches_the_script_and_its_own_write_comes_back() {
             );
             backend.close();
         },
+    );
+}
+
+// --- Story 4.1: register a Script once for repeated use ---
+
+/// Statements in the registration that outlasts the fast execution submitted beside it.
+const LARGE_REGISTRATION_STATEMENTS: usize = 200_000;
+
+/// [`serve`]'s run against `cache`, which the test keeps to inspect after the connection ends.
+fn serve_cached(
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    script: Vec<Received>,
+) -> (Vec<Envelope<Value>>, usize) {
+    let (written, left, _) = run_timed_with_cache(sessions, cache, script, None, None);
+    (written, left)
+}
+
+/// A `CodeRegister` request for `source`, with no starting-variable names.
+fn register(id: u64, source: &str) -> Received {
+    register_with(id, source, None)
+}
+
+/// A `CodeRegister` request for `source`, naming its starting variables `variables` when given.
+fn register_with(id: u64, source: &str, variables: Option<&[&str]>) -> Received {
+    let mut fields = vec![(string("source"), string(source))];
+    if let Some(variables) = variables {
+        fields.push((
+            string("variables"),
+            Value::Array(variables.iter().map(|name| string(name)).collect()),
+        ));
+    }
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::CodeRegister,
+        Value::Map(fields),
+    ))
+}
+
+/// The `handle` of a successful `CodeRegister` reply: exactly `handle` when no check ran, and a
+/// 16-character lowercase hex text.
+fn handle_of(response: &Envelope<Value>) -> ScriptHandle {
+    assert_eq!(
+        response.message_type,
+        MessageType::Result,
+        "{:?}",
+        response.payload
+    );
+    let text = field_of(response, "handle")
+        .expect("a `handle` field")
+        .as_str()
+        .expect("a string handle")
+        .to_owned();
+    assert_eq!(text.len(), 16, "{text}");
+    assert!(
+        text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{text}"
+    );
+    text.parse().unwrap()
+}
+
+/// The keys of a reply's payload map, in order.
+fn keys_of(response: &Envelope<Value>) -> Vec<String> {
+    response
+        .payload
+        .as_map()
+        .expect("a payload map")
+        .iter()
+        .map(|(key, _)| key.as_str().expect("a string key").to_owned())
+        .collect()
+}
+
+#[test]
+fn a_registration_parses_once_and_its_handle_names_the_cached_program() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, left) = serve_cached(
+        &sessions,
+        &cache,
+        vec![init(1, init_payload(&[])), register(2, "return 1 + x;")],
+    );
+    assert_eq!(left, 0);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].id, Some(CorrelationId(2)));
+    assert_eq!(keys_of(&sent[1]), ["handle"]);
+    let handle = handle_of(&sent[1]);
+    let client = client_id_of(&sent[0]);
+    let program = cache
+        .get(client, handle)
+        .expect("the handle names exactly that entry");
+    assert_eq!(*program, hexput_parser::parse("return 1 + x;").unwrap());
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn every_registration_gets_a_new_handle_even_for_the_same_source() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_payload(&[])),
+            register(2, "return 1;"),
+            register(3, "return 1;"),
+        ],
+    );
+    let (first, second) = (handle_of(&sent[1]), handle_of(&sent[2]));
+    assert_ne!(first, second);
+    let client = client_id_of(&sent[0]);
+    assert_eq!(cache.entry_count(), 2);
+    assert!(cache.get(client, first).is_some());
+    assert!(cache.get(client, second).is_some());
+    let mut handles = cache.handles(client);
+    handles.sort();
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(handles, expected);
+}
+
+#[test]
+fn a_source_that_fails_to_parse_is_answered_with_its_diagnostic_and_creates_no_entry() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![init(1, init_payload(&[])), register(2, "let = ;")],
+    );
+    assert_eq!(sent[1].id, Some(CorrelationId(2)));
+    assert_eq!(sent[1].message_type, MessageType::Error);
+    assert!(code_of(&sent[1]).starts_with("syntax."), "{sent:?}");
+    assert!(field_of(&sent[1], "span").is_some(), "the parser's span");
+    assert_eq!(cache.entry_count(), 0);
+}
+
+#[test]
+fn a_registration_before_init_is_refused_and_creates_no_entry() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(&sessions, &cache, vec![register(1, "return 1;")]);
+    assert_eq!(outcome(&sent[0]), "protocol.init_not_completed");
+    assert_eq!(cache.entry_count(), 0);
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_malformed_registration_is_refused_naming_what_is_wrong_and_creates_no_entry() {
+    let source = |text: &str| (string("source"), string(text));
+    // Each case names the key, or the item, its refusal must mention — any of the alternatives.
+    let cases: Vec<(Value, &[&str])> = vec![
+        (Value::Nil, &["`source`"]),
+        (Value::Map(vec![]), &["`source`"]),
+        (
+            Value::Map(vec![(string("source"), Value::from(1))]),
+            &["`source`"],
+        ),
+        (
+            Value::Map(vec![source("1;"), (string("x"), Value::from(1))]),
+            &["`x`"],
+        ),
+        (
+            Value::Map(vec![
+                source("1;"),
+                (string("overrides"), Value::Map(vec![])),
+            ]),
+            &["`overrides`"],
+        ),
+        (
+            Value::Map(vec![
+                source("1;"),
+                (string("variables"), Value::Map(vec![])),
+            ]),
+            &["`variables`"],
+        ),
+        (
+            Value::Map(vec![
+                source("1;"),
+                (
+                    string("variables"),
+                    Value::Array(vec![string("a"), string("a")]),
+                ),
+            ]),
+            &["variables[1]", "`a`", "\"a\""],
+        ),
+        (
+            Value::Map(vec![
+                source("1;"),
+                (string("variables"), Value::Array(vec![string("1a")])),
+            ]),
+            &["variables[0]", "`1a`", "\"1a\""],
+        ),
+    ];
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    for (payload, mentions) in cases {
+        let (sent, _) = serve_cached(
+            &sessions,
+            &cache,
+            vec![
+                init(1, init_payload(&[])),
+                Received::Message(Envelope::new(
+                    CorrelationId(2),
+                    MessageType::CodeRegister,
+                    payload.clone(),
+                )),
+            ],
+        );
+        assert_eq!(code_of(&sent[1]), "protocol.invalid_payload", "{payload:?}");
+        let message = message_of(&sent[1]);
+        assert!(
+            mentions.iter().any(|m| message.contains(m)),
+            "{payload:?} refused as {message:?}, which names none of {mentions:?}"
+        );
+    }
+    assert_eq!(cache.entry_count(), 0);
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn under_warn_a_registration_is_cached_and_answered_with_its_findings() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_configured(check_of(string("warn")), &[])),
+            register_with(2, "let unused = 1; return x;", Some(&["x"])),
+        ],
+    );
+    assert_eq!(keys_of(&sent[1]), ["handle", "findings"]);
+    handle_of(&sent[1]);
+    let findings = findings_of(&sent[1]);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].code, "reference.unused_variable");
+    assert_eq!(findings[0].severity, "warning");
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn under_error_an_error_finding_rejects_the_registration_and_creates_no_entry() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_configured(check_of(string("error")), &[])),
+            register(2, "return y;"),
+        ],
+    );
+    assert_eq!(sent[1].message_type, MessageType::Error);
+    assert_eq!(code_of(&sent[1]), "reference.undeclared_identifier");
+    let findings = findings_of(&sent[1]);
+    assert_eq!(
+        findings.iter().map(|f| f.code.as_str()).collect::<Vec<_>>(),
+        ["reference.undeclared_identifier"]
+    );
+    assert_eq!(cache.entry_count(), 0);
+}
+
+#[test]
+fn under_error_naming_the_starting_variables_is_accepted_without_findings() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_configured(check_of(string("error")), &[])),
+            register_with(2, "return y;", Some(&["y"])),
+        ],
+    );
+    assert_eq!(keys_of(&sent[1]), ["handle"]);
+    handle_of(&sent[1]);
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn under_error_a_registered_function_is_callable_in_a_registration() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(
+                1,
+                init_configured(check_of(string("error")), &[("f", false)]),
+            ),
+            register(2, "if (false) { f(1); }; return 1;"),
+        ],
+    );
+    assert_eq!(keys_of(&sent[1]), ["handle"]);
+    handle_of(&sent[1]);
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn a_registration_reads_the_live_config_its_check_mode_and_toggles() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let loops_off = by_key(&[
+        ("check", string("error")),
+        ("features", by_key(&[("loops", Value::Boolean(false))])),
+    ]);
+    let (mut sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_payload(&[])),
+            // Registered under the Config as `Init` left it: the check is off.
+            register(2, "return y;"),
+            config_update(3, check_of(string("error"))),
+            // The update applies to the next registration without reconnecting.
+            register(4, "return y;"),
+            config_update(5, loops_off),
+            register(6, "while (false) { let a = 1; }; return 1;"),
+        ],
+    );
+    // A registration's reply is written when its task finishes; each read the Config at dispatch.
+    sent.sort_by_key(|reply| reply.id.map(|id| id.0));
+    assert_eq!(ids(&sent), [1, 2, 3, 4, 5, 6]);
+    handle_of(&sent[1]);
+    assert_updated(&sent[2], 3);
+    assert_eq!(code_of(&sent[3]), "reference.undeclared_identifier");
+    assert_updated(&sent[4], 5);
+    assert_eq!(code_of(&sent[5]), "policy.construct_disabled");
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn with_the_check_off_no_pass_runs_and_the_registration_is_plain() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![init(1, init_payload(&[])), register(2, "return y;")],
+    );
+    assert_eq!(keys_of(&sent[1]), ["handle"]);
+    handle_of(&sent[1]);
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn two_sessions_registering_the_same_source_get_entries_only_they_can_find() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let source = "return 1 + x;";
+    let (a, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![init(1, init_payload(&[])), register(2, source)],
+    );
+    let (b, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![init(1, init_payload(&[])), register(2, source)],
+    );
+    let (client_a, client_b) = (client_id_of(&a[0]), client_id_of(&b[0]));
+    let (handle_a, handle_b) = (handle_of(&a[1]), handle_of(&b[1]));
+    assert_ne!(client_a, client_b);
+    assert_ne!(handle_a, handle_b);
+    assert!(cache.get(client_a, handle_a).is_some());
+    assert!(cache.get(client_b, handle_b).is_some());
+    assert!(cache.get(client_a, handle_b).is_none());
+    assert!(cache.get(client_b, handle_a).is_none());
+    assert_eq!(cache.handles(client_a), vec![handle_a]);
+    assert_eq!(cache.handles(client_b), vec![handle_b]);
+    assert_eq!(cache.entry_count(), 2);
+}
+
+#[test]
+fn a_direct_execution_never_touches_the_cache() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![init(1, init_payload(&[])), execution(2, "return 1;")],
+    );
+    assert_eq!(
+        sent[1].payload,
+        Value::Map(vec![(string("value"), Value::from(1))])
+    );
+    assert_eq!(cache.entry_count(), 0);
+}
+
+#[test]
+fn a_large_registration_does_not_hold_back_a_fast_execution_on_its_connection() {
+    let mut source: String = (0..LARGE_REGISTRATION_STATEMENTS)
+        .map(|n| format!("let v{n} = {n};\n"))
+        .collect();
+    source.push_str("return 0;");
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, left) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_payload(&[])),
+            register(2, &source),
+            execution(3, "return 3;"),
+        ],
+    );
+    assert_eq!(left, 0);
+    assert_eq!(ids(&sent), [1, 3, 2], "the registration completes last");
+    assert_eq!(
+        sent[1].payload,
+        Value::Map(vec![(string("value"), Value::from(3))])
+    );
+    handle_of(&sent[2]);
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn a_successful_registration_is_logged_at_debug_under_its_request() {
+    let log = Captured::default();
+    let writer = log.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(writer))
+            .finish(),
+    );
+    let runtime = wired_runtime();
+    let mut registered = None;
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let sessions = Arc::new(Sessions::new());
+            let (mut backend, serving) = connect(&sessions, init_payload(&[]), false).await;
+            backend.send(register(7, "return 1;"));
+            let reply = backend.next().await;
+            registered = Some(handle_of(&reply));
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    let handle = registered.expect("the registration was answered");
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["message"] == "script registered")
+        .collect();
+    assert_eq!(events.len(), 1, "{text}");
+    let event = &events[0];
+    assert_eq!(event["level"], "DEBUG", "{event}");
+    assert_eq!(event["fields"]["handle"], handle.to_string(), "{event}");
+    assert_eq!(event["span"]["name"], "request", "{event}");
+    assert_eq!(event["span"]["id"], "7", "{event}");
+    let spans = event["spans"].as_array().expect("span fields");
+    assert_eq!(spans[0]["name"], "connection", "{event}");
+    assert_eq!(
+        spans[0]["client_id"].as_str().map(str::len),
+        Some(ClientId::TEXT_LEN),
+        "{event}"
     );
 }

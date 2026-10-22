@@ -25,6 +25,13 @@
 //!   changes nothing. Handled inline, so it is in force for every execution this connection sends
 //!   after it, and for every later execution on any Connection attached to the Session. An
 //!   execution already dispatched keeps the settings it started with.
+//! * `CodeRegister` — `protocol.init_not_completed` before init. After init, a registration
+//!   (FR-5, Story 4.1): [`hexput_script::code_register`] parses the source once, runs the static
+//!   check when the Session's check mode asks for it, and stores the AST in the Daemon's one
+//!   [`AstCache`] under this Session's Client ID, and the connection answers `Result { handle }`
+//!   (with `findings` when the check found anything) or the `Error` it returns, with no entry
+//!   created. Dispatched as its own task, like an execution, so a large source never stalls the
+//!   loop. Logged at `debug`: "script registered" with its `handle`, or the failure.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
@@ -42,7 +49,8 @@
 //!
 //! # Concurrency
 //!
-//! Every initialized `ExecutionStart` is dispatched as its own task, owned by the connection. The
+//! Every initialized `ExecutionStart` and `CodeRegister` is dispatched as its own task, owned by
+//! the connection; a registration's parse and check run on the blocking pool too (NFR5). The
 //! task runs [`hexput_script::direct_execution`], which runs every piece of Script work on the
 //! shared runtime's blocking pool: runtime workers never run Script code, so a slow Script delays
 //! neither this connection's reads nor any other connection, even when slow Scripts outnumber the
@@ -130,7 +138,7 @@ use hexput_port::{
     ProtocolError, Received, Value, error_response,
 };
 use hexput_rpc::{Call, Caller, Calls};
-use hexput_script::Registration;
+use hexput_script::{AstCache, Registration};
 use hexput_session::{ClientId, Config, ConnectionId, InitRequest, Sessions, Settings};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{Instrument, Span};
@@ -138,6 +146,8 @@ use tracing::{Instrument, Span};
 /// The one connection's identity and state, as the loop sees it.
 struct Connection<'s> {
     sessions: &'s Sessions,
+    /// The Daemon's one AST Cache, which a registration stores its Script in (Story 4.1).
+    cache: &'s Arc<AstCache>,
     /// Issued when the connection opened; also its attachment once init completes.
     id: ConnectionId,
     /// The Client ID of the Session this connection is attached to, once init completes. Never a
@@ -150,10 +160,14 @@ struct Connection<'s> {
 /// Serve one connection until the peer leaves, a write fails, or a fatal protocol error closes
 /// it, then detach it from its Session if it completed init. Never panics on anything the peer
 /// sends; failures are logged at `debug`, since a peer leaving is routine.
-pub async fn serve<P: Port>(port: P, sessions: Arc<Sessions>) {
+///
+/// `sessions` and `cache` are the Daemon run's one Session registry and one AST Cache, shared by
+/// every connection.
+pub async fn serve<P: Port>(port: P, sessions: Arc<Sessions>, cache: Arc<AstCache>) {
     let id = sessions.connect();
     let mut connection = Connection {
         sessions: &sessions,
+        cache: &cache,
         id,
         attached: None,
         span: connection_span(id, None),
@@ -260,20 +274,7 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         (reply, span)
                     }
                     Answer::Execute(id, payload) => {
-                        // The Session's registrations, grants and Config settings as they are
-                        // now, read together once per execution and never cached (AD-5).
-                        let (registrations, settings) = connection
-                            .attached
-                            .and_then(|client_id| connection.sessions.for_execution(client_id))
-                            .unwrap_or_default();
-                        let registrations = registrations
-                            .into_iter()
-                            .map(|r| Registration {
-                                name: r.name().to_owned(),
-                                key: r.key().map(str::to_owned),
-                                blanket: r.blanket(),
-                            })
-                            .collect();
+                        let (registrations, settings) = session_now(connection);
                         // The task carries the request's span, so everything the execution logs
                         // names its connection, its Client ID and its request.
                         running.spawn(
@@ -283,6 +284,22 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                                 registrations,
                                 settings,
                                 caller.for_execution(id),
+                            )
+                            .instrument(span),
+                        );
+                        continue;
+                    }
+                    Answer::Register(id, payload, client_id) => {
+                        let (registrations, settings) = session_now(connection);
+                        // Like an execution: its own task, carrying the request's span.
+                        running.spawn(
+                            register(
+                                id,
+                                payload,
+                                client_id,
+                                Arc::clone(connection.cache),
+                                registrations,
+                                settings,
                             )
                             .instrument(span),
                         );
@@ -349,7 +366,7 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
             Event::Finished(Err(error)) => {
                 // A task that panicked has no id left to answer with. It ends only itself.
                 connection.span.in_scope(|| {
-                    tracing::error!(%error, "a Direct Execution task failed; its request goes unanswered");
+                    tracing::error!(%error, "a Direct Execution or registration task failed; its request goes unanswered");
                 });
                 continue;
             }
@@ -453,6 +470,9 @@ enum Answer {
     Initialized(ClientId, Envelope<Value>),
     /// By a Direct Execution of this payload, dispatched as its own task, replying to this id.
     Execute(Option<CorrelationId>, Value),
+    /// By a registration of this payload for the Session with this Client ID, dispatched as its
+    /// own task, replying to this id (Story 4.1).
+    Register(Option<CorrelationId>, Value, ClientId),
 }
 
 /// Answer one well-formed message. Takes it by value so an execution's payload — up to a whole
@@ -461,7 +481,7 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
     // Messages that need no Session.
     match request.message_type {
         MessageType::Init => return init(&request, connection),
-        MessageType::ExecutionStart | MessageType::ConfigUpdate => {}
+        MessageType::ExecutionStart | MessageType::ConfigUpdate | MessageType::CodeRegister => {}
         other => {
             // A stray reply's id is the Daemon's call id, not a Backend request id: echoing it
             // would fail whatever Backend request shares the number. Nil is allowed on `Error`.
@@ -479,7 +499,7 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
 
     // The init gate: the one check between a connection and everything that needs a Session.
     // Health/metrics (Epic 7) join the arm above to bypass it.
-    if connection.attached.is_none() {
+    let Some(client_id) = connection.attached else {
         return Answer::Reply(refuse(
             request.id,
             ProtocolCode::InitNotCompleted,
@@ -488,13 +508,32 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
                 request.message_type
             ),
         ));
-    }
+    };
 
-    // Past the gate: a `ConfigUpdate`, answered inline, or a Direct Execution.
-    if request.message_type == MessageType::ConfigUpdate {
-        return Answer::Reply(config_update(&request, connection));
+    // Past the gate: a `ConfigUpdate`, answered inline, a registration or a Direct Execution.
+    match request.message_type {
+        MessageType::ConfigUpdate => Answer::Reply(config_update(&request, connection)),
+        MessageType::CodeRegister => Answer::Register(request.id, request.payload, client_id),
+        _ => Answer::Execute(request.id, request.payload),
     }
-    Answer::Execute(request.id, request.payload)
+}
+
+/// The Session's registrations, grants and Config settings as they are now, read together once
+/// per execution or registration and never cached (AD-5).
+fn session_now(connection: &Connection<'_>) -> (Vec<Registration>, Settings) {
+    let (registrations, settings) = connection
+        .attached
+        .and_then(|client_id| connection.sessions.for_execution(client_id))
+        .unwrap_or_default();
+    let registrations = registrations
+        .into_iter()
+        .map(|r| Registration {
+            name: r.name().to_owned(),
+            key: r.key().map(str::to_owned),
+            blanket: r.blanket(),
+        })
+        .collect();
+    (registrations, settings)
 }
 
 /// Serve `ConfigUpdate` (Story 3.8): decode the complete new Config and replace the Session's
@@ -547,6 +586,42 @@ async fn execute(
         },
         Err(body) => {
             tracing::debug!(code = %body.code, "a Direct Execution failed");
+            error_response(id, &body)
+        }
+    }
+}
+
+/// Run one registration to its reply (Story 4.1). Parsing and checking run on the blocking pool;
+/// this task only waits.
+async fn register(
+    id: Option<CorrelationId>,
+    payload: Value,
+    client_id: ClientId,
+    cache: Arc<AstCache>,
+    registrations: Vec<Registration>,
+    settings: Settings,
+) -> Envelope<Value> {
+    match hexput_script::code_register(payload, client_id, cache, registrations, settings).await {
+        Ok(payload) => {
+            if let Some(handle) = payload
+                .as_map()
+                .and_then(|fields| {
+                    fields
+                        .iter()
+                        .find(|(key, _)| key.as_str() == Some("handle"))
+                })
+                .and_then(|(_, handle)| handle.as_str())
+            {
+                tracing::debug!(handle, "script registered");
+            }
+            Envelope {
+                id,
+                message_type: MessageType::Result,
+                payload,
+            }
+        }
+        Err(body) => {
+            tracing::debug!(code = %body.code, "a registration failed");
             error_response(id, &body)
         }
     }

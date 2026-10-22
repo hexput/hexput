@@ -25,6 +25,9 @@
 //!   an `Init`'s `config`, a `ConfigUpdate`'s `config` (Story 3.8) and an `ExecutionStart`'s
 //!   `overrides` so they can never disagree on a key, a type or a range. [`Settings`] and [`Setting`] are re-exported from `hexput-shared`.
 //!
+//! * [`ClientId`] and [`ScriptHandle`] (Story 4.1) are re-exported from `hexput-shared`, so every
+//!   crate past the Port names an id the one way it is defined.
+//!
 //! Binds: AD-1.
 
 mod codec;
@@ -39,6 +42,7 @@ pub use frame::{FrameDecoder, LENGTH_PREFIX_LEN, MAX_FRAME_LEN, encode_frame};
 pub use port::{Inbound, Outbound, Port, Received};
 pub use settings::{CheckMode, Feature, Features, OutOfRange, Setting, Settings, decode_settings};
 
+pub use hexput_shared::ids::{ClientId, ParseClientIdError, ParseScriptHandleError, ScriptHandle};
 pub use hexput_shared::wire::{CorrelationId, Envelope, MessageType};
 /// The untyped MessagePack value the Port uses as its payload type. Re-exported so consumers
 /// reach the same pinned `rmpv` without depending on it themselves.

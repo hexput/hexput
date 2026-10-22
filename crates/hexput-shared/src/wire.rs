@@ -48,7 +48,7 @@ impl fmt::Display for CorrelationId {
 ///
 /// Names are PascalCase on the wire, matching the PRD's `ExecutionStart`. A response is not
 /// per-request-type — a Backend knows what a `Result` answers from its id. `#[non_exhaustive]`
-/// because later epics add to this vocabulary (`CodeRegister`, `HealthCheck`, …).
+/// because later epics add to this vocabulary (`CachedExecutionStart`, `HealthCheck`, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MessageType {
@@ -61,6 +61,14 @@ pub enum MessageType {
     /// leaves out goes back to the Daemon default. Answered `Result {}` (an empty map); every
     /// attached Connection's later executions run under the new Config.
     ConfigUpdate,
+    /// Request: parse a Script once and keep its AST in the AST Cache for repeated use (Story
+    /// 4.1). The payload is `{source}`, plus optionally `variables` — an array of the Script's
+    /// starting-variable *names*, which only the static check reads (a registration has no
+    /// values). Answered `Result {handle}`, `handle` a 16-lowercase-hex-character text naming the
+    /// entry under this Session's Client ID, with `findings` after it when the Session's check
+    /// mode ran the static check and it found anything; or `Error` (a parse diagnostic, a
+    /// rejection under check mode `error`, `protocol.invalid_payload`), with no entry created.
+    CodeRegister,
     /// Response: a request succeeded; the payload is its result.
     Result,
     /// Request, from the Daemon to the Backend: a Script called a Registered Function (Story
@@ -86,6 +94,7 @@ impl MessageType {
         Self::Init,
         Self::ExecutionStart,
         Self::ConfigUpdate,
+        Self::CodeRegister,
         Self::Result,
         Self::Call,
         Self::Authorize,
@@ -99,6 +108,7 @@ impl MessageType {
             Self::Init => "Init",
             Self::ExecutionStart => "ExecutionStart",
             Self::ConfigUpdate => "ConfigUpdate",
+            Self::CodeRegister => "CodeRegister",
             Self::Result => "Result",
             Self::Call => "Call",
             Self::Authorize => "Authorize",

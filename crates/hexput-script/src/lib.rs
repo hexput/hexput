@@ -58,13 +58,23 @@
 //! final value — and exactly the payload it always was when it wrote none. `findings` follows
 //! them. The frame checks cover the whole payload, and an `Error` never carries modifications.
 //!
-//! Not yet: the AST Cache and Cached Execution (Epic 4), which will run the check once at
-//! `CodeRegister`.
+//! [`code_register`] serves one `CodeRegister` (FR-5, Story 4.1): decode `{source, variables?}`,
+//! parse the source once, run the static check when the Session's check mode asks for it — the
+//! same pass as Direct Execution's, run at registration and never again when the Script is later
+//! executed (AD-8) — and only then store the AST in the [`AstCache`] under the registering
+//! Session's Client ID and a fresh [`ScriptHandle`], answering `{handle}` (with `findings` when
+//! the pass found anything). Decoding, parsing and checking run on the blocking pool. A refused
+//! registration leaves the cache exactly as it was. Direct Execution never touches the cache
+//! (FR-4).
+//!
+//! Not yet: Cached Execution (Story 4.2), and the cache's capacity, eviction, unregister and
+//! Session-teardown cleanup (Story 4.3) — until then an entry lives until the Daemon exits.
 //!
 //! Binds: AD-3, AD-6, AD-8.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hexput_check::{Environment, Policy, Severity};
 /// A Session's registration as Direct Execution takes it — a Registered Function, or a
@@ -75,8 +85,8 @@ use hexput_exec::wire;
 use hexput_exec::{Caller, Finished, Host, Limits};
 use hexput_interpreter::{Category, Code, Diagnostic, Held, Program, Span};
 use hexput_port::{
-    CheckMode, ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, Settings, Value,
-    decode_settings, findings_value,
+    CheckMode, ClientId, ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, ScriptHandle,
+    Settings, Value, decode_settings, findings_value,
 };
 
 pub use hexput_exec::wire::{MAX_MODIFICATION_DEPTH, MAX_RESULT_DEPTH};
@@ -86,6 +96,7 @@ const VARIABLES: &str = "variables";
 const OVERRIDES: &str = "overrides";
 const VALUE: &str = "value";
 const FINDINGS: &str = "findings";
+const HANDLE: &str = "handle";
 
 /// The most static check findings one reply carries, in source order (Story 3.10). A Script with
 /// more has the rest dropped — except that a rejection's first error is always kept, in place of
@@ -178,22 +189,20 @@ pub async fn direct_execution(
     let (program, variables, effective, checked) = blocking(move || {
         let (program, variables, overrides) = prepare(&payload)?;
         let effective = settings.overlay(&overrides);
-        let checked = static_check(&program, &variables, names, &methods, &effective);
+        let checked = (effective.check() != CheckMode::Off).then(|| {
+            let starting = variables.iter().map(|(name, _)| name.to_string()).collect();
+            static_check(
+                &program,
+                starting,
+                names,
+                keyed(&variables, &methods),
+                &effective,
+            )
+        });
         Ok::<_, Box<ErrorBody>>((program, variables, effective, checked))
     })
     .await?;
-    let findings = match checked {
-        Ok(findings) => findings,
-        Err(Rejection { body, found }) => {
-            // Logged here, not on the blocking pool, so the event carries the request span.
-            tracing::debug!(
-                code = %body.code,
-                findings = found,
-                "rejected by the static check"
-            );
-            return Err(fitted(body));
-        }
-    };
+    let findings = passed(checked.unwrap_or(Ok(Vec::new())))?;
     let limits = Limits::from_settings(&effective);
     let result =
         hexput_exec::execute_held(program, variables, Host::new(registrations, caller), limits)
@@ -204,6 +213,228 @@ pub async fn direct_execution(
         Err(diagnostic) => Err(with_findings(ErrorBody::from(&diagnostic), findings)),
     })
     .await
+}
+
+/// The AST Cache (Story 4.1): every registered Script's parsed AST, keyed by the registering
+/// Session's Client ID and the [`ScriptHandle`] its registration was answered with.
+///
+/// One per Daemon run, created by the Daemon beside its Session registry and shared by every
+/// connection. A lookup under another Client ID never finds an entry, so identical source
+/// registered by two Sessions makes two entries that cannot collide. Handles come from one
+/// counter, starting at 1, so no handle is ever reused during the run. There is no capacity bound
+/// and no eviction yet (Story 4.3).
+pub struct AstCache {
+    entries: moka::sync::Cache<(ClientId, ScriptHandle), Arc<Program>>,
+    /// The next handle's value.
+    next: AtomicU64,
+}
+
+impl AstCache {
+    /// An empty cache whose first handle is `0000000000000001`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: moka::sync::Cache::builder().build(),
+            next: AtomicU64::new(1),
+        }
+    }
+
+    /// The program `client_id` registered under `handle`, if it is there.
+    #[must_use]
+    pub fn get(&self, client_id: ClientId, handle: ScriptHandle) -> Option<Arc<Program>> {
+        self.entries.get(&(client_id, handle))
+    }
+
+    /// Every handle `client_id` has an entry under, in issue order.
+    ///
+    /// This walks every entry of every Session — linear in the whole cache, not in `client_id`'s
+    /// share of it — so it is for inspection, not for a hot path.
+    #[must_use]
+    pub fn handles(&self, client_id: ClientId) -> Vec<ScriptHandle> {
+        let mut handles: Vec<ScriptHandle> = self
+            .entries
+            .iter()
+            .filter(|(key, _)| key.0 == client_id)
+            .map(|(key, _)| key.1)
+            .collect();
+        handles.sort_unstable();
+        handles
+    }
+
+    /// How many entries the cache holds, exactly: pending maintenance is run first.
+    #[must_use]
+    pub fn entry_count(&self) -> u64 {
+        self.entries.run_pending_tasks();
+        self.entries.entry_count()
+    }
+
+    /// Store `program` for `client_id` under a handle never issued before, and return it.
+    fn insert(&self, client_id: ClientId, program: Arc<Program>) -> ScriptHandle {
+        let handle = ScriptHandle::new(self.next.fetch_add(1, Ordering::Relaxed));
+        self.entries.insert((client_id, handle), program);
+        handle
+    }
+}
+
+impl Default for AstCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::fmt::Debug for AstCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AstCache")
+            // Without running pending maintenance: unlike `entry_count`, an approximation.
+            .field("approximate_entries", &self.entries.entry_count())
+            .field("next", &self.next)
+            .finish()
+    }
+}
+
+/// Serve one registration (FR-5, Story 4.1): `payload` is a `CodeRegister` payload, a map with the
+/// key `source` (the Script, a string) and optionally `variables` (an array of its
+/// starting-variable names, §2 identifiers each given once; absent or nil names none). The names
+/// are for the static check alone: a registration has no values, and nothing runs.
+///
+/// The source is parsed once. When the `check` mode in `settings` — the Session's Config as it
+/// is at registration (AD-5) — is not `off`, the static check runs exactly as on Direct Execution
+/// (Story 3.10): the starting-variable names, the Registered Functions in `registrations` as the
+/// callable list, and the policy the Session's feature toggles describe. No variable is declared
+/// keyed, since none has a value, so a method override is never reported here. The pass is not
+/// charged to any budget and its findings are never cached. Only then is the AST stored in
+/// `cache` under `client_id` and a fresh handle.
+///
+/// Returns the `Result` payload `{handle: "<16 lowercase hex>"}`, with `findings` after it — at
+/// most [`MAX_FINDINGS`], in source order, left out if they would not fit a frame — when the pass
+/// ran and found anything.
+///
+/// Must run inside a Tokio runtime: the work runs on its blocking pool.
+///
+/// # Errors
+///
+/// The `Error` payload, each exactly one of, and in every case no entry is created:
+///
+/// * `protocol.invalid_payload` — the payload is not a map, `source` is missing (absent or nil)
+///   or not a string, a key is unknown (`overrides` included: nothing runs at registration),
+///   repeated or not a string, `variables` is not an array, or one of its items is not a string,
+///   not a §2 identifier, or repeated. The message names the key, or the item by its index.
+/// * The parser's [`Diagnostic`] — category, code, severity, message and span.
+/// * Under check mode `error`, the first error-severity static check finding's body, with every
+///   finding (warnings included, [`MAX_FINDINGS`] at most, the rejection's own among them) under
+///   `findings`. Logged at `debug`.
+///
+/// # Panics
+///
+/// If the work on the blocking pool panics, the panic continues here.
+pub async fn code_register(
+    payload: Value,
+    client_id: ClientId,
+    cache: Arc<AstCache>,
+    registrations: Vec<Registration>,
+    settings: Settings,
+) -> Result<Value, Box<ErrorBody>> {
+    let callables: Vec<String> = registrations
+        .into_iter()
+        .filter(|r| r.key.is_none())
+        .map(|r| r.name)
+        .collect();
+    let registered = blocking(move || {
+        let (source, starting) = decode_registration(&payload).map_err(invalid_payload)?;
+        let program = hexput_parser::parse(source).map_err(|d| Box::new(ErrorBody::from(&d)))?;
+        // An entry is inserted only once the pass let the Script through.
+        Ok::<_, Box<ErrorBody>>(
+            static_check(&program, starting, callables, Vec::new(), &settings)
+                .map(|findings| (cache.insert(client_id, Arc::new(program)), findings)),
+        )
+    })
+    .await?;
+    let (handle, findings) = registered.map_err(rejected)?;
+    let mut fields = vec![(Value::from(HANDLE), Value::from(handle.to_string()))];
+    let size = encoded_len(&Value::Map(fields.clone()));
+    push_findings(&mut fields, size, &findings);
+    Ok(Value::Map(fields))
+}
+
+/// A `protocol.invalid_payload` body carrying `message`.
+fn invalid_payload(message: String) -> Box<ErrorBody> {
+    Box::new(ErrorBody::from(&ProtocolError::new(
+        ProtocolCode::InvalidPayload,
+        message,
+    )))
+}
+
+/// Decode a `CodeRegister` payload by hand, like `ExecutionStart`'s: the source, and the
+/// starting-variable names in the order given (none when `variables` is absent or nil).
+fn decode_registration(payload: &Value) -> Result<(&str, Vec<String>), String> {
+    let fields: &[(Value, Value)] = match payload {
+        Value::Nil => &[],
+        Value::Map(fields) => fields,
+        _ => {
+            return Err(format!(
+                "the `CodeRegister` payload must be a map with `{SOURCE}`"
+            ));
+        }
+    };
+
+    let mut source = None;
+    let mut variables = None;
+    for (key, value) in fields {
+        let slot = match key.as_str() {
+            Some(SOURCE) => &mut source,
+            Some(VARIABLES) => &mut variables,
+            Some(other) => {
+                return Err(format!(
+                    "the `CodeRegister` payload has an unknown key `{}`",
+                    wire::bounded(other)
+                ));
+            }
+            None => {
+                return Err("the `CodeRegister` payload has a key that is not a string".to_owned());
+            }
+        };
+        if slot.is_some() {
+            return Err(format!(
+                "the `CodeRegister` payload repeats the key `{}`",
+                key.as_str().unwrap_or_default()
+            ));
+        }
+        *slot = Some(value);
+    }
+
+    let Some(source) = present(source) else {
+        return Err(format!("the `CodeRegister` payload is missing `{SOURCE}`"));
+    };
+    let Some(source) = source.as_str() else {
+        return Err(format!("`{SOURCE}` is not a string"));
+    };
+    let items: &[Value] = match present(variables) {
+        None => &[],
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(format!("`{VARIABLES}` is not an array of names")),
+    };
+    let mut seen: HashSet<&str> = HashSet::with_capacity(items.len());
+    let mut names = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(name) = item.as_str() else {
+            return Err(format!("`{VARIABLES}[{index}]` is not a string"));
+        };
+        if !hexput_parser::is_identifier(name) {
+            return Err(format!(
+                "`{VARIABLES}[{index}]`, the starting variable {:?}, is not a Hexput identifier \
+                 (ASCII letters, digits and `_`, not starting with a digit, not a reserved word)",
+                wire::bounded(name)
+            ));
+        }
+        if !seen.insert(name) {
+            return Err(format!(
+                "`{VARIABLES}[{index}]` names the starting variable `{}` a second time",
+                wire::bounded(name)
+            ));
+        }
+        names.push(name.to_owned());
+    }
+    Ok((source, names))
 }
 
 /// A Script the static check rejected: the reply's body, and how many findings the pass made
@@ -227,6 +458,23 @@ fn fitted(mut body: Box<ErrorBody>) -> Box<ErrorBody> {
     body
 }
 
+/// Append `findings` to a successful reply's `fields` under `findings`, unless the reply — `size`
+/// bytes without them — would then not fit a frame. The one fitting rule for every successful
+/// reply that carries findings (Direct Execution's `{value}`, a registration's `{handle}`).
+fn push_findings(fields: &mut Vec<(Value, Value)>, size: usize, findings: &[ErrorBody]) {
+    if findings.is_empty() {
+        return;
+    }
+    let listed = findings_value(findings);
+    // The `findings` key and value, beside the payload without them.
+    let size = size
+        .saturating_add(FINDINGS.len() + 1)
+        .saturating_add(encoded_len(&listed));
+    if size <= MAX_FRAME_LEN - ENVELOPE_ROOM {
+        fields.push((Value::from(FINDINGS), listed));
+    }
+}
+
 /// The MessagePack length of `value`.
 fn encoded_len(value: &Value) -> usize {
     let mut bytes = Vec::new();
@@ -235,8 +483,50 @@ fn encoded_len(value: &Value) -> usize {
     bytes.len()
 }
 
-/// Run the static check the effective `check` mode asks for (Story 3.10) and return its findings
-/// as wire bodies — none at all under `off`, where no pass runs.
+/// The findings of a pass that let the Script through, or — logged at `debug` — the rejection's
+/// body, fitted to a frame.
+///
+/// Called on the async task, not on the blocking pool, so the event carries the request span.
+fn passed(checked: Result<Vec<ErrorBody>, Rejection>) -> Result<Vec<ErrorBody>, Box<ErrorBody>> {
+    checked.map_err(rejected)
+}
+
+/// A rejection's body, fitted to a frame, logged at `debug` — on the async task, like [`passed`].
+fn rejected(Rejection { body, found }: Rejection) -> Box<ErrorBody> {
+    tracing::debug!(
+        code = %body.code,
+        findings = found,
+        "rejected by the static check"
+    );
+    fitted(body)
+}
+
+/// The starting variables holding an array or object whose own Value Secret carries a key the
+/// Session registered methods under (Story 3.12), each with those methods' names. A keyed string,
+/// number, bool or `null` has no properties to override — writing one is a `type` error — so it is
+/// never declared keyed.
+fn keyed(
+    variables: &[(Arc<str>, Held)],
+    methods: &HashMap<String, Vec<String>>,
+) -> Vec<(String, Vec<String>)> {
+    variables
+        .iter()
+        .filter_map(|(name, held)| {
+            held.value
+                .secret()
+                .and_then(|secret| secret.key())
+                .and_then(|key| methods.get(key))
+                .map(|methods| (name.to_string(), methods.clone()))
+        })
+        .collect()
+}
+
+/// Run the static check the `check` mode in `effective` asks for (Story 3.10) and return its
+/// findings as wire bodies — none at all under `off`, where no pass runs. Shared by Direct
+/// Execution and registration (Story 4.1), the two submission paths (AD-8).
+///
+/// `starting` are the starting-variable names, `callables` the Registered Functions' names and
+/// `keyed` the starting variables declared keyed, with their methods.
 ///
 /// # Errors
 ///
@@ -244,9 +534,9 @@ fn encoded_len(value: &Value) -> usize {
 /// finding under `findings`.
 fn static_check(
     program: &Program,
-    variables: &[(Arc<str>, Held)],
+    starting: Vec<String>,
     callables: Vec<String>,
-    methods: &HashMap<String, Vec<String>>,
+    keyed: Vec<(String, Vec<String>)>,
     effective: &Settings,
 ) -> Result<Vec<ErrorBody>, Rejection> {
     let mode = effective.check();
@@ -254,20 +544,10 @@ fn static_check(
         return Ok(Vec::new());
     }
     let mut environment = Environment::new()
-        .with_variables(variables.iter().map(|(name, _)| name.to_string()))
+        .with_variables(starting)
         .with_callables(callables);
-    // A starting variable holding an array or object whose own Value Secret carries a key the
-    // Session registered methods under (Story 3.12). A keyed string, number, bool or `null` has
-    // no properties to override — writing one is a `type` error — so it is never declared keyed.
-    for (name, held) in variables {
-        if let Some(methods) = held
-            .value
-            .secret()
-            .and_then(|secret| secret.key())
-            .and_then(|key| methods.get(key))
-        {
-            environment = environment.with_keyed(name.to_string(), methods.iter().cloned());
-        }
+    for (name, methods) in keyed {
+        environment = environment.with_keyed(name, methods);
     }
     let findings = hexput_check::check(
         program,
@@ -306,7 +586,7 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
             Ok(panic) => std::panic::resume_unwind(panic),
             // Only a runtime shutting down cancels a blocking task, and it is dropping this
             // future too.
-            Err(error) => panic!("a Direct Execution step was cancelled: {error}"),
+            Err(error) => panic!("a Script step was cancelled: {error}"),
         },
     }
 }
@@ -316,12 +596,7 @@ type Prepared = (Arc<Program>, Vec<(Arc<str>, Held)>, Settings);
 
 /// Decode the payload and parse its source.
 fn prepare(payload: &Value) -> Result<Prepared, Box<ErrorBody>> {
-    let (source, variables, overrides) = decode(payload).map_err(|message| {
-        Box::new(ErrorBody::from(&ProtocolError::new(
-            ProtocolCode::InvalidPayload,
-            message,
-        )))
-    })?;
+    let (source, variables, overrides) = decode(payload).map_err(invalid_payload)?;
     let program = hexput_parser::parse(source).map_err(|d| Box::new(ErrorBody::from(&d)))?;
     Ok((Arc::new(program), variables, overrides))
 }
@@ -357,14 +632,8 @@ fn reply(finished: &Finished, findings: Vec<ErrorBody>) -> Result<Value, Box<Err
                 fields.push((Value::from(wire::MODIFICATIONS_KEY), listed));
             }
             if !findings.is_empty() {
-                let listed = findings_value(&findings);
-                // The `findings` key and value, beside the `{value, modifications?}` payload.
-                let size = wire::result_payload_size(result, modifications, MAX_FRAME_LEN)
-                    .saturating_add(FINDINGS.len() + 1)
-                    .saturating_add(encoded_len(&listed));
-                if size <= MAX_FRAME_LEN - ENVELOPE_ROOM {
-                    fields.push((Value::from(FINDINGS), listed));
-                }
+                let size = wire::result_payload_size(result, modifications, MAX_FRAME_LEN);
+                push_findings(&mut fields, size, &findings);
             }
             Ok(Value::Map(fields))
         }

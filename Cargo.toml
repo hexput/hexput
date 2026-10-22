@@ -55,7 +55,8 @@ dashmap = "6.2.1"
 # The OS CSPRNG (Story 2.4): Client IDs are 128 unguessable bits. OQ-2's reconnect secret will
 # draw from the same source. `fill` needs no feature.
 getrandom = "0.4.3"
-moka = "0.12.16"
+# The AST Cache (Story 4.1): `sync::Cache` keyed by `(Client ID, Script handle)`.
+moka = { version = "0.12.16", features = ["sync"] }
 criterion = "0.8.2"
 tracing = "0.1.44"
 # The daemon's log output (Story 2.1): `fmt` lines filtered at System Config's `log_level`.

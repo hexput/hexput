@@ -5,8 +5,9 @@ use hexput_port::{
     CorrelationId, Envelope, ErrorBody, MAX_FRAME_LEN, MAX_NESTING_DEPTH, MessageType, Setting,
     Settings, Value, decode, encode, encode_frame,
 };
-use hexput_script::{MAX_MODIFICATION_DEPTH, MAX_RESULT_DEPTH, Registration};
+use hexput_script::{AstCache, MAX_MODIFICATION_DEPTH, MAX_RESULT_DEPTH, Registration};
 use rmpv::Integer;
+use std::sync::Arc;
 
 /// Serve one Direct Execution with no Registered Functions, on a runtime of its own.
 fn direct_execution(payload: &Value) -> Result<Value, Box<ErrorBody>> {
@@ -1014,4 +1015,377 @@ fn a_modification_nested_past_the_frame_makes_the_result_too_deep() {
     let envelope = Envelope::new(CorrelationId(1), MessageType::Result, reply);
     let bytes = encode(&envelope).unwrap();
     assert_eq!(decode(&bytes).unwrap(), envelope);
+}
+
+// --- Story 4.1: register a Script once for repeated use ---
+
+/// Register `payload` for `client` into `cache` on a runtime of its own, with `registrations` and
+/// `settings`. The check, if its mode asks for one, runs here and nowhere else (AD-8).
+fn registered(
+    payload: &Value,
+    client: hexput_shared::ids::ClientId,
+    cache: &Arc<AstCache>,
+    registrations: Vec<(String, bool)>,
+    settings: Settings,
+) -> Result<Value, Box<ErrorBody>> {
+    registered_as(
+        payload,
+        client,
+        cache,
+        registrations.into_iter().map(Registration::from).collect(),
+        settings,
+    )
+}
+
+/// [`registered`] with any [`Registration`]s, Registered Methods included.
+fn registered_as(
+    payload: &Value,
+    client: hexput_shared::ids::ClientId,
+    cache: &Arc<AstCache>,
+    registrations: Vec<Registration>,
+    settings: Settings,
+) -> Result<Value, Box<ErrorBody>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(hexput_script::code_register(
+        payload.clone(),
+        client,
+        Arc::clone(cache),
+        registrations,
+        settings,
+    ))
+}
+
+/// A `CodeRegister` payload: `source`, and `variables` (names only) when given.
+fn registration(source: &str, variables: Option<Vec<&str>>) -> Value {
+    let mut fields = vec![("source", s(source))];
+    if let Some(variables) = variables {
+        fields.push((
+            "variables",
+            Value::Array(variables.into_iter().map(s).collect()),
+        ));
+    }
+    map(fields)
+}
+
+/// The keys of a successful reply, in order.
+fn reply_keys(reply: &Value) -> Vec<&str> {
+    let Value::Map(fields) = reply else {
+        panic!("a Result payload is a map: {reply:?}");
+    };
+    fields
+        .iter()
+        .map(|(key, _)| key.as_str().unwrap())
+        .collect()
+}
+
+/// The `handle` of a successful registration, asserting it is exactly 16 lowercase hex characters.
+fn handle_in(reply: &Value) -> hexput_shared::ids::ScriptHandle {
+    let Value::Map(fields) = reply else {
+        panic!("a Result payload is a map");
+    };
+    let (key, value) = &fields[0];
+    assert_eq!(key.as_str(), Some("handle"));
+    let text = value.as_str().expect("a string handle");
+    assert_eq!(text.len(), 16, "{text}");
+    assert!(
+        text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{text}"
+    );
+    text.parse().unwrap()
+}
+
+fn client(byte: u8) -> hexput_shared::ids::ClientId {
+    hexput_shared::ids::ClientId::from_bytes([byte; 16])
+}
+
+#[test]
+fn a_registration_parses_once_into_the_cache_under_its_client_id() {
+    let cache = Arc::new(AstCache::new());
+    let reply = registered(
+        &registration("return 1 + x;", None),
+        client(1),
+        &cache,
+        vec![],
+        Settings::new(),
+    )
+    .unwrap();
+    assert_eq!(reply_keys(&reply), ["handle"]);
+    let handle = handle_in(&reply);
+    let program = cache
+        .get(client(1), handle)
+        .expect("the handle names the entry");
+    assert_eq!(*program, hexput_parser::parse("return 1 + x;").unwrap());
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn every_registration_of_the_same_source_gets_its_own_handle() {
+    let cache = Arc::new(AstCache::new());
+    let payload = registration("return 1;", None);
+    let first =
+        handle_in(&registered(&payload, client(1), &cache, vec![], Settings::new()).unwrap());
+    let second =
+        handle_in(&registered(&payload, client(1), &cache, vec![], Settings::new()).unwrap());
+    assert_ne!(first, second);
+    assert_eq!(cache.entry_count(), 2);
+    assert!(cache.get(client(1), first).is_some());
+    assert!(cache.get(client(1), second).is_some());
+}
+
+#[test]
+fn the_first_handle_of_a_cache_is_0000000000000001() {
+    let cache = Arc::new(AstCache::new());
+    let reply = registered(
+        &registration("return 1;", None),
+        client(1),
+        &cache,
+        vec![],
+        Settings::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        reply.as_map().unwrap()[0].1.as_str(),
+        Some("0000000000000001")
+    );
+}
+
+#[test]
+fn a_parse_failure_is_the_parser_diagnostic_and_creates_no_entry() {
+    let cache = Arc::new(AstCache::new());
+    let body = *registered(
+        &registration("let = ;", None),
+        client(1),
+        &cache,
+        vec![],
+        Settings::new(),
+    )
+    .expect_err("a parse failure");
+    assert!(body.code.starts_with("syntax."), "{}", body.code);
+    assert!(body.span.is_some(), "the parser's span");
+    assert_eq!(cache.entry_count(), 0);
+}
+
+#[test]
+fn a_malformed_registration_is_refused_naming_the_key_and_creates_no_entry() {
+    let cache = Arc::new(AstCache::new());
+    let cases: Vec<(Value, &[&str])> = vec![
+        (Value::Nil, &["`source`"]),
+        (map(vec![]), &["`source`"]),
+        (map(vec![("source", int(1))]), &["`source`"]),
+        (map(vec![("source", s("1;")), ("x", int(1))]), &["`x`"]),
+        (
+            map(vec![("source", s("1;")), ("overrides", map(vec![]))]),
+            &["`overrides`"],
+        ),
+        (
+            map(vec![("source", s("1;")), ("variables", map(vec![]))]),
+            &["`variables`"],
+        ),
+        (
+            map(vec![
+                ("source", s("1;")),
+                ("variables", Value::Array(vec![s("a"), s("a")])),
+            ]),
+            &["variables[1]", "`a`", "\"a\""],
+        ),
+        (
+            map(vec![
+                ("source", s("1;")),
+                ("variables", Value::Array(vec![s("1a")])),
+            ]),
+            &["variables[0]", "`1a`", "\"1a\""],
+        ),
+    ];
+    for (payload, mentions) in cases {
+        let body =
+            *registered(&payload, client(1), &cache, vec![], Settings::new()).expect_err("refused");
+        assert_eq!(body.code, "protocol.invalid_payload", "{payload:?}");
+        assert!(
+            mentions.iter().any(|m| body.message.contains(m)),
+            "{payload:?} refused as {:?}, naming none of {mentions:?}",
+            body.message
+        );
+    }
+    assert_eq!(cache.entry_count(), 0);
+}
+
+#[test]
+fn under_warn_the_registration_is_cached_and_its_findings_come_with_the_handle() {
+    use hexput_port::CheckMode;
+    let cache = Arc::new(AstCache::new());
+    let reply = registered(
+        &registration("let unused = 1; return x;", Some(vec!["x"])),
+        client(1),
+        &cache,
+        vec![],
+        checked(CheckMode::Warn),
+    )
+    .unwrap();
+    assert_eq!(reply_keys(&reply), ["handle", "findings"]);
+    handle_in(&reply);
+    let findings: Vec<ErrorBody> =
+        rmpv::ext::from_value(reply.as_map().unwrap()[1].1.clone()).unwrap();
+    assert_eq!(codes(&findings), ["reference.unused_variable"]);
+    assert_eq!(findings[0].severity, "warning");
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn under_error_an_error_finding_rejects_the_registration_with_every_finding() {
+    use hexput_port::CheckMode;
+    let cache = Arc::new(AstCache::new());
+    let body = *registered(
+        &registration("let unused = 1; return y;", None),
+        client(1),
+        &cache,
+        vec![],
+        checked(CheckMode::Error),
+    )
+    .expect_err("rejected");
+    assert_eq!(body.code, "reference.undeclared_identifier");
+    assert_eq!(body.severity, "error");
+    assert_eq!(
+        codes(&body.findings),
+        [
+            "reference.unused_variable",
+            "reference.undeclared_identifier"
+        ]
+    );
+    assert_eq!(cache.entry_count(), 0);
+}
+
+#[test]
+fn under_error_naming_the_starting_variables_is_accepted_without_findings() {
+    use hexput_port::CheckMode;
+    let cache = Arc::new(AstCache::new());
+    let reply = registered(
+        &registration("return y;", Some(vec!["y"])),
+        client(1),
+        &cache,
+        vec![],
+        checked(CheckMode::Error),
+    )
+    .unwrap();
+    assert_eq!(reply_keys(&reply), ["handle"]);
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn with_the_check_off_no_pass_runs() {
+    let cache = Arc::new(AstCache::new());
+    let reply = registered(
+        &registration("return y;", None),
+        client(1),
+        &cache,
+        vec![],
+        Settings::new(),
+    )
+    .unwrap();
+    assert_eq!(reply_keys(&reply), ["handle"]);
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn the_registrations_are_the_callable_names_the_check_knows() {
+    use hexput_port::CheckMode;
+    let cache = Arc::new(AstCache::new());
+    let reply = registered(
+        &registration("if (false) { askFirst(1); }; return 1;", None),
+        client(1),
+        &cache,
+        vec![("askFirst".to_owned(), false)],
+        checked(CheckMode::Error),
+    )
+    .unwrap();
+    assert_eq!(reply_keys(&reply), ["handle"]);
+    let body = *registered(
+        &registration("if (false) { other(2); }; return 1;", None),
+        client(1),
+        &cache,
+        vec![("askFirst".to_owned(), false)],
+        checked(CheckMode::Error),
+    )
+    .expect_err("an unregistered call");
+    assert_eq!(body.code, "capability.unknown_function");
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn a_method_is_no_callable_name_for_the_registration_check() {
+    use hexput_port::CheckMode;
+    // `save` is a method under `User`: a bare `save(1)` can never reach it.
+    let cache = Arc::new(AstCache::new());
+    let body = *registered_as(
+        &registration("if (false) { save(1); }; return 1;", None),
+        client(1),
+        &cache,
+        vec![Registration::method("User", "save", true)],
+        checked(CheckMode::Error),
+    )
+    .expect_err("an unknown call");
+    assert_eq!(body.code, "capability.unknown_function");
+    assert_eq!(cache.entry_count(), 0);
+}
+
+#[test]
+fn registration_findings_that_would_not_fit_a_frame_are_left_out_and_the_handle_wins() {
+    use hexput_port::CheckMode;
+    // `MAX_FINDINGS` unused locals, each named long enough that their findings outgrow a frame.
+    let long = MAX_FRAME_LEN / hexput_script::MAX_FINDINGS + 1024;
+    let source: String = (0..hexput_script::MAX_FINDINGS)
+        .map(|n| format!("let {}{n} = 1;\n", "v".repeat(long)))
+        .chain(std::iter::once("return 1;".to_owned()))
+        .collect();
+    let cache = Arc::new(AstCache::new());
+    let reply = registered(
+        &registration(&source, None),
+        client(1),
+        &cache,
+        vec![],
+        checked(CheckMode::Warn),
+    )
+    .unwrap();
+    assert_eq!(reply_keys(&reply), ["handle"], "exactly `{{handle}}`");
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn a_large_warn_result_keeps_at_most_max_findings() {
+    use hexput_port::CheckMode;
+    let cache = Arc::new(AstCache::new());
+    let reply = registered(
+        &registration(&unused_locals(150, "return 1;"), None),
+        client(1),
+        &cache,
+        vec![],
+        checked(CheckMode::Warn),
+    )
+    .unwrap();
+    let findings: Vec<ErrorBody> =
+        rmpv::ext::from_value(reply.as_map().unwrap()[1].1.clone()).unwrap();
+    assert_eq!(findings.len(), hexput_script::MAX_FINDINGS);
+    assert!(
+        codes(&findings)
+            .iter()
+            .all(|c| *c == "reference.unused_variable")
+    );
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn two_clients_registering_the_same_source_are_scoped_apart() {
+    let cache = Arc::new(AstCache::new());
+    let payload = registration("return 1 + x;", None);
+    let a = handle_in(&registered(&payload, client(1), &cache, vec![], Settings::new()).unwrap());
+    let b = handle_in(&registered(&payload, client(2), &cache, vec![], Settings::new()).unwrap());
+    assert_ne!(a, b);
+    assert!(cache.get(client(1), a).is_some());
+    assert!(cache.get(client(2), b).is_some());
+    assert!(cache.get(client(1), b).is_none());
+    assert!(cache.get(client(2), a).is_none());
+    assert_eq!(cache.handles(client(1)), vec![a]);
+    assert_eq!(cache.handles(client(2)), vec![b]);
 }

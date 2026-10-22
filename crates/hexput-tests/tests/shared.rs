@@ -258,6 +258,7 @@ fn message_types_spell_pascal_case_and_parse_exactly() {
             "Init",
             "ExecutionStart",
             "ConfigUpdate",
+            "CodeRegister",
             "Result",
             "Call",
             "Authorize",
@@ -501,4 +502,68 @@ mod check_mode {
         assert_eq!(config.check(), CheckMode::Warn);
         assert_eq!(Settings::new().overlay(&over).check(), CheckMode::Error);
     }
+}
+
+// --- Story 4.1: the Script handle ---
+
+#[test]
+fn script_handle_text_form_is_16_lowercase_hex_and_round_trips() {
+    use hexput_shared::ids::ScriptHandle;
+    let first: ScriptHandle = "0000000000000001".parse().unwrap();
+    assert_eq!(first.to_string(), "0000000000000001");
+    let high: ScriptHandle = "00000000000000ff".parse().unwrap();
+    assert_eq!(high.to_string(), "00000000000000ff");
+    assert_eq!(high.to_string().parse::<ScriptHandle>().unwrap(), high);
+    assert_ne!(first, high);
+    // The edges of the 64-bit range: every value has its 16-character form.
+    for (text, value) in [
+        ("0000000000000000", 0),
+        ("f000000000000000", 0xf000_0000_0000_0000),
+        ("ffffffffffffffff", u64::MAX),
+    ] {
+        let handle: ScriptHandle = text.parse().unwrap();
+        assert_eq!(handle.get(), value);
+        assert_eq!(handle.to_string(), text);
+        assert_eq!(ScriptHandle::new(value).to_string(), text);
+    }
+}
+
+#[test]
+fn script_handle_rejects_malformed_text() {
+    use hexput_shared::ids::ScriptHandle;
+    let good = "00000000000000ff";
+    let cases = [
+        String::new(),
+        good[..15].to_owned(),
+        format!("{good}0"),
+        good.to_uppercase(),
+        format!("{}g", &good[..15]),
+        format!("-{}", &good[..15]),
+        format!("{}é", &good[..14]),
+        format!(" {}", &good[..15]),
+    ];
+    for case in cases {
+        assert!(
+            case.parse::<ScriptHandle>().is_err(),
+            "{case:?} must be refused"
+        );
+    }
+}
+
+#[test]
+fn script_handle_serializes_as_a_string() {
+    use hexput_shared::ids::ScriptHandle;
+    let handle: ScriptHandle = "00000000000000ab".parse().unwrap();
+    let bytes = rmp_serde::to_vec(&handle).unwrap();
+    let value = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+    assert_eq!(value.as_str(), Some("00000000000000ab"));
+    assert_eq!(
+        rmp_serde::from_slice::<ScriptHandle>(&bytes).unwrap(),
+        handle
+    );
+
+    let malformed = rmp_serde::to_vec("not-a-handle").unwrap();
+    assert!(rmp_serde::from_slice::<ScriptHandle>(&malformed).is_err());
+    let integer = rmp_serde::to_vec(&7_u64).unwrap();
+    assert!(rmp_serde::from_slice::<ScriptHandle>(&integer).is_err());
 }

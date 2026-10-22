@@ -23,6 +23,14 @@
 //! (AD-5): every attached Connection's later executions read it afresh when dispatched, and an
 //! execution already dispatched keeps what it read. A refused update never reaches the registry.
 //!
+//! # What Story 4.3 adds
+//!
+//! [`Sessions::with_teardown`] gives the registry a teardown hook: a function called with the
+//! Client ID of every Session the one teardown path releases, last, after the Config and the
+//! registrations are released and outside any lock. The Daemon wires it to the AST Cache, so a
+//! Session's cached Scripts go with it without this crate reaching `hexput-script`. When Story
+//! 5.8 delays teardown behind a TTL, the hook is delayed with it.
+//!
 //! Nothing here is `async`, so no lock of this crate's can be held across an `.await`; nothing
 //! here writes to disk.
 //!
@@ -31,6 +39,7 @@
 mod init;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
@@ -69,17 +78,43 @@ pub struct Session {
 ///
 /// Every operation takes one `DashMap` shard lock synchronously and releases it before
 /// returning; none is `async`.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Sessions {
     sessions: DashMap<ClientId, Session>,
     next_connection: AtomicU64,
+    /// Called with a Session's Client ID when it is torn down (Story 4.3), if set.
+    on_teardown: Option<TeardownHook>,
+}
+
+/// The function [`Sessions::with_teardown`] stores.
+type TeardownHook = Arc<dyn Fn(ClientId) + Send + Sync + 'static>;
+
+impl core::fmt::Debug for Sessions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Sessions")
+            .field("sessions", &self.sessions)
+            .field("next_connection", &self.next_connection)
+            .field("on_teardown", &self.on_teardown.is_some())
+            .finish()
+    }
 }
 
 impl Sessions {
-    /// An empty registry.
+    /// An empty registry, with no teardown hook.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This registry, calling `hook` with the Client ID of every Session it tears down (Story
+    /// 4.3) — once per Session, after the Session is out of the registry and its Config and
+    /// registrations are released, outside any lock of the registry's, so the hook may call back
+    /// into it. The Daemon wires it to release the Session's AST Cache entries. A later call
+    /// replaces an earlier hook.
+    #[must_use]
+    pub fn with_teardown(mut self, hook: impl Fn(ClientId) + Send + Sync + 'static) -> Self {
+        self.on_teardown = Some(Arc::new(hook));
+        self
     }
 
     /// Issue a new Connection its identity for this run. Called when a Connection opens, before
@@ -156,8 +191,8 @@ impl Sessions {
         let removed = self.sessions.remove_if_mut(&client_id, |_, session| {
             session.connections.remove(&connection) && session.connections.is_empty()
         });
-        if let Some((_, session)) = removed {
-            teardown(session);
+        if let Some((client_id, session)) = removed {
+            teardown(client_id, session, self.on_teardown.as_deref());
         }
     }
 
@@ -250,8 +285,14 @@ fn generate_client_id() -> ClientId {
 /// Today it releases the Config and the Registered Functions. When Plugins land (Epic 6), each
 /// of the Session's Plugins has its Global Variable store torn down here through
 /// `hexput_globalvar::teardown(plugin_id)` before its actor is dropped (AD-4); when TTLs land
-/// (Story 5.8), the call to this function is delayed, not moved.
-fn teardown(session: Session) {
+/// (Story 5.8), the call to this function is delayed, not moved — and the teardown hook with it.
+///
+/// The hook, when the registry has one, is called last, with the Session's Client ID (Story 4.3).
+fn teardown(
+    client_id: ClientId,
+    session: Session,
+    hook: Option<&(dyn Fn(ClientId) + Send + Sync)>,
+) {
     let Session {
         config,
         registrations,
@@ -259,4 +300,7 @@ fn teardown(session: Session) {
     } = session;
     debug_assert!(connections.is_empty(), "a Session is torn down unattached");
     drop((config, registrations));
+    if let Some(hook) = hook {
+        hook(client_id);
+    }
 }

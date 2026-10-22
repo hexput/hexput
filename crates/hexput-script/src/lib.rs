@@ -77,18 +77,28 @@
 //! runtime. The registrations and settings are the Session's live ones, read at dispatch (AD-5).
 //! The cached program is immutable and shared; every run builds its own heap, scopes and budget,
 //! so nothing one run writes is visible to another. A handle this Session has no entry under —
-//! never issued, another Session's, or no longer cached — is `protocol.unknown_script_handle`,
+//! never issued, another Session's, or no longer cached (evicted, unregistered or released with
+//! its Session, Story 4.3) — is `protocol.unknown_script_handle`,
 //! telling the Backend to register again; the payload is decoded fully first, so a malformed
 //! one is `protocol.invalid_payload` whatever its handle.
 //!
-//! Not yet: the cache's capacity, eviction, unregister and Session-teardown cleanup (Story 4.3) —
-//! until then an entry lives until the Daemon exits.
+//! The cache is bounded and cleaned up (Story 4.3). It holds at most System Config's
+//! `ast_cache_capacity` entries; which one goes over it follows moka's policy, and every such
+//! eviction is counted ([`AstCache::evictions`], for Epic 7's metrics) and logged at `debug`.
+//! [`code_unregister`] serves one `CodeUnregister {handle}`, removing the entry at once and
+//! answering `{}`. A Session's entries are released when it is torn down: the Daemon wires the
+//! Session registry's teardown hook to [`AstCache::close`], and the cache refuses an insert for a
+//! Session that is not open, so a registration still in flight when its Session ends answers
+//! `protocol.init_not_completed` and leaves nothing behind. Every removal releases the program
+//! at once, and a run that already fetched it finishes normally. An evicted, unregistered or
+//! released handle is `protocol.unknown_script_handle`, exactly like one never issued; nothing is
+//! ever re-parsed.
 //!
 //! Binds: AD-3, AD-6, AD-8.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use hexput_check::{Environment, Policy, Severity};
 /// A Session's registration as Direct Execution takes it — a Registered Function, or a
@@ -270,6 +280,12 @@ async fn run(
 /// heap, scopes and Resource Budget, so nothing one run writes is visible to another. A run holds
 /// its own handle on the program, so it finishes safely even if the entry is removed meanwhile.
 ///
+/// The handle's entry is fetched when this function is *called*, before the returned future is
+/// first polled: the connection calls it as it dispatches the request, so a `CodeUnregister` (or
+/// an eviction or teardown) processed after the dispatch cannot take the program from a run sent
+/// before it (Story 4.3). The payload itself is still decoded on the blocking pool, and its
+/// errors come first: a malformed payload is answered as one whatever its handle names.
+///
 /// Returns the `Result` payload `{value}`, with `modifications` after `value` when the Script
 /// wrote a referenced place or collection — exactly as [`direct_execution`] does.
 ///
@@ -285,11 +301,12 @@ async fn run(
 ///   nothing is parsed), repeated or not a string; `handle` is not a string or not a Script
 ///   handle (echoed bounded); `variables` is malformed exactly as for [`direct_execution`]; an
 ///   override is unknown, mistyped or out of its range; or `overrides.check` is given. Nothing
-///   runs, and the handle is not looked up.
-/// * `protocol.unknown_script_handle` — a well-formed handle with no entry under `client_id`:
-///   never issued, registered by another Session (the same message, so nothing reveals that it
-///   exists), or no longer cached. The message names the handle and says to register the Script
-///   again with `CodeRegister`. Nothing runs.
+///   runs, and whatever entry the handle names is not used.
+/// * `protocol.unknown_script_handle` — a well-formed handle with no entry under `client_id`
+///   when the call was made: never issued, registered by another Session (the same message, so
+///   nothing reveals that it exists), or no longer cached — evicted over the cache's capacity,
+///   removed by a `CodeUnregister`, or released with its Session. The message names the handle
+///   and says to register the Script again with `CodeRegister`. Nothing runs.
 /// * The interpreter's or Executor's [`Diagnostic`], exactly as for [`direct_execution`]:
 ///   `syntax.duplicate_declaration` for a starting variable the Script also declares, every
 ///   `reference`, `type`, `capability`, `host`, `budget` and `policy` error.
@@ -299,41 +316,52 @@ async fn run(
 /// # Panics
 ///
 /// If the work on the blocking pool panics, the panic continues here.
-pub async fn cached_execution(
+pub fn cached_execution(
     payload: Value,
     client_id: ClientId,
-    cache: Arc<AstCache>,
+    cache: &AstCache,
     registrations: Vec<Registration>,
     settings: Settings,
     caller: Caller,
-) -> Result<Value, Box<ErrorBody>> {
-    let (program, variables, effective) = blocking(move || {
-        let (handle, variables, overrides) =
-            decode(&payload, Request::CachedExecution).map_err(invalid_payload)?;
-        let handle: ScriptHandle = handle.parse().map_err(|_| {
-            invalid_payload(format!(
-                "`{HANDLE}` is not a Script handle ({} lowercase hex characters); found {:?}",
-                ScriptHandle::TEXT_LEN,
-                wire::bounded(handle)
-            ))
-        })?;
-        // Only now, with the whole payload accepted, is the handle looked up: a malformed request
-        // is answered as one whatever its handle names.
-        let program = cache
-            .get(client_id, handle)
-            .ok_or_else(|| unknown_handle(handle))?;
-        Ok::<_, Box<ErrorBody>>((program, variables, settings.overlay(&overrides)))
-    })
-    .await?;
-    run(
-        program,
-        variables,
-        &effective,
-        Vec::new(),
-        registrations,
-        caller,
-    )
-    .await
+) -> impl Future<Output = Result<Value, Box<ErrorBody>>> + Send + 'static {
+    // Fetched now, as the request is dispatched — a scan for the key, no decoding — so a removal
+    // processed after the dispatch leaves this run its program.
+    let fetched = handle_named(&payload).and_then(|handle| cache.get(client_id, handle));
+    async move {
+        let (program, variables, effective) = blocking(move || {
+            let (handle, variables, overrides) =
+                decode(&payload, Request::CachedExecution).map_err(invalid_payload)?;
+            let handle = parse_handle(handle)?;
+            // Only now, with the whole payload accepted, is the fetched program used: a malformed
+            // request is answered as one whatever its handle names. An accepted payload has one
+            // `handle`, so it is the one fetched.
+            let program = fetched.ok_or_else(|| unknown_handle(handle))?;
+            Ok::<_, Box<ErrorBody>>((program, variables, settings.overlay(&overrides)))
+        })
+        .await?;
+        run(
+            program,
+            variables,
+            &effective,
+            Vec::new(),
+            registrations,
+            caller,
+        )
+        .await
+    }
+}
+
+/// The well-formed handle under the first `handle` key of `payload`, if there is one. Only a scan:
+/// the payload is decoded, and its errors decided, on the blocking pool.
+fn handle_named(payload: &Value) -> Option<ScriptHandle> {
+    payload
+        .as_map()?
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(HANDLE))?
+        .1
+        .as_str()?
+        .parse()
+        .ok()
 }
 
 /// The `protocol.unknown_script_handle` body for `handle`. It names only the handle asked for, so
@@ -354,22 +382,80 @@ fn unknown_handle(handle: ScriptHandle) -> Box<ErrorBody> {
 /// One per Daemon run, created by the Daemon beside its Session registry and shared by every
 /// connection. A lookup under another Client ID never finds an entry, so identical source
 /// registered by two Sessions makes two entries that cannot collide. Handles come from one
-/// counter, starting at 1, so no handle is ever reused during the run. There is no capacity bound
-/// and no eviction yet (Story 4.3).
+/// counter, starting at 1, so no handle is ever reused during the run.
+///
+/// Story 4.3 bounds and cleans it up:
+///
+/// * It holds at most its capacity of entries — a count, not bytes (each source is already
+///   bounded by a frame). Which entry goes follows moka's policy, which may also refuse to admit
+///   the newest entry, so a handle just issued can be unknown at once; every such removal is
+///   counted by [`evictions`](Self::evictions) and logged at `debug`, naming the evicted entry's
+///   Client ID. The capacity is one pool shared by every Session, with no per-Session share: a
+///   Backend that registers heavily can displace another Backend's entries, which then register
+///   again. A per-Session quota is deferred.
+/// * [`remove`](Self::remove) takes one entry out at once (`CodeUnregister`).
+/// * [`close`](Self::close), called through the Session registry's teardown hook, releases every
+///   entry of a Session that has ended. A Session is [`open`](Self::open)ed at init, and an
+///   insert for a Client ID that is not open is refused: the insert holds the open set's read
+///   lock while it inserts and `close` takes its write lock before releasing anything, so a
+///   registration still in flight when its Session ends can never leave an entry behind.
+///
+/// Every removal runs moka's pending maintenance before returning, so the cache keeps no
+/// reference to a removed program; a run that already fetched one holds its own and finishes.
+/// No lock here is ever held across an `.await` or while calling code outside this type: the
+/// open set's read lock covers only an insert's check and moka's own insert, never maintenance,
+/// which calls the eviction listener.
 pub struct AstCache {
     entries: moka::sync::Cache<(ClientId, ScriptHandle), Arc<Program>>,
     /// The next handle's value.
     next: AtomicU64,
+    /// The Client IDs whose Sessions are live: the only ones an insert is accepted for.
+    open: RwLock<HashSet<ClientId>>,
+    /// How many entries the capacity removed, shared with the eviction listener.
+    evictions: Arc<AtomicU64>,
+    /// The most entries the cache holds.
+    capacity: u64,
 }
 
 impl AstCache {
-    /// An empty cache whose first handle is `0000000000000001`.
+    /// An empty cache holding at most `capacity` entries, whose first handle is
+    /// `0000000000000001`. The Daemon passes System Config's `ast_cache_capacity`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn with_capacity(capacity: u64) -> Self {
+        let evictions = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&evictions);
+        let entries = moka::sync::Cache::builder()
+            .max_capacity(capacity)
+            .eviction_listener(move |key: Arc<(ClientId, ScriptHandle)>, _program, cause| {
+                // Only the capacity's removals are evictions: an unregister or a teardown
+                // (`Explicit`) and a replacement never happen to a Backend unasked.
+                if cause == moka::notification::RemovalCause::Size {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    // A root event naming the evicted entry's own Session: maintenance runs on
+                    // whichever request's thread happens to trigger it — often another
+                    // Session's — whose span must not claim the eviction (FR-12).
+                    tracing::debug!(
+                        parent: None,
+                        client_id = %key.0,
+                        handle = %key.1,
+                        "evicted a cached Script over the cache's capacity"
+                    );
+                }
+            })
+            .build();
         Self {
-            entries: moka::sync::Cache::builder().build(),
+            entries,
             next: AtomicU64::new(1),
+            open: RwLock::new(HashSet::new()),
+            evictions,
+            capacity,
         }
+    }
+
+    /// The most entries this cache holds.
+    #[must_use]
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
     }
 
     /// The program `client_id` registered under `handle`, if it is there.
@@ -401,27 +487,84 @@ impl AstCache {
         self.entries.entry_count()
     }
 
-    /// Store `program` for `client_id` under a handle never issued before, and return it.
-    fn insert(&self, client_id: ClientId, program: Arc<Program>) -> ScriptHandle {
+    /// How many entries the capacity has removed during this run, a refused admission included —
+    /// never an unregister or a teardown. Pending maintenance is run first, so the count is exact.
+    /// Epic 7's metrics publish it.
+    #[must_use]
+    pub fn evictions(&self) -> u64 {
+        self.entries.run_pending_tasks();
+        self.evictions.load(Ordering::Relaxed)
+    }
+
+    /// Accept registrations for `client_id`, whose Session has just been created. Opening one
+    /// already open changes nothing.
+    pub fn open(&self, client_id: ClientId) {
+        self.open_set_mut().insert(client_id);
+    }
+
+    /// Release every entry of `client_id`, whose Session has ended, and refuse any later insert
+    /// for it — including one already in flight. Walks the whole cache once: linear in its size,
+    /// run once per Session teardown. Closing a Client ID that is not open still releases its
+    /// entries.
+    pub fn close(&self, client_id: ClientId) {
+        // Taken before anything is released: an insert for `client_id` holding the read lock
+        // finishes first and its entry is released below; any later one sees the ID closed.
+        self.open_set_mut().remove(&client_id);
+        self.entries.run_pending_tasks();
+        let ended: Vec<(ClientId, ScriptHandle)> = self
+            .entries
+            .iter()
+            .filter(|(key, _)| key.0 == client_id)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &ended {
+            self.entries.invalidate(key);
+        }
+        self.entries.run_pending_tasks();
+    }
+
+    /// Remove the entry `client_id` registered under `handle`, at once. Returns whether there
+    /// was one; another Session's entry is never touched.
+    pub fn remove(&self, client_id: ClientId, handle: ScriptHandle) -> bool {
+        let removed = self.entries.remove(&(client_id, handle)).is_some();
+        self.entries.run_pending_tasks();
+        removed
+    }
+
+    /// Store `program` for `client_id` under a handle never issued before, and return it — or
+    /// `None`, storing nothing, when `client_id`'s Session is not open. Pending maintenance runs
+    /// before it returns, so the capacity holds as soon as the registration is answered.
+    fn insert(&self, client_id: ClientId, program: Arc<Program>) -> Option<ScriptHandle> {
+        // Held across the insert itself, so a `close` is ordered strictly before or after it.
+        let open = self.open.read().unwrap_or_else(PoisonError::into_inner);
+        if !open.contains(&client_id) {
+            return None;
+        }
         let handle = ScriptHandle::new(self.next.fetch_add(1, Ordering::Relaxed));
         self.entries.insert((client_id, handle), program);
-        handle
+        // Released before maintenance, which calls the eviction listener and so the installed
+        // subscriber: the entry is already visible to a `close` walking the cache.
+        drop(open);
+        self.entries.run_pending_tasks();
+        Some(handle)
     }
-}
 
-impl Default for AstCache {
-    fn default() -> Self {
-        Self::new()
+    /// The open set for writing. A poisoned lock is still a consistent set: no code here panics
+    /// halfway through changing it.
+    fn open_set_mut(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<ClientId>> {
+        self.open.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl core::fmt::Debug for AstCache {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AstCache")
+            .field("capacity", &self.capacity)
             // Without running pending maintenance: unlike `entry_count`, an approximation.
             .field("approximate_entries", &self.entries.entry_count())
+            .field("evictions", &self.evictions.load(Ordering::Relaxed))
             .field("next", &self.next)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -456,6 +599,9 @@ impl core::fmt::Debug for AstCache {
 /// * Under check mode `error`, the first error-severity static check finding's body, with every
 ///   finding (warnings included, [`MAX_FINDINGS`] at most, the rejection's own among them) under
 ///   `findings`. Logged at `debug`.
+/// * `protocol.init_not_completed` — `client_id`'s Session is not open in `cache`: it has ended
+///   (or was never opened) before the entry could be stored, so nothing was registered (Story
+///   4.3).
 ///
 /// # Panics
 ///
@@ -476,10 +622,16 @@ pub async fn code_register(
         let (source, starting) = decode_registration(&payload).map_err(invalid_payload)?;
         let program = hexput_parser::parse(source).map_err(|d| Box::new(ErrorBody::from(&d)))?;
         // An entry is inserted only once the pass let the Script through.
-        Ok::<_, Box<ErrorBody>>(
-            static_check(&program, starting, callables, Vec::new(), &settings)
-                .map(|findings| (cache.insert(client_id, Arc::new(program)), findings)),
-        )
+        let findings = match static_check(&program, starting, callables, Vec::new(), &settings) {
+            Ok(findings) => findings,
+            Err(rejection) => return Ok(Err(rejection)),
+        };
+        // Inside this closure, so even a connection aborted meanwhile cannot leave an entry
+        // behind: the cache refuses it once the Session has ended (Story 4.3).
+        let handle = cache
+            .insert(client_id, Arc::new(program))
+            .ok_or_else(session_ended)?;
+        Ok::<_, Box<ErrorBody>>(Ok((handle, findings)))
     })
     .await?;
     let (handle, findings) = registered.map_err(rejected)?;
@@ -487,6 +639,100 @@ pub async fn code_register(
     let size = encoded_len(&Value::Map(fields.clone()));
     push_findings(&mut fields, size, &findings);
     Ok(Value::Map(fields))
+}
+
+/// The body answering a registration whose Session ended before its entry could be stored (Story
+/// 4.3): the cache no longer accepts entries for its Client ID.
+fn session_ended() -> Box<ErrorBody> {
+    Box::new(ErrorBody::from(&ProtocolError::new(
+        ProtocolCode::InitNotCompleted,
+        "the Session has ended; nothing was registered".to_owned(),
+    )))
+}
+
+/// Serve one unregister (Story 4.3): `payload` is a `CodeUnregister` payload, exactly `{handle}`
+/// — the 16-lowercase-hex-character handle a `CodeRegister` was answered with. The entry
+/// `client_id` registered under it is removed from `cache` at once, and the cache keeps no
+/// reference to its program; a run that already fetched the program holds its own and finishes
+/// normally. The next `CachedExecutionStart` of the handle is `protocol.unknown_script_handle`.
+///
+/// Returns the `Result` payload `{}`, an empty map. Synchronous and cheap — no parse, no Script —
+/// so the connection serves it inline.
+///
+/// # Errors
+///
+/// The `Error` payload, each exactly one of, and in every case nothing is removed:
+///
+/// * `protocol.invalid_payload` — the payload is not a map, `handle` is missing (absent or nil),
+///   not a string or not a Script handle (echoed bounded), or a key is unknown, repeated or not a
+///   string. The message names the key. The handle is not looked up.
+/// * `protocol.unknown_script_handle` — a well-formed handle with no entry under `client_id`:
+///   never issued, another Session's (left untouched, and the same message), evicted, or already
+///   removed — so a repeated unregister tells the Backend the entry was already gone.
+pub fn code_unregister(
+    payload: &Value,
+    client_id: ClientId,
+    cache: &AstCache,
+) -> Result<Value, Box<ErrorBody>> {
+    let handle = decode_unregister(payload).map_err(invalid_payload)?;
+    if cache.remove(client_id, handle) {
+        Ok(Value::Map(Vec::new()))
+    } else {
+        Err(unknown_handle(handle))
+    }
+}
+
+/// Decode a `CodeUnregister` payload by hand: exactly `{handle}`.
+fn decode_unregister(payload: &Value) -> Result<ScriptHandle, String> {
+    const NAME: &str = "CodeUnregister";
+    let fields: &[(Value, Value)] = match payload {
+        Value::Nil => &[],
+        Value::Map(fields) => fields,
+        _ => {
+            return Err(format!(
+                "the `{NAME}` payload must be a map with `{HANDLE}`"
+            ));
+        }
+    };
+    let mut handle = None;
+    for (key, value) in fields {
+        match key.as_str() {
+            Some(HANDLE) if handle.is_some() => {
+                return Err(format!("the `{NAME}` payload repeats the key `{HANDLE}`"));
+            }
+            Some(HANDLE) => handle = Some(value),
+            Some(other) => {
+                return Err(format!(
+                    "the `{NAME}` payload has an unknown key `{}`",
+                    wire::bounded(other)
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "the `{NAME}` payload has a key that is not a string"
+                ));
+            }
+        }
+    }
+    let Some(handle) = present(handle) else {
+        return Err(missing(NAME, &[HANDLE]));
+    };
+    let Some(handle) = handle.as_str() else {
+        return Err(format!("`{HANDLE}` is not a string"));
+    };
+    parse_handle(handle).map_err(|body| body.message)
+}
+
+/// `text` as a [`ScriptHandle`], or the `protocol.invalid_payload` body naming `handle` and echoing
+/// it bounded.
+fn parse_handle(text: &str) -> Result<ScriptHandle, Box<ErrorBody>> {
+    text.parse().map_err(|_| {
+        invalid_payload(format!(
+            "`{HANDLE}` is not a Script handle ({} lowercase hex characters); found {:?}",
+            ScriptHandle::TEXT_LEN,
+            wire::bounded(text)
+        ))
+    })
 }
 
 /// A `protocol.invalid_payload` body carrying `message`.

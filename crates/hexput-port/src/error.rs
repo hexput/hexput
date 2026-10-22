@@ -35,9 +35,9 @@ pub enum ProtocolCode {
     /// as a `Result` or `Error` answering nothing the Daemon asked.
     UnexpectedMessage,
     /// A request payload the Daemon cannot accept: an `Init`, `ConfigUpdate`, `ExecutionStart`,
-    /// `CodeRegister` or `CachedExecutionStart` with a missing, mistyped, unknown or repeated key,
-    /// a malformed or duplicate registration, a starting variable that is not a §2 identifier, or
-    /// a value with no lossless Hexput representation. The message names the offending key, index
+    /// `CodeRegister`, `CachedExecutionStart` or `CodeUnregister` with a missing, mistyped,
+    /// unknown or repeated key, a malformed or duplicate registration, a starting variable that
+    /// is not a §2 identifier, or a value with no lossless Hexput representation. The message names the offending key, index
     /// or path. Nothing runs, and a refused `ConfigUpdate` changes nothing.
     InvalidPayload,
     /// An `Init` on a connection already attached to a Session; that Session is untouched.
@@ -48,9 +48,11 @@ pub enum ProtocolCode {
     /// A response whose frame would exceed [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN). Sent in its
     /// place, with the request's id, so no request is left unanswered; the connection stays open.
     ResponseTooLarge,
-    /// A `CachedExecutionStart` naming a well-formed handle this Session has no AST Cache entry
-    /// under: never issued, issued to another Session, or no longer cached (Story 4.2). The
-    /// Backend registers the Script again with `CodeRegister`. Nothing is parsed or run.
+    /// A `CachedExecutionStart` or `CodeUnregister` naming a well-formed handle this Session has
+    /// no AST Cache entry under: never issued, issued to another Session, or no longer cached —
+    /// evicted over the cache's capacity, unregistered, or released with its Session (Stories
+    /// 4.2, 4.3). The Backend registers the Script again with `CodeRegister`. Nothing is parsed,
+    /// run or removed.
     UnknownScriptHandle,
 }
 

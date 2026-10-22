@@ -301,6 +301,7 @@ dependencies = [
  "hexput-script",
  "hexput-session",
  "hexput-transport",
+ "rmpv",
  "tokio",
  "tracing",
  "tracing-subscriber",

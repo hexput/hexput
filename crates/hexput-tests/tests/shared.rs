@@ -260,6 +260,7 @@ fn message_types_spell_pascal_case_and_parse_exactly() {
             "ConfigUpdate",
             "CodeRegister",
             "CachedExecutionStart",
+            "CodeUnregister",
             "Result",
             "Call",
             "Authorize",

@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use hexput_config::{
-    ConfigError, ConfigSource, DEFAULT_SESSION_TTL, ENV_VAR, Location, LogFormat, LogLevel,
-    Problem, parse, resolve,
+    ConfigError, ConfigSource, DEFAULT_AST_CACHE_CAPACITY, DEFAULT_SESSION_TTL, ENV_VAR, Location,
+    LogFormat, LogLevel, Problem, parse, resolve,
 };
 
 /// A temporary directory, removed when the test ends.
@@ -655,4 +655,54 @@ fn the_default_path_and_env_var_are_the_documented_ones() {
 fn config_error_is_a_std_error() {
     fn assert_error<E: std::error::Error + Send + Sync + 'static>() {}
     assert_error::<ConfigError>();
+}
+
+// --- Story 4.3: the AST cache's capacity ---
+
+#[test]
+fn the_ast_cache_capacity_defaults_to_ten_thousand_entries() {
+    let config = parse(MINIMAL).expect("a minimal file");
+    assert_eq!(config.ast_cache_capacity, 10_000);
+    assert_eq!(DEFAULT_AST_CACHE_CAPACITY, 10_000);
+}
+
+#[test]
+fn the_ast_cache_capacity_is_read_from_the_file() {
+    let config = parse(&format!("ast_cache_capacity = 5\n{MINIMAL}")).expect("a valid file");
+    assert_eq!(config.ast_cache_capacity, 5);
+}
+
+#[test]
+fn a_zero_or_negative_ast_cache_capacity_is_an_error_naming_the_field_and_position() {
+    for value in ["0", "-1"] {
+        let (path, text) = rendered_error(&format!("ast_cache_capacity = {value}\n{MINIMAL}"));
+        assert!(
+            text.starts_with(&format!("{}:1:22: ", path.display())),
+            "{text}"
+        );
+        assert!(text.contains("`ast_cache_capacity`"), "{text}");
+        assert!(text.contains("at least 1"), "{text}");
+        assert!(text.contains(&format!("got {value}")), "{text}");
+    }
+}
+
+#[test]
+fn an_ast_cache_capacity_of_the_wrong_type_is_rejected() {
+    assert!(matches!(
+        parse_err(&format!("ast_cache_capacity = \"x\"\n{MINIMAL}")),
+        Problem::Parse {
+            location: Some(Location { line: 1, .. }),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn the_example_file_documents_the_ast_cache_capacity() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../hexput-config/config.example.toml");
+    let text = std::fs::read_to_string(&path).expect("the example file");
+    assert!(
+        text.contains("ast_cache_capacity"),
+        "the example documents it"
+    );
 }

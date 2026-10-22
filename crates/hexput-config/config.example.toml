@@ -25,6 +25,13 @@ log_format = "text"
 # Optional; defaults to 300.
 session_ttl_secs = 300
 
+# The most registered Scripts (CodeRegister) the AST Cache holds at once, across every Session:
+# a count of entries, not bytes, a whole number, at least 1. Past it, the cache's policy evicts an
+# entry (or declines the newest), and a Backend running an evicted handle is told to register it
+# again. A Session's entries are also released when the Session ends.
+# Optional; defaults to 10000.
+ast_cache_capacity = 10000
+
 # Transports. At least one [transport.*] section is required, and every field inside a
 # section that is present is required unless marked optional.
 

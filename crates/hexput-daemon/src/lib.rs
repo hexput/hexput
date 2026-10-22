@@ -212,6 +212,16 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The Daemon proper: announce the System Config, bind the socket, serve connections until
 /// `shutdown` completes, then remove the socket. `Err` is the one-line startup failure.
+/// The Daemon's Session registry over `cache`: a Session's teardown releases its cache entries
+/// through the registry's hook, so `hexput-session` never reaches `hexput-script` (Story 4.3). The
+/// one place this pairing is made — the connection opens a Session in the cache at init, and this
+/// hook closes it — so a test can check the Daemon's own wiring.
+#[cfg(unix)]
+fn registry(cache: &Arc<hexput_script::AstCache>) -> Arc<Sessions> {
+    let released = Arc::clone(cache);
+    Arc::new(Sessions::new().with_teardown(move |client_id| released.close(client_id)))
+}
+
 #[cfg(unix)]
 async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(), String> {
     tracing::info!(
@@ -229,10 +239,13 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
     let armed = std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx))).await;
     if armed.is_pending() {
         tracing::info!("daemon started; waiting for a shutdown signal");
-        // One Session registry per Daemon run, shared by every connection.
-        let sessions = Arc::new(Sessions::new());
-        // One AST Cache per Daemon run beside it (Story 4.1): its handles come from one counter.
-        let cache = Arc::new(hexput_script::AstCache::new());
+        // One AST Cache per Daemon run (Story 4.1): its handles come from one counter, and it
+        // holds at most System Config's capacity of entries (Story 4.3).
+        let cache = Arc::new(hexput_script::AstCache::with_capacity(
+            loaded.config.ast_cache_capacity,
+        ));
+        // One Session registry per Daemon run beside it, shared by every connection.
+        let sessions = registry(&cache);
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -391,5 +404,70 @@ async fn shutdown_signal() {
             tracing::warn!("cannot install the Ctrl-C handler; relying on default signal handling");
             std::future::pending::<()>().await;
         }
+    }
+}
+
+// In-crate rather than in `hexput-tests`: `registry` is private to the Daemon's composition root,
+// and the wiring it makes is not observable over the socket before Epic 5 lets a Client ID be
+// reattached (Story 4.3).
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::Arc;
+
+    use hexput_script::AstCache;
+    use hexput_session::{InitRequest, Settings};
+    use rmpv::Value;
+
+    use super::registry;
+
+    fn map(fields: Vec<(&str, Value)>) -> Value {
+        Value::Map(
+            fields
+                .into_iter()
+                .map(|(key, value)| (Value::from(key), value))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_daemons_registry_releases_a_sessions_entries_when_it_is_torn_down() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let register = |cache: &Arc<AstCache>, client_id| {
+            runtime.block_on(hexput_script::code_register(
+                map(vec![("source", Value::from("return 1;"))]),
+                client_id,
+                Arc::clone(cache),
+                Vec::new(),
+                Settings::default(),
+            ))
+        };
+        let cache = Arc::new(AstCache::with_capacity(16));
+        let sessions = registry(&cache);
+        let init = map(vec![
+            ("config", map(Vec::new())),
+            ("registrations", Value::Array(Vec::new())),
+        ]);
+        let mut sessions_made = Vec::new();
+        for _ in 0..2 {
+            let connection = sessions.connect();
+            let client_id = sessions.create(InitRequest::from_value(&init).unwrap(), connection);
+            // As `hexput-connection`'s init does.
+            cache.open(client_id);
+            register(&cache, client_id).unwrap();
+            sessions_made.push((client_id, connection));
+        }
+        let [(ended, connection), (kept, _)] = sessions_made[..] else {
+            unreachable!("two Sessions were made");
+        };
+        sessions.detach(ended, connection);
+        assert!(cache.handles(ended).is_empty());
+        assert_eq!(cache.handles(kept).len(), 1);
+        assert_eq!(cache.entry_count(), 1);
+        // And a registration arriving after the teardown leaves nothing behind.
+        let late = register(&cache, ended).unwrap_err();
+        assert_eq!(late.code, "protocol.init_not_completed");
+        assert_eq!(cache.entry_count(), 1);
     }
 }

@@ -1511,3 +1511,141 @@ fn a_cached_execution_over_the_socket_runs_the_registered_script_with_fresh_vari
     }
     serving.stop().exit(0);
 }
+
+// --- Story 4.3: the cache's capacity, and CodeUnregister, over the real socket ---
+
+/// A `CachedExecutionStart` for `handle` with no variables, as an envelope.
+#[cfg(unix)]
+fn cached_run_request(id: u64, handle: &str) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::CachedExecutionStart,
+        Value::Map(vec![
+            (Value::from("handle"), Value::from(handle)),
+            (Value::from("variables"), Value::Map(vec![])),
+        ]),
+    )
+}
+
+/// A `CodeUnregister` for `handle`, as an envelope.
+#[cfg(unix)]
+fn unregister_request(id: u64, handle: &str) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::CodeUnregister,
+        Value::Map(vec![(Value::from("handle"), Value::from(handle))]),
+    )
+}
+
+/// The `code` of an `Error` reply's payload.
+#[cfg(unix)]
+fn error_code_of(reply: &hexput_port::Envelope<hexput_port::Value>) -> String {
+    use hexput_port::{MessageType, Value};
+
+    assert_eq!(
+        reply.message_type,
+        MessageType::Error,
+        "{:?}",
+        reply.payload
+    );
+    let Value::Map(fields) = &reply.payload else {
+        panic!("an error payload is a map");
+    };
+    fields
+        .iter()
+        .find(|(key, _)| key.as_str() == Some("code"))
+        .and_then(|(_, value)| value.as_str())
+        .expect("a code")
+        .to_owned()
+}
+
+/// Story 4.3: with `ast_cache_capacity = 1`, two registrations over the real socket leave one
+/// Script cached. Exactly one of the two handles still runs, the other is
+/// `protocol.unknown_script_handle`, and `CodeUnregister` removes the survivor.
+#[cfg(unix)]
+#[test]
+fn a_capacity_of_one_over_the_socket_keeps_one_script_and_code_unregister_removes_it() {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(
+        &sandbox,
+        &format!("ast_cache_capacity = 1\n{}", sandbox.valid()),
+    );
+    let mut client = serving.connect();
+    let init = Envelope::new(
+        CorrelationId(1),
+        MessageType::Init,
+        Value::Map(vec![
+            (Value::from("config"), Value::Map(vec![])),
+            (Value::from("registrations"), Value::Array(vec![])),
+        ]),
+    );
+    wire::send(&mut client, &init);
+    assert_eq!(
+        wire::reply(&mut client).expect("a reply").message_type,
+        MessageType::Result
+    );
+
+    let mut handles = Vec::new();
+    for (id, source) in [(2u64, "return 1;"), (3, "return 2;")] {
+        let register = Envelope::new(
+            CorrelationId(id),
+            MessageType::CodeRegister,
+            Value::Map(vec![(Value::from("source"), Value::from(source))]),
+        );
+        wire::send(&mut client, &register);
+        let reply = wire::reply(&mut client).expect("a reply");
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        let handle = reply.payload.as_map().expect("a map payload")[0]
+            .1
+            .as_str()
+            .expect("a string handle")
+            .to_owned();
+        handles.push(handle);
+    }
+
+    let mut replies = Vec::new();
+    for (id, handle) in [(4u64, &handles[0]), (5, &handles[1])] {
+        wire::send(&mut client, &cached_run_request(id, handle));
+        let reply = wire::reply(&mut client).expect("a reply");
+        assert_eq!(reply.id, Some(CorrelationId(id)));
+        replies.push((handle.clone(), reply));
+    }
+    let (kept, evicted): (Vec<_>, Vec<_>) = replies
+        .iter()
+        .partition(|(_, reply)| reply.message_type == MessageType::Result);
+    assert_eq!(kept.len(), 1, "exactly one Script is still cached");
+    assert_eq!(evicted.len(), 1);
+    assert_eq!(
+        error_code_of(&evicted[0].1),
+        "protocol.unknown_script_handle"
+    );
+
+    let survivor = kept[0].0.clone();
+    wire::send(&mut client, &unregister_request(6, &survivor));
+    let removed = wire::reply(&mut client).expect("a reply");
+    assert_eq!(removed.id, Some(CorrelationId(6)));
+    assert_eq!(
+        removed.message_type,
+        MessageType::Result,
+        "{:?}",
+        removed.payload
+    );
+    assert_eq!(removed.payload, Value::Map(vec![]));
+    wire::send(&mut client, &cached_run_request(7, &survivor));
+    assert_eq!(
+        wire::refusal(&mut client),
+        (Some(7), "protocol.unknown_script_handle".to_owned())
+    );
+    serving.stop().exit(0);
+}

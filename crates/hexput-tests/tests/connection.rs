@@ -135,7 +135,13 @@ fn run_timed(
     fail: Option<(usize, io::ErrorKind)>,
     probe: Option<Probe>,
 ) -> (Vec<Envelope<Value>>, usize, Duration) {
-    run_timed_with_cache(sessions, &Arc::new(AstCache::new()), script, fail, probe)
+    run_timed_with_cache(
+        sessions,
+        &Arc::new(AstCache::with_capacity(10_000)),
+        script,
+        fail,
+        probe,
+    )
 }
 
 /// [`run_timed`] sharing `cache` (Story 4.1), which the test keeps to inspect after the connection.
@@ -1064,7 +1070,7 @@ fn at_a_quiet_level_a_warning_keeps_its_span_fields() {
         runtime.block_on(hexput_connection::serve(
             port,
             Arc::clone(&sessions),
-            Arc::new(AstCache::new()),
+            Arc::new(AstCache::with_capacity(10_000)),
         ));
     });
     assert!(sessions.is_empty(), "the connection detached");
@@ -1252,17 +1258,44 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    hosted_on(runtime, &sessions, &cache, registered, refuse_calls, drive);
+    sessions
+}
+
+/// [`hosted`] on `sessions` and `cache`, which the test keeps to inspect after the connection
+/// (Story 4.3). A Session torn down when its connection ends is one built with
+/// [`torn_down_by`].
+fn hosted_on<F, Fut>(
+    runtime: &tokio::runtime::Runtime,
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    registered: &[(&str, bool)],
+    refuse_calls: bool,
+    drive: F,
+) where
+    F: FnOnce(Backend) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let dispatch = discarding_dispatch();
-    let registry = Arc::clone(&sessions);
+    let registry = Arc::clone(sessions);
+    let cache = Arc::clone(cache);
     let init_payload = init_payload(registered);
     tracing::dispatcher::with_default(&dispatch, || {
         runtime.block_on(async move {
-            let (backend, serving) = connect(&registry, init_payload, refuse_calls).await;
+            let (backend, serving, _) =
+                connect_on(&registry, &cache, init_payload, refuse_calls).await;
             drive(backend).await;
             finished(serving).await;
         });
     });
-    sessions
+}
+
+/// A Session registry whose teardown releases the Session's entries in `cache`, wired the way the
+/// Daemon wires it (Story 4.3).
+fn torn_down_by(cache: &Arc<AstCache>) -> Arc<Sessions> {
+    let cache = Arc::clone(cache);
+    Arc::new(Sessions::new().with_teardown(move |client_id| cache.close(client_id)))
 }
 
 /// Open one wired connection on `sessions` and complete its init with `init_payload`: the
@@ -1282,6 +1315,22 @@ async fn connect_as(
     init_payload: Value,
     refuse_calls: bool,
 ) -> (Backend, tokio::task::JoinHandle<()>, ClientId) {
+    connect_on(
+        sessions,
+        &Arc::new(AstCache::with_capacity(10_000)),
+        init_payload,
+        refuse_calls,
+    )
+    .await
+}
+
+/// [`connect_as`] sharing `cache`, which the test keeps to inspect (Story 4.3).
+async fn connect_on(
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    init_payload: Value,
+    refuse_calls: bool,
+) -> (Backend, tokio::task::JoinHandle<()>, ClientId) {
     let (to_daemon, from_test) = tokio::sync::mpsc::unbounded_channel();
     let (to_test, from_daemon) = tokio::sync::mpsc::unbounded_channel();
     let port = Wired {
@@ -1292,7 +1341,7 @@ async fn connect_as(
     let serving = tokio::spawn(hexput_connection::serve(
         port,
         Arc::clone(sessions),
-        Arc::new(AstCache::new()),
+        Arc::clone(cache),
     ));
     let mut backend = Backend {
         to_daemon: Some(to_daemon),
@@ -4097,7 +4146,7 @@ fn keys_of(response: &Envelope<Value>) -> Vec<String> {
 #[test]
 fn a_registration_parses_once_and_its_handle_names_the_cached_program() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, left) = serve_cached(
         &sessions,
         &cache,
@@ -4119,7 +4168,7 @@ fn a_registration_parses_once_and_its_handle_names_the_cached_program() {
 #[test]
 fn every_registration_gets_a_new_handle_even_for_the_same_source() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(
         &sessions,
         &cache,
@@ -4145,7 +4194,7 @@ fn every_registration_gets_a_new_handle_even_for_the_same_source() {
 #[test]
 fn a_source_that_fails_to_parse_is_answered_with_its_diagnostic_and_creates_no_entry() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(
         &sessions,
         &cache,
@@ -4161,7 +4210,7 @@ fn a_source_that_fails_to_parse_is_answered_with_its_diagnostic_and_creates_no_e
 #[test]
 fn a_registration_before_init_is_refused_and_creates_no_entry() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(&sessions, &cache, vec![register(1, "return 1;")]);
     assert_eq!(outcome(&sent[0]), "protocol.init_not_completed");
     assert_eq!(cache.entry_count(), 0);
@@ -4216,7 +4265,7 @@ fn a_malformed_registration_is_refused_naming_what_is_wrong_and_creates_no_entry
         ),
     ];
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     for (payload, mentions) in cases {
         let (sent, _) = serve_cached(
             &sessions,
@@ -4244,7 +4293,7 @@ fn a_malformed_registration_is_refused_naming_what_is_wrong_and_creates_no_entry
 #[test]
 fn under_warn_a_registration_is_cached_and_answered_with_its_findings() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(
         &sessions,
         &cache,
@@ -4265,7 +4314,7 @@ fn under_warn_a_registration_is_cached_and_answered_with_its_findings() {
 #[test]
 fn under_error_an_error_finding_rejects_the_registration_and_creates_no_entry() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(
         &sessions,
         &cache,
@@ -4287,7 +4336,7 @@ fn under_error_an_error_finding_rejects_the_registration_and_creates_no_entry() 
 #[test]
 fn under_error_naming_the_starting_variables_is_accepted_without_findings() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(
         &sessions,
         &cache,
@@ -4304,7 +4353,7 @@ fn under_error_naming_the_starting_variables_is_accepted_without_findings() {
 #[test]
 fn under_error_a_registered_function_is_callable_in_a_registration() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(
         &sessions,
         &cache,
@@ -4324,7 +4373,7 @@ fn under_error_a_registered_function_is_callable_in_a_registration() {
 #[test]
 fn a_registration_reads_the_live_config_its_check_mode_and_toggles() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let loops_off = by_key(&[
         ("check", string("error")),
         ("features", by_key(&[("loops", Value::Boolean(false))])),
@@ -4357,7 +4406,7 @@ fn a_registration_reads_the_live_config_its_check_mode_and_toggles() {
 #[test]
 fn with_the_check_off_no_pass_runs_and_the_registration_is_plain() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(
         &sessions,
         &cache,
@@ -4371,7 +4420,7 @@ fn with_the_check_off_no_pass_runs_and_the_registration_is_plain() {
 #[test]
 fn two_sessions_registering_the_same_source_get_entries_only_they_can_find() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let source = "return 1 + x;";
     let (a, _) = serve_cached(
         &sessions,
@@ -4399,7 +4448,7 @@ fn two_sessions_registering_the_same_source_get_entries_only_they_can_find() {
 #[test]
 fn a_direct_execution_never_touches_the_cache() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(
         &sessions,
         &cache,
@@ -4419,7 +4468,7 @@ fn a_large_registration_does_not_hold_back_a_fast_execution_on_its_connection() 
         .collect();
     source.push_str("return 0;");
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, left) = serve_cached(
         &sessions,
         &cache,
@@ -4545,7 +4594,7 @@ fn a_cached_run_before_init_is_refused_as_init_not_completed() {
 #[test]
 fn a_cached_run_of_an_unknown_handle_names_it_and_says_to_register_again() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (sent, _) = serve_cached(
         &sessions,
         &cache,
@@ -4564,7 +4613,7 @@ fn a_cached_run_of_an_unknown_handle_names_it_and_says_to_register_again() {
 #[test]
 fn a_handle_another_session_registered_is_unknown_here() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let (registered_by_a, _) = serve_cached(
         &sessions,
         &cache,
@@ -4594,7 +4643,7 @@ fn a_handle_another_session_registered_is_unknown_here() {
 #[test]
 fn a_malformed_cached_run_is_answered_as_invalid_payload_and_the_connection_keeps_serving() {
     let sessions = Arc::new(Sessions::new());
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let source = Received::Message(Envelope::new(
         CorrelationId(2),
         MessageType::CachedExecutionStart,
@@ -4772,4 +4821,341 @@ fn a_failed_cached_run_is_logged_at_debug_under_its_request() {
     assert_eq!(event["fields"]["handle"], "00000000000000ff", "{event}");
     assert_eq!(event["span"]["name"], "request", "{event}");
     assert_eq!(event["span"]["id"], "7", "{event}");
+}
+
+// --- Story 4.3: bound the cache and clean it up with the Session ---
+
+/// A `CodeUnregister` request removing `handle`.
+fn unregister_request(id: u64, handle: &str) -> Received {
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::CodeUnregister,
+        Value::Map(vec![(string("handle"), string(handle))]),
+    ))
+}
+
+#[test]
+fn code_unregister_before_init_is_init_not_completed() {
+    let (sent, _) = serve(vec![message(1, MessageType::CodeUnregister)], None);
+    assert_eq!(code_of(&sent[0]), "protocol.init_not_completed");
+}
+
+#[test]
+fn a_code_unregister_is_answered_with_an_empty_result_and_its_entry_is_gone_before_the_reply() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let probe = Arc::clone(&cache);
+    hosted_on(
+        &wired_runtime(),
+        &Arc::new(Sessions::new()),
+        &cache,
+        &[],
+        false,
+        |mut backend| async move {
+            backend.send(register(2, "return 1;"));
+            let handle = handle_of(&backend.next().await).to_string();
+            backend.send(unregister_request(3, &handle));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(3)));
+            assert_eq!(
+                reply.message_type,
+                MessageType::Result,
+                "{:?}",
+                reply.payload
+            );
+            assert_eq!(reply.payload, Value::Map(vec![]));
+            // The reply is read only after the removal, so the entry is already gone.
+            assert_eq!(probe.entry_count(), 0);
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_malformed_code_unregister_is_refused_by_key_and_the_entry_survives() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let probe = Arc::clone(&cache);
+    hosted_on(
+        &wired_runtime(),
+        &Arc::new(Sessions::new()),
+        &cache,
+        &[],
+        false,
+        |mut backend| async move {
+            backend.send(register(2, "return 1;"));
+            let handle = handle_of(&backend.next().await).to_string();
+            backend.send(Received::Message(Envelope::new(
+                CorrelationId(3),
+                MessageType::CodeUnregister,
+                Value::Map(vec![(string("handle"), Value::from(1))]),
+            )));
+            let refused = backend.next().await;
+            assert_eq!(code_of(&refused), "protocol.invalid_payload");
+            assert!(
+                message_of(&refused).contains("`handle`"),
+                "{}",
+                message_of(&refused)
+            );
+            assert_eq!(probe.entry_count(), 1, "nothing was removed");
+            // The connection keeps serving, and the valid removal then works.
+            backend.send(unregister_request(4, &handle));
+            assert_eq!(backend.next().await.message_type, MessageType::Result);
+            assert_eq!(probe.entry_count(), 0);
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_code_unregister_of_a_foreign_or_removed_handle_is_unknown_and_leaves_the_owner_alone() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let probe = Arc::clone(&cache);
+    let sessions = Arc::new(Sessions::new());
+    // Session A registers handle 1; it stays after A's connection ends, as no teardown is wired.
+    hosted_on(
+        &wired_runtime(),
+        &sessions,
+        &cache,
+        &[],
+        false,
+        |mut backend| async move {
+            backend.send(register(2, "return 1;"));
+            assert_eq!(
+                handle_of(&backend.next().await).to_string(),
+                "0000000000000001"
+            );
+            backend.close();
+        },
+    );
+    hosted_on(
+        &wired_runtime(),
+        &sessions,
+        &cache,
+        &[],
+        false,
+        |mut backend| async move {
+            backend.send(register(2, "return 2;"));
+            assert_eq!(
+                handle_of(&backend.next().await).to_string(),
+                "0000000000000002"
+            );
+            // Session B cannot remove A's handle.
+            backend.send(unregister_request(3, "0000000000000001"));
+            let foreign = backend.next().await;
+            assert_eq!(code_of(&foreign), "protocol.unknown_script_handle");
+            assert_eq!(probe.entry_count(), 2, "A's entry is untouched");
+            // B removes its own once; a second removal is unknown.
+            backend.send(unregister_request(4, "0000000000000002"));
+            assert_eq!(backend.next().await.message_type, MessageType::Result);
+            backend.send(unregister_request(5, "0000000000000002"));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "protocol.unknown_script_handle"
+            );
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn the_run_that_fetched_a_handle_survives_its_removal_and_the_next_run_is_unknown() {
+    // Story 4.2's deferred test: the run holds its program, so removing the handle under it
+    // changes nothing for that run.
+    let source = format!(
+        "let r = echo(1); let i = 0; while (i < {SLOW_TURNS}) {{ i = i + 1; }}; return r + i;"
+    );
+    hosted(
+        &wired_runtime(),
+        &[("echo", true)],
+        false,
+        |mut backend| async move {
+            backend.send(register(2, &source));
+            let handle = handle_of(&backend.next().await).to_string();
+            backend.send(cached_run(10, &handle, vec![]));
+            // The run has started: its first host call has reached the Backend.
+            let (call, _, _, from) = backend.request_from(MessageType::Call).await;
+            assert_eq!(from, 10);
+            backend.send(unregister_request(11, &handle));
+            let removed = backend.next().await;
+            assert_eq!(removed.id, Some(CorrelationId(11)));
+            assert_eq!(removed.message_type, MessageType::Result);
+            backend.reply(
+                call,
+                MessageType::Result,
+                Value::Map(vec![(string("value"), Value::from(5))]),
+            );
+            let finished_run = backend.next().await;
+            assert_eq!(finished_run.id, Some(CorrelationId(10)));
+            assert_eq!(value_of(&finished_run), Value::from(5 + SLOW_TURNS));
+            backend.send(cached_run(12, &handle, vec![]));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "protocol.unknown_script_handle"
+            );
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_capacity_eviction_is_answered_unknown_over_the_wire_and_the_kept_handle_runs() {
+    let cache = Arc::new(AstCache::with_capacity(1));
+    let sessions = Arc::new(Sessions::new());
+    let runtime = wired_runtime();
+    tracing::dispatcher::with_default(&discarding_dispatch(), || {
+        runtime.block_on(async {
+            let (mut backend, serving, client) =
+                connect_on(&sessions, &cache, init_payload(&[]), false).await;
+            backend.send(register(2, "return 1;"));
+            let first = handle_of(&backend.next().await).to_string();
+            backend.send(register(3, "return 2;"));
+            let second = handle_of(&backend.next().await).to_string();
+            let kept = cache.handles(client);
+            assert_eq!(kept.len(), 1, "{kept:?}");
+            let kept = kept[0].to_string();
+            let evicted = if kept == first {
+                second.clone()
+            } else {
+                first.clone()
+            };
+            backend.send(cached_run(4, &evicted, vec![]));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "protocol.unknown_script_handle"
+            );
+            backend.send(cached_run(5, &kept, vec![]));
+            let expected = if kept == first { 1 } else { 2 };
+            assert_eq!(value_of(&backend.next().await), Value::from(expected));
+            backend.close();
+            finished(serving).await;
+        });
+    });
+}
+
+#[test]
+fn a_teardown_releases_its_session_and_leaves_another_sessions_entries() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let sessions = torn_down_by(&cache);
+    let runtime = wired_runtime();
+    tracing::dispatcher::with_default(&discarding_dispatch(), || {
+        runtime.block_on(async {
+            let (mut a, serving_a, client_a) =
+                connect_on(&sessions, &cache, init_payload(&[]), false).await;
+            let (mut b, serving_b, client_b) =
+                connect_on(&sessions, &cache, init_payload(&[]), false).await;
+            a.send(register(2, "return 1;"));
+            handle_of(&a.next().await);
+            b.send(register(2, "return 2;"));
+            let theirs = handle_of(&b.next().await);
+            // A's last connection closes: its Session is torn down, B's entries stay.
+            a.close();
+            finished(serving_a).await;
+            assert!(cache.handles(client_a).is_empty());
+            assert_eq!(cache.handles(client_b), vec![theirs]);
+            assert_eq!(cache.entry_count(), 1);
+            b.close();
+            finished(serving_b).await;
+            assert!(cache.handles(client_b).is_empty());
+            assert_eq!(cache.entry_count(), 0);
+        });
+    });
+}
+
+#[test]
+fn a_session_whose_only_connection_closes_cleanly_leaves_no_entry() {
+    // The serial variant: a Session's entries are gone once its only connection has ended.
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let sessions = torn_down_by(&cache);
+    let (first, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![init(1, init_payload(&[])), register(2, "return 1;")],
+    );
+    // The registration did store an entry, so its absence below is the teardown's doing.
+    assert_eq!(first[1].message_type, MessageType::Result, "{:?}", first[1]);
+    handle_of(&first[1]);
+    let gone = client_id_of(&first[0]);
+    assert!(cache.handles(gone).is_empty());
+    assert_eq!(cache.entry_count(), 0);
+}
+
+#[test]
+fn an_eviction_is_logged_at_debug_and_each_one_is_counted() {
+    let log = Captured::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(log.clone()))
+            .finish(),
+    );
+    let worker = dispatch.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .on_thread_start(move || {
+            // Blocking threads too: the insert, and so the eviction, runs there.
+            std::mem::forget(tracing::dispatcher::set_default(&worker));
+        })
+        .build()
+        .unwrap();
+    let cache = Arc::new(AstCache::with_capacity(1));
+    let sessions = Arc::new(Sessions::new());
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let (mut backend, serving, _) =
+                connect_on(&sessions, &cache, init_payload(&[]), false).await;
+            backend.send(register(2, "return 1;"));
+            handle_of(&backend.next().await);
+            backend.send(register(3, "return 2;"));
+            handle_of(&backend.next().await);
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| {
+            event["fields"]["message"] == "evicted a cached Script over the cache's capacity"
+        })
+        .collect();
+    assert!(
+        cache.evictions() >= 1,
+        "the second registration displaced or was refused"
+    );
+    assert_eq!(events.len() as u64, cache.evictions(), "{text}");
+    assert_eq!(events[0]["level"], "DEBUG", "{}", events[0]);
+    assert!(events[0]["fields"]["handle"].is_string(), "{}", events[0]);
+    // It names the evicted entry's own Session, and claims no request's span: maintenance runs
+    // on whichever request triggers it.
+    assert!(
+        events[0]["fields"]["client_id"].is_string(),
+        "{}",
+        events[0]
+    );
+    assert!(events[0].get("span").is_none(), "{}", events[0]);
+}
+
+#[test]
+fn a_cached_run_dispatched_before_an_unregister_of_its_handle_still_runs() {
+    // Requests take effect in the order sent: the run fetched its program as it was dispatched,
+    // so the unregister served right after it cannot take the program away.
+    hosted(&wired_runtime(), &[], false, |mut backend| async move {
+        backend.send(register(2, "return 7;"));
+        let handle = handle_of(&backend.next().await).to_string();
+        backend.send(cached_run(3, &handle, vec![]));
+        backend.send(unregister_request(4, &handle));
+        let mut replies = [backend.next().await, backend.next().await];
+        replies.sort_by_key(|reply| reply.id.map(|id| id.0));
+        assert_eq!(replies[0].id, Some(CorrelationId(3)));
+        assert_eq!(value_of(&replies[0]), Value::from(7));
+        assert_eq!(replies[1].id, Some(CorrelationId(4)));
+        assert_eq!(replies[1].message_type, MessageType::Result);
+        backend.send(cached_run(5, &handle, vec![]));
+        assert_eq!(
+            code_of(&backend.next().await),
+            "protocol.unknown_script_handle"
+        );
+        backend.close();
+    });
 }

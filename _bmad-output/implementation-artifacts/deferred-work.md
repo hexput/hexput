@@ -292,11 +292,22 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-4-1-register-a-script-once-for-repeated-use.md`
   summary: The AST Cache has no capacity bound and no Session-teardown cleanup, so an initialized Backend can grow Daemon memory without limit by registering repeatedly.
   evidence: Review finding (blind and edge, medium). `AstCache::insert` stores every registration in an unbounded moka cache and nothing removes an entry until the Daemon exits. Story 4.3 (bounds, unregister, Session cleanup) must close this before a release ships Cached Execution.
+  status: RESOLVED 2026-10-22 by `spec-4-3-keep-the-cache-bounded-and-clean-it-up-with-the-session.md` — `ast_cache_capacity` bounds the cache, `CodeUnregister` removes an entry, Session teardown releases a Session's entries, and the cache's open set refuses an insert for a Session that has ended.
 
 - source_spec: `spec-4-1-register-a-script-once-for-repeated-use.md`
   summary: A registration still parsing when its connection closes or is lost inserts its entry after the Session may be gone, under a handle nobody was told about.
   evidence: Review finding (blind and edge, medium). `code_register` inserts on the blocking pool once parse and check succeed, whether or not its reply is still awaited. Story 4.3's teardown cleanup (by Client ID) must run after, or guard against, such late inserts.
+  status: RESOLVED 2026-10-22 by `spec-4-3-keep-the-cache-bounded-and-clean-it-up-with-the-session.md` — `ast_cache_capacity` bounds the cache, `CodeUnregister` removes an entry, Session teardown releases a Session's entries, and the cache's open set refuses an insert for a Session that has ended.
 
 - source_spec: `spec-4-1-register-a-script-once-for-repeated-use.md`
   summary: The `variables` names a registration was checked against are not stored; Story 4.2 must decide whether a `CachedExecutionStart`'s variables are validated against them.
   evidence: Review finding (blind, low). The entry is only `Arc<Program>`; the check's judgement on undeclared names assumed the registered names. Record the choice in Story 4.2's spec.
+
+- source_spec: `spec-4-3-keep-the-cache-bounded-and-clean-it-up-with-the-session.md`
+  summary: No test interleaves an AST Cache insert with a `close` of the same Session, so a regression that checks the open set and inserts without holding its read lock would pass every test.
+  evidence: Review findings (blind and verification-gap). The current code is correct (the read lock covers the check and moka's insert), but the late-registration tests are serial. A deterministic test needs a seam inside `AstCache::insert` (a test hook) or a stress loop; neither is settled by the spec.
+
+- source_spec: `spec-4-3-keep-the-cache-bounded-and-clean-it-up-with-the-session.md`
+  summary: The AST Cache's capacity is one pool shared by every Session, so a Backend that registers heavily can displace other Backends' entries.
+  evidence: Review findings (blind and edge, medium). Documented in the `AstCache` doc, the Spine's Story 4.3 amendment and the epic context; a per-Session quota (or share) is a design change left for a later story (Epic 5's multi-tenant hardening or Epic 7's operations work).
+

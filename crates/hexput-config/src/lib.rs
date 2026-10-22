@@ -26,6 +26,7 @@
 //! log_level = "info"          # optional: error | warn | info | debug | trace — default "info"
 //! log_format = "text"         # optional: text | json — default "text"
 //! session_ttl_secs = 300      # optional: a whole number of seconds, at least 1 — default 300
+//! ast_cache_capacity = 10000  # optional: the most cached Scripts, at least 1 — default 10000
 //!
 //! [transport.uds]             # at least one [transport.*] section is required
 //! path = "/run/hexput/hexput.sock"
@@ -42,8 +43,8 @@
 //!
 //! `crates/hexput-config/config.example.toml` documents every field, and a test parses it so the
 //! example cannot drift from this parser. Every field inside a present transport section is
-//! required; only `log_level`, `log_format` and `session_ttl_secs` have defaults, and all three are
-//! stated above.
+//! required; only `log_level`, `log_format`, `session_ttl_secs` and `ast_cache_capacity` have
+//! defaults, and all four are stated above.
 //! Unknown keys are rejected, so a typo cannot silently drop a setting. Paths are kept exactly as
 //! written; a relative path is relative to the Daemon's working directory, not to the file.
 //!
@@ -86,6 +87,10 @@ pub const DEFAULT_PATH: &str = r"C:\ProgramData\hexput\config.toml";
 /// `session_ttl_secs` when the file does not set it.
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
 
+/// `ast_cache_capacity` when the file does not set it: the most registered Scripts the AST Cache
+/// holds at once, across every Session (Story 4.3).
+pub const DEFAULT_AST_CACHE_CAPACITY: u64 = 10_000;
+
 /// The fixed per-OS default path: `/etc/hexput/config.toml` on Unix,
 /// `%ProgramData%\hexput\config.toml` on Windows (falling back to [`DEFAULT_PATH`],
 /// `C:\ProgramData\hexput\config.toml`, only when `ProgramData` is unset).
@@ -101,7 +106,8 @@ pub fn default_path() -> PathBuf {
     PathBuf::from(DEFAULT_PATH)
 }
 
-/// The Daemon's operational settings: transports, log level, default Session TTL.
+/// The Daemon's operational settings: transports, log level, default Session TTL, AST Cache
+/// capacity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SystemConfig {
@@ -114,6 +120,9 @@ pub struct SystemConfig {
     /// How long a Session outlives its last Connection. Never zero; defaults to
     /// [`DEFAULT_SESSION_TTL`] (300 seconds).
     pub session_ttl: Duration,
+    /// The most entries — registered Scripts, across every Session — the AST Cache holds at once
+    /// (Story 4.3). A count, not bytes; never zero; defaults to [`DEFAULT_AST_CACHE_CAPACITY`].
+    pub ast_cache_capacity: u64,
 }
 
 /// The configured transports. A parsed [`SystemConfig`] always has at least one of them.

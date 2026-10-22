@@ -78,6 +78,14 @@ pub enum MessageType {
     /// Script wrote a referenced place, never `findings` — or `Error`, including
     /// `protocol.unknown_script_handle` for a handle this Session has no entry under.
     CachedExecutionStart,
+    /// Request: remove a Script registered with `CodeRegister` from the AST Cache at once (Story
+    /// 4.3). The payload is exactly `{handle}`, the registration's 16-lowercase-hex-character
+    /// handle, looked up under this Session's Client ID. Answered `Result {}` (an empty map) once
+    /// the entry is gone — a Cached Execution dispatched before it finishes normally — or `Error`:
+    /// `protocol.unknown_script_handle` for a handle this Session has no entry under (never
+    /// issued, another Session's, evicted or already removed), `protocol.invalid_payload` for a
+    /// malformed payload, with nothing removed.
+    CodeUnregister,
     /// Response: a request succeeded; the payload is its result.
     Result,
     /// Request, from the Daemon to the Backend: a Script called a Registered Function (Story
@@ -105,6 +113,7 @@ impl MessageType {
         Self::ConfigUpdate,
         Self::CodeRegister,
         Self::CachedExecutionStart,
+        Self::CodeUnregister,
         Self::Result,
         Self::Call,
         Self::Authorize,
@@ -120,6 +129,7 @@ impl MessageType {
             Self::ConfigUpdate => "ConfigUpdate",
             Self::CodeRegister => "CodeRegister",
             Self::CachedExecutionStart => "CachedExecutionStart",
+            Self::CodeUnregister => "CodeUnregister",
             Self::Result => "Result",
             Self::Call => "Call",
             Self::Authorize => "Authorize",

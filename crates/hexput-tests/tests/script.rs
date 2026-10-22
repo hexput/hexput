@@ -1043,8 +1043,23 @@ fn registered(
     )
 }
 
-/// [`registered`] with any [`Registration`]s, Registered Methods included.
+/// [`registered`] with any [`Registration`]s, Registered Methods included. The Session is open
+/// first, as `init` makes it (Story 4.3): a registration for a Client ID that was never opened is
+/// refused, see [`register_unopened`].
 fn registered_as(
+    payload: &Value,
+    client: hexput_shared::ids::ClientId,
+    cache: &Arc<AstCache>,
+    registrations: Vec<Registration>,
+    settings: Settings,
+) -> Result<Value, Box<ErrorBody>> {
+    cache.open(client);
+    register_unopened(payload, client, cache, registrations, settings)
+}
+
+/// [`registered_as`] without opening the Session first: exactly what a registration sees when its
+/// Client ID was never opened, or has ended (Story 4.3).
+fn register_unopened(
     payload: &Value,
     client: hexput_shared::ids::ClientId,
     cache: &Arc<AstCache>,
@@ -1109,7 +1124,7 @@ fn client(byte: u8) -> hexput_shared::ids::ClientId {
 
 #[test]
 fn a_registration_parses_once_into_the_cache_under_its_client_id() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let reply = registered(
         &registration("return 1 + x;", None),
         client(1),
@@ -1129,7 +1144,7 @@ fn a_registration_parses_once_into_the_cache_under_its_client_id() {
 
 #[test]
 fn every_registration_of_the_same_source_gets_its_own_handle() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let payload = registration("return 1;", None);
     let first =
         handle_in(&registered(&payload, client(1), &cache, vec![], Settings::new()).unwrap());
@@ -1143,7 +1158,7 @@ fn every_registration_of_the_same_source_gets_its_own_handle() {
 
 #[test]
 fn the_first_handle_of_a_cache_is_0000000000000001() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let reply = registered(
         &registration("return 1;", None),
         client(1),
@@ -1160,7 +1175,7 @@ fn the_first_handle_of_a_cache_is_0000000000000001() {
 
 #[test]
 fn a_parse_failure_is_the_parser_diagnostic_and_creates_no_entry() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let body = *registered(
         &registration("let = ;", None),
         client(1),
@@ -1176,7 +1191,7 @@ fn a_parse_failure_is_the_parser_diagnostic_and_creates_no_entry() {
 
 #[test]
 fn a_malformed_registration_is_refused_naming_the_key_and_creates_no_entry() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let cases: Vec<(Value, &[&str])> = vec![
         (Value::Nil, &["`source`"]),
         (map(vec![]), &["`source`"]),
@@ -1221,7 +1236,7 @@ fn a_malformed_registration_is_refused_naming_the_key_and_creates_no_entry() {
 #[test]
 fn under_warn_the_registration_is_cached_and_its_findings_come_with_the_handle() {
     use hexput_port::CheckMode;
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let reply = registered(
         &registration("let unused = 1; return x;", Some(vec!["x"])),
         client(1),
@@ -1242,7 +1257,7 @@ fn under_warn_the_registration_is_cached_and_its_findings_come_with_the_handle()
 #[test]
 fn under_error_an_error_finding_rejects_the_registration_with_every_finding() {
     use hexput_port::CheckMode;
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let body = *registered(
         &registration("let unused = 1; return y;", None),
         client(1),
@@ -1266,7 +1281,7 @@ fn under_error_an_error_finding_rejects_the_registration_with_every_finding() {
 #[test]
 fn under_error_naming_the_starting_variables_is_accepted_without_findings() {
     use hexput_port::CheckMode;
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let reply = registered(
         &registration("return y;", Some(vec!["y"])),
         client(1),
@@ -1281,7 +1296,7 @@ fn under_error_naming_the_starting_variables_is_accepted_without_findings() {
 
 #[test]
 fn with_the_check_off_no_pass_runs() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let reply = registered(
         &registration("return y;", None),
         client(1),
@@ -1297,7 +1312,7 @@ fn with_the_check_off_no_pass_runs() {
 #[test]
 fn the_registrations_are_the_callable_names_the_check_knows() {
     use hexput_port::CheckMode;
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let reply = registered(
         &registration("if (false) { askFirst(1); }; return 1;", None),
         client(1),
@@ -1323,7 +1338,7 @@ fn the_registrations_are_the_callable_names_the_check_knows() {
 fn a_method_is_no_callable_name_for_the_registration_check() {
     use hexput_port::CheckMode;
     // `save` is a method under `User`: a bare `save(1)` can never reach it.
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let body = *registered_as(
         &registration("if (false) { save(1); }; return 1;", None),
         client(1),
@@ -1345,7 +1360,7 @@ fn registration_findings_that_would_not_fit_a_frame_are_left_out_and_the_handle_
         .map(|n| format!("let {}{n} = 1;\n", "v".repeat(long)))
         .chain(std::iter::once("return 1;".to_owned()))
         .collect();
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let reply = registered(
         &registration(&source, None),
         client(1),
@@ -1361,7 +1376,7 @@ fn registration_findings_that_would_not_fit_a_frame_are_left_out_and_the_handle_
 #[test]
 fn a_large_warn_result_keeps_at_most_max_findings() {
     use hexput_port::CheckMode;
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let reply = registered(
         &registration(&unused_locals(150, "return 1;"), None),
         client(1),
@@ -1383,7 +1398,7 @@ fn a_large_warn_result_keeps_at_most_max_findings() {
 
 #[test]
 fn two_clients_registering_the_same_source_are_scoped_apart() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let payload = registration("return 1 + x;", None);
     let a = handle_in(&registered(&payload, client(1), &cache, vec![], Settings::new()).unwrap());
     let b = handle_in(&registered(&payload, client(2), &cache, vec![], Settings::new()).unwrap());
@@ -1417,7 +1432,7 @@ fn cached_with(
     runtime.block_on(hexput_script::cached_execution(
         payload.clone(),
         client,
-        Arc::clone(cache),
+        cache,
         registrations,
         settings,
         caller,
@@ -1478,7 +1493,7 @@ const COUNTED_LOOP: &str = "let n = 0; while (n < 2) { n = n + 1; }; return n;";
 
 #[test]
 fn a_registered_script_runs_with_fresh_variables_and_its_entry_is_untouched() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration("return grade >= 50;", client(1), &cache);
     let reply = cached(
         &cached_payload(handle, vec![("grade", int(72))], None),
@@ -1501,7 +1516,7 @@ fn a_registered_script_runs_with_fresh_variables_and_its_entry_is_untouched() {
 
 #[test]
 fn a_run_never_parses_so_a_registered_entry_is_the_one_it_runs() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration("return 1 + x;", client(1), &cache);
     let before = cache.get(client(1), handle).expect("the entry");
     cached(
@@ -1517,7 +1532,7 @@ fn a_run_never_parses_so_a_registered_entry_is_the_one_it_runs() {
 
 #[test]
 fn a_mutated_object_does_not_bleed_into_the_next_run() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration("o.n = o.n + 1; return o.n;", client(1), &cache);
     for _ in 0..2 {
         let reply = cached(
@@ -1532,7 +1547,7 @@ fn a_mutated_object_does_not_bleed_into_the_next_run() {
 
 #[test]
 fn top_level_state_does_not_bleed_into_the_next_run() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration("let c = 0; c = c + x; return c;", client(1), &cache);
     for _ in 0..2 {
         let reply = cached(
@@ -1548,7 +1563,7 @@ fn top_level_state_does_not_bleed_into_the_next_run() {
 #[test]
 fn a_cached_run_replies_with_the_same_bytes_as_a_direct_execution() {
     let source = "let t = x * 2; return t;";
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration(source, client(1), &cache);
     let cached_reply = cached(
         &cached_payload(handle, vec![("x", int(3))], None),
@@ -1566,7 +1581,7 @@ fn a_cached_run_replies_with_the_same_bytes_as_a_direct_execution() {
 
 #[test]
 fn an_unknown_handle_is_answered_with_the_re_register_error_and_nothing_runs() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     handle_of_registration("return 1;", client(1), &cache);
     let unknown: hexput_shared::ids::ScriptHandle = "00000000000000ff".parse().unwrap();
     let body = *cached(&cached_payload(unknown, vec![], None), client(1), &cache)
@@ -1588,7 +1603,7 @@ fn an_unknown_handle_is_answered_with_the_re_register_error_and_nothing_runs() {
 fn handle_zero_is_well_formed_but_never_issued_so_it_is_unknown() {
     // Handles count from 1, so `0000000000000000` parses yet can name no entry: it is the
     // re-register error, never a malformed request.
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     handle_of_registration("return 1;", client(1), &cache);
     let body = *cached(
         &map(vec![
@@ -1613,7 +1628,7 @@ fn handle_zero_is_well_formed_but_never_issued_so_it_is_unknown() {
 
 #[test]
 fn another_sessions_handle_gets_the_same_error_shape_as_a_handle_never_issued() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let theirs = handle_of_registration("return 1;", client(1), &cache);
     let foreign = *cached(&cached_payload(theirs, vec![], None), client(2), &cache)
         .expect_err("another Session's handle");
@@ -1638,7 +1653,7 @@ fn another_sessions_handle_gets_the_same_error_shape_as_a_handle_never_issued() 
 
 #[test]
 fn a_malformed_payload_is_refused_naming_the_key_and_runs_nothing() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration("return 1;", client(1), &cache);
     let text = handle.to_string();
     let cases: Vec<(Value, &[&str])> = vec![
@@ -1757,7 +1772,7 @@ fn a_malformed_payload_is_refused_naming_the_key_and_runs_nothing() {
 
 #[test]
 fn an_invalid_payload_takes_precedence_over_an_unknown_handle() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let body = *cached(
         &map(vec![
             ("handle", s("00000000000000ff")),
@@ -1773,7 +1788,7 @@ fn an_invalid_payload_takes_precedence_over_an_unknown_handle() {
 
 #[test]
 fn an_overlong_handle_is_echoed_bounded_in_its_refusal() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let long = "A".repeat(4096);
     let body = *cached(
         &map(vec![("handle", s(&long)), ("variables", map(vec![]))]),
@@ -1793,7 +1808,7 @@ fn an_overlong_handle_is_echoed_bounded_in_its_refusal() {
 #[test]
 fn a_registration_with_findings_runs_with_a_reply_of_exactly_value() {
     use hexput_port::CheckMode;
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let reply = registered(
         &registration("let unused = 1; return x;", Some(vec!["x"])),
         client(1),
@@ -1824,7 +1839,7 @@ fn the_check_is_not_run_at_a_cached_execution_whatever_the_live_mode() {
     // Registered with the check off, so nothing is rejected. The error finding (`z` is never
     // bound) sits on a path that never runs, so only the check could object.
     let source = "if (false) { return z; }; return 1;";
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration(source, client(1), &cache);
     let reply = cached_with(
         &cached_payload(handle, vec![], None),
@@ -1844,7 +1859,7 @@ fn the_check_is_not_run_at_a_cached_execution_whatever_the_live_mode() {
 
 #[test]
 fn registered_variable_names_are_neither_enforced_nor_stored() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = registered(
         &registration("return x;", Some(vec!["x"])),
         client(1),
@@ -1872,7 +1887,7 @@ fn registered_variable_names_are_neither_enforced_nor_stored() {
 
 #[test]
 fn a_starting_variable_the_script_redeclares_is_a_duplicate_declaration() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration("let x = 1; return x;", client(1), &cache);
     let body = *cached(
         &cached_payload(handle, vec![("x", int(3))], None),
@@ -1885,7 +1900,7 @@ fn a_starting_variable_the_script_redeclares_is_a_duplicate_declaration() {
 
 #[test]
 fn a_live_config_limit_applies_to_a_cached_run() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration("return getOrder(1);", client(1), &cache);
     let body = *cached_with(
         &cached_payload(handle, vec![], None),
@@ -1900,7 +1915,7 @@ fn a_live_config_limit_applies_to_a_cached_run() {
 
 #[test]
 fn a_live_feature_toggle_refuses_a_construct_at_a_cached_run() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration(COUNTED_LOOP, client(1), &cache);
     let mut loops_off = Settings::new();
     loops_off.set_feature(hexput_port::Feature::Loops, false);
@@ -1917,7 +1932,7 @@ fn a_live_feature_toggle_refuses_a_construct_at_a_cached_run() {
 
 #[test]
 fn overrides_apply_to_one_run_alone() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let looping = handle_of_registration(COUNTED_LOOP, client(1), &cache);
     let loops_off = map(vec![(
         "features",
@@ -1978,7 +1993,7 @@ fn overrides_apply_to_one_run_alone() {
 #[test]
 fn a_holder_the_script_writes_comes_back_as_a_modification_as_on_direct_execution() {
     let source = "n = v; return 0;";
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let handle = handle_of_registration(source, client(1), &cache);
     let n = map(vec![
         ("__secret", map(vec![("ref", s("r1"))])),
@@ -2001,7 +2016,7 @@ fn a_holder_the_script_writes_comes_back_as_a_modification_as_on_direct_executio
 
 #[test]
 fn a_blanket_granted_call_is_made_and_an_unregistered_one_is_refused() {
-    let cache = Arc::new(AstCache::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
     let granted = handle_of_registration("return f(1);", client(1), &cache);
     let ungranted = handle_of_registration("return g(1);", client(1), &cache);
     let registrations =
@@ -2026,4 +2041,235 @@ fn a_blanket_granted_call_is_made_and_an_unregistered_one_is_refused() {
     )
     .expect_err("g is not registered");
     assert_eq!(body.code, "capability.unknown_function");
+}
+
+// --- Story 4.3: bound the cache and clean it up with the Session ---
+
+/// A `CodeUnregister` payload removing `handle`.
+fn unregister_payload(handle: hexput_shared::ids::ScriptHandle) -> Value {
+    map(vec![("handle", s(&handle.to_string()))])
+}
+
+/// `code_unregister` for `client` against `cache`.
+fn unregister(
+    payload: &Value,
+    client: hexput_shared::ids::ClientId,
+    cache: &AstCache,
+) -> Result<Value, Box<ErrorBody>> {
+    hexput_script::code_unregister(payload, client, cache)
+}
+
+/// Register `count` distinct Scripts for `client` into `cache`, returning their handles in order.
+fn register_many(
+    count: usize,
+    client: hexput_shared::ids::ClientId,
+    cache: &Arc<AstCache>,
+) -> Vec<hexput_shared::ids::ScriptHandle> {
+    (0..count)
+        .map(|n| {
+            handle_in(
+                &registered(
+                    &registration(&format!("return {n};"), None),
+                    client,
+                    cache,
+                    vec![],
+                    Settings::new(),
+                )
+                .unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_cache_stays_within_its_capacity_and_counts_each_eviction() {
+    let cache = Arc::new(AstCache::with_capacity(2));
+    register_many(5, client(1), &cache);
+    assert!(cache.entry_count() <= 2, "{}", cache.entry_count());
+    assert_eq!(cache.entry_count() + cache.evictions(), 5);
+}
+
+#[test]
+fn an_evicted_handle_is_unknown_to_a_cached_run_and_the_kept_one_still_runs() {
+    let cache = Arc::new(AstCache::with_capacity(1));
+    let handles = register_many(2, client(1), &cache);
+    let kept = cache.handles(client(1));
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let evicted = *handles
+        .iter()
+        .find(|h| !kept.contains(h))
+        .expect("one of them is gone");
+    let body = *cached(&cached_payload(evicted, vec![], None), client(1), &cache)
+        .expect_err("an evicted handle is refused");
+    assert_eq!(body.code, "protocol.unknown_script_handle");
+    let reply = cached(&cached_payload(kept[0], vec![], None), client(1), &cache).unwrap();
+    // Each Script returns its own registration index.
+    let index = handles.iter().position(|h| *h == kept[0]).unwrap();
+    assert_eq!(cached_value(&reply), int(index as i64));
+}
+
+#[test]
+fn a_removed_or_evicted_program_is_released_at_once() {
+    let cache = Arc::new(AstCache::with_capacity(1));
+    let first = handle_of_registration("return 1;", client(1), &cache);
+    let weak = Arc::downgrade(&cache.get(client(1), first).unwrap());
+    handle_of_registration("return 2;", client(1), &cache);
+    // Whichever of the two the cache kept (or whether it refused the newer one at admission), the
+    // first program is alive exactly when the cache still holds its handle.
+    let kept = cache.handles(client(1));
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        weak.upgrade().is_some(),
+        kept.contains(&first),
+        "an evicted program is released by the cache"
+    );
+}
+
+#[test]
+fn a_removed_handle_is_unknown_and_its_program_is_released_at_once() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let handle = handle_of_registration("return 1;", client(1), &cache);
+    let weak = Arc::downgrade(&cache.get(client(1), handle).unwrap());
+    let reply = unregister(&unregister_payload(handle), client(1), &cache).unwrap();
+    // Checked before anything else touches the cache: `entry_count` and `handles` run moka's
+    // maintenance themselves, which would hide a removal that left the program in its write log.
+    assert!(
+        weak.upgrade().is_none(),
+        "the cache keeps no reference to the program"
+    );
+    assert_eq!(reply, Value::Map(vec![]), "Result {{}}");
+    assert!(!cache.handles(client(1)).contains(&handle));
+    assert_eq!(cache.entry_count(), 0);
+    let body = *cached(&cached_payload(handle, vec![], None), client(1), &cache)
+        .expect_err("the handle is gone");
+    assert_eq!(body.code, "protocol.unknown_script_handle");
+}
+
+#[test]
+fn unregistering_twice_or_another_sessions_or_a_never_issued_handle_is_unknown() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let a = handle_of_registration("return 1;", client(1), &cache);
+    let b = handle_of_registration("return 2;", client(2), &cache);
+
+    // B cannot remove A's handle, and A's entry is untouched.
+    let body = *unregister(&unregister_payload(a), client(2), &cache)
+        .expect_err("a foreign handle is unknown here");
+    assert_eq!(body.code, "protocol.unknown_script_handle");
+    assert_eq!(cache.handles(client(1)), vec![a]);
+
+    unregister(&unregister_payload(a), client(1), &cache).unwrap();
+    let again = *unregister(&unregister_payload(a), client(1), &cache)
+        .expect_err("a second removal finds nothing");
+    assert_eq!(again.code, "protocol.unknown_script_handle");
+
+    let never: hexput_shared::ids::ScriptHandle = "00000000000000ff".parse().unwrap();
+    let never = *unregister(&unregister_payload(never), client(1), &cache)
+        .expect_err("a never-issued handle is unknown");
+    assert_eq!(never.code, "protocol.unknown_script_handle");
+    assert_eq!(cache.handles(client(2)), vec![b], "B's entry is untouched");
+}
+
+#[test]
+fn a_malformed_unregister_names_its_key_and_removes_nothing() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let handle = handle_of_registration("return 1;", client(1), &cache);
+    let text = handle.to_string();
+    let cases: Vec<(Value, &str)> = vec![
+        (Value::Nil, "handle"),
+        (map(vec![]), "handle"),
+        (map(vec![("handle", Value::Nil)]), "handle"),
+        (map(vec![("handle", Value::from(1))]), "handle"),
+        (map(vec![("handle", s("ABC"))]), "handle"),
+        (map(vec![("handle", s(&text)), ("x", Value::from(1))]), "x"),
+        (
+            Value::Map(vec![(s("handle"), s(&text)), (s("handle"), s(&text))]),
+            "handle",
+        ),
+        // A refused payload is refused before the handle is looked up.
+        (
+            map(vec![
+                ("handle", s("00000000000000ff")),
+                ("x", Value::from(1)),
+            ]),
+            "x",
+        ),
+    ];
+    for (payload, key) in cases {
+        let body = *unregister(&payload, client(1), &cache).expect_err("refused");
+        assert_eq!(body.code, "protocol.invalid_payload", "{payload:?}");
+        assert!(
+            body.message.contains(&format!("`{key}`")),
+            "{payload:?}: {}",
+            body.message
+        );
+    }
+    assert_eq!(cache.entry_count(), 1, "nothing was removed");
+    assert_eq!(cache.handles(client(1)), vec![handle]);
+}
+
+#[test]
+fn a_removal_is_not_an_eviction_and_a_teardown_is_not_one_either() {
+    let cache = Arc::new(AstCache::with_capacity(10));
+    let a = handle_of_registration("return 1;", client(1), &cache);
+    handle_of_registration("return 2;", client(1), &cache);
+    handle_of_registration("return 3;", client(2), &cache);
+    unregister(&unregister_payload(a), client(1), &cache).unwrap();
+    assert_eq!(cache.evictions(), 0, "an unregister is not an eviction");
+    cache.close(client(1));
+    assert_eq!(cache.evictions(), 0, "a teardown is not an eviction");
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn a_session_teardown_releases_its_entries_and_no_other_sessions() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let ours = register_many(2, client(1), &cache);
+    let theirs = handle_of_registration("return 3;", client(2), &cache);
+    let released: Vec<_> = ours
+        .iter()
+        .map(|handle| Arc::downgrade(&cache.get(client(1), *handle).unwrap()))
+        .collect();
+    cache.close(client(1));
+    // Before anything else runs moka's maintenance: the close itself released the programs.
+    assert!(
+        released.iter().all(|weak| weak.upgrade().is_none()),
+        "the cache keeps no reference to a released program"
+    );
+    assert!(cache.handles(client(1)).is_empty());
+    assert_eq!(cache.handles(client(2)), vec![theirs]);
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn a_registration_for_a_session_never_opened_or_already_ended_inserts_nothing() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    // Never opened.
+    let body = *register_unopened(
+        &registration("return 1;", None),
+        client(1),
+        &cache,
+        vec![],
+        Settings::new(),
+    )
+    .expect_err("an unopened Session refuses");
+    assert_eq!(body.code, "protocol.init_not_completed");
+    assert!(
+        body.message.contains("nothing was registered"),
+        "{}",
+        body.message
+    );
+    // Opened, then ended: a registration still in flight finds it closed.
+    cache.open(client(1));
+    cache.close(client(1));
+    let body = *register_unopened(
+        &registration("return 1;", None),
+        client(1),
+        &cache,
+        vec![],
+        Settings::new(),
+    )
+    .expect_err("an ended Session refuses");
+    assert_eq!(body.code, "protocol.init_not_completed");
+    assert_eq!(cache.entry_count(), 0);
+    assert_eq!(cache.evictions(), 0);
 }

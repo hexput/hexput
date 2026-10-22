@@ -14,8 +14,8 @@ use serde::Deserialize;
 use toml::Spanned;
 
 use crate::{
-    DEFAULT_SESSION_TTL, Location, LogFormat, LogLevel, Problem, SystemConfig, TcpTransport, Tls,
-    Transports, UdsTransport, WebSocketTransport,
+    DEFAULT_AST_CACHE_CAPACITY, DEFAULT_SESSION_TTL, Location, LogFormat, LogLevel, Problem,
+    SystemConfig, TcpTransport, Tls, Transports, UdsTransport, WebSocketTransport,
 };
 
 #[derive(Deserialize)]
@@ -24,6 +24,7 @@ struct RawFile {
     log_level: Option<Spanned<String>>,
     log_format: Option<Spanned<String>>,
     session_ttl_secs: Option<Spanned<i64>>,
+    ast_cache_capacity: Option<Spanned<i64>>,
     transport: Option<RawTransports>,
 }
 
@@ -87,6 +88,10 @@ impl Validator<'_> {
             None => DEFAULT_SESSION_TTL,
             Some(ttl) => self.session_ttl(&ttl)?,
         };
+        let ast_cache_capacity = match raw.ast_cache_capacity {
+            None => DEFAULT_AST_CACHE_CAPACITY,
+            Some(capacity) => self.ast_cache_capacity(&capacity)?,
+        };
         let transports = match raw.transport {
             None => return Err(Problem::NoTransport),
             Some(transports) => self.transports(transports)?,
@@ -96,6 +101,7 @@ impl Validator<'_> {
             log_level,
             log_format,
             session_ttl,
+            ast_cache_capacity,
         })
     }
 
@@ -144,6 +150,20 @@ impl Validator<'_> {
                 format!(
                     "expected a whole number of seconds, at least 1, got {}",
                     ttl.get_ref()
+                ),
+            )),
+        }
+    }
+
+    fn ast_cache_capacity(&self, capacity: &Spanned<i64>) -> Result<u64, Problem> {
+        match u64::try_from(*capacity.get_ref()) {
+            Ok(entries) if entries > 0 => Ok(entries),
+            _ => Err(self.invalid(
+                "ast_cache_capacity",
+                capacity,
+                format!(
+                    "expected a whole number of entries, at least 1, got {}",
+                    capacity.get_ref()
                 ),
             )),
         }

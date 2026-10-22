@@ -11,7 +11,8 @@
 //! connection alone, echoing its correlation id:
 //!
 //! * `Init` on an unattached connection — the payload is decoded; a valid one creates a Session
-//!   with this connection attached and is answered `Result { client_id }`, an invalid one is
+//!   with this connection attached, opens it in the [`AstCache`] so its registrations are
+//!   accepted (Story 4.3), and is answered `Result { client_id }`; an invalid one is
 //!   `protocol.invalid_payload` naming what was wrong, and no Session is created.
 //! * `Init` on an attached connection — `protocol.already_initialized`; its Session is untouched.
 //! * `ExecutionStart` — `protocol.init_not_completed` before init: nothing runs (FR-1). After
@@ -40,6 +41,15 @@
 //!   modifications? }` or the `Error` — or `protocol.unknown_script_handle` for a handle this
 //!   Session has no entry under. A failure is logged at `debug` as "a Cached Execution failed",
 //!   with its `code` and, when the payload names a well-formed one, its `handle`.
+//! * `CodeUnregister` — `protocol.init_not_completed` before init. After init (Story 4.3),
+//!   [`hexput_script::code_unregister`] removes the entry the payload's handle names under this
+//!   Session's Client ID from the [`AstCache`] at once, and the connection answers `Result {}`, or
+//!   `protocol.unknown_script_handle` for a handle this Session has no entry under, or
+//!   `protocol.invalid_payload` for a malformed payload, with nothing removed. Handled inline, so
+//!   the entry is gone before the reply is written. A Cached Execution dispatched before it —
+//!   sent earlier on this connection — fetched its program at dispatch and finishes. A failure
+//!   is logged at `debug` as "an unregister failed", with its `code` and, when the payload names
+//!   a well-formed one, its `handle`.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
@@ -66,9 +76,9 @@
 //! cores (AD-6, FR-16). A connection may have any number of executions in flight, and there is no
 //! per-connection serial queue: up to the size of Tokio's blocking pool (512 threads by default),
 //! none waits on another. Past it, executions queue Daemon-wide for a free thread; a cap on
-//! in-flight executions is deferred to Epic 3. Everything else — `Init`, `ConfigUpdate`, the
-//! gate's refusals, malformed-frame answers, routing a host call's reply — is handled inline, at
-//! once.
+//! in-flight executions is deferred to Epic 3. Everything else — `Init`, `ConfigUpdate`,
+//! `CodeUnregister`, the gate's refusals, malformed-frame answers, routing a host call's reply —
+//! is handled inline, at once.
 //!
 //! The loop races reading the next message, the next host call an execution submits, and the next
 //! finished execution, and is the only writer of the `Outbound` half, so no lock guards it. Each
@@ -300,20 +310,25 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                     }
                     Answer::CachedExecute(id, payload, client_id) => {
                         let (registrations, settings) = session_now(connection);
-                        // Exactly like a Direct Execution: its own task, carrying the request's
-                        // span, its calls naming this request as their execution.
-                        running.spawn(
-                            cached_execute(
-                                id,
+                        // Read before the payload moves, so an operator can tell which handle
+                        // failed.
+                        let handle = handle_of(&payload);
+                        // Called here, as the request is dispatched: the handle's program is
+                        // fetched now, so a `CodeUnregister` this loop serves next cannot take it
+                        // from this run (Story 4.3).
+                        let run = span.in_scope(|| {
+                            hexput_script::cached_execution(
                                 payload,
                                 client_id,
-                                Arc::clone(connection.cache),
+                                connection.cache,
                                 registrations,
                                 settings,
                                 caller.for_execution(id),
                             )
-                            .instrument(span),
-                        );
+                        });
+                        // Exactly like a Direct Execution: its own task, carrying the request's
+                        // span, its calls naming this request as their execution.
+                        running.spawn(cached_execute(id, handle, run).instrument(span));
                         continue;
                     }
                     Answer::Register(id, payload, client_id) => {
@@ -514,7 +529,8 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
         MessageType::ExecutionStart
         | MessageType::ConfigUpdate
         | MessageType::CodeRegister
-        | MessageType::CachedExecutionStart => {}
+        | MessageType::CachedExecutionStart
+        | MessageType::CodeUnregister => {}
         other => {
             // A stray reply's id is the Daemon's call id, not a Backend request id: echoing it
             // would fail whatever Backend request shares the number. Nil is allowed on `Error`.
@@ -543,10 +559,13 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
         ));
     };
 
-    // Past the gate: a `ConfigUpdate`, answered inline, a registration, a Cached Execution or a
-    // Direct Execution.
+    // Past the gate: a `ConfigUpdate` or a `CodeUnregister`, answered inline, a registration, a
+    // Cached Execution or a Direct Execution.
     match request.message_type {
         MessageType::ConfigUpdate => Answer::Reply(config_update(&request, connection)),
+        MessageType::CodeUnregister => {
+            Answer::Reply(code_unregister(&request, client_id, connection))
+        }
         MessageType::CodeRegister => Answer::Register(request.id, request.payload, client_id),
         MessageType::CachedExecutionStart => {
             Answer::CachedExecute(request.id, request.payload, client_id)
@@ -606,6 +625,35 @@ fn config_update(request: &Envelope<Value>, connection: &Connection<'_>) -> Enve
     }
 }
 
+/// Serve `CodeUnregister` (Story 4.3): remove this Session's AST Cache entry at once, answering
+/// `Result {}`. Inline and synchronous — no parse and no Script, only the cache's own short work —
+/// so the entry is gone before the reply is written, and a `CachedExecutionStart` this connection
+/// sends after it finds the handle unknown. A run that already fetched the program finishes.
+fn code_unregister(
+    request: &Envelope<Value>,
+    client_id: ClientId,
+    connection: &Connection<'_>,
+) -> Envelope<Value> {
+    match hexput_script::code_unregister(&request.payload, client_id, connection.cache) {
+        Ok(payload) => Envelope {
+            id: request.id,
+            message_type: MessageType::Result,
+            payload,
+        },
+        Err(body) => {
+            // Like a Cached Execution's failure: the handle when the payload names a well-formed
+            // one, so an operator can tell which entry the Backend expected.
+            match handle_of(&request.payload) {
+                Some(handle) => {
+                    tracing::debug!(code = %body.code, handle = %handle, "an unregister failed");
+                }
+                None => tracing::debug!(code = %body.code, "an unregister failed"),
+            }
+            error_response(request.id, &body)
+        }
+    }
+}
+
 /// Run one Direct Execution to its reply. The Script's own work runs on the blocking pool; this
 /// task only waits, including for its host calls' replies.
 async fn execute(
@@ -629,29 +677,15 @@ async fn execute(
 }
 
 /// Run one Cached Execution to its reply (Story 4.2). Like [`execute`], this task only waits: the
-/// lookup and the Script's own work run on the blocking pool.
+/// Script's own work runs on the blocking pool. `run` is [`hexput_script::cached_execution`]'s
+/// future, made as the request was dispatched; `handle` is the well-formed handle the payload
+/// names, if any — only that is logged; a malformed one is the `invalid_payload` the reply names.
 async fn cached_execute(
     id: Option<CorrelationId>,
-    payload: Value,
-    client_id: ClientId,
-    cache: Arc<AstCache>,
-    registrations: Vec<Registration>,
-    settings: Settings,
-    caller: Caller,
+    handle: Option<ScriptHandle>,
+    run: impl Future<Output = Result<Value, Box<ErrorBody>>>,
 ) -> Envelope<Value> {
-    // Read before the payload moves, so an operator can tell which handle failed. Only a
-    // well-formed handle is logged; a malformed one is the `invalid_payload` the reply names.
-    let handle = handle_of(&payload);
-    match hexput_script::cached_execution(
-        payload,
-        client_id,
-        cache,
-        registrations,
-        settings,
-        caller,
-    )
-    .await
-    {
+    match run.await {
         Ok(payload) => Envelope {
             id,
             message_type: MessageType::Result,
@@ -742,6 +776,8 @@ fn init(request: &Envelope<Value>, connection: &Connection<'_>) -> Answer {
         }
     };
     let client_id = connection.sessions.create(init, connection.id);
+    // The cache accepts this Session's registrations from now until its teardown closes it.
+    connection.cache.open(client_id);
     Answer::Initialized(
         client_id,
         Envelope {

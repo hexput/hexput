@@ -20,5 +20,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Only for the in-crate test of the Daemon's private registry wiring (Story 4.3); the graph check
+# governs normal dependencies alone.
+[dev-dependencies]
+rmpv = { workspace = true }
+
 [lints]
 workspace = true

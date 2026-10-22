@@ -757,3 +757,91 @@ fn an_update_is_seen_by_every_attached_connection() {
     sessions.detach(id, first);
     assert!(sessions.is_empty());
 }
+
+// --- Story 4.3: the teardown hook ---
+
+/// Records every Client ID the teardown hook is called with, in order.
+type Torn = std::sync::Arc<std::sync::Mutex<Vec<ClientId>>>;
+
+/// A registry whose teardown hook records the Client IDs it is called with.
+fn recording(torn: &Torn) -> Sessions {
+    let torn = std::sync::Arc::clone(torn);
+    Sessions::new().with_teardown(move |id| torn.lock().unwrap().push(id))
+}
+
+#[test]
+fn the_hook_is_called_once_with_the_client_id_when_the_last_connection_detaches() {
+    let torn = Torn::default();
+    let sessions = recording(&torn);
+    let (id, first) = create(&sessions, valid(&[]));
+    let second = sessions.connect();
+    assert!(sessions.attach(id, second));
+
+    sessions.detach(id, first);
+    assert!(
+        torn.lock().unwrap().is_empty(),
+        "not while another connection is still attached"
+    );
+    assert!(sessions.contains(id));
+
+    sessions.detach(id, second);
+    assert_eq!(*torn.lock().unwrap(), vec![id]);
+    assert!(!sessions.contains(id));
+}
+
+#[test]
+fn the_hook_runs_after_the_session_is_gone_and_outside_any_lock() {
+    use std::sync::{Mutex, OnceLock, Weak};
+
+    // The hook reads the registry it is part of, so it would deadlock if the registry's locks were
+    // still held, and it would see the Session if the Session were still there.
+    let slot: std::sync::Arc<OnceLock<Weak<Sessions>>> = std::sync::Arc::default();
+    let seen: std::sync::Arc<Mutex<Vec<(ClientId, bool, usize)>>> = std::sync::Arc::default();
+    let hook_slot = std::sync::Arc::clone(&slot);
+    let hook_seen = std::sync::Arc::clone(&seen);
+    let sessions = std::sync::Arc::new(Sessions::new().with_teardown(move |id| {
+        let registry = hook_slot
+            .get()
+            .unwrap()
+            .upgrade()
+            .expect("the registry is alive");
+        hook_seen
+            .lock()
+            .unwrap()
+            .push((id, registry.contains(id), registry.len()));
+    }));
+    slot.set(std::sync::Arc::downgrade(&sessions)).unwrap();
+
+    let (id, connection) = create(&sessions, valid(&[("getOrder", true)]));
+    sessions.detach(id, connection);
+    assert_eq!(*seen.lock().unwrap(), vec![(id, false, 0)]);
+}
+
+#[test]
+fn a_registry_without_a_hook_tears_down_quietly() {
+    let sessions = Sessions::new();
+    let (id, connection) = create(&sessions, valid(&[]));
+    sessions.detach(id, connection);
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn the_hook_is_called_for_each_session_that_ends_and_only_those() {
+    let torn = Torn::default();
+    let sessions = recording(&torn);
+    let (a, first) = create(&sessions, valid(&[]));
+    let (b, second) = create(&sessions, valid(&[]));
+    sessions.detach(a, first);
+    assert_eq!(*torn.lock().unwrap(), vec![a]);
+    sessions.detach(b, second);
+    assert_eq!(*torn.lock().unwrap(), vec![a, b]);
+}
+
+#[test]
+fn a_detach_of_an_unknown_session_does_not_call_the_hook() {
+    let torn = Torn::default();
+    let sessions = recording(&torn);
+    let connection = sessions.connect();
+    sessions.detach(ClientId::from_bytes([9; 16]), connection);
+    assert!(torn.lock().unwrap().is_empty());
+}

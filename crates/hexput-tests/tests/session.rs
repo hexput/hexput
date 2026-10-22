@@ -1226,3 +1226,112 @@ fn reconnect_refusals_never_echo_the_presented_values() {
         assert!(!message.contains(&id.to_string()), "{message}");
     }
 }
+
+// --- Story 5.7: several Connections attached to one Session ---
+
+/// Three Connections on one Session: the creator, then two that reconnect with the issued secret.
+fn three_attached(sessions: &Sessions) -> (ClientId, [ConnectionId; 3]) {
+    let creator = sessions.connect();
+    let (id, secret) = sessions.create(valid(&[("getUser", true), ("ask", false)]), creator);
+    let second = sessions.connect();
+    assert!(sessions.reconnect(id, &secret, second));
+    let third = sessions.connect();
+    assert!(sessions.reconnect(id, &secret, third));
+    (id, [creator, second, third])
+}
+
+#[test]
+fn three_connections_on_one_session_count_up_and_down_in_any_order() {
+    let sessions = Sessions::new();
+    let (id, [creator, second, third]) = three_attached(&sessions);
+    assert_eq!(sessions.attached(id), Some(3));
+    assert_eq!(sessions.len(), 1, "three Connections are one Session");
+
+    // Detaching the middle one leaves the other two.
+    sessions.detach(id, second);
+    assert_eq!(sessions.attached(id), Some(2));
+    assert!(sessions.contains(id));
+
+    // Detaching the creator, which created the Session, leaves the reconnected one.
+    sessions.detach(id, creator);
+    assert_eq!(sessions.attached(id), Some(1));
+    assert!(sessions.contains(id));
+
+    sessions.detach(id, third);
+    assert!(!sessions.contains(id));
+    assert_eq!(sessions.attached(id), None);
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_session_stays_live_until_its_last_connection_leaves_in_every_order() {
+    // Each permutation of detaching three Connections: the Session survives every detach but the last.
+    let orders = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    for order in orders {
+        let sessions = Sessions::new();
+        let (id, connections) = three_attached(&sessions);
+        for (step, index) in order.iter().enumerate() {
+            sessions.detach(id, connections[*index]);
+            let remaining = 3 - step - 1;
+            if remaining == 0 {
+                assert!(
+                    !sessions.contains(id),
+                    "order {order:?}: last detach tears down"
+                );
+            } else {
+                assert!(
+                    sessions.contains(id),
+                    "order {order:?}: Session outlives detach {step}"
+                );
+                assert_eq!(sessions.attached(id), Some(remaining));
+            }
+        }
+        assert!(sessions.is_empty());
+    }
+}
+
+#[test]
+fn the_state_every_connection_reads_is_the_sessions_and_outlives_its_creator() {
+    let sessions = Sessions::new();
+    let (id, [creator, second, _third]) = three_attached(&sessions);
+    // `for_execution` takes the Client ID alone, so no Connection can hold a view of its own: what
+    // one changes, every other reads. The creator leaving takes nothing of the Session's with it,
+    // and an update made after it left is what the remaining Connection reads.
+    sessions.detach(id, creator);
+    assert!(sessions.update_config(id, updated(rpc_calls(0))));
+    sessions.detach(id, second);
+
+    let (registered, settings) = sessions.for_execution(id).expect("the Session is live");
+    assert_eq!(
+        registered
+            .iter()
+            .map(|r| (r.name().to_owned(), r.blanket()))
+            .collect::<Vec<_>>(),
+        [("getUser".to_owned(), true), ("ask".to_owned(), false)],
+        "the registrations made at `Init` serve the reconnected Connection"
+    );
+    let mut expected = Settings::new();
+    expected.set(Setting::RpcCalls, 0).unwrap();
+    assert_eq!(settings, expected, "the update made after the creator left");
+}
+
+#[test]
+fn a_connection_of_another_session_never_attaches_here() {
+    let sessions = Sessions::new();
+    let (id, _connections) = three_attached(&sessions);
+    let (other, other_secret) = {
+        let connection = sessions.connect();
+        sessions.create(valid(&[]), connection)
+    };
+    let stranger = sessions.connect();
+    assert!(!sessions.reconnect(id, &other_secret, stranger));
+    assert_eq!(sessions.attached(id), Some(3));
+    assert_eq!(sessions.attached(other), Some(1));
+}

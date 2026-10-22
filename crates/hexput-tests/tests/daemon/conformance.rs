@@ -7,8 +7,11 @@
 //! `fn(&mut dyn Client, &mut Transcript)` that drives one fresh connection to a real Daemon
 //! (`run_with`, end to end) and asserts every reply the row names: `message_type`, the correlation
 //! id and the payload fields, plus `code` and `span` for an `Error` where the row names one. A case
-//! never opens a connection; the runner hands it a fresh one, and every case except `uninitialized`
-//! begins with the suite's one `Init` (`begin`).
+//! never opens its first connection; the runner hands it a fresh one, and every case except
+//! `uninitialized` begins with the suite's one `Init` (`begin`). A case that needs more Connections
+//! on the same Session opens them through `open` (Story 5.7: `reconnect`, `several_connections`);
+//! each is a fresh connection of the same transport, which the case leaves quiet (`quiet`) and drops
+//! when it returns.
 //!
 //! A **transport** is one way of reaching the Daemon. Cases see only `Client`, so none can branch on
 //! a transport, and none can skip by one (`no_case_names_a_transport` pins that). Every envelope a
@@ -178,6 +181,23 @@ pub(super) mod harness {
                 assert!(
                     started.elapsed() < Duration::from_secs(10) && !self.thread.is_finished(),
                     "never logged `{needle}`; log:\n{text}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// The log, once `needle` appears in it at least `count` times; panics if the Daemon stops
+        /// first.
+        pub fn log_count(&self, needle: &str, count: usize) -> String {
+            let started = Instant::now();
+            loop {
+                let text = self.log.text();
+                if text.matches(needle).count() >= count {
+                    return text;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(10) && !self.thread.is_finished(),
+                    "never logged `{needle}` {count} times; log:\n{text}"
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -750,7 +770,7 @@ fn assert_lower_hex(text: &str, length: usize, what: &str) {
 
 /// One case: it drives a fresh connection and asserts every reply it names.
 /// Opens a further connection to the running Daemon, as the case's transport would. Only the
-/// `reconnect` case uses it; every other case ignores it.
+/// `reconnect` and `several_connections` cases use it; every other case ignores it.
 type Open<'a> = &'a dyn Fn() -> Box<dyn Client>;
 
 type Case = fn(&mut dyn Client, &mut Transcript, Open<'_>);
@@ -972,6 +992,7 @@ const CASES: &[(&str, Case)] = &[
     ("uninitialized", uninitialized),
     ("init_twice", init_twice),
     ("reconnect", reconnect),
+    ("several_connections", several_connections),
     ("direct", direct),
     ("script_error", script_error),
     ("host_call", host_call),
@@ -1281,6 +1302,136 @@ fn reconnect(client: &mut dyn Client, t: &mut Transcript, open: Open<'_>) {
     quiet(other, t);
 }
 
+/// Story 5.7: two Connections on one Session at once, on this transport. A and B send the same
+/// request id 2, each calling `double`, and each receives its own `Call` and its own `Result`, B
+/// answering first. B's `ConfigUpdate` refuses A's next host call. A's registered Script runs on
+/// B, B unregisters it, and it is unknown on A afterwards. Nothing reaches the other Connection.
+fn several_connections(client: &mut dyn Client, t: &mut Transcript, open: Open<'_>) {
+    let payload = begin(client, t);
+    let client_id = text_of(&payload, "client_id").to_owned();
+    let secret = text_of(&payload, "reconnect_secret").to_owned();
+
+    let mut other = open();
+    let other = other.as_mut();
+    t.send(
+        other,
+        &Envelope::new(
+            CorrelationId(1),
+            MessageType::Reconnect,
+            map(vec![
+                ("client_id", Value::from(client_id.as_str())),
+                ("reconnect_secret", Value::from(secret.as_str())),
+            ]),
+        ),
+    );
+    assert_keys(&expect_result(other, t, 1), &["client_id"]);
+
+    // Both executions are in flight before either Connection is read.
+    t.send(client, &run_request(2, "return double(3);"));
+    t.send(other, &run_request(2, "return double(5);"));
+    let from_a = expect_request(client, t, MessageType::Call);
+    let from_b = expect_request(other, t, MessageType::Call);
+    assert_eq!((from_a.execution, from_b.execution), (2, 2));
+    assert_eq!(
+        (from_a.name.as_str(), from_b.name.as_str()),
+        ("double", "double")
+    );
+    assert_eq!(from_a.id, from_b.id, "per-Connection call ids collide");
+    assert_eq!(from_a.arguments, vec![Value::from(3u64)]);
+    assert_eq!(from_b.arguments, vec![Value::from(5u64)]);
+    answer(other, t, from_b.id, Value::from(10u64));
+    assert_eq!(
+        expect_result(other, t, 2),
+        map(vec![("value", Value::from(10u64))])
+    );
+    answer(client, t, from_a.id, Value::from(6u64));
+    assert_eq!(
+        expect_result(client, t, 2),
+        map(vec![("value", Value::from(6u64))])
+    );
+
+    // B's Config is in force on A's next request: A's host call is refused by the budget.
+    t.send(
+        other,
+        &Envelope::new(
+            CorrelationId(3),
+            MessageType::ConfigUpdate,
+            map(vec![("config", budget("rpc_calls", 0))]),
+        ),
+    );
+    assert_eq!(expect_result(other, t, 3), map(vec![]));
+    t.send(client, &run_request(3, "return double(1);"));
+    expect_error(client, t, 3, "budget.rpc_calls_exceeded");
+
+    // A registers a Script; B runs it, then unregisters it; A finds it unknown.
+    t.send(
+        client,
+        &Envelope::new(
+            CorrelationId(4),
+            MessageType::CodeRegister,
+            map(vec![
+                ("source", Value::from("return n * 2;")),
+                ("variables", Value::Array(vec![Value::from("n")])),
+            ]),
+        ),
+    );
+    let registered = expect_result(client, t, 4);
+    let handle = text_of(&registered, "handle").to_owned();
+    t.send(
+        client,
+        &Envelope::new(
+            CorrelationId(5),
+            MessageType::CachedExecutionStart,
+            map(vec![
+                ("handle", Value::from(handle.as_str())),
+                ("variables", map(vec![("n", Value::from(21u64))])),
+            ]),
+        ),
+    );
+    assert_eq!(
+        expect_result(client, t, 5),
+        map(vec![("value", Value::from(42u64))])
+    );
+    t.send(
+        other,
+        &Envelope::new(
+            CorrelationId(4),
+            MessageType::CachedExecutionStart,
+            map(vec![
+                ("handle", Value::from(handle.as_str())),
+                ("variables", map(vec![("n", Value::from(1u64))])),
+            ]),
+        ),
+    );
+    assert_eq!(
+        expect_result(other, t, 4),
+        map(vec![("value", Value::from(2u64))])
+    );
+    t.send(
+        other,
+        &Envelope::new(
+            CorrelationId(5),
+            MessageType::CodeUnregister,
+            map(vec![("handle", Value::from(handle.as_str()))]),
+        ),
+    );
+    assert_eq!(expect_result(other, t, 5), map(vec![]));
+    t.send(
+        client,
+        &Envelope::new(
+            CorrelationId(6),
+            MessageType::CachedExecutionStart,
+            map(vec![
+                ("handle", Value::from(handle.as_str())),
+                ("variables", map(vec![("n", Value::from(21u64))])),
+            ]),
+        ),
+    );
+    expect_error(client, t, 6, "protocol.unknown_script_handle");
+
+    quiet(other, t);
+}
+
 fn direct(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(
@@ -1540,3 +1691,119 @@ fn assert_keys(payload: &Value, expected: &[&str]) {
 }
 
 // END CASES ----------------------------------------------------------------------------------------
+
+/// Story 5.7: one Session spans every transport this platform serves at once. One Daemon's System
+/// Config holds every served transport's section; A initializes on the first, and each other
+/// transport's Connection reconnects to that Session. Interleaved executions with host calls on
+/// each return only to their issuer; a `ConfigUpdate` on the last is in force on the first; and
+/// closing all but the first leaves it serving, after which the Daemon stops with exit `0`.
+#[test]
+fn one_session_spans_every_transport_this_platform_serves() {
+    let sandbox = Sandbox::new();
+    let transports = served();
+    assert!(
+        transports.len() >= 2,
+        "a Session spanning transports needs at least two served ones"
+    );
+    // `debug`, so the test can wait for each Connection's detach before relying on it.
+    let config: String = std::iter::once("log_level = \"debug\"\n".to_owned())
+        .chain(
+            transports
+                .iter()
+                .map(|transport| transport.section(&sandbox)),
+        )
+        .collect();
+    let daemon = Daemon::start(&sandbox, &config);
+    // Recorded only because the shared helpers write through a transcript: no transcript is
+    // compared here, as this one test spans transports instead of running once per transport.
+    let mut t = Transcript {
+        case: "one_session_spans_every_transport_this_platform_serves",
+        entries: Vec::new(),
+    };
+
+    // The first transport initializes; every other one reconnects with the issued credential.
+    let mut first = transports[0].connect(&daemon);
+    let payload = begin(first.as_mut(), &mut t);
+    let client_id = text_of(&payload, "client_id").to_owned();
+    let secret = text_of(&payload, "reconnect_secret").to_owned();
+    let mut clients: Vec<Box<dyn Client>> = vec![first];
+    for transport in &transports[1..] {
+        let mut joined = transport.connect(&daemon);
+        t.send(
+            joined.as_mut(),
+            &Envelope::new(
+                CorrelationId(1),
+                MessageType::Reconnect,
+                map(vec![
+                    ("client_id", Value::from(client_id.as_str())),
+                    ("reconnect_secret", Value::from(secret.as_str())),
+                ]),
+            ),
+        );
+        assert_keys(&expect_result(joined.as_mut(), &mut t, 1), &["client_id"]);
+        clients.push(joined);
+    }
+
+    // Every Connection starts an execution under the same request id 2, calling `double` with its
+    // own argument. Each Call reaches only its issuer, and each Result returns only to it.
+    for (index, client) in clients.iter_mut().enumerate() {
+        let source = format!("return double({});", index + 1);
+        t.send(client.as_mut(), &run_request(2, &source));
+    }
+    let mut calls = Vec::new();
+    for client in clients.iter_mut() {
+        calls.push(expect_request(client.as_mut(), &mut t, MessageType::Call));
+    }
+    for (index, call) in calls.iter().enumerate() {
+        assert_eq!(call.name, "double");
+        assert_eq!(call.id, calls[0].id, "per-Connection call ids collide");
+        assert_eq!(call.execution, 2, "the execution that made the call");
+        assert_eq!(call.arguments, vec![Value::from((index + 1) as u64)]);
+    }
+    // Answered in reverse order, so no Connection is served in its start order.
+    for index in (0..clients.len()).rev() {
+        let value = Value::from(((index + 1) * 10) as u64);
+        answer(clients[index].as_mut(), &mut t, calls[index].id, value);
+    }
+    for (index, client) in clients.iter_mut().enumerate() {
+        assert_eq!(
+            expect_result(client.as_mut(), &mut t, 2),
+            map(vec![("value", Value::from(((index + 1) * 10) as u64))]),
+            "the Result on Connection {index}"
+        );
+    }
+
+    // A ConfigUpdate on the last Connection is in force on the first one's next host call.
+    let last = clients.len() - 1;
+    t.send(
+        clients[last].as_mut(),
+        &Envelope::new(
+            CorrelationId(3),
+            MessageType::ConfigUpdate,
+            map(vec![("config", budget("rpc_calls", 0))]),
+        ),
+    );
+    assert_eq!(
+        expect_result(clients[last].as_mut(), &mut t, 3),
+        map(vec![])
+    );
+    t.send(clients[0].as_mut(), &run_request(3, "return double(1);"));
+    expect_error(clients[0].as_mut(), &mut t, 3, "budget.rpc_calls_exceeded");
+
+    // Nothing stray reached any Connection; then closing all but the first, and waiting until the
+    // Daemon has detached each, leaves the Session serving on it.
+    for client in clients.iter_mut() {
+        quiet(client.as_mut(), &mut t);
+    }
+    let left = clients.len() - 1;
+    clients.truncate(1);
+    daemon.log_count("connection detached from its Session", left);
+    t.send(clients[0].as_mut(), &run_request(4, "return 4;"));
+    assert_eq!(
+        expect_result(clients[0].as_mut(), &mut t, 4),
+        map(vec![("value", Value::from(4u64))])
+    );
+
+    drop(clients);
+    daemon.stop().exit(0);
+}

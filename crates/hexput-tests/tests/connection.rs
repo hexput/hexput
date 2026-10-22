@@ -5837,3 +5837,486 @@ fn a_reconnect_bypasses_the_init_gate_and_is_answered_as_a_denial_not_as_uniniti
     assert_eq!(sent[0].id, Some(CorrelationId(1)));
     assert_eq!(code_of(&sent[0]), "protocol.reconnect_denied");
 }
+
+// --- Story 5.7: several Connections attached to one Session ---
+
+/// A Connection reconnected to the Session `client_id` with `secret`, its `Reconnect` answered
+/// with the Client ID alone: the Backend, and its running `serve`.
+async fn attach_again(
+    registry: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    client_id: ClientId,
+    secret: &str,
+) -> (Backend, tokio::task::JoinHandle<()>) {
+    let (mut backend, serving) = open_bare(registry, cache);
+    backend.send(reconnect(1, &client_id.to_string(), secret));
+    resumed(&mut backend, 1, client_id).await;
+    (backend, serving)
+}
+
+/// The id of the sentinel request [`assert_silent`] sends. No Story 5.7 test uses it otherwise.
+const SILENT_SENTINEL: u64 = 1_000;
+
+/// Asserts nothing has been written to `backend` that the test has not read (a stray envelope on
+/// another Connection is a failure of the per-Connection rule): a sentinel execution's `Result` must
+/// be the very next envelope, so a write that arrives late still lands ahead of it and fails here,
+/// as does a Connection that has died.
+async fn assert_silent(backend: &mut Backend, who: &str) {
+    backend.send(execution(SILENT_SENTINEL, "return 0;"));
+    let next = backend.next().await;
+    assert_eq!(
+        (next.id, next.message_type),
+        (Some(CorrelationId(SILENT_SENTINEL)), MessageType::Result),
+        "{who} received a stray envelope before its sentinel's reply: {next:?}"
+    );
+    assert_eq!(value_of(&next), Value::from(0));
+}
+
+/// `{value: n}` as a `Result` payload, for answering a host call.
+fn answer(n: i64) -> Value {
+    Value::Map(vec![(string("value"), Value::from(n))])
+}
+
+#[test]
+fn two_connections_on_one_session_are_both_attached_and_serve_at_once() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_configured(Value::Map(vec![]), &[])).await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+        assert_eq!(registry.attached(client_id), Some(2));
+
+        // Both executions are in flight before either Connection is read.
+        a.send(execution(2, "return 1 + 1;"));
+        b.send(execution(2, "return 3 + 3;"));
+        let from_a = a.next().await;
+        let from_b = b.next().await;
+        assert_eq!(from_a.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&from_a), Value::from(2));
+        assert_eq!(from_b.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&from_b), Value::from(6));
+        assert_silent(&mut a, "A").await;
+        assert_silent(&mut b, "B").await;
+
+        a.close();
+        finished(serving_a).await;
+        assert_eq!(registry.attached(client_id), Some(1));
+        b.close();
+        finished(serving_b).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn the_same_request_id_on_two_connections_is_two_requests_each_answered_on_its_own() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("double", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+
+        // Both executions use request id 2 and are pending at once.
+        a.send(execution(2, "return double(3);"));
+        b.send(execution(2, "return double(5);"));
+        let (a_call, a_name, a_arguments) = a.call().await;
+        let (b_call, b_name, b_arguments) = b.call().await;
+        assert_eq!(a_name, "double");
+        assert_eq!(b_name, "double");
+        assert_eq!(
+            a_call, b_call,
+            "each Connection has its own call id space, so the ids collide"
+        );
+        assert_eq!(a_arguments, [Value::from(3)], "A's own argument");
+        assert_eq!(b_arguments, [Value::from(5)], "B's own argument");
+
+        // B answers first; A's execution is still waiting on its own Call.
+        b.reply(b_call, MessageType::Result, answer(10));
+        let reply_b = b.next().await;
+        assert_eq!(reply_b.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&reply_b), Value::from(10));
+        assert_silent(&mut a, "A").await;
+
+        a.reply(a_call, MessageType::Result, answer(6));
+        let reply_a = a.next().await;
+        assert_eq!(reply_a.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&reply_a), Value::from(6));
+        assert_silent(&mut a, "A").await;
+        assert_silent(&mut b, "B").await;
+
+        a.close();
+        finished(serving_a).await;
+        b.close();
+        finished(serving_b).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_reply_naming_another_connections_pending_call_is_unexpected_and_leaves_that_call_pending() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("double", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+
+        a.send(execution(2, "return double(3);"));
+        let (a_call, _, _) = a.call().await;
+
+        // B has no call of its own pending under that id: it answers A's call id anyway.
+        b.reply(a_call, MessageType::Result, answer(99));
+        let stray = b.next().await;
+        assert_eq!(
+            stray.id, None,
+            "refused with a nil id, as any stray reply is"
+        );
+        assert_eq!(code_of(&stray), "protocol.unexpected_message");
+        assert_silent(&mut a, "A").await;
+
+        // Not fatal: B keeps serving its own execution.
+        b.send(execution(3, "return 4;"));
+        let own = b.next().await;
+        assert_eq!(own.id, Some(CorrelationId(3)));
+        assert_eq!(value_of(&own), Value::from(4));
+
+        // A's call was never completed by B's stray reply: A's own answer completes it.
+        a.reply(a_call, MessageType::Result, answer(6));
+        let reply_a = a.next().await;
+        assert_eq!(reply_a.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&reply_a), Value::from(6));
+        assert_silent(&mut b, "B").await;
+
+        a.close();
+        finished(serving_a).await;
+        b.close();
+        finished(serving_b).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_per_call_question_reaches_only_the_connection_that_issued_the_execution() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("ask", false)]),
+        )
+        .await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+
+        a.send(execution(2, "return ask(4);"));
+        let (question, name, arguments) = a.question().await;
+        assert_eq!(name, "ask");
+        assert_eq!(arguments, [Value::from(4)]);
+        assert_silent(&mut b, "B").await;
+
+        a.allow(question, Value::Boolean(true));
+        let (call, name, _) = a.call().await;
+        assert_eq!(name, "ask");
+        assert_silent(&mut b, "B").await;
+        a.reply(call, MessageType::Result, answer(9));
+        assert_eq!(value_of(&a.next().await), Value::from(9));
+        assert_silent(&mut b, "B").await;
+
+        a.close();
+        finished(serving_a).await;
+        b.close();
+        finished(serving_b).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_config_update_on_one_connection_is_in_force_on_the_others_next_request_with_no_message_on_it()
+{
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("getOrder", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+
+        b.send(config_update(2, budget_of("rpc_calls", 0)));
+        assert_updated(&b.next().await, 2);
+        assert_silent(&mut a, "A").await;
+
+        // A's next host call is refused by the budget B set: nothing is sent to A's Backend.
+        a.send(execution(2, "return getOrder(1);"));
+        refused_with(&mut a, 2, "budget.rpc_calls_exceeded").await;
+        assert_silent(&mut a, "A").await;
+        assert_silent(&mut b, "B").await;
+
+        a.close();
+        finished(serving_a).await;
+        b.close();
+        finished(serving_b).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_script_registered_on_one_connection_runs_on_another_until_unregistered_there() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_configured(Value::Map(vec![]), &[])).await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+
+        a.send(register(2, "return 7;"));
+        let handle = handle_of(&a.next().await).to_string();
+
+        b.send(cached_run(2, &handle, vec![]));
+        assert_eq!(value_of(&b.next().await), Value::from(7));
+
+        b.send(unregister_request(3, &handle));
+        let removed = b.next().await;
+        assert_eq!(removed.id, Some(CorrelationId(3)));
+        assert_eq!(removed.message_type, MessageType::Result);
+        assert_eq!(removed.payload, Value::Map(vec![]));
+        assert_silent(&mut a, "A").await;
+
+        a.send(cached_run(3, &handle, vec![]));
+        refused_with(&mut a, 3, "protocol.unknown_script_handle").await;
+        assert_silent(&mut b, "B").await;
+
+        a.close();
+        finished(serving_a).await;
+        b.close();
+        finished(serving_b).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_connection_closing_mid_flight_leaves_the_others_execution_to_complete() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("getOrder", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+
+        a.send(execution(2, "return getOrder(1) + 1;"));
+        let (call, _, _) = a.call().await;
+
+        // B leaves while A's execution waits on its Call.
+        b.close();
+        finished(serving_b).await;
+        assert!(registry.contains(client_id), "A keeps the Session live");
+        assert_eq!(registry.attached(client_id), Some(1));
+
+        a.reply(call, MessageType::Result, answer(1));
+        let reply = a.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&reply), Value::from(2));
+
+        // A's own close is the last detach, and it tears the Session down.
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_connection_sending_a_fatal_frame_mid_flight_leaves_the_others_execution_to_complete() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("getOrder", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+
+        a.send(execution(2, "return getOrder(1) + 1;"));
+        let (call, _, _) = a.call().await;
+
+        // B's fatal frame is answered on B alone, and B detaches.
+        b.send(malformed(None, ProtocolCode::FrameTooLarge));
+        let fatal = b.next().await;
+        assert_eq!(code_of(&fatal), "protocol.frame_too_large");
+        finished(serving_b).await;
+        assert_eq!(registry.attached(client_id), Some(1));
+        assert_silent(&mut a, "A").await;
+
+        a.reply(call, MessageType::Result, answer(1));
+        let reply = a.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&reply), Value::from(2));
+
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn three_connections_on_one_session_each_get_only_their_own_replies_and_closing_two_keeps_it() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("double", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+        let (mut c, serving_c) = attach_again(&registry, &cache, client_id, &secret).await;
+        assert_eq!(registry.attached(client_id), Some(3));
+
+        // The same request id 2 on all three, each calling with its own argument.
+        a.send(execution(2, "return double(1);"));
+        b.send(execution(2, "return double(2);"));
+        c.send(execution(2, "return double(3);"));
+        let (a_call, _, a_args) = a.call().await;
+        let (b_call, _, b_args) = b.call().await;
+        let (c_call, _, c_args) = c.call().await;
+        assert_eq!(
+            [a_call, b_call],
+            [c_call, c_call],
+            "per-Connection call ids collide"
+        );
+        assert_eq!(
+            [a_args, b_args, c_args],
+            [[Value::from(1)], [Value::from(2)], [Value::from(3)]]
+        );
+        c.reply(c_call, MessageType::Result, answer(6));
+        b.reply(b_call, MessageType::Result, answer(4));
+        a.reply(a_call, MessageType::Result, answer(2));
+        assert_eq!(value_of(&a.next().await), Value::from(2));
+        assert_eq!(value_of(&b.next().await), Value::from(4));
+        assert_eq!(value_of(&c.next().await), Value::from(6));
+        assert_silent(&mut a, "A").await;
+        assert_silent(&mut b, "B").await;
+        assert_silent(&mut c, "C").await;
+
+        // Closing all but one keeps the Session serving on the one left.
+        b.close();
+        finished(serving_b).await;
+        c.close();
+        finished(serving_c).await;
+        assert_eq!(registry.attached(client_id), Some(1));
+        a.send(execution(3, "return 4;"));
+        assert_eq!(value_of(&a.next().await), Value::from(4));
+
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_connection_closing_with_its_own_call_pending_fails_only_that_call() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("getOrder", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+
+        // Both executions wait on a Call under the same call id, one on each Connection.
+        a.send(execution(2, "return getOrder(1) + 1;"));
+        b.send(execution(2, "return getOrder(2) + 1;"));
+        let (a_call, _, _) = a.call().await;
+        let (b_call, _, _) = b.call().await;
+        assert_eq!(a_call, b_call, "per-Connection call ids collide");
+
+        // B leaves: its own pending call fails with `host.no_reply`, and only its own.
+        b.close();
+        refused_with(&mut b, 2, "host.no_reply").await;
+        finished(serving_b).await;
+        assert_eq!(registry.attached(client_id), Some(1));
+
+        a.reply(a_call, MessageType::Result, answer(1));
+        let reply = a.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&reply), Value::from(2));
+        assert_silent(&mut a, "A").await;
+
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_connection_whose_stream_is_lost_mid_flight_abandons_only_its_own_execution() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("getOrder", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = attach_again(&registry, &cache, client_id, &secret).await;
+
+        a.send(execution(2, "return getOrder(1) + 1;"));
+        b.send(execution(2, "return getOrder(2) + 1;"));
+        let (a_call, _, _) = a.call().await;
+        let (b_call, _, _) = b.call().await;
+        assert_eq!(a_call, b_call, "per-Connection call ids collide");
+
+        // B's stream is lost: its execution is abandoned, nothing more is written to it.
+        b.send(Received::Closed(Some(io::Error::from(
+            io::ErrorKind::ConnectionReset,
+        ))));
+        finished(serving_b).await;
+        assert!(
+            b.from_daemon.try_recv().is_err(),
+            "nothing is written to a lost stream"
+        );
+        assert_eq!(registry.attached(client_id), Some(1));
+
+        a.reply(a_call, MessageType::Result, answer(1));
+        let reply = a.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(value_of(&reply), Value::from(2));
+        assert_silent(&mut a, "A").await;
+
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}

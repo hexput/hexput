@@ -56,6 +56,19 @@
 //! Session's stored ones are resumed. The presented secret is never logged or echoed, and is
 //! dropped with the request after verification.
 //!
+//! # What Story 5.7 adds
+//!
+//! Nothing new in the registry: it states the multi-Connection contract the registry already
+//! holds. Any number of Connections may be attached to one Session at once — the first by
+//! `Init`, every further one by [`Sessions::reconnect`] — with no cap, whatever carried each of
+//! them. What the Session owns is shared by all of them and read afresh at dispatch: its Config
+//! (replaced by [`Sessions::update_config`] from any attached Connection), the registrations made
+//! at `Init` (there is no request that registers a function later) and, keyed by its Client ID,
+//! its AST Cache entries. What a Connection owns — its request ids, its replies, its host-call
+//! correlation — is never here, so nothing in this crate can deliver one Connection's reply to
+//! another, and no change made through one is announced to the others. [`Sessions::detach`]
+//! removes one Connection alone; the Session goes only with the last one, in any detach order.
+//!
 //! Nothing here is `async`, so no lock of this crate's can be held across an `.await`; nothing
 //! here writes to disk.
 //!

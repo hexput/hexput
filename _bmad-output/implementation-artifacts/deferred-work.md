@@ -362,3 +362,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-5-6-reconnect-without-resending-configuration.md`
   summary: `Sessions::attach` is still `pub` and attaches a Connection without verifying any credential, so a production crate could bypass `Sessions::reconnect`.
   evidence: Review finding (blind-hunter). Pre-existing since Story 2.4; Story 5.6 only reworded its doc ("the wire path is `reconnect`; this stays for tests"). No production crate calls it today (`hexput-connection` uses `create` and `reconnect` only). Settle by gating it (`#[doc(hidden)]`, a test-only feature, or moving the tests that need it onto `reconnect`), and pin the rule with a `RESTRICTED_NAMES` entry in `scripts/check-crate-graph.py`.
+
+- source_spec: `spec-5-7-run-several-connections-under-one-client-id.md`
+  summary: AGENTS.md's Build, Lint, Test section lists only debug-profile cargo commands, while the maintainer requires every build on this machine to use `--release` (disk is scarce).
+  evidence: Review finding (blind-hunter), medium. Only Story 5.7's spec records the rule, so the next story's agent following AGENTS.md builds in debug. Routed to defer because the fix edits an agent-context file. Settle with a machine-local note, or an AGENTS.md line saying local runs use the `--release` form while CI keeps its own profile.

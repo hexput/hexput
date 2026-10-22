@@ -135,6 +135,22 @@
 //! once, as does every call made after: no execution the connection is still waiting for can wait
 //! on a reply that cannot arrive.
 //!
+//! # Several Connections on one Session (Story 5.7)
+//!
+//! Any number of Connections may be attached to one Session at once, each served by its own
+//! [`serve`] and each owning, never sharing, its request ids, its replies and its one
+//! [`hexput_rpc::Calls`] table (id counter and pending calls). The same request id on two
+//! Connections is two independent requests. A `Call` or `Authorize` for an execution goes only to
+//! the Connection that started it, and only that Connection's reply completes it: a `Result` or
+//! `Error` on another Connection naming the same id is looked up in *that* Connection's table and,
+//! when it names nothing pending there, answered `protocol.unexpected_message` as above, leaving
+//! the other Connection's call pending. What the Session owns — its Config, its registrations and
+//! its AST Cache entries — is shared: a `ConfigUpdate`, `CodeRegister` or `CodeUnregister` on one
+//! Connection is in force for every later request on any of them, with no message to the others
+//! (no broadcast; a `ConfigUpdate`'s `Result {}` goes to the updater alone), and nothing orders
+//! requests across Connections (AD-6). One Connection leaving detaches it alone; the others'
+//! executions carry on.
+//!
 //! However the connection ends — the peer closing, a lost stream, a failed write, a fatal frame —
 //! [`serve`] detaches it from its Session, and detaching the last Connection tears the Session down
 //! — whether it attached by `Init` or by `Reconnect`. The detach is an explicit call on the one

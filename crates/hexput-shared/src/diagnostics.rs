@@ -158,6 +158,34 @@ impl Code {
     /// Two entries in an object literal have the same decoded key.
     pub const DUPLICATE_OBJECT_KEY: Self = Self::new("syntax.duplicate_object_key");
 
+    // --- plugin source `syntax` codes (Story 6.1) ---
+
+    /// Plugin source does not begin with its `plugin { }` metadata block (§9). Spanned on the
+    /// first token, or on end of input when there is none.
+    pub const PLUGIN_BLOCK_REQUIRED: Self = Self::new("syntax.plugin_block_required");
+    /// A second `plugin { }` block; a Plugin has exactly one. Spanned on the second `plugin`.
+    pub const DUPLICATE_PLUGIN_BLOCK: Self = Self::new("syntax.duplicate_plugin_block");
+    /// A key appears twice in the `plugin { }` block. Spanned on the second occurrence.
+    pub const DUPLICATE_METADATA_KEY: Self = Self::new("syntax.duplicate_metadata_key");
+    /// A `plugin { }` block value is not a scalar literal, or `name` is missing, not a string or
+    /// empty. Spanned on the value, or on the whole block when `name` is missing.
+    pub const INVALID_PLUGIN_METADATA: Self = Self::new("syntax.invalid_plugin_metadata");
+    /// An `@Event` or `@Global` annotation that does not directly precede the top-level `fn` or
+    /// `let` it may annotate. Spanned on `@Name`.
+    pub const MISPLACED_ANNOTATION: Self = Self::new("syntax.misplaced_annotation");
+    /// An unknown annotation, or an annotation argument that is unknown, repeated or has a value
+    /// outside what the annotation accepts. Spanned on the offending name or value.
+    pub const INVALID_ANNOTATION: Self = Self::new("syntax.invalid_annotation");
+    /// An `@Event` handler that does not take exactly one parameter. Spanned on its parameter
+    /// list, `(` through `)`.
+    pub const INVALID_HANDLER: Self = Self::new("syntax.invalid_handler");
+    /// A Plugin's top level holds something other than its block, a `let` or a `fn`. Spanned on
+    /// the statement's first token.
+    pub const INVALID_PLUGIN_STATEMENT: Self = Self::new("syntax.invalid_plugin_statement");
+    /// A Global Variable's initializer is not an expression over literals: it names a variable,
+    /// calls a function or holds a function. Spanned on the identifier, call or `fn` expression.
+    pub const INVALID_GLOBAL_INITIALIZER: Self = Self::new("syntax.invalid_global_initializer");
+
     // --- `lexical` codes (Story 1.2) ---
 
     /// A string literal ran to a raw newline or to end of input without its closing quote.
@@ -311,6 +339,15 @@ impl Code {
         Self::DUPLICATE_DECLARATION,
         Self::LOOP_CONTROL_OUTSIDE_LOOP,
         Self::DUPLICATE_OBJECT_KEY,
+        Self::PLUGIN_BLOCK_REQUIRED,
+        Self::DUPLICATE_PLUGIN_BLOCK,
+        Self::DUPLICATE_METADATA_KEY,
+        Self::INVALID_PLUGIN_METADATA,
+        Self::MISPLACED_ANNOTATION,
+        Self::INVALID_ANNOTATION,
+        Self::INVALID_HANDLER,
+        Self::INVALID_PLUGIN_STATEMENT,
+        Self::INVALID_GLOBAL_INITIALIZER,
         Self::UNTERMINATED_STRING,
         Self::UNTERMINATED_COMMENT,
         Self::UNKNOWN_CHARACTER,

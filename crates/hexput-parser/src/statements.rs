@@ -70,7 +70,7 @@ enum ConditionKind {
 }
 
 impl Parser<'_> {
-    pub(super) fn run(mut self) -> Result<Program, Diagnostic> {
+    pub(super) fn run(&mut self) -> Result<(), Diagnostic> {
         let mut frames = vec![Frame {
             open: None,
             statements: Vec::new(),
@@ -202,16 +202,21 @@ impl Parser<'_> {
                         start,
                         name,
                         equals,
-                    } => self.append(
-                        &mut frames,
-                        start,
-                        StatementKind::Let {
-                            keyword: start,
-                            name,
-                            equals,
-                            initializer: expression,
-                        },
-                    )?,
+                    } => {
+                        if self.plugin.is_some() && frames.len() == 1 {
+                            self.check_global_initializer(expression)?;
+                        }
+                        self.append(
+                            &mut frames,
+                            start,
+                            StatementKind::Let {
+                                keyword: start,
+                                name,
+                                equals,
+                                initializer: expression,
+                            },
+                        )?;
+                    }
                     AfterExpression::Return { keyword } => self.append(
                         &mut frames,
                         keyword,
@@ -341,7 +346,7 @@ impl Parser<'_> {
                                 return Err(self.expected("a statement, not an unmatched `}`"));
                             }
                             self.program.statements = frames.pop().unwrap().statements;
-                            return Ok(self.program);
+                            return Ok(());
                         }
                         let frame = frames.pop().unwrap();
                         let close = self.expect(
@@ -359,6 +364,14 @@ impl Parser<'_> {
                         continue;
                     }
                     tasks.push(Task::Statements);
+                    // Plugin source: the top level holds only annotated or plain `let`s and
+                    // `fn`s; an annotation anywhere deeper is misplaced.
+                    let plugin_top_level = self.plugin.is_some() && frames.len() == 1;
+                    if plugin_top_level {
+                        self.plugin_top_level_statement()?;
+                    } else if self.plugin.is_some() && self.peek() == Some(&TokenKind::At) {
+                        self.annotation(true)?;
+                    }
                     let start = self.span();
                     let in_loop = frames.last().unwrap().in_loop;
                     match self.peek() {
@@ -367,6 +380,9 @@ impl Parser<'_> {
                             let name = self.identifier()?;
                             Self::declare(&mut frames.last_mut().unwrap().names, &name)?;
                             let function = self.function_parameters(keyword)?;
+                            if plugin_top_level {
+                                self.record_function(frames[0].statements.len(), &name, &function)?;
+                            }
                             let names =
                                 function.parameters.iter().map(|p| p.name.clone()).collect();
                             tasks.push(Task::NamedFunction {
@@ -403,6 +419,9 @@ impl Parser<'_> {
                             self.bump();
                             let name = self.identifier()?;
                             Self::declare(&mut frames.last_mut().unwrap().names, &name)?;
+                            if plugin_top_level {
+                                self.record_global(frames[0].statements.len(), &name);
+                            }
                             let equals =
                                 self.expect(TokenKind::Assign, "`=` and an initializer")?;
                             Self::schedule_expression(
@@ -546,7 +565,8 @@ impl Parser<'_> {
         start: Span,
         kind: StatementKind,
     ) -> Result<(), Diagnostic> {
-        let statement = self.finish_statement(start, kind)?;
+        let top_level = frames.len() == 1;
+        let statement = self.finish_statement(start, kind, top_level)?;
         frames.last_mut().unwrap().statements.push(statement);
         Ok(())
     }
@@ -572,11 +592,17 @@ impl Parser<'_> {
         &mut self,
         start: Span,
         kind: StatementKind,
+        top_level: bool,
     ) -> Result<Statement, Diagnostic> {
         let end = self.tokens[self.pos - 1].span;
         let terminator = if self.peek() == Some(&TokenKind::Semicolon) {
             Some(self.bump().span)
-        } else if self.peek().is_none() || self.peek() == Some(&TokenKind::RBrace) {
+        } else if self.peek().is_none()
+            || self.peek() == Some(&TokenKind::RBrace)
+            // Plugin source: at the top level a statement's `;` may be omitted before an
+            // annotation (§9); inside bodies the ordinary §2 rule applies.
+            || (top_level && self.plugin.is_some() && self.peek() == Some(&TokenKind::At))
+        {
             None
         } else {
             let label = match &kind {

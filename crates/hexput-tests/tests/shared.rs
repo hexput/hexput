@@ -65,6 +65,46 @@ fn runtime_codes_are_stable_and_distinct() {
     }
 }
 
+/// Story 6.1: the nine plugin shape codes are `syntax` codes with stable spellings, distinct from
+/// one another and from every Script syntax code.
+#[test]
+fn plugin_codes_are_stable_and_distinct() {
+    use hexput_shared::diagnostics::Code;
+    let codes = [
+        (Code::PLUGIN_BLOCK_REQUIRED, "syntax.plugin_block_required"),
+        (
+            Code::DUPLICATE_PLUGIN_BLOCK,
+            "syntax.duplicate_plugin_block",
+        ),
+        (
+            Code::DUPLICATE_METADATA_KEY,
+            "syntax.duplicate_metadata_key",
+        ),
+        (
+            Code::INVALID_PLUGIN_METADATA,
+            "syntax.invalid_plugin_metadata",
+        ),
+        (Code::MISPLACED_ANNOTATION, "syntax.misplaced_annotation"),
+        (Code::INVALID_ANNOTATION, "syntax.invalid_annotation"),
+        (Code::INVALID_HANDLER, "syntax.invalid_handler"),
+        (
+            Code::INVALID_PLUGIN_STATEMENT,
+            "syntax.invalid_plugin_statement",
+        ),
+        (
+            Code::INVALID_GLOBAL_INITIALIZER,
+            "syntax.invalid_global_initializer",
+        ),
+    ];
+    for (i, (code, text)) in codes.iter().enumerate() {
+        assert_eq!(code.as_str(), *text);
+        assert!(text.starts_with("syntax."), "{text}");
+        for (other, _) in &codes[i + 1..] {
+            assert_ne!(code, other);
+        }
+    }
+}
+
 #[test]
 fn host_call_codes_are_stable_and_distinct() {
     use hexput_shared::diagnostics::{Category, Code};
@@ -119,6 +159,15 @@ fn every_code_is_enumerated_exactly_once() {
         "syntax.duplicate_declaration",
         "syntax.loop_control_outside_loop",
         "syntax.duplicate_object_key",
+        "syntax.plugin_block_required",
+        "syntax.duplicate_plugin_block",
+        "syntax.duplicate_metadata_key",
+        "syntax.invalid_plugin_metadata",
+        "syntax.misplaced_annotation",
+        "syntax.invalid_annotation",
+        "syntax.invalid_handler",
+        "syntax.invalid_plugin_statement",
+        "syntax.invalid_global_initializer",
         "lex.unterminated_string",
         "lex.unterminated_comment",
         "lex.unknown_character",

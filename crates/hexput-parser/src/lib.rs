@@ -15,9 +15,19 @@ pub use hexput_ast::{
     render_diagnostic,
 };
 
+/// The Plugin AST [`parse_plugin`] returns (Story 6.1), re-exported so a consumer of it —
+/// `hexput-plugin` in particular — reaches it through this crate alone.
+pub use hexput_ast::{
+    EventHandler, GlobalAnnotation, GlobalVariableBehavior, GlobalVariableDeclaration,
+    GlobalVariableLocking, Identifier, Literal, MetadataEntry, PluginMetadata, PluginProgram,
+    Spanned,
+};
+
 mod expressions;
+mod plugin;
 mod statements;
 use expressions::{ExpressionState, Pending};
+use plugin::PluginState;
 
 /// Parse an entire file, preserving grouping, optional access links, and source locations.
 ///
@@ -25,20 +35,39 @@ use expressions::{ExpressionState, Pending};
 /// Returns lexical diagnostics unchanged, or the first syntax diagnostic. Unsupported language
 /// constructs are rejected. Names need not be declared; duplicate declarations in a scope fail.
 pub fn parse(source: &str) -> Result<Program, Diagnostic> {
-    let tokens = tokenize(source)?;
-    Parser {
-        source,
-        tokens,
-        pos: 0,
-        eof: eof_span(source),
-        program: Program {
-            span: Span::new(0, source.len(), 1, 1),
-            statements: Vec::new(),
-            expressions: Vec::new(),
-            blocks: Vec::new(),
-        },
-    }
-    .run()
+    let mut parser = Parser::new(source, tokenize(source)?, None);
+    parser.run()?;
+    Ok(parser.program)
+}
+
+/// Parse Plugin source (LANGUAGE-REFERENCE §9): its `plugin { }` block, then top-level `let`s
+/// (Global Variables, optionally `@Global(...)`-annotated) and `fn`s (`@Event(...)`-annotated
+/// handlers, or helpers). Bodies and initializers are ordinary Hexput, parsed exactly as
+/// [`parse`] parses a Script.
+///
+/// The parser only records what the source says: whether an Event is declared, whether the
+/// Backend permits an annotation, and what `priority`/`async` mean are decided later.
+///
+/// # Errors
+/// Returns lexical diagnostics unchanged, or the first syntax diagnostic — including the plugin
+/// shape codes (`syntax.plugin_block_required`, `syntax.duplicate_plugin_block`,
+/// `syntax.duplicate_metadata_key`, `syntax.invalid_plugin_metadata`,
+/// `syntax.misplaced_annotation`, `syntax.invalid_annotation`, `syntax.invalid_handler`,
+/// `syntax.invalid_plugin_statement`, `syntax.invalid_global_initializer`).
+pub fn parse_plugin(source: &str) -> Result<PluginProgram, Diagnostic> {
+    let mut parser = Parser::new(source, tokenize(source)?, Some(PluginState::default()));
+    let metadata = parser.metadata_block()?;
+    parser.run()?;
+    let state = parser
+        .plugin
+        .take()
+        .expect("plugin mode stays on for the whole parse");
+    Ok(PluginProgram {
+        program: parser.program,
+        metadata,
+        global_variables: state.global_variables,
+        handlers: state.handlers,
+    })
 }
 
 /// Whether `text` is a §2 identifier: the lexer's own judgement, so the reserved-word list lives
@@ -66,9 +95,26 @@ struct Parser<'a> {
     pos: usize,
     eof: Span,
     program: Program,
+    /// `Some` while parsing Plugin source; `None` for a Script, whose parse it never touches.
+    plugin: Option<PluginState>,
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
+    fn new(source: &'a str, tokens: Vec<Token>, plugin: Option<PluginState>) -> Self {
+        Parser {
+            source,
+            tokens,
+            pos: 0,
+            eof: eof_span(source),
+            program: Program {
+                span: Span::new(0, source.len(), 1, 1),
+                statements: Vec::new(),
+                expressions: Vec::new(),
+                blocks: Vec::new(),
+            },
+            plugin,
+        }
+    }
     fn peek(&self) -> Option<&TokenKind> {
         self.tokens.get(self.pos).map(|t| &t.kind)
     }

@@ -1,5 +1,6 @@
 use hexput_ast::*;
-use hexput_parser::parse;
+use hexput_parser::{parse, parse_plugin};
+use hexput_shared::diagnostics::{Category, Code, Diagnostic};
 
 fn root(p: &Program) -> ExprId {
     let StatementKind::Expression(id) = p.statements[0].kind else {
@@ -1671,4 +1672,638 @@ fn every_syntax_code_spans_the_offending_source() {
     assert_eq!(parse(source).unwrap_err().span.offset, 15);
     let source = "let o = {a:1, a:2};";
     assert_eq!(parse(source).unwrap_err().span.offset, 14);
+}
+
+// --- Story 6.1: plugin source ---
+//
+// Decisions the tests pin (LANGUAGE-REFERENCE §9, recorded as `[DECISION, 2026-10-22]`):
+// - two annotations in a row: the first is misplaced (its target is another annotation);
+// - a bad `ttl` with `behavior = "ttl"`, or a `ttl` without it, is reported inside the annotation's
+//   parentheses — the exact token is the implementation's choice, the annotation is not.
+
+fn plugin(source: &str) -> PluginProgram {
+    match parse_plugin(source) {
+        Ok(p) => p,
+        Err(d) => panic!("{source}: {d}"),
+    }
+}
+
+/// Rejects `source` as a `syntax` error with `code`, checks its span's line and column against the
+/// source, and returns the diagnostic for the caller to inspect further.
+fn rejected(source: &str, code: Code) -> Diagnostic {
+    let d = match parse_plugin(source) {
+        Ok(_) => panic!("{source:?}: accepted, expected {}", code.as_str()),
+        Err(d) => d,
+    };
+    assert_eq!(d.category, Category::Syntax, "{source:?}: {d}");
+    assert_eq!(d.code, code, "{source:?}: {d}");
+    assert_eq!(
+        hexput_tests::line_and_column(source, d.span.offset),
+        (d.span.line, d.span.column),
+        "{source:?}: {d}"
+    );
+    d
+}
+
+fn sliced<'a>(source: &'a str, d: &Diagnostic) -> &'a str {
+    &source[d.span.range()]
+}
+
+/// For rows where the spec names the annotation but not one exact token inside it.
+fn inside_annotation(source: &str, d: &Diagnostic) -> bool {
+    let open = source.find('(').unwrap();
+    let close = source.find(')').unwrap();
+    d.span.offset > open && d.span.offset + d.span.len <= close + 1
+}
+
+/// A valid block followed by `rest`, for rows that test one construct after the block.
+fn with_block(rest: &str) -> String {
+    format!("plugin {{ name = \"x\" }}\n{rest}")
+}
+
+fn handler_name<'a>(p: &'a PluginProgram, h: &EventHandler) -> &'a str {
+    match &p.program.statements[h.statement].kind {
+        StatementKind::Function { name, .. } => name.name.as_str(),
+        other => panic!("handler statement is not a function: {other:?}"),
+    }
+}
+
+/// The §9 example, verbatim.
+const SECTION_NINE_EXAMPLE: &str = r#"plugin {
+  name = "loyalty_rules",
+  version = "1.0.0",
+}
+
+let counter = 0;
+
+@Global(behavior = "ttl", ttl = "5m", locking = "safe")
+let cache = {};
+
+@Event(BackendRegisteredInit)
+fn setup(params) { counter = 0; }
+
+@Event(OrderPlaced, priority = 1)
+fn on_order(params) { counter = counter + 1; return { ok: true }; }
+
+@Event(OrderPlaced, async = true)
+fn audit(params) { logOrder(params.id); return { ok: true }; }
+"#;
+
+#[test]
+fn section_nine_example_records_metadata_globals_and_handlers_in_source_order() {
+    let p = plugin(SECTION_NINE_EXAMPLE);
+    assert_eq!(p.metadata.name(), "loyalty_rules");
+    let version = p
+        .metadata
+        .entries
+        .iter()
+        .find(|e| e.key.name == "version")
+        .unwrap();
+    assert_eq!(version.value.kind, Literal::String("1.0.0".into()));
+
+    assert_eq!(p.global_variables.len(), 2);
+    let counter = &p.global_variables[0];
+    assert_eq!(counter.name.name, "counter");
+    assert!(counter.annotation.is_none());
+    assert!(matches!(
+        p.program.statements[counter.statement].kind,
+        StatementKind::Let { .. }
+    ));
+    let cache = &p.global_variables[1];
+    assert_eq!(cache.name.name, "cache");
+    let annotation = cache.annotation.as_ref().unwrap();
+    assert_eq!(
+        annotation.behavior.as_ref().unwrap().kind,
+        GlobalVariableBehavior::Ttl { millis: 300_000 }
+    );
+    assert_eq!(
+        annotation.locking.as_ref().unwrap().kind,
+        GlobalVariableLocking::Safe
+    );
+
+    assert_eq!(p.handlers.len(), 3);
+    let [setup, on_order, audit] = &p.handlers[..] else {
+        panic!()
+    };
+    assert_eq!(handler_name(&p, setup), "setup");
+    assert_eq!(setup.event.name, "BackendRegisteredInit");
+    assert_eq!(setup.priority, None);
+    assert!(!setup.is_async);
+    assert_eq!(
+        &SECTION_NINE_EXAMPLE[setup.annotation.range()],
+        "@Event(BackendRegisteredInit)"
+    );
+
+    assert_eq!(handler_name(&p, on_order), "on_order");
+    assert_eq!(on_order.event.name, "OrderPlaced");
+    assert_eq!(on_order.priority.as_ref().map(|p| p.kind), Some(1));
+    assert!(!on_order.is_async);
+
+    assert_eq!(handler_name(&p, audit), "audit");
+    assert_eq!(audit.event.name, "OrderPlaced");
+    assert_eq!(audit.priority, None);
+    assert!(audit.is_async);
+    assert!(audit.async_span.is_some());
+
+    assert!(setup.statement < on_order.statement && on_order.statement < audit.statement);
+    assert_global_statements(&p);
+}
+
+/// Every Global Variable's `statement` is the `let` that declares it.
+fn assert_global_statements(p: &PluginProgram) {
+    for global in &p.global_variables {
+        match &p.program.statements[global.statement].kind {
+            StatementKind::Let { name, .. } => assert_eq!(name.name, global.name.name),
+            other => panic!("global statement is not a `let`: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn global_statement_indexes_count_functions_declared_before_them() {
+    let p = plugin(&with_block(
+        "fn h(a) {};\nlet x = 1;\n@Event(A) fn g(p) {}\n@Global() let y = 2;",
+    ));
+    assert_eq!(p.global_variables.len(), 2);
+    assert_eq!(p.global_variables[0].statement, 1);
+    assert_eq!(p.global_variables[1].statement, 3);
+    assert_global_statements(&p);
+    assert_eq!(handler_name(&p, &p.handlers[0]), "g");
+}
+
+#[test]
+fn priority_is_signed_whole_and_bounded_by_two_to_the_fifty_three() {
+    let p = plugin(&with_block("@Event(A, priority = -3) fn f(p) {}"));
+    assert_eq!(p.handlers[0].priority.as_ref().map(|p| p.kind), Some(-3));
+    let p = plugin(&with_block("@Event(A, priority = 1,) fn f(p) {}"));
+    assert_eq!(p.handlers[0].priority.as_ref().map(|p| p.kind), Some(1));
+    let p = plugin(&with_block(
+        "@Event(A, priority = 9007199254740992) fn f(p) {}",
+    ));
+    assert_eq!(
+        p.handlers[0].priority.as_ref().map(|p| p.kind),
+        Some(9_007_199_254_740_992)
+    );
+    let p = plugin(&with_block(
+        "@Event(A, priority = -9007199254740992) fn f(p) {}",
+    ));
+    assert_eq!(
+        p.handlers[0].priority.as_ref().map(|p| p.kind),
+        Some(-9_007_199_254_740_992)
+    );
+    let p = plugin(&with_block("@Event(A) fn f(p) {}"));
+    assert_eq!(p.handlers[0].priority, None);
+    assert!(!p.handlers[0].is_async);
+    assert_eq!(p.handlers[0].async_span, None);
+
+    // An explicit `async = false` is recorded as written: not async, with its span.
+    let source = with_block("@Event(A, async = false) fn f(p) {}");
+    let p = plugin(&source);
+    assert!(!p.handlers[0].is_async);
+    assert_eq!(&source[p.handlers[0].async_span.unwrap().range()], "false");
+}
+
+#[test]
+fn unannotated_top_level_function_is_a_helper_not_a_handler() {
+    let source = "plugin { name = \"x\" }\nfn helper(a, b) {}";
+    let p = plugin(source);
+    assert!(p.handlers.is_empty());
+    assert_eq!(p.program.statements.len(), 1);
+    assert!(matches!(
+        p.program.statements[0].kind,
+        StatementKind::Function { .. }
+    ));
+}
+
+#[test]
+fn handler_bodies_parse_as_ordinary_code_with_nesting_and_closures() {
+    let source = with_block(
+        "@Event(A) fn f(p) {\n  if (p) { while (false) { break; } };\n  let g = fn(x) { return x; };\n  for (k in p) { continue; };\n  return g(1);\n}",
+    );
+    let p = plugin(&source);
+    assert_eq!(p.handlers.len(), 1);
+    assert_eq!(handler_name(&p, &p.handlers[0]), "f");
+}
+
+#[test]
+fn block_and_statement_terminators_follow_the_plugin_rules() {
+    plugin("plugin { name = \"x\" };");
+    plugin("plugin { name = \"x\" }\nlet a = 1\n@Event(A) fn f(p) {}");
+    plugin("plugin { name = \"x\" }\n@Global() let b = 2;\n@Event(A) fn f(p) {}");
+    let source = "plugin { name = \"x\", n = -1.5, b = true, z = null, f = false, }";
+    let p = plugin(source);
+    let values: Vec<_> = p
+        .metadata
+        .entries
+        .iter()
+        .map(|e| (e.key.name.as_str(), e.value.kind.clone()))
+        .collect();
+    assert_eq!(
+        values,
+        [
+            ("name", Literal::String("x".into())),
+            ("n", Literal::Number(-1.5)),
+            ("b", Literal::Bool(true)),
+            ("z", Literal::Null),
+            ("f", Literal::Bool(false)),
+        ]
+    );
+    // A negative number's span includes its `-`.
+    assert_eq!(&source[p.metadata.entries[1].value.span.range()], "-1.5");
+
+    // Inside a body the ordinary §2 rule applies: a missing `;` before `@` is reported as such.
+    let source = with_block("fn f(p) { let a = 1 @Event(A) fn g(q) {} }");
+    let d = rejected(&source, Code::EXPECTED_SYNTAX);
+    assert_eq!(d.span.offset, source.find('@').unwrap());
+}
+
+#[test]
+fn a_missing_separator_in_the_block_is_reported_where_the_next_entry_begins() {
+    let source = "plugin { name = \"a\" version = \"1\" }";
+    let d = rejected(source, Code::EXPECTED_SYNTAX);
+    assert_eq!(sliced(source, &d), "version");
+
+    let source = "plugin { name = \"a\"\nlet x = 1; fn f(p) {}";
+    let d = rejected(source, Code::EXPECTED_SYNTAX);
+    assert_eq!(sliced(source, &d), "let");
+
+    // A value that is no scalar is still spanned on itself alone.
+    let source = "plugin { name = \"a\", v = 1 + 2 w = 3 }";
+    let d = rejected(source, Code::INVALID_PLUGIN_METADATA);
+    assert_eq!(sliced(source, &d), "1 + 2");
+}
+
+#[test]
+fn metadata_block_requirements() {
+    let d = rejected("let x = 1;", Code::PLUGIN_BLOCK_REQUIRED);
+    assert_eq!(sliced("let x = 1;", &d), "let");
+    let d = rejected("// only a comment\n", Code::PLUGIN_BLOCK_REQUIRED);
+    assert_eq!(d.span.len, 0);
+    assert_eq!(d.span.offset, "// only a comment\n".len());
+    let d = rejected("", Code::PLUGIN_BLOCK_REQUIRED);
+    assert_eq!((d.span.offset, d.span.len), (0, 0));
+    let source = "// c\nlet x = 1;";
+    let d = rejected(source, Code::PLUGIN_BLOCK_REQUIRED);
+    assert_eq!(sliced(source, &d), "let");
+    let source = "let x = 1; plugin { name = \"x\" }";
+    let d = rejected(source, Code::PLUGIN_BLOCK_REQUIRED);
+    assert_eq!(sliced(source, &d), "let");
+
+    let source = "plugin {name=\"a\"} plugin {name=\"b\"}";
+    let d = rejected(source, Code::DUPLICATE_PLUGIN_BLOCK);
+    assert_eq!(d.span.offset, source.rfind("plugin").unwrap());
+    assert_eq!(sliced(source, &d), "plugin");
+
+    let source = "plugin { name = \"a\", name = \"b\" }";
+    let d = rejected(source, Code::DUPLICATE_METADATA_KEY);
+    assert_eq!(d.span.offset, source.rfind("name").unwrap());
+    assert_eq!(sliced(source, &d), "name");
+
+    let source = "plugin { version = \"1.0\" }";
+    let d = rejected(source, Code::INVALID_PLUGIN_METADATA);
+    assert_eq!(sliced(source, &d), source);
+    let source = "plugin {}";
+    let d = rejected(source, Code::INVALID_PLUGIN_METADATA);
+    assert_eq!(sliced(source, &d), source);
+    for (source, offending) in [
+        ("plugin { name = 1 }", "1"),
+        ("plugin { name = \"\" }", "\"\""),
+        ("plugin { name = \"a\", tags = [1] }", "[1]"),
+        ("plugin { name = x }", "x"),
+        ("plugin { name = \"a\", version = {a: 1} }", "{a: 1}"),
+    ] {
+        let d = rejected(source, Code::INVALID_PLUGIN_METADATA);
+        assert_eq!(sliced(source, &d), offending, "{source}");
+    }
+    let source = "plugin { name = [1] }";
+    let d = rejected(source, Code::INVALID_PLUGIN_METADATA);
+    assert_eq!(sliced(source, &d), "[1]");
+}
+
+#[test]
+fn misplaced_annotations_name_the_annotation() {
+    let source = with_block("@Event(A) let x = 1;");
+    let d = rejected(&source, Code::MISPLACED_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "@Event");
+    assert_eq!(d.span.offset, source.find('@').unwrap());
+
+    let source = with_block("@Global() fn f(p) {}");
+    let d = rejected(&source, Code::MISPLACED_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "@Global");
+
+    // Two annotations in a row: the first has no declaration it may annotate.
+    let source = with_block("@Event(A) @Event(B) fn f(p) {}");
+    let d = rejected(&source, Code::MISPLACED_ANNOTATION);
+    assert_eq!(d.span.offset, source.find('@').unwrap());
+    assert_eq!(sliced(&source, &d), "@Event");
+
+    let source = with_block("@Event(A)");
+    let d = rejected(&source, Code::MISPLACED_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "@Event");
+
+    let source = with_block("fn f(p) { @Event(A) fn g(q) {} }");
+    let d = rejected(&source, Code::MISPLACED_ANNOTATION);
+    assert_eq!(d.span.offset, source.find('@').unwrap());
+    assert_eq!(sliced(&source, &d), "@Event");
+
+    let source = with_block("@Event(A) fn f(p) { @Global() let y = 1; }");
+    let d = rejected(&source, Code::MISPLACED_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "@Global");
+}
+
+#[test]
+fn invalid_annotations_name_the_offending_argument_or_value() {
+    let cases: [(&str, &str); 6] = [
+        ("@Foo(A) fn f(p) {}", "Foo"),
+        ("@Event(A, priority = 1.5) fn f(p) {}", "1.5"),
+        (
+            "@Event(A, priority = 9007199254740993) fn f(p) {}",
+            "9007199254740993",
+        ),
+        ("@Event(A, async = 1) fn f(p) {}", "1"),
+        ("@Event(A, colour = 1) fn f(p) {}", "colour"),
+        ("@Global(behavior = \"weekly\") let x = 1;", "\"weekly\""),
+    ];
+    for (annotated, offending) in cases {
+        let source = with_block(annotated);
+        let d = rejected(&source, Code::INVALID_ANNOTATION);
+        assert_eq!(sliced(&source, &d), offending, "{source}");
+    }
+
+    let source = with_block("@Event(A, async = true, async = false) fn f(p) {}");
+    let d = rejected(&source, Code::INVALID_ANNOTATION);
+    assert_eq!(d.span.offset, source.rfind("async").unwrap());
+    assert_eq!(sliced(&source, &d), "async");
+
+    // The annotation's target is named only by its Event: the first argument must be a bare name.
+    let source = with_block("@Event(priority = 1) fn f(p) {}");
+    let d = rejected(&source, Code::INVALID_ANNOTATION);
+    assert!(inside_annotation(&source, &d), "{source}: {d}");
+
+    // `behavior = "ttl"` without `ttl`, and `ttl` without `behavior = "ttl"`: the spec names the
+    // annotation, not the token.
+    for annotated in [
+        "@Global(behavior = \"ttl\") let x = 1;",
+        "@Global(ttl = \"5m\") let x = 1;",
+        "@Global(behavior = \"forever\", ttl = \"5m\") let x = 1;",
+    ] {
+        let source = with_block(annotated);
+        let d = rejected(&source, Code::INVALID_ANNOTATION);
+        assert!(inside_annotation(&source, &d), "{source}: {d}");
+    }
+
+    let source = with_block("@Global(behavior = \"ttl\", ttl = \"5 minutes\") let x = 1;");
+    let d = rejected(&source, Code::INVALID_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "\"5 minutes\"");
+    let source = with_block("@Global(behavior = \"ttl\", ttl = \"0s\") let x = 1;");
+    let d = rejected(&source, Code::INVALID_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "\"0s\"");
+    let source =
+        with_block("@Global(behavior = \"ttl\", ttl = \"99999999999999999999d\") let x = 1;");
+    let d = rejected(&source, Code::INVALID_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "\"99999999999999999999d\"");
+    // Fits in 64 bits as a number of days, but not once converted to milliseconds.
+    let source =
+        with_block("@Global(behavior = \"ttl\", ttl = \"18446744073709551615d\") let x = 1;");
+    let d = rejected(&source, Code::INVALID_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "\"18446744073709551615d\"");
+    let source = with_block("@Global(behavior = \"ttl\", ttl = \"213503982335d\") let x = 1;");
+    let d = rejected(&source, Code::INVALID_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "\"213503982335d\"");
+    let source = with_block("@Global(locking = \"fast\") let x = 1;");
+    let d = rejected(&source, Code::INVALID_ANNOTATION);
+    assert_eq!(sliced(&source, &d), "\"fast\"");
+}
+
+#[test]
+fn well_formed_annotations_are_accepted_and_recorded() {
+    for (annotated, millis) in [
+        ("@Global(behavior = \"ttl\", ttl = \"5ms\") let x = 1;", 5),
+        (
+            "@Global(behavior = \"ttl\", ttl = \"2s\") let x = 1;",
+            2_000,
+        ),
+        (
+            "@Global(behavior = \"ttl\", ttl = \"5m\") let x = 1;",
+            300_000,
+        ),
+        (
+            "@Global(behavior = \"ttl\", ttl = \"1h\") let x = 1;",
+            3_600_000,
+        ),
+        (
+            "@Global(behavior = \"ttl\", ttl = \"1d\") let x = 1;",
+            86_400_000,
+        ),
+    ] {
+        let p = plugin(&with_block(annotated));
+        let behavior = p.global_variables[0]
+            .annotation
+            .as_ref()
+            .unwrap()
+            .behavior
+            .as_ref()
+            .unwrap()
+            .kind;
+        assert_eq!(
+            behavior,
+            GlobalVariableBehavior::Ttl { millis },
+            "{annotated}"
+        );
+    }
+    let p = plugin(&with_block(
+        "@Global(behavior = \"keyed\", locking = \"unsafe\") let x = 1;",
+    ));
+    let annotation = p.global_variables[0].annotation.as_ref().unwrap();
+    assert_eq!(
+        annotation.behavior.as_ref().unwrap().kind,
+        GlobalVariableBehavior::Keyed
+    );
+    assert_eq!(
+        annotation.locking.as_ref().unwrap().kind,
+        GlobalVariableLocking::Unsafe
+    );
+    for (behavior, expected) in [
+        ("forever", GlobalVariableBehavior::Forever),
+        (
+            "separate_each_trigger",
+            GlobalVariableBehavior::SeparateEachTrigger,
+        ),
+    ] {
+        let p = plugin(&with_block(&format!(
+            "@Global(behavior = \"{behavior}\") let x = 1;"
+        )));
+        let annotation = p.global_variables[0].annotation.as_ref().unwrap();
+        assert_eq!(
+            annotation.behavior.as_ref().unwrap().kind,
+            expected,
+            "{behavior}"
+        );
+    }
+    plugin(&with_block("@Global() let x = 1;"));
+    assert!(
+        plugin(&with_block("@Global() let x = 1;")).global_variables[0]
+            .annotation
+            .is_some()
+    );
+}
+
+#[test]
+fn handler_arity_is_exactly_one_parameter_of_any_name() {
+    let source = with_block("@Event(A) fn h() {}");
+    let d = rejected(&source, Code::INVALID_HANDLER);
+    assert_eq!(sliced(&source, &d), "()");
+    let source = with_block("@Event(A) fn h(a, b) {}");
+    let d = rejected(&source, Code::INVALID_HANDLER);
+    assert_eq!(sliced(&source, &d), "(a, b)");
+    let p = plugin(&with_block("@Event(A) fn h(anything) {}"));
+    assert_eq!(p.handlers.len(), 1);
+}
+
+#[test]
+fn other_top_level_statements_are_rejected_at_their_first_token() {
+    for (statement, first) in [
+        ("if (true) {}", "if"),
+        ("return 1;", "return"),
+        ("f();", "f"),
+        ("x = 1;", "x"),
+        ("{}", "{"),
+    ] {
+        let source = with_block(statement);
+        let d = rejected(&source, Code::INVALID_PLUGIN_STATEMENT);
+        assert_eq!(sliced(&source, &d), first, "{source}");
+    }
+}
+
+#[test]
+fn global_initializers_are_expressions_over_literals() {
+    for (initializer, offending) in [
+        ("let a = b;", "b"),
+        ("let a = f();", "()"),
+        ("let a = { f: fn(x) {} };", "fn"),
+        ("let a = [1, b];", "b"),
+        ("let a = 1 + b;", "b"),
+        ("let a = [1][b];", "b"),
+    ] {
+        let source = with_block(initializer);
+        let d = rejected(&source, Code::INVALID_GLOBAL_INITIALIZER);
+        if offending == "fn" {
+            assert!(sliced(&source, &d).starts_with("fn"), "{source}");
+        } else {
+            assert_eq!(sliced(&source, &d), offending, "{source}");
+        }
+    }
+    for initializer in [
+        "let a = -(1 + 2) * 3;",
+        "let a = {x: [1, 2]}.x[1];",
+        "let a = [1, {b: \"c\"}][0];",
+    ] {
+        plugin(&with_block(initializer));
+    }
+}
+
+#[test]
+fn deep_global_initializers_parse_without_host_recursion() {
+    let depth = 12_000;
+    let source = with_block(&format!(
+        "let a = {}1{};",
+        "[".repeat(depth),
+        "]".repeat(depth)
+    ));
+    let p = plugin(&source);
+    assert_eq!(p.global_variables.len(), 1);
+    let source = with_block(&format!(
+        "let a = {}b{};",
+        "[".repeat(depth),
+        "]".repeat(depth)
+    ));
+    let d = rejected(&source, Code::INVALID_GLOBAL_INITIALIZER);
+    assert_eq!(sliced(&source, &d), "b");
+}
+
+#[test]
+fn a_function_and_a_global_share_the_declaration_namespace() {
+    let source = with_block("let f = 1;\n@Event(A) fn f(p) {}");
+    let d = rejected(&source, Code::DUPLICATE_DECLARATION);
+    assert_eq!(d.span.offset, source.rfind("f(").unwrap());
+}
+
+#[test]
+fn script_parse_still_refuses_plugin_source_as_before() {
+    for source in ["plugin { name = \"x\" }", "@Event(A) fn a(p) {}"] {
+        let d = parse(source).unwrap_err();
+        assert_eq!(d.code, Code::EXPECTED_SYNTAX, "{source}: {d}");
+        assert_eq!(d.span.offset, 0, "{source}: {d}");
+    }
+}
+
+/// Every plugin shape code, reached from real source, with the text its span must slice out.
+/// Story 6.1's acceptance is that a span points at the offending construct; slicing the original
+/// source is the only proof. Each case is one code, `tests/shared.rs` pins the code strings.
+#[test]
+fn every_plugin_code_spans_the_offending_source() {
+    let cases: [(&str, Code, &str); 9] = [
+        ("let x = 1;", Code::PLUGIN_BLOCK_REQUIRED, "let"),
+        (
+            "plugin { name = \"a\" } plugin { name = \"b\" }",
+            Code::DUPLICATE_PLUGIN_BLOCK,
+            "plugin",
+        ),
+        (
+            "plugin { name = \"a\", name = \"b\" }",
+            Code::DUPLICATE_METADATA_KEY,
+            "name",
+        ),
+        ("plugin { name = 1 }", Code::INVALID_PLUGIN_METADATA, "1"),
+        (
+            "plugin { name = \"x\" }\n@Event(A) let x = 1;",
+            Code::MISPLACED_ANNOTATION,
+            "@Event",
+        ),
+        (
+            "plugin { name = \"x\" }\n@Event(A, priority = 1.5) fn f(p) {}",
+            Code::INVALID_ANNOTATION,
+            "1.5",
+        ),
+        (
+            "plugin { name = \"x\" }\n@Event(A) fn h() {}",
+            Code::INVALID_HANDLER,
+            "()",
+        ),
+        (
+            "plugin { name = \"x\" }\nf();",
+            Code::INVALID_PLUGIN_STATEMENT,
+            "f",
+        ),
+        (
+            "plugin { name = \"x\" }\nlet a = b;",
+            Code::INVALID_GLOBAL_INITIALIZER,
+            "b",
+        ),
+    ];
+    for (source, code, offending) in cases {
+        let d = rejected(source, code);
+        assert_eq!(sliced(source, &d), offending, "{source}: {d}");
+        assert_eq!(
+            hexput_tests::line_and_column(source, d.span.offset),
+            (d.span.line, d.span.column),
+            "{source}: {d}"
+        );
+    }
+    for (i, (_, code, _)) in cases.iter().enumerate() {
+        for (_, other, _) in &cases[i + 1..] {
+            assert_ne!(code, other, "the sweep must reach each code once");
+        }
+    }
+    // The duplicate codes point at the *second* occurrence, which slicing cannot tell apart.
+    let source = "plugin { name = \"a\" } plugin { name = \"b\" }";
+    assert_eq!(
+        rejected(source, Code::DUPLICATE_PLUGIN_BLOCK).span.offset,
+        source.rfind("plugin").unwrap()
+    );
+    let source = "plugin { name = \"a\", name = \"b\" }";
+    assert_eq!(
+        rejected(source, Code::DUPLICATE_METADATA_KEY).span.offset,
+        source.rfind("name").unwrap()
+    );
 }

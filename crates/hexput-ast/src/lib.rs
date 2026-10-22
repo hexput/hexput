@@ -279,3 +279,113 @@ pub struct ObjectEntry {
     pub value: ExprId,
     pub span: Span,
 }
+
+// --- Plugin source (Story 6.1, LANGUAGE-REFERENCE §9) ---
+
+/// A parsed Plugin: an ordinary [`Program`] holding only the top-level `let`s (Global Variables)
+/// and `fn`s (Event handlers and helpers), plus side tables describing them. The side tables
+/// index into [`Program::statements`]; the `plugin { }` block and the annotations are not
+/// statements.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginProgram {
+    pub program: Program,
+    pub metadata: PluginMetadata,
+    /// Every top-level `let`, in source order.
+    pub global_variables: Vec<GlobalVariableDeclaration>,
+    /// Every `@Event`-annotated top-level `fn`, in source order. An unannotated top-level `fn`
+    /// is a helper and appears only in [`Self::program`].
+    pub handlers: Vec<EventHandler>,
+}
+
+/// The `plugin { }` block: `plugin` through its closing `}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginMetadata {
+    pub span: Span,
+    /// In source order; each key appears once and `name` is always present.
+    pub entries: Vec<MetadataEntry>,
+}
+
+impl PluginMetadata {
+    /// The Plugin's `name`: a non-empty string whenever this value came from the parser, which
+    /// refuses a block without one. The fields are public, so a value built by hand without a
+    /// string `name` entry yields `""` — build one through the parser where the name matters.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.entries
+            .iter()
+            .find_map(|entry| match &entry.value.kind {
+                Literal::String(name) if entry.key.name == "name" => Some(name.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// One `key = value` entry of the `plugin { }` block. The value is a scalar literal; a negative
+/// number's span includes its `-`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataEntry {
+    pub key: Identifier,
+    pub equals: Span,
+    pub value: Spanned<Literal>,
+}
+
+/// A top-level `let`: a Global Variable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalVariableDeclaration {
+    /// Index of its `let` in [`PluginProgram::program`]'s statements.
+    pub statement: usize,
+    pub name: Identifier,
+    /// The `@Global(...)` annotation, `None` when the `let` has none (`@Global()` is `Some`).
+    pub annotation: Option<GlobalAnnotation>,
+}
+
+/// An `@Global(...)` annotation's recorded values; an absent argument is `None` (the Daemon's
+/// default applies). Whether the Backend permits them is decided at registration, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalAnnotation {
+    /// `@Global` through `)`.
+    pub span: Span,
+    /// Spanned on the `behavior` value.
+    pub behavior: Option<Spanned<GlobalVariableBehavior>>,
+    /// Spanned on the `locking` value.
+    pub locking: Option<Spanned<GlobalVariableLocking>>,
+}
+
+/// A Global Variable Behavior (lifetime strategy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalVariableBehavior {
+    Forever,
+    /// `ttl` converted to milliseconds.
+    Ttl {
+        millis: u64,
+    },
+    SeparateEachTrigger,
+    Keyed,
+}
+
+/// A Global Variable Locking strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalVariableLocking {
+    Safe,
+    Unsafe,
+}
+
+/// An `@Event(...)`-annotated top-level `fn`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventHandler {
+    /// Index of its `fn` in [`PluginProgram::program`]'s statements.
+    pub statement: usize,
+    /// The function's name.
+    pub function: Identifier,
+    /// The Event it handles, as written.
+    pub event: Identifier,
+    /// `@Event` through `)`.
+    pub annotation: Span,
+    /// `priority`, spanned on its value; `None` when absent.
+    pub priority: Option<Spanned<i64>>,
+    /// `async`, `false` when absent.
+    pub is_async: bool,
+    /// The `async` value's span, when present.
+    pub async_span: Option<Span>,
+}

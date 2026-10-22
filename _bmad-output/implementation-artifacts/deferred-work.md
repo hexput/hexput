@@ -374,3 +374,11 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-5-8-expire-a-session-only-after-the-last-connection-is-gone.md`
   summary: The Story 2.4 entry "a panic inside `serve` skips the detach and leaks the Session" stays open after Story 5.8: the TTL countdown starts only from `detach`, so a panicking attached connection still never gets an `Expiry` and its Session lives until the Daemon stops.
   evidence: Review finding (blind-hunter), medium. Pre-existing; Story 5.8 delays teardown but adds no supervisor. Nothing in `serve` is known to panic on peer input. Settle with a supervisor in `hexput-daemon` that, on a connection task's joined panic, detaches it and runs the returned `Expiry` (needs `serve` to expose its Client ID/Connection ID to the supervisor), or a guard that detaches without implying teardown by `Drop`.
+
+- source_spec: `spec-6-1-parse-plugin-source-with-metadata-globals-and-event-handlers.md`
+  summary: AGENTS.md's "Next step" line skipped Story 6.1's own review.
+  evidence: Review finding (blind-hunter), low. Routed to defer because the fix edits an agent-context file; settled in Story 6.1's finalization commit, whose AGENTS.md update lists Story 6.1's review first.
+
+- source_spec: `spec-6-1-parse-plugin-source-with-metadata-globals-and-event-handlers.md`
+  summary: `tests/script.rs::a_removed_handle_is_unknown_and_its_program_is_released_at_once` failed once under parallel load (moka maintenance timing) and passed on reruns.
+  evidence: Review finding (blind-hunter), low. Pre-existing Epic 4 AST Cache test, untouched by Story 6.1. Settle by making the test wait on moka's `run_pending_tasks` (or poll with a deadline) instead of relying on maintenance timing, then running the full suite repeatedly under load.

@@ -95,8 +95,8 @@ development_status:
   5-9-benchmark-the-remote-path-separately-from-the-local-one: review
   epic-5-retrospective: optional
 
-  epic-6: backlog
-  6-1-parse-plugin-source-with-metadata-globals-and-event-handlers: backlog
+  epic-6: in-progress
+  6-1-parse-plugin-source-with-metadata-globals-and-event-handlers: review
   6-2-register-a-plugin-as-its-own-kind-of-registration: backlog
   6-3-declare-every-event-and-its-return-shape-upfront: backlog
   6-4-run-initialization-handlers-before-the-plugin-serves-anythin: backlog

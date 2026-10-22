@@ -76,8 +76,8 @@ development_status:
   epic-3-retrospective: optional
 
   epic-4: backlog
-  4-1-register-a-script-once-for-repeated-use: in-progress  # blocked by story-loop, see spec
-  4-2-re-run-a-registered-script-with-fresh-variables: in-progress  # blocked by story-loop, see spec
+  4-1-register-a-script-once-for-repeated-use: backlog
+  4-2-re-run-a-registered-script-with-fresh-variables: backlog
   4-3-keep-the-cache-bounded-and-clean-it-up-with-the-session: backlog
   4-4-measure-the-cache-win: backlog
   4-5-compare-the-hot-path-against-rhai: backlog

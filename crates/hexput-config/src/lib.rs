@@ -28,7 +28,7 @@
 //! session_ttl_secs = 300      # optional: a whole number of seconds, at least 1 — default 300
 //! ast_cache_capacity = 10000  # optional: the most cached Scripts, at least 1 — default 10000
 //!
-//! [transport.uds]             # at least one [transport.*] section is required
+//! [transport.uds]             # at least one [transport.*] section is required; Unix-only
 //! path = "/run/hexput/hexput.sock"
 //! mode = "0660"               # optional: the socket's permission bits — default: the umask
 //!
@@ -41,7 +41,15 @@
 //! bind = "0.0.0.0"            # an IP, with an optional port — default port 7478
 //! tls_cert = "/etc/hexput/tls/cert.pem"
 //! tls_key = "/etc/hexput/tls/key.pem"
+//!
+//! [transport.named_pipe]      # Windows-only: ignored with a warning elsewhere
+//! path = '\\.\pipe\hexput'    # a literal string: '\\.\pipe\' and a name with no further '\'
 //! ```
+//!
+//! Every section is parsed and validated on every platform, so one file can serve hosts of
+//! both kinds. The Daemon serves `[transport.uds]` only on Unix and `[transport.named_pipe]`
+//! only on Windows, skipping the other with a warning, and fails only when nothing configured
+//! is served on its platform.
 //!
 //! `crates/hexput-config/config.example.toml` documents every field, and a test parses it so the
 //! example cannot drift from this parser. Every field inside a present transport section is
@@ -141,12 +149,24 @@ pub struct SystemConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Transports {
-    /// `[transport.uds]`: a Unix Domain Socket.
+    /// `[transport.uds]`: a Unix Domain Socket. Parsed on every platform, served only on Unix.
     pub uds: Option<UdsTransport>,
     /// `[transport.tcp]`: TCP, always with TLS.
     pub tcp: Option<TcpTransport>,
     /// `[transport.websocket]`: WebSocket, always with TLS.
     pub websocket: Option<WebSocketTransport>,
+    /// `[transport.named_pipe]`: a Windows Named Pipe. Parsed on every platform, served only on
+    /// Windows.
+    pub named_pipe: Option<NamedPipeTransport>,
+}
+
+/// `[transport.named_pipe]` (Story 5.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NamedPipeTransport {
+    /// The pipe's name, `\\.\pipe\<name>`, exactly as written: at most 256 characters, with no
+    /// `\` in the name.
+    pub path: String,
 }
 
 /// `[transport.uds]`.

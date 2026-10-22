@@ -35,7 +35,8 @@ ast_cache_capacity = 10000
 # Transports. At least one [transport.*] section is required, and every field inside a
 # section that is present is required unless marked optional.
 
-# A Unix Domain Socket.
+# A Unix Domain Socket. Unix-only: on Windows this section is ignored with a warning (the Daemon
+# still starts when another section is served there).
 #
 # The Daemon creates the socket file at startup and removes it on a clean shutdown. A socket file
 # left behind by an unclean shutdown (nothing listening on it) is removed and replaced. Anything
@@ -73,3 +74,14 @@ tls_key = "/etc/hexput/tls/key.pem"
 bind = "0.0.0.0"
 tls_cert = "/etc/hexput/tls/cert.pem"
 tls_key = "/etc/hexput/tls/key.pem"
+
+# A Windows Named Pipe, the Windows-native local transport. Windows-only: on any other platform
+# this section is ignored with a warning (the Daemon still starts when another section is served
+# there), but it is always validated. `path` is `\\.\pipe\` followed by a non-empty name with no
+# further `\`, at most 256 characters in all; write it as a TOML literal string (single quotes)
+# so the backslashes stay as written. The pipe accepts local clients only, so it needs no TLS. It
+# uses Windows' default security descriptor: only the Daemon's own account and administrators can
+# open it read/write. The Daemon refuses to start, naming the pipe, when another process already
+# serves that name. A client that finds every instance busy (ERROR_PIPE_BUSY) retries.
+[transport.named_pipe]
+path = '\\.\pipe\hexput'

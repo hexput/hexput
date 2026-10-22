@@ -54,3 +54,23 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  # The Named Pipe adapter (Story 5.3) is Windows-only, so its tests run on a Windows host. The
+  # whole workspace is linted for Windows too, and the Named Pipe tests (adapter, Daemon, System
+  # Config) run; the full suite stays on the Linux job.
+  windows:
+    name: windows clippy / named pipe tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Named Pipe tests
+        run: cargo test --locked -p hexput-tests --test transport --test daemon --test config -- named_pipe

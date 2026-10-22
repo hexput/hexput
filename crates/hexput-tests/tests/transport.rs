@@ -1,9 +1,12 @@
 //! Story 2.3: the Unix Domain Socket adapter — the socket file's lifecycle, and the Port it
 //! hands the core for each accepted connection, over a real socket in a temporary directory.
-#![cfg(unix)]
+//! Story 5.3: the Windows Named Pipe adapter, in `mod named_pipe` at the end of this file. The
+//! UDS tests are `cfg(unix)` and the pipe tests `cfg(windows)`; the TCP, TLS and WebSocket tests
+//! run on both.
 
 use std::fs;
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,12 +21,15 @@ use hexput_port::{
 use hexput_transport::tcp_tls::{
     HANDSHAKE_TIMEOUT, TcpTlsListener, TcpTlsPort, TlsError, TlsIdentity,
 };
+#[cfg(unix)]
 use hexput_transport::uds::{BindErrorKind, UdsListener, UdsPort};
 use hexput_transport::websocket::{WebSocketListener, WebSocketPort};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
@@ -39,7 +45,13 @@ impl Sandbox {
     fn new() -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // Directly under /tmp: a socket path has a ~108-byte limit, so keep it short.
-        let dir = PathBuf::from("/tmp").join(format!(
+        // A socket path is short on Unix; a pipe name is no path at all.
+        let base = if cfg!(unix) {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = base.join(format!(
             "hx-uds-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -48,11 +60,13 @@ impl Sandbox {
         Self { dir }
     }
 
+    #[cfg(unix)]
     fn socket(&self) -> PathBuf {
         self.dir.join("s.sock")
     }
 
     /// Everything in the sandbox directory, by name.
+    #[cfg(unix)]
     fn entries(&self) -> Vec<String> {
         let mut names: Vec<_> = fs::read_dir(&self.dir)
             .unwrap()
@@ -69,6 +83,7 @@ impl Drop for Sandbox {
     }
 }
 
+#[cfg(unix)]
 fn is_socket(path: &std::path::Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket())
 }
@@ -86,6 +101,7 @@ fn request(id: u64) -> Envelope<Value> {
 }
 
 /// A connected client and the server-side Port for it.
+#[cfg(unix)]
 async fn pair(listener: &UdsListener) -> (UnixStream, UdsPort) {
     let (client, server) = tokio::join!(UnixStream::connect(listener.path()), listener.accept());
     (client.unwrap(), server.unwrap())
@@ -93,6 +109,7 @@ async fn pair(listener: &UdsListener) -> (UnixStream, UdsPort) {
 
 // --- the socket file ---
 
+#[cfg(unix)]
 #[tokio::test]
 async fn bind_creates_the_socket_and_close_removes_it() {
     let sandbox = Sandbox::new();
@@ -103,6 +120,7 @@ async fn bind_creates_the_socket_and_close_removes_it() {
     assert!(sandbox.entries().is_empty(), "{:?}", sandbox.entries());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_stale_socket_is_replaced() {
     let sandbox = Sandbox::new();
@@ -115,6 +133,7 @@ async fn a_stale_socket_is_replaced() {
     let (_client, _server) = pair(&listener).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_live_socket_is_in_use_and_left_alone() {
     let sandbox = Sandbox::new();
@@ -132,6 +151,7 @@ async fn a_live_socket_is_in_use_and_left_alone() {
     drop(live);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn something_that_is_not_a_socket_is_never_deleted() {
     let sandbox = Sandbox::new();
@@ -148,6 +168,7 @@ async fn something_that_is_not_a_socket_is_never_deleted() {
     assert!(directory.is_dir());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_missing_parent_or_an_overlong_path_names_the_path() {
     let sandbox = Sandbox::new();
@@ -181,6 +202,7 @@ async fn a_missing_parent_or_an_overlong_path_names_the_path() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_mode_leaves_a_live_socket_alone_and_nothing_behind() {
     let sandbox = Sandbox::new();
@@ -196,6 +218,7 @@ async fn a_mode_leaves_a_live_socket_alone_and_nothing_behind() {
     drop(live);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_mode_works_with_a_stale_socket_and_a_relative_path() {
     let sandbox = Sandbox::new();
@@ -219,6 +242,7 @@ async fn a_mode_works_with_a_stale_socket_and_a_relative_path() {
     assert!(sandbox.entries().is_empty());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_mode_is_applied_before_the_socket_appears_and_leaves_nothing_behind() {
     for mode in [0o660, 0o600, 0o777] {
@@ -233,6 +257,7 @@ async fn a_mode_is_applied_before_the_socket_appears_and_leaves_nothing_behind()
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn close_leaves_a_socket_that_replaced_ours_alone() {
     let sandbox = Sandbox::new();
@@ -249,6 +274,7 @@ async fn close_leaves_a_socket_that_replaced_ours_alone() {
 
 // --- the Port ---
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_framed_message_arrives_as_an_envelope_and_a_reply_goes_back() {
     let sandbox = Sandbox::new();
@@ -280,6 +306,7 @@ async fn a_framed_message_arrives_as_an_envelope_and_a_reply_goes_back() {
     assert_eq!(decode(&body).unwrap(), reply);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_malformed_frame_is_reported_and_the_next_one_still_arrives() {
     let sandbox = Sandbox::new();
@@ -299,6 +326,7 @@ async fn a_malformed_frame_is_reported_and_the_next_one_still_arrives() {
     assert!(matches!(inbound.recv().await, Received::Message(e) if e == request(5)));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn an_oversized_prefix_is_fatal_and_the_half_then_stays_closed() {
     let sandbox = Sandbox::new();
@@ -320,6 +348,7 @@ async fn an_oversized_prefix_is_fatal_and_the_half_then_stays_closed() {
     assert!(matches!(inbound.recv().await, Received::Closed(None)));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_peer_leaving_mid_frame_is_a_clean_close() {
     let sandbox = Sandbox::new();
@@ -333,6 +362,7 @@ async fn a_peer_leaving_mid_frame_is_a_clean_close() {
     assert!(matches!(inbound.recv().await, Received::Closed(None)));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn an_envelope_too_large_to_frame_is_refused_without_writing() {
     let sandbox = Sandbox::new();
@@ -1258,4 +1288,223 @@ async fn a_websocket_envelope_too_large_to_frame_is_refused_without_writing() {
     let reply = Envelope::new(CorrelationId(8), MessageType::Result, Value::from(8));
     outbound.send(reply.clone()).await.unwrap();
     assert_eq!(next_envelope(&mut client).await, reply);
+}
+
+// --- Story 5.3: the Windows Named Pipe adapter ---
+
+/// Story 5.3: the Named Pipe adapter over a real pipe, each test under its own name. Clients use
+/// tokio's `ClientOptions`, retrying `ERROR_PIPE_BUSY` for the instant between two instances.
+#[cfg(windows)]
+mod named_pipe {
+    use super::*;
+    use hexput_transport::named_pipe::{BindErrorKind, NamedPipeListener, NamedPipePort};
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+
+    /// `ERROR_PIPE_BUSY`: every instance is connected, or the next one is not yet created.
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    /// A pipe name no other test, or process, uses.
+    fn pipe_name() -> String {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        format!(
+            r"\\.\pipe\hexput-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// A client on `name`, retrying the busy instant for up to ten seconds.
+    async fn client(name: &str) -> NamedPipeClient {
+        let started = Instant::now();
+        loop {
+            match ClientOptions::new().open(name) {
+                Ok(pipe) => return pipe,
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                        && started.elapsed() < Duration::from_secs(10) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("{name}: {error}"),
+            }
+        }
+    }
+
+    /// A connected client and the server-side Port for it.
+    async fn pair(listener: &mut NamedPipeListener) -> (NamedPipeClient, NamedPipePort) {
+        let name = listener.path().to_owned();
+        let (client_side, server) = tokio::join!(client(&name), listener.accept());
+        (client_side, server.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_framed_message_crosses_the_pipe_and_a_reply_comes_back() {
+        let mut listener = NamedPipeListener::bind(&pipe_name()).expect("binds");
+        let (mut client_side, server) = pair(&mut listener).await;
+        let (mut inbound, mut outbound) = server.split();
+
+        // Two frames in one write, the second split across two.
+        let (first, second) = (framed(&request(1)), framed(&request(2)));
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&second[..3]);
+        client_side.write_all(&bytes).await.unwrap();
+        match inbound.recv().await {
+            Received::Message(envelope) => assert_eq!(envelope, request(1)),
+            other => panic!("{other:?}"),
+        }
+        client_side.write_all(&second[3..]).await.unwrap();
+        match inbound.recv().await {
+            Received::Message(envelope) => assert_eq!(envelope, request(2)),
+            other => panic!("{other:?}"),
+        }
+
+        // The reply's bytes on the pipe are exactly the shared framing of its encoding.
+        let reply = Envelope::new(CorrelationId(2), MessageType::Result, Value::from("ok"));
+        outbound.send(reply.clone()).await.unwrap();
+        let expected = framed(&reply);
+        let mut received = vec![0; expected.len()];
+        client_side.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn the_listener_reports_the_name_it_was_bound_to() {
+        let name = pipe_name();
+        let listener = NamedPipeListener::bind(&name).expect("binds");
+        assert_eq!(listener.path(), name);
+    }
+
+    #[tokio::test]
+    async fn a_second_bind_on_a_served_name_is_in_use_and_the_first_still_serves() {
+        let name = pipe_name();
+        let mut first = NamedPipeListener::bind(&name).expect("binds");
+        let error = match NamedPipeListener::bind(&name) {
+            Err(error) => error,
+            Ok(_) => panic!("a second bind on a served name must fail"),
+        };
+        assert!(matches!(error.kind, BindErrorKind::InUse), "{error:?}");
+        let text = error.to_string();
+        assert!(text.starts_with(&name), "{text}");
+        assert!(
+            text.contains("pipe already in use: another process is serving it"),
+            "{text}"
+        );
+        // The first listener is untouched and still accepts.
+        let (_client_side, _server) = pair(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn a_client_dropping_its_handle_is_a_clean_close() {
+        let mut listener = NamedPipeListener::bind(&pipe_name()).expect("binds");
+        let (client_side, server) = pair(&mut listener).await;
+        let (mut inbound, _outbound) = server.split();
+        drop(client_side);
+        assert!(
+            matches!(inbound.recv().await, Received::Closed(None)),
+            "a client that left is a clean close"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_instances_are_served_at_once() {
+        let mut listener = NamedPipeListener::bind(&pipe_name()).expect("binds");
+        let (mut first, first_server) = pair(&mut listener).await;
+        let (mut second, second_server) = pair(&mut listener).await;
+        let (mut first_in, mut first_out) = first_server.split();
+        let (mut second_in, mut second_out) = second_server.split();
+
+        first.write_all(&framed(&request(1))).await.unwrap();
+        second.write_all(&framed(&request(2))).await.unwrap();
+        // Each instance delivers its own client's envelope, whichever arrives first.
+        match second_in.recv().await {
+            Received::Message(envelope) => assert_eq!(envelope, request(2)),
+            other => panic!("{other:?}"),
+        }
+        match first_in.recv().await {
+            Received::Message(envelope) => assert_eq!(envelope, request(1)),
+            other => panic!("{other:?}"),
+        }
+
+        let (reply1, reply2) = (
+            Envelope::new(CorrelationId(1), MessageType::Result, Value::from(1u64)),
+            Envelope::new(CorrelationId(2), MessageType::Result, Value::from(2u64)),
+        );
+        first_out.send(reply1.clone()).await.unwrap();
+        second_out.send(reply2.clone()).await.unwrap();
+        assert_eq!(read_frame(&mut first).await, reply1);
+        assert_eq!(read_frame(&mut second).await, reply2);
+    }
+
+    /// The case cancel-safety protects: a client connects to the waiting instance while an
+    /// accept is pending, and that accept is dropped before it is polled again. The next accept
+    /// must return that very client, not a fresh instance it never opened.
+    #[tokio::test]
+    async fn a_client_arriving_while_a_dropped_accept_was_pending_is_the_next_accept() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let mut listener = NamedPipeListener::bind(&pipe_name()).expect("binds");
+        let name = listener.path().to_owned();
+        {
+            let mut pending = Box::pin(listener.accept());
+            // Polled once with no client: it waits on the instance.
+            let first =
+                std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_ready())).await;
+            assert!(!first, "no client has come yet");
+            // The client connects to that instance, then the accept is dropped unpolled.
+            let mut client_side = client(&name).await;
+            client_side.write_all(&framed(&request(4))).await.unwrap();
+            drop(pending);
+            // The client stays connected to the instance the listener still holds.
+            let server = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .expect("the waiting client is accepted")
+                .expect("accepts");
+            let (mut inbound, _outbound) = server.split();
+            match inbound.recv().await {
+                Received::Message(envelope) => assert_eq!(envelope, request(4)),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// A client that opens the pipe and leaves before the accept connects its instance fails
+    /// that instance; the listener must not keep retrying it, so a later client is served.
+    #[tokio::test]
+    async fn a_client_leaving_before_the_accept_does_not_wedge_the_listener() {
+        let mut listener = NamedPipeListener::bind(&pipe_name()).expect("binds");
+        let name = listener.path().to_owned();
+        drop(client(&name).await);
+        // This accept may report the departed client as an error, or hand back its instance.
+        let _ = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("the first accept finishes");
+        let (mut client_side, server) =
+            tokio::time::timeout(Duration::from_secs(10), pair(&mut listener))
+                .await
+                .expect("a later client is served");
+        let (mut inbound, _outbound) = server.split();
+        client_side.write_all(&framed(&request(5))).await.unwrap();
+        match inbound.recv().await {
+            Received::Message(envelope) => assert_eq!(envelope, request(5)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pending_accept_loses_no_client() {
+        let mut listener = NamedPipeListener::bind(&pipe_name()).expect("binds");
+        // No client yet: this accept is pending, and is dropped when its timeout fires.
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+        assert!(timed_out.is_err(), "no client has come yet");
+
+        // The next accept still gets the client, and that client is served.
+        let (mut client_side, server) = pair(&mut listener).await;
+        let (mut inbound, _outbound) = server.split();
+        client_side.write_all(&framed(&request(3))).await.unwrap();
+        match inbound.recv().await {
+            Received::Message(envelope) => assert_eq!(envelope, request(3)),
+            other => panic!("{other:?}"),
+        }
+    }
 }

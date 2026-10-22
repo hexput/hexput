@@ -1120,8 +1120,10 @@ fn traced_execution(id: u64, source: &str) -> hexput_port::Envelope<hexput_port:
 }
 
 /// One parsed JSON log line.
+#[cfg(unix)]
 struct JsonEvent(serde_json::Value);
 
+#[cfg(unix)]
 impl JsonEvent {
     fn message(&self) -> &str {
         self.0["fields"]["message"].as_str().unwrap_or_default()
@@ -1149,6 +1151,7 @@ impl JsonEvent {
 }
 
 /// Every log line, each of which must be exactly one JSON object.
+#[cfg(unix)]
 fn json_events(log: &str) -> Vec<JsonEvent> {
     log.lines()
         .map(|line| {
@@ -3558,5 +3561,513 @@ mod tls_serving {
             "the TCP listener is unbound"
         );
         drop(holder);
+    }
+}
+
+// --- Story 5.3: the Named Pipe on Windows, and the platform rule everywhere ---
+
+/// The `Init` every Named Pipe test sends: no Config and no registrations.
+fn init_envelope(id: u64) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::Init,
+        Value::Map(vec![
+            (Value::from("config"), Value::Map(vec![])),
+            (Value::from("registrations"), Value::Array(vec![])),
+        ]),
+    )
+}
+
+/// An `ExecutionStart` for `source`, with no variables.
+fn execution_envelope(id: u64, source: &str) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::ExecutionStart,
+        Value::Map(vec![
+            (Value::from("source"), Value::from(source)),
+            (Value::from("variables"), Value::Map(vec![])),
+        ]),
+    )
+}
+
+/// The `Result {value: n}` a Script answering `n` is owed.
+fn value_reply(id: u64, n: u64) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::Result,
+        Value::Map(vec![(Value::from("value"), Value::from(n))]),
+    )
+}
+
+/// A `[transport.named_pipe]` section for `pipe`, a TOML literal string.
+fn named_pipe_section(pipe: &str) -> String {
+    format!("[transport.named_pipe]\npath = '{pipe}'\n")
+}
+
+/// Story 5.3: the Named Pipe is Windows-only. On any other host a configured pipe is skipped with
+/// a warning, logged right after the System Config loads, and UDS serves the local role.
+#[cfg(unix)]
+#[test]
+fn a_pipe_on_a_non_windows_host_is_warned_about_and_uds_still_serves() {
+    let sandbox = Sandbox::new();
+    let pipe = r"\\.\pipe\hexput-test-unix-only";
+    let config = format!("{}{}", sandbox.valid(), named_pipe_section(pipe));
+    let serving = Serving::start(&sandbox, &config);
+    let mut client = serving.connect();
+    wire::send(&mut client, &init_envelope(1));
+    let reply = wire::reply(&mut client).expect("a reply");
+    assert_eq!(reply.message_type, hexput_port::MessageType::Result);
+    wire::send(&mut client, &execution_envelope(2, "return 1 + 2;"));
+    assert_eq!(wire::reply(&mut client), Some(value_reply(2, 3)));
+
+    let run = serving.stop();
+    run.exit(0);
+    let loaded = run
+        .log
+        .find("System Config loaded")
+        .expect("the config loads");
+    let warning = run
+        .log
+        .find("[transport.named_pipe] is Windows-only; not serving it on this platform")
+        .unwrap_or_else(|| panic!("no warning:\n{}", run.log));
+    let listening = run
+        .log
+        .find("listening on a Unix Domain Socket")
+        .expect("UDS is bound");
+    assert!(loaded < warning && warning < listening, "{}", run.log);
+    let line = run
+        .log
+        .lines()
+        .find(|line| line.contains("is Windows-only"))
+        .expect("the warning line");
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(&format!("path={pipe}")), "{line}");
+}
+
+/// Story 5.3: a configuration whose only transport is the Named Pipe has nothing servable on a
+/// non-Windows host. It exits 1 before anything is bound, naming the Windows-only section.
+#[cfg(unix)]
+#[test]
+fn a_pipe_only_config_on_a_non_windows_host_exits_one_and_binds_nothing() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.file(
+        "config.toml",
+        &named_pipe_section(r"\\.\pipe\hexput-test-unix-only"),
+    );
+    let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+    run.exit(1);
+    assert_eq!(
+        run.stderr,
+        format!(
+            "error: {}: no configured transport is served on this platform ([transport.named_pipe] is Windows-only)\n",
+            config.display()
+        )
+    );
+    assert!(!run.log.contains("daemon started"), "{}", run.log);
+    assert!(!run.log.contains("listening on"), "{}", run.log);
+}
+
+/// Story 5.3: the Named Pipe, served by a real Daemon over a real pipe. Each test has its own
+/// pipe name; the blocking client retries `ERROR_PIPE_BUSY` and the not-yet-listening instant.
+#[cfg(windows)]
+mod named_pipe_serving {
+    use std::collections::HashSet;
+    use std::ffi::OsString;
+    use std::fs::{File, OpenOptions};
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    use hexput_daemon::run_with;
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value, decode, encode, encode_frame};
+    use hexput_transport::named_pipe::NamedPipeListener;
+
+    use super::{
+        Run, Sandbox, SharedLog, daemon, execution_envelope, init_envelope, named_pipe_section,
+        nothing, value_reply,
+    };
+
+    /// `ERROR_PIPE_BUSY`: every instance is connected, or the next one is not yet created.
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    /// How long a client or a log line may take before the test gives up.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A pipe name no other test, or process, uses.
+    fn pipe_name() -> String {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        format!(
+            r"\\.\pipe\hexput-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// One attempt at a blocking client on `pipe`, read and write.
+    fn open_once(pipe: &str) -> std::io::Result<File> {
+        OpenOptions::new().read(true).write(true).open(pipe)
+    }
+
+    /// Not listening yet, or every instance busy: both are for the client to retry.
+    fn retryable(error: &std::io::Error) -> bool {
+        error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(ERROR_PIPE_BUSY)
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("tls")
+            .join(name)
+    }
+
+    /// A Daemon serving `config_text` on its own thread until [`Serving::stop`], with its log
+    /// readable while it runs.
+    struct Serving {
+        stop: tokio::sync::oneshot::Sender<()>,
+        thread: std::thread::JoinHandle<Run>,
+        log: SharedLog,
+        pipe: String,
+    }
+
+    impl Serving {
+        fn start(sandbox: &Sandbox, pipe: &str, config_text: &str) -> Self {
+            let config = sandbox.file("config.toml", config_text);
+            let discovery = nothing(sandbox);
+            let log = SharedLog::default();
+            let thread_log = log.clone();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                let argv: Vec<OsString> =
+                    vec!["hexput-daemon".into(), "--config".into(), config.into()];
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let code = run_with(
+                    argv,
+                    &discovery,
+                    &mut out,
+                    &mut err,
+                    thread_log.clone(),
+                    async {
+                        let _ = stopped.await;
+                    },
+                );
+                Run {
+                    code: format!("{code:?}"),
+                    stdout: String::from_utf8(out).unwrap(),
+                    stderr: String::from_utf8(err).unwrap(),
+                    log: thread_log.text(),
+                }
+            });
+            Self {
+                stop,
+                thread,
+                log,
+                pipe: pipe.to_owned(),
+            }
+        }
+
+        /// A client on the pipe, waiting until the Daemon is listening on it.
+        fn connect(&self) -> File {
+            let started = Instant::now();
+            loop {
+                match open_once(&self.pipe) {
+                    Ok(pipe) => return pipe,
+                    Err(error)
+                        if retryable(&error)
+                            && started.elapsed() < TIMEOUT
+                            && !self.thread.is_finished() =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("the Daemon never listened on {}: {error}", self.pipe),
+                }
+            }
+        }
+
+        /// Waits until the Daemon's log contains `text`.
+        fn wait_for(&self, text: &str) {
+            let started = Instant::now();
+            while !self.log.text().contains(text) {
+                assert!(
+                    started.elapsed() < TIMEOUT,
+                    "{text:?} was never logged:\n{}",
+                    self.log.text()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn stop(self) -> Run {
+            let _ = self.stop.send(());
+            self.thread.join().expect("the Daemon thread")
+        }
+    }
+
+    fn send(pipe: &mut File, envelope: &Envelope<Value>) {
+        pipe.write_all(&encode_frame(&encode(envelope).unwrap()).unwrap())
+            .unwrap();
+    }
+
+    /// The next frame, prefix included, or `None` once the Daemon has closed the pipe.
+    fn frame(pipe: &mut File) -> Option<Vec<u8>> {
+        let mut prefix = [0; 4];
+        match pipe.read_exact(&mut prefix) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe
+                ) =>
+            {
+                return None;
+            }
+            Err(error) => panic!("no reply: {error}"),
+        }
+        let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+        pipe.read_exact(&mut body).unwrap();
+        let mut bytes = prefix.to_vec();
+        bytes.extend(body);
+        Some(bytes)
+    }
+
+    /// The next reply, or `None` once the Daemon has closed the pipe.
+    fn reply(pipe: &mut File) -> Option<Envelope<Value>> {
+        frame(pipe).map(|bytes| decode(&bytes[4..]).unwrap())
+    }
+
+    /// The `(id, code)` of the next reply, which must be an `Error`.
+    fn refusal(pipe: &mut File) -> (Option<u64>, String) {
+        let reply = reply(pipe).expect("a reply");
+        assert_eq!(reply.message_type, MessageType::Error);
+        let Value::Map(fields) = reply.payload else {
+            panic!("an error payload is a map");
+        };
+        let code = fields
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("code"))
+            .and_then(|(_, value)| value.as_str())
+            .expect("a code")
+            .to_owned();
+        (reply.id.map(CorrelationId::get), code)
+    }
+
+    /// Sends `Init` as `id` and returns the Client ID it is answered with.
+    fn init(pipe: &mut File, id: u64) -> String {
+        send(pipe, &init_envelope(id));
+        let reply = reply(pipe).expect("a reply");
+        assert_eq!(reply.id, Some(CorrelationId(id)));
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        let fields = reply.payload.as_map().expect("a map payload");
+        assert_eq!(fields.len(), 1, "exactly `client_id`: {fields:?}");
+        assert_eq!(fields[0].0.as_str(), Some("client_id"));
+        let client_id = fields[0].1.as_str().expect("a string Client ID").to_owned();
+        assert_eq!(client_id.len(), 32);
+        client_id
+    }
+
+    #[test]
+    fn the_pipe_round_trip_answers_like_the_wire_and_logs_its_path() {
+        let sandbox = Sandbox::new();
+        let pipe = pipe_name();
+        let serving = Serving::start(&sandbox, &pipe, &named_pipe_section(&pipe));
+        let mut client = serving.connect();
+        init(&mut client, 1);
+        send(&mut client, &execution_envelope(2, "return 1 + 2;"));
+
+        // The frame on the pipe is exactly the shared framing of the reply, byte for byte.
+        let expected = value_reply(2, 3);
+        let bytes = frame(&mut client).expect("a reply");
+        assert_eq!(bytes, encode_frame(&encode(&expected).unwrap()).unwrap());
+
+        let run = serving.stop();
+        run.exit(0);
+        assert!(
+            run.log
+                .contains(&format!("listening on a Named Pipe path={pipe}")),
+            "{}",
+            run.log
+        );
+        assert!(run.log.contains("daemon stopping"), "{}", run.log);
+    }
+
+    #[test]
+    fn shutdown_ends_the_daemon_and_the_pipe_is_gone() {
+        let sandbox = Sandbox::new();
+        let pipe = pipe_name();
+        let serving = Serving::start(&sandbox, &pipe, &named_pipe_section(&pipe));
+        drop(serving.connect());
+        let run = serving.stop();
+        run.exit(0);
+        let error = open_once(&pipe).expect_err("the pipe is gone after shutdown");
+        assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+    }
+
+    #[test]
+    fn three_clients_at_once_are_each_answered_on_their_own_instance() {
+        let sandbox = Sandbox::new();
+        let pipe = pipe_name();
+        let serving = Serving::start(&sandbox, &pipe, &named_pipe_section(&pipe));
+        let mut clients: Vec<File> = (0..3).map(|_| serving.connect()).collect();
+
+        let ids: Vec<String> = clients
+            .iter_mut()
+            .enumerate()
+            .map(|(n, client)| init(client, 10 + n as u64))
+            .collect();
+        let distinct: HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), 3, "each connection has its own Client ID");
+
+        for (n, client) in clients.iter_mut().enumerate() {
+            let source = format!("return {};", 100 + n);
+            send(client, &execution_envelope(20 + n as u64, &source));
+        }
+        for (n, client) in clients.iter_mut().enumerate() {
+            assert_eq!(
+                reply(client),
+                Some(value_reply(20 + n as u64, 100 + n as u64)),
+                "client {n}"
+            );
+        }
+        serving.stop().exit(0);
+    }
+
+    #[test]
+    fn a_pipe_already_served_exits_one_naming_it_and_listens_on_nothing() {
+        let sandbox = Sandbox::new();
+        let pipe = pipe_name();
+        // Another listener holds the name first. Its instance needs a runtime to exist.
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let holder = runtime.block_on(async { NamedPipeListener::bind(&pipe) });
+        let _holder = match holder {
+            Ok(listener) => listener,
+            Err(error) => panic!("the name is free: {error}"),
+        };
+
+        let config = sandbox.file("config.toml", &named_pipe_section(&pipe));
+        let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+        run.exit(1);
+        assert_eq!(
+            run.stderr,
+            format!("error: {pipe}: pipe already in use: another process is serving it\n")
+        );
+        assert!(!run.log.contains("daemon started"), "{}", run.log);
+        assert!(
+            !run.log.contains("listening on a Named Pipe"),
+            "{}",
+            run.log
+        );
+    }
+
+    #[test]
+    fn a_client_leaving_abruptly_is_detached_and_a_new_client_is_still_served() {
+        let sandbox = Sandbox::new();
+        let pipe = pipe_name();
+        // The detach is logged at `debug`, so this test's Daemon logs at that level.
+        let config = format!("log_level = \"debug\"\n{}", named_pipe_section(&pipe));
+        let serving = Serving::start(&sandbox, &pipe, &config);
+
+        let mut first = serving.connect();
+        init(&mut first, 1);
+        drop(first);
+        serving.wait_for("connection detached from its Session");
+
+        let mut second = serving.connect();
+        init(&mut second, 2);
+        let run = serving.stop();
+        run.exit(0);
+        assert!(
+            run.log.contains("connection detached from its Session"),
+            "{}",
+            run.log
+        );
+    }
+
+    #[test]
+    fn a_malformed_frame_is_answered_and_the_connection_keeps_serving() {
+        let sandbox = Sandbox::new();
+        let pipe = pipe_name();
+        let serving = Serving::start(&sandbox, &pipe, &named_pipe_section(&pipe));
+        let mut client = serving.connect();
+        // 0xc1 is never valid MessagePack, so this frame is malformed.
+        client.write_all(&encode_frame(&[0xc1]).unwrap()).unwrap();
+        assert_eq!(
+            refusal(&mut client),
+            (None, "protocol.malformed_frame".to_owned())
+        );
+        // The connection is still served: the next frame is answered as usual.
+        send(&mut client, &init_envelope(6));
+        let reply = reply(&mut client).expect("a reply");
+        assert_eq!(reply.id, Some(CorrelationId(6)));
+        assert_eq!(reply.message_type, MessageType::Result);
+        serving.stop().exit(0);
+    }
+
+    #[test]
+    fn a_pipe_and_tcp_are_both_served_by_one_daemon() {
+        let sandbox = Sandbox::new();
+        let pipe = pipe_name();
+        // A free TCP port, which the Daemon binds with its TLS identity.
+        let tcp = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let config = format!(
+            "{}[transport.tcp]\nbind = '{tcp}'\ntls_cert = '{}'\ntls_key = '{}'\n",
+            named_pipe_section(&pipe),
+            fixture("server.pem").display(),
+            fixture("server.key").display(),
+        );
+        let serving = Serving::start(&sandbox, &pipe, &config);
+
+        let mut client = serving.connect();
+        assert_eq!(init(&mut client, 1).len(), 32);
+
+        // TCP accepts a connection too. The TLS handshake waits for a ClientHello this test
+        // never sends, so only the accept is checked.
+        let started = Instant::now();
+        loop {
+            match TcpStream::connect(tcp) {
+                Ok(_) => break,
+                Err(error) => {
+                    assert!(started.elapsed() < TIMEOUT, "TCP never listened: {error}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        serving.stop().exit(0);
+    }
+
+    #[test]
+    fn uds_only_on_windows_exits_one_naming_the_unix_only_section() {
+        let sandbox = Sandbox::new();
+        let config = sandbox.file("config.toml", &sandbox.valid());
+        let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+        run.exit(1);
+        assert_eq!(
+            run.stderr,
+            format!(
+                "error: {}: no configured transport is served on this platform ([transport.uds] is Unix-only)\n",
+                config.display()
+            )
+        );
+        assert!(
+            run.log
+                .contains("[transport.uds] is Unix-only; not serving it on this platform"),
+            "{}",
+            run.log
+        );
+        assert!(!sandbox.socket().exists(), "nothing is bound");
     }
 }

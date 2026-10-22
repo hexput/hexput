@@ -92,6 +92,9 @@ tls_key = "/tls/tcp-key.pem"
 bind = "[::1]:7401"
 tls_cert = "/tls/ws-cert.pem"
 tls_key = "/tls/ws-key.pem"
+
+[transport.named_pipe]
+path = '\\.\pipe\hexput'
 "#,
     )
     .expect("a valid file");
@@ -112,6 +115,12 @@ tls_key = "/tls/ws-key.pem"
     let tls = websocket.tls;
     assert_eq!(tls.cert, Path::new("/tls/ws-cert.pem"));
     assert_eq!(tls.key, Path::new("/tls/ws-key.pem"));
+    // Story 5.3: the Named Pipe is a transport on every platform, its path kept verbatim.
+    let pipe = config
+        .transports
+        .named_pipe
+        .expect("a Named Pipe transport");
+    assert_eq!(pipe.path, r"\\.\pipe\hexput");
 }
 
 #[test]
@@ -197,6 +206,18 @@ fn the_example_file_parses_and_documents_every_field() {
     let uds = config.transports.uds.expect("the example sets UDS");
     assert!(uds.mode.is_some(), "the example documents the socket mode");
     assert!(config.transports.tcp.is_some());
+    // Story 5.3: the example documents the Named Pipe, parsed on every platform.
+    let pipe = config
+        .transports
+        .named_pipe
+        .as_ref()
+        .expect("the example sets the Named Pipe");
+    assert_eq!(pipe.path, r"\\.\pipe\hexput");
+    assert!(
+        text.contains("Windows-only"),
+        "the pipe is documented as Windows-only"
+    );
+    assert!(text.contains("Unix-only"), "UDS is documented as Unix-only");
     let websocket = config
         .transports
         .websocket
@@ -842,4 +863,115 @@ fn a_bare_ip_websocket_bind_listens_on_the_default_port_7478() {
         config.transports.websocket.unwrap().bind,
         "127.0.0.1:7401".parse::<SocketAddr>().unwrap()
     );
+}
+
+// --- Story 5.3: the Named Pipe transport ---
+
+/// A file whose only transport is the Named Pipe at `path`, which is a TOML literal string.
+fn pipe_only(path: &str) -> String {
+    format!("[transport.named_pipe]\npath = '{path}'\n")
+}
+
+/// The expected form, verbatim, as the message names it.
+const PIPE_EXPECTED: &str = r"expected a pipe path such as '\\.\pipe\hexput' (at most 256 characters, no '\' after '\\.\pipe\')";
+
+#[test]
+fn a_named_pipe_is_a_transport_so_a_pipe_only_file_parses() {
+    let config = parse(&pipe_only(r"\\.\pipe\hexput")).expect("a pipe-only file is valid");
+    let pipe = config
+        .transports
+        .named_pipe
+        .expect("a Named Pipe transport");
+    assert_eq!(pipe.path, r"\\.\pipe\hexput");
+    assert!(config.transports.uds.is_none());
+    assert!(config.transports.tcp.is_none());
+    assert!(config.transports.websocket.is_none());
+}
+
+#[test]
+fn a_bad_named_pipe_path_names_the_field_its_position_and_the_expected_form() {
+    let long = format!(r"\\.\pipe\{}", "a".repeat(248));
+    assert_eq!(long.chars().count(), 257);
+    for path in ["/tmp/x", r"\\.\pipe\", r"\\.\pipe\a\b", long.as_str()] {
+        let text = pipe_only(path);
+        match parse_err(&text) {
+            Problem::InvalidValue {
+                field,
+                location,
+                message,
+            } => {
+                assert_eq!(field, "transport.named_pipe.path", "{path:?}");
+                assert_eq!(location, Some(Location { line: 2, column: 8 }), "{path:?}");
+                assert!(message.contains(PIPE_EXPECTED), "{path:?}: {message}");
+            }
+            other => panic!("{path:?}: expected an invalid pipe path, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn accepted_named_pipe_path_forms_are_kept_verbatim() {
+    let exactly_256 = format!(r"\\.\pipe\{}", "a".repeat(247));
+    assert_eq!(exactly_256.chars().count(), 256);
+    for path in [r"\\.\pipe\hexput", r"\\.\PIPE\hexput", exactly_256.as_str()] {
+        let config = parse(&pipe_only(path)).unwrap_or_else(|error| panic!("{path:?}: {error:?}"));
+        assert_eq!(
+            config.transports.named_pipe.expect("a pipe").path,
+            path,
+            "{path:?} is kept verbatim"
+        );
+    }
+}
+
+/// A NUL would end the name Windows sees early, so the Daemon would serve another pipe; any
+/// control character is refused, and the message escapes it so it stays one line. The length is
+/// Windows' own count, in UTF-16 units: a character outside the BMP is two.
+#[test]
+fn a_named_pipe_path_with_a_control_character_or_too_many_utf16_units_is_rejected() {
+    // TOML basic strings, so `\u0000` and `\n` reach the validator as the characters.
+    for (path, shown) in [
+        (r"\\\\.\\pipe\\a\u0000b", r"\\.\pipe\a\u{0}b"),
+        (r"\\\\.\\pipe\\a\nb", r"\\.\pipe\a\nb"),
+    ] {
+        let text = format!("[transport.named_pipe]\npath = \"{path}\"\n");
+        match parse_err(&text) {
+            Problem::InvalidValue { field, message, .. } => {
+                assert_eq!(field, "transport.named_pipe.path", "{path:?}");
+                assert!(message.contains(PIPE_EXPECTED), "{path:?}: {message}");
+                assert!(message.contains(shown), "{path:?}: {message}");
+                assert!(!message.contains('\n'), "one line: {message:?}");
+            }
+            other => panic!("{path:?}: expected an invalid pipe path, got {other:?}"),
+        }
+    }
+
+    // 129 non-BMP characters: 138 characters, but 267 UTF-16 units.
+    let wide = format!(r"\\.\pipe\{}", "\u{1F600}".repeat(129));
+    assert!(wide.chars().count() <= 256 && wide.encode_utf16().count() > 256);
+    match parse_err(&pipe_only(&wide)) {
+        Problem::InvalidValue { field, .. } => assert_eq!(field, "transport.named_pipe.path"),
+        other => panic!("expected an invalid pipe path, got {other:?}"),
+    }
+    // 123 of them, 255 units, fit.
+    let fits = format!(r"\\.\pipe\{}", "\u{1F600}".repeat(123));
+    assert_eq!(fits.encode_utf16().count(), 255);
+    assert!(parse(&pipe_only(&fits)).is_ok());
+}
+
+#[test]
+fn a_named_pipe_section_without_a_path_or_with_an_unknown_key_is_rejected() {
+    match parse_err("[transport.named_pipe]\n") {
+        Problem::Parse { location, message } => {
+            assert!(message.contains("missing field `path`"), "{message}");
+            assert!(location.is_some(), "the missing field has a position");
+        }
+        other => panic!("expected a missing-field error, got {other:?}"),
+    }
+    match parse_err("[transport.named_pipe]\npath = '\\\\.\\pipe\\hexput'\nmode = \"0660\"\n") {
+        Problem::Parse { location, message } => {
+            assert!(message.contains("unknown field `mode`"), "{message}");
+            assert!(location.is_some(), "the unknown field has a position");
+        }
+        other => panic!("expected an unknown-field error, got {other:?}"),
+    }
 }

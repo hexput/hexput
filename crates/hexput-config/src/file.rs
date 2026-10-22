@@ -15,8 +15,8 @@ use toml::Spanned;
 
 use crate::{
     DEFAULT_AST_CACHE_CAPACITY, DEFAULT_SESSION_TTL, DEFAULT_TCP_PORT, DEFAULT_WEBSOCKET_PORT,
-    Location, LogFormat, LogLevel, Problem, SystemConfig, TcpTransport, Tls, Transports,
-    UdsTransport, WebSocketTransport,
+    Location, LogFormat, LogLevel, NamedPipeTransport, Problem, SystemConfig, TcpTransport, Tls,
+    Transports, UdsTransport, WebSocketTransport,
 };
 
 #[derive(Deserialize)]
@@ -35,6 +35,13 @@ struct RawTransports {
     uds: Option<RawUds>,
     tcp: Option<RawTcp>,
     websocket: Option<RawWebSocket>,
+    named_pipe: Option<RawNamedPipe>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNamedPipe {
+    path: Spanned<String>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +66,9 @@ struct RawWebSocket {
     tls_cert: Spanned<String>,
     tls_key: Spanned<String>,
 }
+
+/// The longest Named Pipe path Windows accepts, in characters.
+const MAX_PIPE_PATH: usize = 256;
 
 /// Parse System Config text. Pure: no I/O, no environment. [`crate::resolve`] is this plus
 /// finding and reading the file, and wraps a failure with the file's path.
@@ -171,7 +181,11 @@ impl Validator<'_> {
     }
 
     fn transports(&self, raw: RawTransports) -> Result<Transports, Problem> {
-        if raw.uds.is_none() && raw.tcp.is_none() && raw.websocket.is_none() {
+        if raw.uds.is_none()
+            && raw.tcp.is_none()
+            && raw.websocket.is_none()
+            && raw.named_pipe.is_none()
+        {
             return Err(Problem::NoTransport);
         }
         let uds = match raw.uds {
@@ -210,11 +224,56 @@ impl Validator<'_> {
                 },
             }),
         };
+        // Story 5.3: validated on every platform, although only Windows serves it — one System
+        // Config may be shared across platforms, and a typo should not wait for a Windows host.
+        let named_pipe = match raw.named_pipe {
+            None => None,
+            Some(pipe) => Some(NamedPipeTransport {
+                path: self.pipe_path("transport.named_pipe.path", &pipe.path)?,
+            }),
+        };
         Ok(Transports {
             uds,
             tcp,
             websocket,
+            named_pipe,
         })
+    }
+
+    /// A Named Pipe's name: `\\.\pipe\` (`pipe` in any ASCII case), then a non-empty name with
+    /// no further `\` and no control character (a NUL would end the name Windows sees early), at
+    /// most [`MAX_PIPE_PATH`] UTF-16 units in all — Windows' own count. Kept verbatim.
+    fn pipe_path(&self, field: &str, path: &Spanned<String>) -> Result<String, Problem> {
+        let text = path.get_ref();
+        let name = text
+            .strip_prefix(r"\\.\")
+            .and_then(|rest| rest.get(..5).zip(rest.get(5..)))
+            .filter(|(pipe, _)| pipe.eq_ignore_ascii_case(r"pipe\"))
+            .map(|(_, name)| name);
+        let valid = name.is_some_and(|name| {
+            !name.is_empty() && !name.contains('\\') && !name.chars().any(char::is_control)
+        }) && text.encode_utf16().count() <= MAX_PIPE_PATH;
+        if valid {
+            return Ok(text.clone());
+        }
+        // Control characters escaped, so the message stays one line; backslashes kept as typed.
+        let text: String = text
+            .chars()
+            .map(|c| {
+                if c.is_control() {
+                    c.escape_default().to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        Err(self.invalid(
+            field,
+            path,
+            format!(
+                r#"expected a pipe path such as '\\.\pipe\hexput' (at most {MAX_PIPE_PATH} characters, no '\' after '\\.\pipe\'), got "{text}""#
+            ),
+        ))
     }
 
     /// A listener's address. The port may be left out — a bare IP (`0.0.0.0`, `::`, `::1` or

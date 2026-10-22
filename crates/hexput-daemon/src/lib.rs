@@ -19,53 +19,53 @@
 //!   the version was explicitly requested (printed to stdout).
 //! * `2` — the invocation was wrong (an unknown flag, `--config` without a value).
 //! * `1` — the System Config could not be loaded (missing, unreadable, malformed, invalid —
-//!   including a TCP or WebSocket section without `tls_cert`/`tls_key`), a TLS certificate or key
-//!   could not be loaded (missing, unreadable, malformed, or a key that does not match the
-//!   certificate), a listener could not be bound, or the runtime could not start. The reason is
-//!   one line on stderr naming the file, the socket path or the TCP/WebSocket address; nothing is
-//!   left listening or on disk.
+//!   including a TCP or WebSocket section without `tls_cert`/`tls_key`), it configures no
+//!   transport this platform serves, a TLS certificate or key could not be loaded (missing,
+//!   unreadable, malformed, or a key that does not match the certificate), a listener could not
+//!   be bound (including a Named Pipe another process already serves), or the runtime could not
+//!   start. The reason is one line on stderr naming the file, the socket path, the pipe or the
+//!   TCP/WebSocket address; nothing is left listening or on disk.
 //!
 //! # Serving
 //!
 //! The Daemon serves every configured transport from one accept loop (`hexput-transport`): the
-//! Unix Domain Socket, TCP with mandatory TLS (Story 5.1) and WebSocket with mandatory TLS
-//! (Story 5.2). Startup runs in a fixed order — load the TCP TLS identity, load the WebSocket
-//! TLS identity (separately, even when it names the same files), bind the socket, bind the TCP
-//! listener, bind the WebSocket listener — so a bad certificate binds nothing, and a bind
-//! failure closes every listener bound before it. Everything is bound before the Daemon
-//! announces that it started; each network listener's actual address is logged
-//! (`"listening on TCP with TLS"` / `"listening on WebSocket with TLS"`, field `address`). Each
-//! accepted connection is its own Tokio task running `hexput_connection::serve`, which is generic
-//! over the Port and never learns the transport (AD-1); a connection that fails, disconnects
-//! abruptly or panics ends only its own task. A TCP connection's TLS handshake, and a WebSocket
+//! local transport — the Unix Domain Socket on Unix, the Named Pipe on Windows (Story 5.3) —,
+//! TCP with mandatory TLS (Story 5.1) and WebSocket with mandatory TLS (Story 5.2), the last two
+//! on every platform. A configured section this platform cannot serve (`[transport.uds]` off
+//! Unix, `[transport.named_pipe]` off Windows) is skipped with a `warn` naming it, logged right
+//! after the System Config, so one file can serve hosts of both kinds; only a System Config with
+//! nothing servable here fails to start. Startup then runs in a fixed order — load the TCP TLS
+//! identity, load the WebSocket TLS identity (separately, even when it names the same files),
+//! bind the local transport, bind the TCP listener, bind the WebSocket listener — so a bad
+//! certificate binds nothing, and a bind failure closes every listener bound before it.
+//! Everything is bound before the Daemon announces that it started; the socket's or pipe's path
+//! is logged (`"listening on a Unix Domain Socket"` / `"listening on a Named Pipe"`, field
+//! `path`), and each network listener's actual address (`"listening on TCP with TLS"` /
+//! `"listening on WebSocket with TLS"`, field `address`). Each accepted connection is its own
+//! Tokio task running `hexput_connection::serve`, which is generic over the Port and never
+//! learns the transport (AD-1); a connection that fails, disconnects abruptly or panics ends
+//! only its own task. A TCP connection's TLS handshake, and a WebSocket
 //! connection's TLS handshake and upgrade, run inside that task, bounded by
 //! `hexput_transport::tcp_tls::HANDSHAKE_TIMEOUT`, so a slow peer never stalls the accept loop;
 //! a failed handshake closes that socket and is logged at `debug` with the peer's address
 //! (`"TLS handshake failed"` / `"WebSocket handshake failed"`). Every connection shares the run's
 //! one Session registry (`hexput-session`), which is where an `Init` creates a Session. On
-//! shutdown the Daemon stops accepting on every listener and removes the socket file it created.
+//! shutdown the Daemon stops accepting on every listener and removes the socket file it created;
+//! a Named Pipe has no file and is gone once its listener is dropped.
 
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(unix)]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
-#[cfg(unix)]
 use std::time::Duration;
 
 use clap::Parser;
 use hexput_config::{Loaded, LogFormat, LogLevel};
-#[cfg(unix)]
 use hexput_session::Sessions;
-#[cfg(unix)]
 use hexput_transport::tcp_tls::{TcpTlsListener, TlsIdentity};
-#[cfg(unix)]
-use hexput_transport::uds::UdsListener;
-#[cfg(unix)]
 use hexput_transport::websocket::WebSocketListener;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -223,14 +223,12 @@ where
 
 /// How long the accept loop pauses after a failed accept, so a persistent failure (out of file
 /// descriptors) cannot spin a core.
-#[cfg(unix)]
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The Daemon's Session registry over `cache`: a Session's teardown releases its cache entries
 /// through the registry's hook, so `hexput-session` never reaches `hexput-script` (Story 4.3). The
 /// one place this pairing is made — the connection opens a Session in the cache at init, and this
 /// hook closes it — so a test can check the Daemon's own wiring.
-#[cfg(unix)]
 fn registry(cache: &Arc<hexput_script::AstCache>) -> Arc<Sessions> {
     let released = Arc::clone(cache);
     Arc::new(Sessions::new().with_teardown(move |client_id| released.close(client_id)))
@@ -239,14 +237,14 @@ fn registry(cache: &Arc<hexput_script::AstCache>) -> Arc<Sessions> {
 /// The Daemon proper: announce the System Config, bind every listener, serve connections until
 /// `shutdown` completes, then stop listening and remove the socket. `Err` is the one-line
 /// startup failure.
-#[cfg(unix)]
 async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(), String> {
     tracing::info!(
         path = %loaded.path.display(),
         source = %loaded.source.as_str(),
         "System Config loaded",
     );
-    let listeners = listen(loaded).await?;
+    servable(loaded)?;
+    let mut listeners = listen(loaded).await?;
 
     // Poll once before announcing readiness: a signal future installs its handlers on first
     // poll, so once "waiting" is logged a signal is certain to be caught rather than meeting the
@@ -274,7 +272,9 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                         tracing::error!("a connection task panicked; other connections are unaffected");
                     }
                 }
-                accepted = accept(listeners.uds.as_ref(), UdsListener::accept) => match accepted {
+                // The local transport — the Unix Domain Socket on Unix, the Named Pipe on Windows —
+                // has no handshake, so its connection is served directly.
+                accepted = accept(listeners.local.as_mut(), local::accept) => match accepted {
                     Ok(port) => {
                         // `serve` logs the connection's opening inside its own span.
                         connections.spawn(hexput_connection::serve(
@@ -284,7 +284,11 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                         ));
                     }
                     Err(error) => {
-                        tracing::warn!(transport = "uds", %error, "cannot accept a connection");
+                        tracing::warn!(
+                            transport = local::TRANSPORT,
+                            %error,
+                            "cannot accept a connection",
+                        );
                         tokio::time::sleep(ACCEPT_BACKOFF).await;
                     }
                 },
@@ -340,9 +344,9 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
 }
 
 /// The next connection on `listener`; never ready when the transport is not configured, so an
-/// absent listener's `select!` branch simply never fires.
-#[cfg(unix)]
-async fn accept<'l, L, F, T>(listener: Option<&'l L>, accept: impl FnOnce(&'l L) -> F) -> T
+/// absent listener's `select!` branch simply never fires. `R` is a shared or a mutable borrow of
+/// the listener, whichever its `accept` takes.
+async fn accept<R, F, T>(listener: Option<R>, accept: impl FnOnce(R) -> F) -> T
 where
     F: Future<Output = T>,
 {
@@ -352,50 +356,163 @@ where
     }
 }
 
-/// No adapter serves a non-Unix platform until the Named Pipe arrives (Epic 5), so the Daemon
-/// refuses to start rather than listen nowhere.
-#[cfg(not(unix))]
-async fn serve<S: Future<Output = ()>>(loaded: &Loaded, _shutdown: S) -> Result<(), String> {
-    Err(format!(
-        "{}: no transport is served on this platform yet; the Named Pipe adapter arrives with \
-         a later release",
-        loaded.path.display()
-    ))
+/// The platform rule (Story 5.3): the Unix Domain Socket is served only on Unix and the Named
+/// Pipe only on Windows; TCP and WebSocket everywhere. A configured section this platform cannot
+/// serve is skipped with a warning, and the Daemon fails to start only when nothing configured is
+/// served here — a Daemon listening nowhere is not running. Runs before any identity loads or
+/// anything binds.
+fn servable(loaded: &Loaded) -> Result<(), String> {
+    let transports = &loaded.config.transports;
+    let mut skipped = Vec::new();
+    if !cfg!(unix)
+        && let Some(uds) = &transports.uds
+    {
+        tracing::warn!(
+            path = %uds.path.display(),
+            "[transport.uds] is Unix-only; not serving it on this platform",
+        );
+        skipped.push("[transport.uds] is Unix-only");
+    }
+    if !cfg!(windows)
+        && let Some(pipe) = &transports.named_pipe
+    {
+        tracing::warn!(
+            path = %pipe.path,
+            "[transport.named_pipe] is Windows-only; not serving it on this platform",
+        );
+        skipped.push("[transport.named_pipe] is Windows-only");
+    }
+    let served =
+        local::configured(transports) || transports.tcp.is_some() || transports.websocket.is_some();
+    if served {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: no configured transport is served on this platform ({})",
+            loaded.path.display(),
+            skipped.join("; ")
+        ))
+    }
 }
 
-/// Every listener the System Config names, each present only when configured.
+/// The local transport on Unix: the Unix Domain Socket.
 #[cfg(unix)]
+mod local {
+    use std::io;
+
+    use hexput_config::Transports;
+    use hexput_transport::uds::{UdsListener, UdsPort};
+
+    /// The local listener's type.
+    pub(crate) type Listener = UdsListener;
+
+    /// The `transport` field of an accept failure's log line.
+    pub(crate) const TRANSPORT: &str = "uds";
+
+    /// Whether the System Config names the local transport this platform serves.
+    pub(crate) const fn configured(transports: &Transports) -> bool {
+        transports.uds.is_some()
+    }
+
+    /// Bind the Unix Domain Socket, if configured.
+    pub(crate) fn bind(transports: &Transports) -> Result<Option<Listener>, String> {
+        let Some(uds) = transports.uds.as_ref() else {
+            return Ok(None);
+        };
+        let listener = UdsListener::bind(&uds.path, uds.mode).map_err(|e| e.to_string())?;
+        if listener.replaced_stale() {
+            tracing::info!(
+                path = %uds.path.display(),
+                "removed a stale socket file left by an unclean shutdown",
+            );
+        }
+        tracing::info!(path = %listener.path().display(), "listening on a Unix Domain Socket");
+        Ok(Some(listener))
+    }
+
+    /// The next connection on the socket.
+    pub(crate) async fn accept(listener: &mut Listener) -> io::Result<UdsPort> {
+        listener.accept().await
+    }
+
+    /// Stop listening and remove the socket file.
+    pub(crate) fn close(listener: Listener) {
+        let path = listener.path().to_path_buf();
+        if let Err(error) = listener.close() {
+            tracing::warn!(path = %path.display(), %error, "cannot remove the socket file");
+        }
+    }
+}
+
+/// The local transport on Windows: the Named Pipe (Story 5.3).
+#[cfg(windows)]
+mod local {
+    use std::io;
+
+    use hexput_config::Transports;
+    use hexput_transport::named_pipe::{NamedPipeListener, NamedPipePort};
+
+    /// The local listener's type.
+    pub(crate) type Listener = NamedPipeListener;
+
+    /// The `transport` field of an accept failure's log line.
+    pub(crate) const TRANSPORT: &str = "named_pipe";
+
+    /// Whether the System Config names the local transport this platform serves.
+    pub(crate) const fn configured(transports: &Transports) -> bool {
+        transports.named_pipe.is_some()
+    }
+
+    /// Create the Named Pipe's first instance, if configured.
+    pub(crate) fn bind(transports: &Transports) -> Result<Option<Listener>, String> {
+        let Some(pipe) = transports.named_pipe.as_ref() else {
+            return Ok(None);
+        };
+        let listener = NamedPipeListener::bind(&pipe.path).map_err(|e| e.to_string())?;
+        tracing::info!(path = %listener.path(), "listening on a Named Pipe");
+        Ok(Some(listener))
+    }
+
+    /// The next client on the pipe.
+    pub(crate) async fn accept(listener: &mut Listener) -> io::Result<NamedPipePort> {
+        listener.accept().await
+    }
+
+    /// Stop serving the pipe: dropping the listener closes its waiting instance, and there is
+    /// no file to remove.
+    pub(crate) fn close(listener: Listener) {
+        drop(listener);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+compile_error!("hexput-daemon serves Unix and Windows hosts only");
+
+/// Every listener the System Config names, each present only when configured and served on this
+/// platform.
 struct Listeners {
-    uds: Option<UdsListener>,
+    /// The Unix Domain Socket on Unix, the Named Pipe on Windows.
+    local: Option<local::Listener>,
     tcp: Option<TcpTlsListener>,
     websocket: Option<WebSocketListener>,
 }
 
-#[cfg(unix)]
 impl Listeners {
     /// Stop accepting on every listener and remove the socket file.
     fn close(self) {
         drop(self.websocket);
         drop(self.tcp);
-        if let Some(uds) = self.uds {
-            close_uds(uds);
+        if let Some(listener) = self.local {
+            local::close(listener);
         }
     }
 }
 
-#[cfg(unix)]
-fn close_uds(listener: UdsListener) {
-    let path = listener.path().to_path_buf();
-    if let Err(error) = listener.close() {
-        tracing::warn!(path = %path.display(), %error, "cannot remove the socket file");
-    }
-}
-
 /// Bind every configured listener, in the fixed startup order: load the TCP TLS identity, load
-/// the WebSocket TLS identity, bind the Unix Domain Socket, bind the TCP listener, bind the
-/// WebSocket listener. A failure after a listener is bound closes every listener bound before
-/// it, so a failed start leaves nothing listening or on disk.
-#[cfg(unix)]
+/// the WebSocket TLS identity, bind the local transport (the Unix Domain Socket on Unix, the
+/// Named Pipe on Windows), bind the TCP listener, bind the WebSocket listener. A failure after a
+/// listener is bound closes every listener bound before it, so a failed start leaves nothing
+/// listening or on disk.
 async fn listen(loaded: &Loaded) -> Result<Listeners, String> {
     let transports = &loaded.config.transports;
     // 1–2. The TLS identities, before anything is bound: a bad certificate binds nothing. The
@@ -415,21 +532,8 @@ async fn listen(loaded: &Loaded) -> Result<Listeners, String> {
                 .map_err(|error| error.to_string())?,
         )),
     };
-    // 3. The Unix Domain Socket.
-    let uds = match transports.uds.as_ref() {
-        None => None,
-        Some(uds) => {
-            let listener = UdsListener::bind(&uds.path, uds.mode).map_err(|e| e.to_string())?;
-            if listener.replaced_stale() {
-                tracing::info!(
-                    path = %uds.path.display(),
-                    "removed a stale socket file left by an unclean shutdown",
-                );
-            }
-            tracing::info!(path = %listener.path().display(), "listening on a Unix Domain Socket");
-            Some(listener)
-        }
-    };
+    // 3. The local transport.
+    let local = local::bind(transports)?;
     // 4. The TCP listener.
     let tcp = match tcp {
         None => None,
@@ -440,8 +544,8 @@ async fn listen(loaded: &Loaded) -> Result<Listeners, String> {
                 Some(listener)
             }
             Err(error) => {
-                if let Some(uds) = uds {
-                    close_uds(uds);
+                if let Some(listener) = local {
+                    local::close(listener);
                 }
                 return Err(format!("{bind}: cannot listen for TCP: {error}"));
             }
@@ -458,7 +562,7 @@ async fn listen(loaded: &Loaded) -> Result<Listeners, String> {
             }
             Err(error) => {
                 Listeners {
-                    uds,
+                    local,
                     tcp,
                     websocket: None,
                 }
@@ -468,7 +572,7 @@ async fn listen(loaded: &Loaded) -> Result<Listeners, String> {
         },
     };
     Ok(Listeners {
-        uds,
+        local,
         tcp,
         websocket,
     })
@@ -552,7 +656,7 @@ async fn shutdown_signal() {
 // In-crate rather than in `hexput-tests`: `registry` is private to the Daemon's composition root,
 // and the wiring it makes is not observable over the socket before Epic 5 lets a Client ID be
 // reattached (Story 4.3).
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 

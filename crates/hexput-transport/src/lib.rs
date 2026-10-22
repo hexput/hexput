@@ -4,12 +4,14 @@
 //!
 //! Today: the Unix Domain Socket adapter ([`uds`], Unix only) and the TCP+TLS adapter
 //! ([`tcp_tls`], Story 5.1), both over one private length-prefixed framing, and the WebSocket
-//! adapter ([`websocket`], Story 5.2), one envelope per binary message over the same TLS. The
-//! Named Pipe arrives later in Epic 5.
+//! adapter ([`websocket`], Story 5.2), one envelope per binary message over the same TLS, and
+//! the Named Pipe adapter ([`named_pipe`], Windows only, Story 5.3), the same framing again.
 //!
 //! Binds: AD-1, FR-9.
 
 mod framed;
+#[cfg(windows)]
+pub mod named_pipe;
 pub mod tcp_tls;
 #[cfg(unix)]
 pub mod uds;

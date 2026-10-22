@@ -474,6 +474,7 @@ fn protocol_codes_are_stable_and_in_the_protocol_category() {
         "protocol.result_too_deep",
         "protocol.response_too_large",
         "protocol.unknown_script_handle",
+        "protocol.reconnect_denied",
     ];
     let actual: Vec<_> = ProtocolCode::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1082,4 +1083,29 @@ fn a_code_register_envelope_is_spelled_code_register_on_the_wire() {
     let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.message_type, MessageType::CodeRegister);
     assert_eq!(decoded.id, Some(CorrelationId(4)));
+}
+
+#[test]
+fn a_reconnect_envelope_is_spelled_reconnect_on_the_wire_and_its_denial_is_not_fatal() {
+    let bytes = encode(&Envelope::new(
+        CorrelationId(4),
+        MessageType::Reconnect,
+        map(vec![("client_id", s("0")), ("reconnect_secret", s("0"))]),
+    ))
+    .unwrap();
+    let value = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+    assert_eq!(
+        value
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("type"))
+            .unwrap()
+            .1
+            .as_str(),
+        Some("Reconnect")
+    );
+    assert_eq!(decode(&bytes).unwrap().message_type, MessageType::Reconnect);
+    // A denied reconnect leaves the connection open: the code is not fatal.
+    assert!(!hexput_port::ProtocolError::new(ProtocolCode::ReconnectDenied, "").is_fatal());
 }

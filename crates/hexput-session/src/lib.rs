@@ -43,6 +43,19 @@
 //! time). The credential is defined here alone, whatever carried the
 //! Connection; Story 5.6 builds reconnect on it.
 //!
+//! # What Story 5.6 adds
+//!
+//! [`Sessions::reconnect`] is the one wire path that attaches a further Connection to a live
+//! Session: it verifies the presented secret with the Session's credential (constant time) and,
+//! when it matches, inserts the Connection under the same shard lock — so a racing
+//! [`Sessions::detach`] either tears the Session down first (and the reconnect is denied) or sees
+//! the new attachment. An unknown Client ID runs the same dummy verify as
+//! [`Sessions::verify_reconnect`] and is denied identically. [`ReconnectRequest`] decodes a
+//! `Reconnect` payload — exactly `client_id` and `reconnect_secret` — from the payload alone,
+//! before any lookup; a carried Config or registrations list is refused, never applied, since the
+//! Session's stored ones are resumed. The presented secret is never logged or echoed, and is
+//! dropped with the request after verification.
+//!
 //! Nothing here is `async`, so no lock of this crate's can be held across an `.await`; nothing
 //! here writes to disk.
 //!
@@ -50,6 +63,7 @@
 
 mod credential;
 mod init;
+mod reconnect;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -63,6 +77,7 @@ use credential::Credential;
 pub use credential::ReconnectSecret;
 pub use hexput_port::{Setting, Settings};
 pub use init::{Config, InitError, InitRequest, RegisteredFunction};
+pub use reconnect::ReconnectRequest;
 
 /// A Connection's identity for this Daemon run, issued by [`Sessions::connect`] when it opens —
 /// before init, so even its pre-init log events name it — and also its attachment to a Session.
@@ -191,8 +206,9 @@ impl Sessions {
     /// registry and is attached to at most one Session, once — this call or one
     /// [`create`](Self::create), never both, never twice.
     ///
-    /// Nothing on the wire reaches this before reconnect (Epic 5); it exists so a Session with
-    /// several attachments is a state the registry supports from the start (AD-2).
+    /// Nothing on the wire reaches this: the wire path is [`reconnect`](Self::reconnect), which
+    /// verifies the reconnect secret first. This unverified form stays for tests and for a
+    /// Session with several attachments to be a state the registry supports directly (AD-2).
     #[must_use]
     pub fn attach(&self, client_id: ClientId, connection: ConnectionId) -> bool {
         match self.sessions.get_mut(&client_id) {
@@ -206,8 +222,8 @@ impl Sessions {
 
     /// Detach a Connection from its Session. When it was the last one attached, the Session is
     /// removed from the registry under the same shard lock as the detach — so no racing
-    /// [`attach`](Self::attach) can find a Session on its way out — and then torn down, outside
-    /// any lock.
+    /// [`attach`](Self::attach) or [`reconnect`](Self::reconnect) can find a Session on its way
+    /// out — and then torn down, outside any lock.
     ///
     /// Detaching a Connection that is not attached, or from a Session that no longer exists, does
     /// nothing.
@@ -231,6 +247,48 @@ impl Sessions {
             None => {
                 // The result is discarded — an unknown Client ID never verifies — but kept opaque to
                 // the optimizer so the dummy verify is not elided.
+                let _ = core::hint::black_box(
+                    Credential::dummy().verify(core::hint::black_box(secret)),
+                );
+                false
+            }
+        }
+    }
+
+    /// Attach `connection` to the Session with this Client ID when `secret` is its reconnect
+    /// secret (Story 5.6), and return whether it did.
+    ///
+    /// The secret is verified with the Session's credential in constant time, and the Connection
+    /// is inserted under the same shard lock, so a racing [`detach`](Self::detach) of the
+    /// Session's last Connection either removes the Session first — this returns `false` — or
+    /// finds the new attachment and leaves the Session live. An unknown Client ID (never issued,
+    /// or already torn down) is checked against the fixed dummy credential, as in
+    /// [`verify_reconnect`](Self::verify_reconnect), and gives `false` like a wrong secret: one
+    /// HMAC verify per attempt either way. When this returns `false`, nothing changes.
+    ///
+    /// What is identical between the two denials is the outcome, and so the reply; the timing is
+    /// not guaranteed to be — a live Client ID takes its shard's write lock and may wait on it —
+    /// which is no oracle worth having, as a Client ID is 128 random bits.
+    ///
+    /// Precondition, not checked: as for [`attach`](Self::attach).
+    #[must_use]
+    pub fn reconnect(
+        &self,
+        client_id: ClientId,
+        secret: &ReconnectSecret,
+        connection: ConnectionId,
+    ) -> bool {
+        match self.sessions.get_mut(&client_id) {
+            Some(mut session) => {
+                if session.credential.verify(secret) {
+                    session.connections.insert(connection);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                // As in `verify_reconnect`: discarded, but kept opaque so it is not elided.
                 let _ = core::hint::black_box(
                     Credential::dummy().verify(core::hint::black_box(secret)),
                 );

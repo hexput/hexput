@@ -5297,3 +5297,543 @@ fn an_invalid_init_answers_no_reconnect_secret_and_creates_no_session() {
     );
     assert!(sessions.is_empty());
 }
+
+// --- Story 5.6: reconnect without resending configuration ---
+
+/// A `Reconnect` request as `id`, carrying exactly `client_id` and `reconnect_secret`.
+fn reconnect(id: u64, client_id: &str, secret: &str) -> Received {
+    reconnect_raw(
+        id,
+        Value::Map(vec![
+            (string("client_id"), string(client_id)),
+            (string("reconnect_secret"), string(secret)),
+        ]),
+    )
+}
+
+/// A `Reconnect` request as `id` with an extra `key` beside its credential.
+fn reconnect_carrying(
+    id: u64,
+    client_id: &str,
+    secret: &str,
+    (key, value): (&str, Value),
+) -> Received {
+    reconnect_raw(
+        id,
+        Value::Map(vec![
+            (string("client_id"), string(client_id)),
+            (string("reconnect_secret"), string(secret)),
+            (string(key), value),
+        ]),
+    )
+}
+
+/// A `Reconnect` request as `id` with exactly `payload`.
+fn reconnect_raw(id: u64, payload: Value) -> Received {
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::Reconnect,
+        payload,
+    ))
+}
+
+/// `secret` with its last character changed: still 64 lowercase hex characters, never the secret.
+fn altered_secret(secret: &str) -> String {
+    let mut text = secret.to_owned();
+    let last = text.pop().expect("a secret");
+    text.push(if last == '0' { '1' } else { '0' });
+    text
+}
+
+/// The Client ID no Session has: 32 lowercase hex characters, all zero.
+const UNKNOWN_CLIENT_ID: &str = "00000000000000000000000000000000";
+
+/// The refusal every denied reconnect carries, fixed (Story 5.6).
+const RECONNECT_DENIED: &str = "no Session matches this Client ID and reconnect secret";
+
+/// A Connection opened on `sessions` and `cache` with nothing sent: the Backend's side of it, and
+/// its running `serve`.
+fn open_bare(
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+) -> (Backend, tokio::task::JoinHandle<()>) {
+    let (to_daemon, from_test) = tokio::sync::mpsc::unbounded_channel();
+    let (to_test, from_daemon) = tokio::sync::mpsc::unbounded_channel();
+    let port = Wired {
+        from_test,
+        to_test,
+        refuse_calls: false,
+    };
+    let serving = tokio::spawn(hexput_connection::serve(
+        port,
+        Arc::clone(sessions),
+        Arc::clone(cache),
+    ));
+    (
+        Backend {
+            to_daemon: Some(to_daemon),
+            from_daemon,
+        },
+        serving,
+    )
+}
+
+/// [`open_bare`] and an `Init` with `payload`, its reply read: the Backend, its `serve`, and the
+/// Client ID and reconnect secret the init issued.
+async fn issued(
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    payload: Value,
+) -> (Backend, tokio::task::JoinHandle<()>, ClientId, String) {
+    let (mut backend, serving) = open_bare(sessions, cache);
+    backend.reply(CorrelationId(1), MessageType::Init, payload);
+    let (client_id, secret) = init_reply_of(&backend.next().await);
+    (backend, serving, client_id, secret)
+}
+
+/// Runs `body` on a fresh runtime, with the discarding subscriber every wired test runs under.
+fn on_runtime(body: impl std::future::Future<Output = ()>) {
+    let runtime = wired_runtime();
+    let dispatch = discarding_dispatch();
+    tracing::dispatcher::with_default(&dispatch, || runtime.block_on(body));
+}
+
+/// The next reply, which must be `Error` `code` to `id`; returns it.
+async fn refused_with(backend: &mut Backend, id: u64, code: &str) -> Envelope<Value> {
+    let reply = backend.next().await;
+    assert_eq!(reply.id, Some(CorrelationId(id)), "{:?}", reply.payload);
+    assert_eq!(code_of(&reply), code, "{:?}", reply.payload);
+    reply
+}
+
+/// The next reply, which must be a `Result` to `id` whose payload is exactly `client_id`.
+async fn resumed(backend: &mut Backend, id: u64, client_id: ClientId) -> Envelope<Value> {
+    let reply = backend.next().await;
+    assert_eq!(reply.id, Some(CorrelationId(id)), "{:?}", reply.payload);
+    assert_eq!(
+        reply.message_type,
+        MessageType::Result,
+        "{:?}",
+        reply.payload
+    );
+    assert_eq!(keys_of(&reply), ["client_id"], "{:?}", reply.payload);
+    assert_eq!(
+        field_of(&reply, "client_id"),
+        Some(string(&client_id.to_string()))
+    );
+    reply
+}
+
+/// The registered function names of a Session, in order.
+fn names_of(sessions: &Sessions, client_id: ClientId) -> Vec<String> {
+    sessions
+        .registrations(client_id)
+        .expect("the Session is live")
+        .iter()
+        .map(|registered| registered.name().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_reconnect_is_answered_with_its_client_id_alone_and_attaches_the_connection() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(Value::Map(vec![]), &[("getOrder", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        let reply = resumed(&mut b, 2, client_id).await;
+        assert!(!format!("{reply:?}").contains(&secret), "{reply:?}");
+        assert_eq!(registry.attached(client_id), Some(2));
+
+        // The reconnecting Connection leaves: the first still holds the Session.
+        b.close();
+        finished(serving_b).await;
+        assert!(registry.contains(client_id));
+        assert_eq!(registry.attached(client_id), Some(1));
+
+        // The last one leaves: the Session is torn down.
+        a.close();
+        finished(serving_a).await;
+        assert!(!registry.contains(client_id));
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_reconnect_resumes_the_registrations_so_a_blanket_call_goes_to_the_reconnecting_connection() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[("getOrder", true)])).await;
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        resumed(&mut b, 2, client_id).await;
+
+        // Nothing was resent, yet the stored registration is in force on this Connection.
+        b.send(execution(3, "return getOrder(1);"));
+        let (call, name, arguments) = b.call().await;
+        assert_eq!(name, "getOrder");
+        assert_eq!(arguments, vec![Value::from(1u64)]);
+        b.reply(
+            call,
+            MessageType::Result,
+            Value::Map(vec![(string("value"), Value::from(7u64))]),
+        );
+        let reply = b.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(3)));
+        assert_eq!(value_of(&reply), Value::from(7u64));
+
+        // The Call went to the reconnecting Connection alone.
+        assert!(
+            a.from_daemon.try_recv().is_err(),
+            "no Call reached the first Connection"
+        );
+        b.close();
+        finished(serving_b).await;
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_reconnect_resumes_the_config_so_its_limits_apply_to_the_reconnecting_connection() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(budget_of("rpc_calls", 0), &[("getOrder", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        resumed(&mut b, 2, client_id).await;
+
+        // A zero RPC budget in the stored Config refuses the call before anything is sent.
+        b.send(execution(3, "return getOrder(1);"));
+        let reply = refused_with(&mut b, 3, "budget.rpc_calls_exceeded").await;
+        assert_eq!(reply.message_type, MessageType::Error);
+
+        b.close();
+        finished(serving_b).await;
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_reconnect_resumes_the_cached_handles_of_the_session() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[])).await;
+        a.send(register_with(2, "return n * 2;", Some(&["n"])));
+        let handle = handle_of(&a.next().await).to_string();
+
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        resumed(&mut b, 2, client_id).await;
+        b.send(cached_run(3, &handle, vec![("n", Value::from(21u64))]));
+        let reply = b.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(3)));
+        assert_eq!(value_of(&reply), Value::from(42u64));
+
+        b.close();
+        finished(serving_b).await;
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_wrong_secret_and_an_unknown_id_are_denied_with_identical_payloads_and_the_connection_stays_open()
+ {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[("getOrder", true)])).await;
+        let wrong = altered_secret(&secret);
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+
+        b.send(reconnect(2, &client_id.to_string(), &wrong));
+        let first = refused_with(&mut b, 2, "protocol.reconnect_denied").await;
+        b.send(reconnect(3, UNKNOWN_CLIENT_ID, &secret));
+        let second = refused_with(&mut b, 3, "protocol.reconnect_denied").await;
+
+        assert_eq!(message_of(&first), RECONNECT_DENIED);
+        assert_eq!(message_of(&second), RECONNECT_DENIED);
+        assert_eq!(
+            first.payload, second.payload,
+            "the denials differ in nothing but the echoed id"
+        );
+        for reply in [&first, &second] {
+            let shown = format!("{reply:?}");
+            assert!(!shown.contains(&wrong), "{shown}");
+            assert!(!shown.contains(&secret), "{shown}");
+            assert!(!shown.contains(&client_id.to_string()), "{shown}");
+        }
+        // The registry is unchanged, and the refused Connection is unattached and open: it
+        // may retry with the right credential.
+        assert_eq!(registry.attached(client_id), Some(1));
+        assert_eq!(names_of(&registry, client_id), ["getOrder"]);
+        b.send(reconnect(4, &client_id.to_string(), &secret));
+        resumed(&mut b, 4, client_id).await;
+
+        b.close();
+        finished(serving_b).await;
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_reconnect_after_the_session_is_torn_down_is_denied_exactly_like_an_unknown_id() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[])).await;
+        a.close();
+        finished(serving_a).await;
+        assert!(!registry.contains(client_id));
+
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        let torn = refused_with(&mut b, 2, "protocol.reconnect_denied").await;
+        b.send(reconnect(3, UNKNOWN_CLIENT_ID, &secret));
+        let unknown = refused_with(&mut b, 3, "protocol.reconnect_denied").await;
+        assert_eq!(torn.payload, unknown.payload);
+
+        // Still unattached after its denials, the connection may `Init` instead: a fresh Session.
+        b.reply(CorrelationId(4), MessageType::Init, init_payload(&[]));
+        let (fresh, _) = init_reply_of(&b.next().await);
+        assert_ne!(fresh, client_id);
+        assert_eq!(registry.attached(fresh), Some(1));
+        assert!(!registry.contains(client_id));
+
+        b.close();
+        finished(serving_b).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_reconnect_carrying_config_or_registrations_is_refused_before_any_lookup_and_changes_nothing() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) = issued(
+            &registry,
+            &cache,
+            init_configured(budget_of("rpc_calls", 2), &[("getOrder", true)]),
+        )
+        .await;
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        let id = client_id.to_string();
+
+        // A valid credential with a Config, a registration list, and an unknown Client ID with
+        // a Config: all refused as invalid payload, naming the key.
+        b.send(reconnect_carrying(
+            2,
+            &id,
+            &secret,
+            ("config", budget_of("rpc_calls", 0)),
+        ));
+        let config = refused_with(&mut b, 2, "protocol.invalid_payload").await;
+        assert!(message_of(&config).contains("config"), "{config:?}");
+        b.send(reconnect_carrying(
+            3,
+            &id,
+            &secret,
+            ("registrations", Value::Array(vec![])),
+        ));
+        let registrations = refused_with(&mut b, 3, "protocol.invalid_payload").await;
+        assert!(
+            message_of(&registrations).contains("registrations"),
+            "{registrations:?}"
+        );
+        b.send(reconnect_carrying(
+            4,
+            UNKNOWN_CLIENT_ID,
+            &secret,
+            ("config", budget_of("rpc_calls", 0)),
+        ));
+        let unknown = refused_with(&mut b, 4, "protocol.invalid_payload").await;
+        assert_eq!(
+            message_of(&config).replace("config", "KEY"),
+            message_of(&unknown).replace("config", "KEY"),
+            "the refusal reveals nothing about which Client IDs exist"
+        );
+
+        // Nothing was attached: the Connection is still unattached, so an execution is refused.
+        assert_eq!(registry.attached(client_id), Some(1));
+        b.send(execution(5, "return 1;"));
+        refused_with(&mut b, 5, "protocol.init_not_completed").await;
+
+        // The stored Config stays authoritative: its limit of 2 applies, not the refused 0.
+        b.send(reconnect(6, &id, &secret));
+        resumed(&mut b, 6, client_id).await;
+        b.send(execution(7, &calls(3)));
+        answer_calls(&mut b, 2).await;
+        refused_with(&mut b, 7, "budget.rpc_calls_exceeded").await;
+
+        b.close();
+        finished(serving_b).await;
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_malformed_reconnect_is_invalid_payload_and_no_presented_value_is_echoed() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[])).await;
+        let id = client_id.to_string();
+        let upper_id = id.to_uppercase();
+        let upper_secret = secret.to_uppercase();
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+
+        let malformed = [
+            (Value::Nil, String::new()),
+            (Value::from(3u64), String::new()),
+            (Value::Map(vec![]), String::new()),
+            (
+                Value::Map(vec![(string("client_id"), string(&id))]),
+                String::new(),
+            ),
+            (
+                Value::Map(vec![
+                    (string("client_id"), string(&upper_id)),
+                    (string("reconnect_secret"), string(&secret)),
+                ]),
+                upper_id.clone(),
+            ),
+            (
+                Value::Map(vec![
+                    (string("client_id"), string(&id)),
+                    (string("reconnect_secret"), string(&upper_secret)),
+                ]),
+                upper_secret.clone(),
+            ),
+            (
+                Value::Map(vec![
+                    (string("client_id"), string(&id)),
+                    (string("reconnect_secret"), string(&secret[..63])),
+                ]),
+                secret[..63].to_owned(),
+            ),
+            (
+                Value::Map(vec![
+                    (string("client_id"), string(&id)),
+                    (string("reconnect_secret"), Value::from(1u64)),
+                ]),
+                String::new(),
+            ),
+            (
+                Value::Map(vec![
+                    (string("client_id"), string(&id)),
+                    (string("client_id"), string(&id)),
+                    (string("reconnect_secret"), string(&secret)),
+                ]),
+                String::new(),
+            ),
+        ];
+        for (offset, (payload, presented)) in malformed.into_iter().enumerate() {
+            let request = 10 + offset as u64;
+            b.send(reconnect_raw(request, payload));
+            let reply = refused_with(&mut b, request, "protocol.invalid_payload").await;
+            let shown = format!("{reply:?}");
+            assert!(!shown.contains(&secret) && !shown.contains(&id), "{shown}");
+            if !presented.is_empty() {
+                assert!(!shown.contains(&presented), "{shown}");
+            }
+        }
+
+        // Still open and unattached after all of them.
+        b.send(reconnect(30, &id, &secret));
+        resumed(&mut b, 30, client_id).await;
+
+        b.close();
+        finished(serving_b).await;
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_second_init_or_reconnect_on_an_attached_connection_is_already_initialized_and_changes_nothing()
+{
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = Arc::clone(&sessions);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[("getOrder", true)])).await;
+        let id = client_id.to_string();
+        let wrong = altered_secret(&secret);
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+
+        // Init after Reconnect, and Reconnect after Reconnect, are both refused.
+        b.send(reconnect(2, &id, &secret));
+        resumed(&mut b, 2, client_id).await;
+        b.send(init(3, init_payload(&[("other", true)])));
+        refused_with(&mut b, 3, "protocol.already_initialized").await;
+        b.send(reconnect(4, &id, &secret));
+        refused_with(&mut b, 4, "protocol.already_initialized").await;
+
+        // Reconnect after Init is refused too, and the credential is not even looked at: a wrong
+        // one, or an unknown ID, gets the same refusal rather than a denial.
+        a.send(reconnect(2, &id, &wrong));
+        refused_with(&mut a, 2, "protocol.already_initialized").await;
+        a.send(reconnect(3, UNKNOWN_CLIENT_ID, &secret));
+        refused_with(&mut a, 3, "protocol.already_initialized").await;
+        a.send(init(4, init_payload(&[("other", true)])));
+        refused_with(&mut a, 4, "protocol.already_initialized").await;
+
+        // Neither refusal touched the Session.
+        assert_eq!(registry.attached(client_id), Some(2));
+        assert_eq!(names_of(&registry, client_id), ["getOrder"]);
+
+        b.close();
+        finished(serving_b).await;
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_reconnect_bypasses_the_init_gate_and_is_answered_as_a_denial_not_as_uninitialized() {
+    let (sent, left) = serve(vec![reconnect(1, UNKNOWN_CLIENT_ID, &"0".repeat(64))], None);
+    assert_eq!(left, 0);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].id, Some(CorrelationId(1)));
+    assert_eq!(code_of(&sent[0]), "protocol.reconnect_denied");
+}

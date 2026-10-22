@@ -57,6 +57,15 @@ pub enum MessageType {
     /// as 32 lowercase hex characters and the Session's reconnect secret as 64, sent this once
     /// and in no later response.
     Init,
+    /// Request: attach this connection to a live Session without resending its Config or
+    /// registrations (Story 5.6) — the alternative to `Init` on a connection not yet attached.
+    /// The payload is exactly `{client_id, reconnect_secret}`: the Client ID as 32 lowercase hex
+    /// characters and the reconnect secret its `Init` reply carried as 64. Any other key —
+    /// `config` and `registrations` included — is `protocol.invalid_payload`, since the stored
+    /// Config and registrations are resumed. Answered `Result {client_id}` (never the secret);
+    /// a wrong secret and an unknown Client ID are both `protocol.reconnect_denied`, with one
+    /// identical message, and the connection stays open and unattached.
+    Reconnect,
     /// Request: run a Script (Story 2.6).
     ExecutionStart,
     /// Request: replace the Session's Config with a new one, without reconnecting (Story 3.8).
@@ -112,6 +121,7 @@ impl MessageType {
     /// Every message type, in declaration order.
     pub const ALL: &'static [Self] = &[
         Self::Init,
+        Self::Reconnect,
         Self::ExecutionStart,
         Self::ConfigUpdate,
         Self::CodeRegister,
@@ -128,6 +138,7 @@ impl MessageType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Init => "Init",
+            Self::Reconnect => "Reconnect",
             Self::ExecutionStart => "ExecutionStart",
             Self::ConfigUpdate => "ConfigUpdate",
             Self::CodeRegister => "CodeRegister",

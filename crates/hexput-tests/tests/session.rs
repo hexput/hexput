@@ -1,12 +1,15 @@
 //! Stories 2.4 + 2.5: decoding an `Init` payload, and the Session registry it creates into.
 //! Stories 3.7 + 3.8: the Config's execution limits, and replacing the Config at runtime.
 //! Story 5.5: the reconnect credential issued at init, and verifying a presented secret.
+//! Story 5.6: reconnecting a Connection to a live Session, and decoding a `Reconnect` payload.
 
 use std::collections::HashSet;
+use std::sync::Barrier;
 
 use hexput_port::Value;
 use hexput_session::{
-    ClientId, Config, ConnectionId, InitRequest, ReconnectSecret, Sessions, Setting, Settings,
+    ClientId, Config, ConnectionId, InitRequest, ReconnectRequest, ReconnectSecret, Sessions,
+    Setting, Settings,
 };
 
 fn s(text: &str) -> Value {
@@ -971,4 +974,255 @@ fn the_secret_debug_and_the_sessions_debug_never_show_the_secret() {
     assert!(!registry.contains(&text[..16]), "{registry}");
     // Formatting changes nothing: the secret still verifies.
     assert!(sessions.verify_reconnect(id, &secret));
+}
+
+// --- Story 5.6: reconnecting a Connection to a live Session ---
+
+/// The `ReconnectRequest` refusal message for `value`, which must be refused.
+fn reconnect_refusal(value: &Value) -> String {
+    match ReconnectRequest::from_value(value) {
+        Ok(_) => panic!("the payload is accepted: {value:?}"),
+        Err(error) => error.to_string(),
+    }
+}
+
+/// A well-formed `Reconnect` payload: `client_id` then `reconnect_secret`, as text.
+fn reconnect_payload(client_id: &str, secret: &str) -> Value {
+    map(vec![
+        ("client_id", s(client_id)),
+        ("reconnect_secret", s(secret)),
+    ])
+}
+
+/// `secret` with its last character changed, still 64 lowercase hex characters.
+fn altered(secret: &ReconnectSecret) -> ReconnectSecret {
+    let text = secret.to_hex();
+    let other = if text.ends_with('0') { '1' } else { '0' };
+    ReconnectSecret::from_hex(&format!("{}{other}", &text[..63])).expect("still 64 lowercase hex")
+}
+
+#[test]
+fn reconnect_attaches_a_second_connection_with_the_issued_secret() {
+    let sessions = Sessions::new();
+    let (id, secret) = created(&sessions);
+    let second = sessions.connect();
+    assert!(sessions.reconnect(id, &secret, second));
+    assert_eq!(sessions.attached(id), Some(2));
+    assert!(sessions.contains(id));
+}
+
+#[test]
+fn reconnect_refuses_a_wrong_secret_and_changes_no_attachment() {
+    let sessions = Sessions::new();
+    let (id, secret) = created(&sessions);
+    let before = registrations(&sessions, id);
+    let stranger = sessions.connect();
+    assert!(!sessions.reconnect(id, &altered(&secret), stranger));
+    assert_eq!(
+        sessions.attached(id),
+        Some(1),
+        "the attachment count is unchanged"
+    );
+    assert_eq!(registrations(&sessions, id), before);
+    // The refused connection is not attached: detaching it changes nothing.
+    sessions.detach(id, stranger);
+    assert_eq!(sessions.attached(id), Some(1));
+    // The correct secret still works afterwards: a refusal is not a lockout.
+    let retry = sessions.connect();
+    assert!(sessions.reconnect(id, &secret, retry));
+    assert_eq!(sessions.attached(id), Some(2));
+}
+
+#[test]
+fn reconnect_refuses_another_sessions_secret() {
+    let sessions = Sessions::new();
+    let (first_id, _first) = created(&sessions);
+    let (_second_id, second) = created(&sessions);
+    let stranger = sessions.connect();
+    assert!(!sessions.reconnect(first_id, &second, stranger));
+    assert_eq!(sessions.attached(first_id), Some(1));
+}
+
+#[test]
+fn reconnect_refuses_an_unknown_client_id_and_creates_nothing() {
+    let sessions = Sessions::new();
+    let (_, secret) = created(&sessions);
+    let stranger = sessions.connect();
+    let unknown = ClientId::from_bytes([9; 16]);
+    assert!(!sessions.reconnect(unknown, &secret, stranger));
+    assert!(!sessions.contains(unknown));
+    assert_eq!(sessions.len(), 1);
+}
+
+#[test]
+fn reconnect_refuses_a_torn_down_session_like_an_unknown_one() {
+    let sessions = Sessions::new();
+    let connection = sessions.connect();
+    let (id, secret) = sessions.create(valid(&[]), connection);
+    sessions.detach(id, connection);
+    let stranger = sessions.connect();
+    assert!(!sessions.reconnect(id, &secret, stranger));
+    assert!(!sessions.contains(id));
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_reconnected_session_outlives_the_connection_that_created_it() {
+    let sessions = Sessions::new();
+    let creator = sessions.connect();
+    let (id, secret) = sessions.create(valid(&[("getUser", true)]), creator);
+    let joiner = sessions.connect();
+    assert!(sessions.reconnect(id, &secret, joiner));
+    sessions.detach(id, creator);
+    assert!(sessions.contains(id), "the reconnected Connection keeps it");
+    assert_eq!(sessions.attached(id), Some(1));
+    assert_eq!(
+        registrations(&sessions, id),
+        Some(vec![("getUser".to_owned(), true)])
+    );
+    sessions.detach(id, joiner);
+    assert!(!sessions.contains(id));
+}
+
+#[test]
+fn a_reconnect_racing_the_last_detach_either_tears_down_first_or_attaches() {
+    // Each round: the only other Connection detaches while a reconnect is in flight. Either the
+    // detach tears the Session down first (the reconnect is denied) or the reconnect lands
+    // first (the Session survives the detach with the new Connection). Never a mix of both.
+    let sessions = Sessions::new();
+    for _ in 0..500 {
+        let creator = sessions.connect();
+        let (id, secret) = sessions.create(valid(&[]), creator);
+        let joiner = sessions.connect();
+        let barrier = Barrier::new(2);
+        let attached = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                sessions.detach(id, creator);
+            });
+            barrier.wait();
+            sessions.reconnect(id, &secret, joiner)
+        });
+        if attached {
+            assert!(sessions.contains(id), "the reconnect won the race");
+            assert_eq!(sessions.attached(id), Some(1));
+            sessions.detach(id, joiner);
+        } else {
+            assert!(!sessions.contains(id), "the detach won the race");
+            assert_eq!(sessions.attached(id), None);
+        }
+        assert!(!sessions.contains(id));
+    }
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn reconnect_request_accepts_exactly_a_client_id_and_a_secret() {
+    let sessions = Sessions::new();
+    let (id, secret) = created(&sessions);
+    let payload = reconnect_payload(&id.to_string(), &secret.to_hex());
+    assert!(ReconnectRequest::from_value(&payload).is_ok());
+}
+
+#[test]
+fn reconnect_request_names_a_carried_config_or_registrations_and_says_what_resumes() {
+    let sessions = Sessions::new();
+    let (id, secret) = created(&sessions);
+    let id_text = id.to_string();
+    let secret_text = secret.to_hex();
+    for key in ["config", "registrations", "stray"] {
+        let mut fields = vec![
+            ("client_id", s(&id_text)),
+            ("reconnect_secret", s(&secret_text)),
+        ];
+        fields.push((key, Value::Map(vec![])));
+        let message = reconnect_refusal(&map(fields));
+        assert!(message.contains(&format!("`{key}`")), "{message}");
+        assert!(!message.contains(&id_text), "{message}");
+        assert!(!message.contains(&secret_text), "{message}");
+    }
+    let message = reconnect_refusal(&map(vec![
+        ("client_id", s(&id_text)),
+        ("reconnect_secret", s(&secret_text)),
+        ("config", Value::Map(vec![])),
+    ]));
+    assert!(message.contains("ConfigUpdate"), "{message}");
+}
+
+#[test]
+fn reconnect_request_names_missing_parts_together() {
+    let text = reconnect_refusal(&Value::Nil);
+    assert!(
+        text.contains("client_id") && text.contains("reconnect_secret"),
+        "{text}"
+    );
+    let text = reconnect_refusal(&map(vec![("client_id", s(&"0".repeat(32)))]));
+    assert!(text.contains("reconnect_secret"), "{text}");
+    assert!(!text.contains("`client_id`"), "{text}");
+    let text = reconnect_refusal(&map(vec![("reconnect_secret", s(&"0".repeat(64)))]));
+    assert!(text.contains("client_id"), "{text}");
+    assert!(!text.contains("`reconnect_secret`"), "{text}");
+}
+
+#[test]
+fn reconnect_request_refuses_a_non_map_a_repeated_key_and_malformed_values() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let secret = "0123456789abcdef".repeat(4);
+    let refused = [
+        Value::from(7u64),
+        Value::Array(vec![]),
+        map(vec![
+            ("client_id", s(id)),
+            ("client_id", s(id)),
+            ("reconnect_secret", s(&secret)),
+        ]),
+        // Uppercase hex, a short or long ID or secret, a non-string, each a malformed value.
+        reconnect_payload(&id.to_uppercase(), &secret),
+        reconnect_payload(&id[..31], &secret),
+        reconnect_payload(id, &secret.to_uppercase()),
+        reconnect_payload(id, &format!("{secret}0")),
+        map(vec![
+            ("client_id", s(id)),
+            ("reconnect_secret", Value::from(1u64)),
+        ]),
+        map(vec![
+            ("client_id", Value::from(1u64)),
+            ("reconnect_secret", s(&secret)),
+        ]),
+    ];
+    for payload in &refused {
+        let message = reconnect_refusal(payload);
+        assert!(!message.contains(id), "{message}");
+        assert!(!message.contains(&secret), "{message}");
+        assert!(!message.contains(&id.to_uppercase()), "{message}");
+        assert!(!message.contains(&secret.to_uppercase()), "{message}");
+    }
+}
+
+#[test]
+fn reconnect_refusals_never_echo_the_presented_values() {
+    let sessions = Sessions::new();
+    let (id, secret) = created(&sessions);
+    let text = secret.to_hex();
+    let refused = [
+        reconnect_payload(&id.to_string().to_uppercase(), &text),
+        reconnect_payload(&id.to_string(), &format!("{}G", &text[..63])),
+        map(vec![
+            ("client_id", s(&id.to_string())),
+            ("reconnect_secret", s(&text)),
+            ("config", s(&text)),
+        ]),
+        // A credential sent as a key — a wrongly serialized struct — is not echoed either.
+        map(vec![
+            ("client_id", s(&id.to_string())),
+            ("reconnect_secret", s(&text)),
+            (text.as_str(), Value::Boolean(true)),
+        ]),
+        map(vec![(id.to_string().as_str(), s(&text))]),
+    ];
+    for payload in &refused {
+        let message = reconnect_refusal(payload);
+        assert!(!message.contains(&text[..16]), "{message}");
+        assert!(!message.contains(&id.to_string()), "{message}");
+    }
 }

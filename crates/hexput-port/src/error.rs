@@ -34,13 +34,16 @@ pub enum ProtocolCode {
     /// A well-formed message the Daemon never accepts from a Backend on its own initiative, such
     /// as a `Result` or `Error` answering nothing the Daemon asked.
     UnexpectedMessage,
-    /// A request payload the Daemon cannot accept: an `Init`, `ConfigUpdate`, `ExecutionStart`,
-    /// `CodeRegister`, `CachedExecutionStart` or `CodeUnregister` with a missing, mistyped,
-    /// unknown or repeated key, a malformed or duplicate registration, a starting variable that
-    /// is not a §2 identifier, or a value with no lossless Hexput representation. The message names the offending key, index
-    /// or path. Nothing runs, and a refused `ConfigUpdate` changes nothing.
+    /// A request payload the Daemon cannot accept: an `Init`, `Reconnect`, `ConfigUpdate`,
+    /// `ExecutionStart`, `CodeRegister`, `CachedExecutionStart` or `CodeUnregister` with a
+    /// missing, mistyped, unknown or repeated key (a `Reconnect` carrying `config` or
+    /// `registrations` included, or a Client ID or secret not of its hex form), a malformed or
+    /// duplicate registration, a starting variable that is not a §2 identifier, or a value with
+    /// no lossless Hexput representation. The message names the offending key, index or path.
+    /// Nothing runs, and a refused `ConfigUpdate` changes nothing.
     InvalidPayload,
-    /// An `Init` on a connection already attached to a Session; that Session is untouched.
+    /// An `Init` or `Reconnect` on a connection already attached to a Session (by either); that
+    /// Session is untouched, and a `Reconnect`'s credential is not even decoded.
     AlreadyInitialized,
     /// A Script result nested deeper than the Daemon's own decoder accepts in a frame, so a
     /// Backend could never read it back. The Script ran; its result is not sent.
@@ -54,6 +57,11 @@ pub enum ProtocolCode {
     /// 4.2, 4.3). The Backend registers the Script again with `CodeRegister`. Nothing is parsed,
     /// run or removed.
     UnknownScriptHandle,
+    /// A well-formed `Reconnect` whose Client ID and reconnect secret match no live Session
+    /// (Story 5.6): a wrong secret and an unknown or torn-down Client ID get this one code with
+    /// one identical message, so Client IDs cannot be enumerated. Nothing is attached; the
+    /// connection stays open and unattached, free to retry or `Init`.
+    ReconnectDenied,
 }
 
 impl ProtocolCode {
@@ -74,6 +82,7 @@ impl ProtocolCode {
         Self::ResultTooDeep,
         Self::ResponseTooLarge,
         Self::UnknownScriptHandle,
+        Self::ReconnectDenied,
     ];
 
     /// The code's stable string form.
@@ -92,6 +101,7 @@ impl ProtocolCode {
             Self::ResultTooDeep => "protocol.result_too_deep",
             Self::ResponseTooLarge => "protocol.response_too_large",
             Self::UnknownScriptHandle => "protocol.unknown_script_handle",
+            Self::ReconnectDenied => "protocol.reconnect_denied",
         }
     }
 }

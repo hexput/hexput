@@ -1237,6 +1237,145 @@ fn the_reconnect_secret_is_never_logged_even_at_trace_in_json() {
     );
 }
 
+/// Story 5.6: at `trace` in JSON, neither the issued reconnect secret nor a wrong one presented on
+/// a second connection reaches any log line — while the Client ID still does.
+#[cfg(unix)]
+#[test]
+fn neither_a_right_nor_a_wrong_reconnect_secret_is_logged_even_at_trace_in_json() {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let sandbox = Sandbox::new();
+    let config = format!(
+        "log_level = \"trace\"\nlog_format = \"json\"\n{}",
+        sandbox.valid()
+    );
+    let serving = Serving::start(&sandbox, &config);
+    let mut first = serving.connect();
+    wire::send(
+        &mut first,
+        &Envelope::new(
+            CorrelationId(1),
+            MessageType::Init,
+            Value::Map(vec![
+                (Value::from("config"), Value::Map(vec![])),
+                (Value::from("registrations"), Value::Array(vec![])),
+            ]),
+        ),
+    );
+    let reply = wire::reply(&mut first).expect("an init reply");
+    let fields = reply.payload.as_map().expect("a map payload");
+    let text_of = |key: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .and_then(|(_, value)| value.as_str())
+            .unwrap_or_else(|| panic!("the init reply has a string `{key}`"))
+            .to_owned()
+    };
+    let client_id = text_of("client_id");
+    let secret = text_of("reconnect_secret");
+
+    let mut second = serving.connect();
+    let mut wrong = secret.clone();
+    let last = wrong.pop().expect("a secret");
+    wrong.push(if last == '0' { '1' } else { '0' });
+    let reconnect = |id: u64, presented: &str| {
+        Envelope::new(
+            CorrelationId(id),
+            MessageType::Reconnect,
+            Value::Map(vec![
+                (Value::from("client_id"), Value::from(client_id.as_str())),
+                (Value::from("reconnect_secret"), Value::from(presented)),
+            ]),
+        )
+    };
+    wire::send(&mut second, &reconnect(2, &wrong));
+    let denied = wire::reply(&mut second).expect("a denial");
+    assert_eq!(
+        denied.message_type,
+        MessageType::Error,
+        "{:?}",
+        denied.payload
+    );
+    wire::send(&mut second, &reconnect(3, &secret));
+    let resumed = wire::reply(&mut second).expect("a resumed reply");
+    assert_eq!(
+        resumed.message_type,
+        MessageType::Result,
+        "{:?}",
+        resumed.payload
+    );
+    // A failing request on the reconnected connection, so its events can be traced.
+    wire::send(&mut second, &traced_execution(4, "return 1 / 0;"));
+    assert_eq!(
+        wire::refusal(&mut second),
+        (Some(4), "arithmetic.division_by_zero".to_owned())
+    );
+
+    let run = serving.stop();
+    run.exit(0);
+    assert!(
+        !run.log.contains(&secret),
+        "the log carries the issued reconnect secret: {}",
+        run.log
+    );
+    assert!(
+        !run.log.contains(&wrong),
+        "the log carries the presented wrong secret: {}",
+        run.log
+    );
+    assert!(run.log.contains(&client_id), "the spans name the Client ID");
+
+    // FR-12 across a reconnect: the denial is still unattributed, the completed reconnect is the
+    // first event naming the Client ID on the second connection, and every later event there
+    // carries it — exactly as after `Init`.
+    let events = json_events(&run.log);
+    let find = |message: &str, request: u64| -> &JsonEvent {
+        let request = serde_json::Value::from(request.to_string());
+        events
+            .iter()
+            .find(|e| e.message() == message && e.request() == Some(&request))
+            .unwrap_or_else(|| panic!("no {message:?} for request {request}:\n{}", run.log))
+    };
+    let connection_of = |event: &JsonEvent| event.connection().unwrap()["connection"].clone();
+    let denied = find("refused a request", 2);
+    assert_eq!(denied.connection().unwrap()["client_id"], "none");
+    assert_eq!(denied.0["fields"]["code"], "protocol.reconnect_denied");
+    let completed = find("reconnect completed; attached to the Session", 3);
+    assert_eq!(
+        completed.connection().unwrap()["client_id"],
+        client_id.as_str()
+    );
+    assert_eq!(completed.0["level"], "DEBUG");
+    let second_connection = connection_of(completed);
+    assert_eq!(connection_of(denied), second_connection);
+    let failed = find("a Direct Execution failed", 4);
+    assert_eq!(connection_of(failed), second_connection);
+    assert_eq!(
+        failed.connection().unwrap()["client_id"],
+        client_id.as_str()
+    );
+    let on_second: Vec<&JsonEvent> = events
+        .iter()
+        .filter(|e| e.connection().is_some() && connection_of(e) == second_connection)
+        .collect();
+    let first_named = on_second
+        .iter()
+        .position(|e| e.connection().unwrap()["client_id"] != "none")
+        .expect("an event naming the Client ID");
+    assert_eq!(
+        on_second[first_named].message(),
+        "reconnect completed; attached to the Session"
+    );
+    assert!(
+        on_second[first_named..]
+            .iter()
+            .all(|e| e.connection().unwrap()["client_id"] == client_id.as_str()),
+        "{}",
+        run.log
+    );
+}
+
 /// Story 2.8, the matrix's pre-init, init, execution, two-connection and JSON rows over the real
 /// socket: every event a connection logs carries `connection` and `client_id` as span fields —
 /// `"none"` before init, its own Client ID after — and every event for a request its `id`,

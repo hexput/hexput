@@ -14,7 +14,19 @@
 //!   with this connection attached, opens it in the [`AstCache`] so its registrations are
 //!   accepted (Story 4.3), and is answered `Result { client_id }`; an invalid one is
 //!   `protocol.invalid_payload` naming what was wrong, and no Session is created.
-//! * `Init` on an attached connection — `protocol.already_initialized`; its Session is untouched.
+//! * `Reconnect` on an unattached connection (Story 5.6) — the alternative to `Init`: the
+//!   payload, exactly `{client_id, reconnect_secret}`, is decoded by
+//!   [`ReconnectRequest::from_value`] before any registry lookup, so a malformed one — or one
+//!   carrying `config` or `registrations`, which are never applied — is `protocol.invalid_payload`
+//!   whether or not the Session exists. A well-formed one goes to [`Sessions::reconnect`], which
+//!   alone verifies the secret and attaches this connection under one lock (AD-2); this crate
+//!   only carries the credential. Attached, the connection is answered `Result { client_id }` and
+//!   from then on serves exactly as if it had sent the `Init`, against the Session's stored
+//!   Config, registrations and AST Cache entries. Refused, it is `protocol.reconnect_denied` with
+//!   one fixed message for a wrong secret and an unknown Client ID alike, and stays open and
+//!   unattached. The presented secret is never logged and is dropped once verified.
+//! * `Init` or `Reconnect` on an attached connection — `protocol.already_initialized`; its
+//!   Session is untouched, and a `Reconnect`'s payload is not even decoded.
 //! * `ExecutionStart` — `protocol.init_not_completed` before init: nothing runs (FR-1). After
 //!   init, a Direct Execution (FR-4): [`hexput_script::direct_execution`] decodes the payload,
 //!   runs the Script through the one Executor, and the connection answers `Result { value }` or
@@ -124,9 +136,10 @@
 //! on a reply that cannot arrive.
 //!
 //! However the connection ends — the peer closing, a lost stream, a failed write, a fatal frame —
-//! [`serve`] detaches it from its Session, and detaching the last Connection tears the Session
-//! down. The detach is an explicit call on the one exit path rather than a `Drop` guard, so
-//! teardown is never implied by `Drop` (AD-4); a panic inside `serve` skips it.
+//! [`serve`] detaches it from its Session, and detaching the last Connection tears the Session down
+//! — whether it attached by `Init` or by `Reconnect`. The detach is an explicit call on the one
+//! exit path rather than a `Drop` guard, so teardown is never implied by `Drop` (AD-4); a panic
+//! inside `serve` skips it.
 //!
 //! # Logging
 //!
@@ -140,12 +153,12 @@
 //! entered again while the execution's reply is written, so every event about a request —
 //! wherever it is emitted — names both the Client ID and the request.
 //!
-//! A successful init *replaces* the connection span with one carrying the issued Client ID,
-//! rather than recording into the old one: an unset field would be omitted from output, and a
-//! re-recorded one is written twice in text output. "init completed" is the first event of the
-//! new span. Both spans are created at `ERROR` level, so no configured log level disables them
-//! and strips their fields from the events that do pass. This crate only creates spans; the
-//! Daemon chooses how they are written.
+//! A successful init *replaces* the connection span with one carrying the issued Client ID, rather
+//! than recording into the old one: an unset field would be omitted from output, and a re-recorded
+//! one is written twice in text output. "init completed" is the first event of the new span — or,
+//! after a `Reconnect`, "reconnect completed; attached to the Session". Both spans are created at
+//! `ERROR` level, so no configured log level disables them and strips their fields from the events
+//! that do pass. This crate only creates spans; the Daemon chooses how they are written.
 //!
 //! Binds: AD-1, AD-2, AD-6, FR-12.
 
@@ -158,7 +171,9 @@ use hexput_port::{
 };
 use hexput_rpc::{Call, Caller, Calls};
 use hexput_script::{AstCache, Registration};
-use hexput_session::{ClientId, Config, ConnectionId, InitRequest, Sessions, Settings};
+use hexput_session::{
+    ClientId, Config, ConnectionId, InitRequest, ReconnectRequest, Sessions, Settings,
+};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{Instrument, Span};
 
@@ -283,13 +298,18 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                 let span = request_span(&connection.span, request.id);
                 match span.in_scope(|| answer(request, connection)) {
                     Answer::Reply(reply) => (reply, span),
-                    Answer::Initialized(client_id, reply) => {
+                    Answer::Attached(how, client_id, reply) => {
                         // The Client ID becomes part of the connection span, so the span is
-                        // replaced (see "Logging"); "init completed" is its first event.
+                        // replaced (see "Logging"); the completed attachment is its first event.
                         connection.attached = Some(client_id);
                         connection.span = connection_span(connection.id, Some(client_id));
                         let span = request_span(&connection.span, reply.id);
-                        span.in_scope(|| tracing::debug!("init completed; Session created"));
+                        span.in_scope(|| match how {
+                            Attach::Init => tracing::debug!("init completed; Session created"),
+                            Attach::Reconnect => {
+                                tracing::debug!("reconnect completed; attached to the Session");
+                            }
+                        });
                         (reply, span)
                     }
                     Answer::Execute(id, payload) => {
@@ -507,9 +527,9 @@ async fn deliver<O: Outbound>(outbound: &mut O, reply: Envelope<Value>) -> bool 
 enum Answer {
     /// At once, with this reply.
     Reply(Envelope<Value>),
-    /// At once, with this reply: init completed and a Session with this Client ID now has the
-    /// connection attached.
-    Initialized(ClientId, Envelope<Value>),
+    /// At once, with this reply: an `Init` or a `Reconnect` completed, and the Session with this
+    /// Client ID now has the connection attached.
+    Attached(Attach, ClientId, Envelope<Value>),
     /// By a Direct Execution of this payload, dispatched as its own task, replying to this id.
     Execute(Option<CorrelationId>, Value),
     /// By a registration of this payload for the Session with this Client ID, dispatched as its
@@ -520,12 +540,22 @@ enum Answer {
     CachedExecute(Option<CorrelationId>, Value, ClientId),
 }
 
+/// How a connection came to be attached to its Session.
+#[derive(Clone, Copy)]
+enum Attach {
+    /// By an `Init`, which created the Session.
+    Init,
+    /// By a `Reconnect` to a live Session (Story 5.6).
+    Reconnect,
+}
+
 /// Answer one well-formed message. Takes it by value so an execution's payload — up to a whole
 /// frame — moves to its task instead of being copied.
 fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
     // Messages that need no Session.
     match request.message_type {
         MessageType::Init => return init(&request, connection),
+        MessageType::Reconnect => return reconnect(&request, connection),
         MessageType::ExecutionStart
         | MessageType::ConfigUpdate
         | MessageType::CodeRegister
@@ -553,7 +583,7 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
             request.id,
             ProtocolCode::InitNotCompleted,
             format!(
-                "`{}` needs a completed init; send `Init` first",
+                "`{}` needs a completed init; send `Init` (or `Reconnect`) first",
                 request.message_type
             ),
         ));
@@ -761,7 +791,8 @@ fn init(request: &Envelope<Value>, connection: &Connection<'_>) -> Answer {
         return Answer::Reply(refuse(
             request.id,
             ProtocolCode::AlreadyInitialized,
-            "this connection already completed init; its Session is unchanged".to_owned(),
+            "this connection is already attached to a Session; that Session is unchanged"
+                .to_owned(),
         ));
     }
     let init = match InitRequest::from_value(&request.payload) {
@@ -791,12 +822,72 @@ fn init(request: &Envelope<Value>, connection: &Connection<'_>) -> Answer {
     };
     // The cache accepts this Session's registrations from now until its teardown closes it.
     connection.cache.open(client_id);
-    Answer::Initialized(
+    Answer::Attached(
+        Attach::Init,
         client_id,
         Envelope {
             id: request.id,
             message_type: MessageType::Result,
             payload,
+        },
+    )
+}
+
+/// The one message every denied `Reconnect` carries, whether the secret was wrong or no Session
+/// has the Client ID, so the denial reveals nothing about which Client IDs exist (Story 5.6).
+const RECONNECT_DENIED: &str = "no Session matches this Client ID and reconnect secret";
+
+/// Serve `Reconnect` (Story 5.6): decode the presented credential, have the registry verify it
+/// and attach this connection, and answer the Client ID — never the secret. The caller records
+/// the attachment and logs the completed reconnect in the new connection span.
+///
+/// Nothing here verifies anything: [`Sessions::reconnect`] alone does (AD-2). The cache is not
+/// opened, since a live Session's Client ID already is. The decoded request, secret included, is
+/// dropped when this returns.
+fn reconnect(request: &Envelope<Value>, connection: &Connection<'_>) -> Answer {
+    if connection.attached.is_some() {
+        return Answer::Reply(refuse(
+            request.id,
+            ProtocolCode::AlreadyInitialized,
+            "this connection is already attached to a Session; that Session is unchanged"
+                .to_owned(),
+        ));
+    }
+    // Decoded from the payload alone, before any lookup; no refusal echoes a presented value.
+    let presented = match ReconnectRequest::from_value(&request.payload) {
+        Ok(presented) => presented,
+        Err(error) => {
+            tracing::debug!(%error, "refused an invalid reconnect");
+            return Answer::Reply(refuse(
+                request.id,
+                ProtocolCode::InvalidPayload,
+                error.to_string(),
+            ));
+        }
+    };
+    let client_id = presented.client_id();
+    // The presented secret lives only for this call; nothing logs it, and it is dropped with
+    // `presented` when this returns.
+    if !connection
+        .sessions
+        .reconnect(client_id, presented.secret(), connection.id)
+    {
+        return Answer::Reply(refuse(
+            request.id,
+            ProtocolCode::ReconnectDenied,
+            RECONNECT_DENIED.to_owned(),
+        ));
+    }
+    Answer::Attached(
+        Attach::Reconnect,
+        client_id,
+        Envelope {
+            id: request.id,
+            message_type: MessageType::Result,
+            payload: Value::Map(vec![(
+                Value::from("client_id"),
+                Value::from(client_id.to_string()),
+            )]),
         },
     )
 }

@@ -256,6 +256,7 @@ fn message_types_spell_pascal_case_and_parse_exactly() {
         spellings,
         [
             "Init",
+            "Reconnect",
             "ExecutionStart",
             "ConfigUpdate",
             "CodeRegister",

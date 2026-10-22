@@ -123,15 +123,16 @@ pub struct InitRequest {
     pub(crate) registrations: Vec<RegisteredFunction>,
 }
 
-/// Why an `Init` (or `ConfigUpdate`) payload was refused, naming the offending key or index. No
-/// Session is ever created from a refused `Init`, and a refused `ConfigUpdate` changes nothing.
+/// Why an `Init` (or `ConfigUpdate`, or `Reconnect`) payload was refused, naming the offending
+/// key or index. No Session is ever created from a refused `Init`, a refused `ConfigUpdate`
+/// changes nothing, and a refused `Reconnect` attaches nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitError {
     message: String,
 }
 
 impl InitError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -228,12 +229,12 @@ impl InitRequest {
 }
 
 /// A key that is absent or nil is missing.
-fn present(value: Option<&Value>) -> Option<&Value> {
+pub(crate) fn present(value: Option<&Value>) -> Option<&Value> {
     value.filter(|v| !v.is_nil())
 }
 
 /// `message`'s payload lacks `keys`.
-fn missing(message: &str, keys: &[&str]) -> InitError {
+pub(crate) fn missing(message: &str, keys: &[&str]) -> InitError {
     let names: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
     InitError::new(format!(
         "the `{message}` payload is missing {}",
@@ -255,7 +256,7 @@ fn bounded(text: &str) -> String {
 
 /// A map key as a Backend would recognise it: a string in backticks, anything else as the
 /// MessagePack value it was — either bounded to [`ECHO_LIMIT`] characters.
-fn describe_key(key: &Value) -> String {
+pub(crate) fn describe_key(key: &Value) -> String {
     key.as_str().map_or_else(
         || {
             // Render at most one character past the limit, however large the value.

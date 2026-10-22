@@ -749,7 +749,11 @@ fn assert_lower_hex(text: &str, length: usize, what: &str) {
 // --- Running the suite --------------------------------------------------------------------------
 
 /// One case: it drives a fresh connection and asserts every reply it names.
-type Case = fn(&mut dyn Client, &mut Transcript);
+/// Opens a further connection to the running Daemon, as the case's transport would. Only the
+/// `reconnect` case uses it; every other case ignores it.
+type Open<'a> = &'a dyn Fn() -> Box<dyn Client>;
+
+type Case = fn(&mut dyn Client, &mut Transcript, Open<'_>);
 
 /// Runs every case over `transport` in matrix order, each on its own fresh connection, against one
 /// Daemon whose System Config holds only that transport. The Daemon must stop with exit `0`.
@@ -763,8 +767,9 @@ fn run(transport: &dyn Transport) -> Vec<Recorded> {
             case: name,
             entries: Vec::new(),
         };
+        let open = || transport.connect(&daemon);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            case(client.as_mut(), &mut transcript);
+            case(client.as_mut(), &mut transcript, &open);
             quiet(client.as_mut(), &mut transcript);
         }));
         if let Err(payload) = outcome {
@@ -966,6 +971,7 @@ const CASES: &[(&str, Case)] = &[
     ("init", init),
     ("uninitialized", uninitialized),
     ("init_twice", init_twice),
+    ("reconnect", reconnect),
     ("direct", direct),
     ("script_error", script_error),
     ("host_call", host_call),
@@ -1194,25 +1200,88 @@ fn answer(client: &mut dyn Client, t: &mut Transcript, id: CorrelationId, value:
     );
 }
 
-fn init(client: &mut dyn Client, t: &mut Transcript) {
+fn init(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     let payload = begin(client, t);
     assert_keys(&payload, &["client_id", "reconnect_secret"]);
 }
 
-fn uninitialized(client: &mut dyn Client, t: &mut Transcript) {
+fn uninitialized(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     t.send(client, &run_request(1, "return 1;"));
     expect_error(client, t, 1, "protocol.init_not_completed");
     let payload = init_result(client, t, 2);
     assert_keys(&payload, &["client_id", "reconnect_secret"]);
 }
 
-fn init_twice(client: &mut dyn Client, t: &mut Transcript) {
+fn init_twice(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(client, &init_envelope(2));
     expect_error(client, t, 2, "protocol.already_initialized");
 }
 
-fn direct(client: &mut dyn Client, t: &mut Transcript) {
+/// Story 5.6: a second connection resumes the Session with `Reconnect`, the same mechanism over
+/// every transport (FR-13). Both denials come back identical, a Config carried is refused, the
+/// right credential attaches, a Reconnect on an attached connection is refused, and the Session's
+/// registrations serve the second connection: a `double` call is answered by it.
+fn reconnect(client: &mut dyn Client, t: &mut Transcript, open: Open<'_>) {
+    let payload = begin(client, t);
+    let client_id = text_of(&payload, "client_id").to_owned();
+    let secret = text_of(&payload, "reconnect_secret").to_owned();
+    let reconnect_with = |id: u64, client_id: &str, secret: &str, extra: Option<Value>| {
+        let mut fields = vec![
+            ("client_id", Value::from(client_id)),
+            ("reconnect_secret", Value::from(secret)),
+        ];
+        if let Some(extra) = extra {
+            fields.push(("config", extra));
+        }
+        Envelope::new(CorrelationId(id), MessageType::Reconnect, map(fields))
+    };
+    let wrong = {
+        let mut text = secret.clone();
+        let last = text.pop().expect("a secret");
+        text.push(if last == '0' { '1' } else { '0' });
+        text
+    };
+    let unknown = "0".repeat(32);
+
+    let mut other = open();
+    let other = other.as_mut();
+    t.send(other, &reconnect_with(2, &client_id, &wrong, None));
+    let denied = expect_error(other, t, 2, "protocol.reconnect_denied");
+    t.send(other, &reconnect_with(3, &unknown, &secret, None));
+    let denied_unknown = expect_error(other, t, 3, "protocol.reconnect_denied");
+    assert_eq!(
+        denied.payload, denied_unknown.payload,
+        "a wrong secret and an unknown Client ID are denied identically"
+    );
+
+    t.send(
+        other,
+        &reconnect_with(4, &client_id, &secret, Some(map(vec![]))),
+    );
+    expect_error(other, t, 4, "protocol.invalid_payload");
+
+    t.send(other, &reconnect_with(5, &client_id, &secret, None));
+    let resumed = expect_result(other, t, 5);
+    assert_keys(&resumed, &["client_id"]);
+    assert_eq!(text_of(&resumed, "client_id"), client_id);
+
+    t.send(other, &reconnect_with(6, &client_id, &secret, None));
+    expect_error(other, t, 6, "protocol.already_initialized");
+
+    t.send(other, &run_request(7, "return double(21);"));
+    let call = expect_request(other, t, MessageType::Call);
+    assert_eq!(call.name, "double");
+    assert_eq!(call.execution, 7);
+    answer(other, t, call.id, Value::from(42u64));
+    assert_eq!(
+        expect_result(other, t, 7),
+        map(vec![("value", Value::from(42u64))])
+    );
+    quiet(other, t);
+}
+
+fn direct(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(
         client,
@@ -1224,7 +1293,7 @@ fn direct(client: &mut dyn Client, t: &mut Transcript) {
     );
 }
 
-fn script_error(client: &mut dyn Client, t: &mut Transcript) {
+fn script_error(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     let source = "return missing;";
     t.send(client, &run_request(2, source));
@@ -1239,7 +1308,7 @@ fn script_error(client: &mut dyn Client, t: &mut Transcript) {
     assert_eq!(span_text(source, &reply), ";");
 }
 
-fn host_call(client: &mut dyn Client, t: &mut Transcript) {
+fn host_call(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(client, &run_request(2, "return double(21);"));
     let call = expect_request(client, t, MessageType::Call);
@@ -1253,7 +1322,7 @@ fn host_call(client: &mut dyn Client, t: &mut Transcript) {
     );
 }
 
-fn cached(client: &mut dyn Client, t: &mut Transcript) {
+fn cached(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(
         client,
@@ -1301,7 +1370,7 @@ fn cached(client: &mut dyn Client, t: &mut Transcript) {
     expect_error(client, t, 5, "protocol.unknown_script_handle");
 }
 
-fn config_update(client: &mut dyn Client, t: &mut Transcript) {
+fn config_update(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(
         client,
@@ -1318,7 +1387,7 @@ fn config_update(client: &mut dyn Client, t: &mut Transcript) {
     expect_error(client, t, 3, "budget.rpc_calls_exceeded");
 }
 
-fn capability_unregistered(client: &mut dyn Client, t: &mut Transcript) {
+fn capability_unregistered(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     let source = "return nope(1);";
     t.send(client, &run_request(2, source));
@@ -1326,7 +1395,7 @@ fn capability_unregistered(client: &mut dyn Client, t: &mut Transcript) {
     assert_eq!(span_text(source, &reply), "nope(1)");
 }
 
-fn capability_denied(client: &mut dyn Client, t: &mut Transcript) {
+fn capability_denied(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(client, &run_request(2, "return ask(1);"));
     let question = expect_request(client, t, MessageType::Authorize);
@@ -1337,7 +1406,7 @@ fn capability_denied(client: &mut dyn Client, t: &mut Transcript) {
     expect_error(client, t, 2, "capability.unknown_function");
 }
 
-fn budget_case(client: &mut dyn Client, t: &mut Transcript) {
+fn budget_case(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(
         client,
@@ -1352,7 +1421,7 @@ fn budget_case(client: &mut dyn Client, t: &mut Transcript) {
     expect_error(client, t, 3, "budget.allocations_exceeded");
 }
 
-fn invalid_payload(client: &mut dyn Client, t: &mut Transcript) {
+fn invalid_payload(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(
         client,
@@ -1381,7 +1450,7 @@ fn invalid_payload(client: &mut dyn Client, t: &mut Transcript) {
     );
 }
 
-fn malformed(client: &mut dyn Client, t: &mut Transcript) {
+fn malformed(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send_body(client, b"\xc1");
     let reply = t.recv(client);
@@ -1401,7 +1470,7 @@ fn malformed(client: &mut dyn Client, t: &mut Transcript) {
     );
 }
 
-fn unknown_type(client: &mut dyn Client, t: &mut Transcript) {
+fn unknown_type(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     let body = map(vec![
         ("id", Value::from(4u64)),
@@ -1414,7 +1483,7 @@ fn unknown_type(client: &mut dyn Client, t: &mut Transcript) {
     expect_error(client, t, 4, "protocol.unknown_message_type");
 }
 
-fn unexpected_reply(client: &mut dyn Client, t: &mut Transcript) {
+fn unexpected_reply(client: &mut dyn Client, t: &mut Transcript, _open: Open<'_>) {
     begin(client, t);
     t.send(
         client,

@@ -358,3 +358,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-5-4-behave-identically-no-matter-how-the-backend-connected.md`
   summary: The Named Pipe conformance run (`conformance::named_pipe`, and the Windows transcript equality against TCP+TLS and WebSocket) has never executed; it is compile-checked only.
   evidence: Review finding (intent-alignment), unverified (medium if it fails). This machine cannot run Windows code; the `windows` CI job runs the `conformance` filter (now bounded by `timeout-minutes: 45`). One green run of that job showing both tests passing settles it.
+
+- source_spec: `spec-5-6-reconnect-without-resending-configuration.md`
+  summary: `Sessions::attach` is still `pub` and attaches a Connection without verifying any credential, so a production crate could bypass `Sessions::reconnect`.
+  evidence: Review finding (blind-hunter). Pre-existing since Story 2.4; Story 5.6 only reworded its doc ("the wire path is `reconnect`; this stays for tests"). No production crate calls it today (`hexput-connection` uses `create` and `reconnect` only). Settle by gating it (`#[doc(hidden)]`, a test-only feature, or moving the tests that need it onto `reconnect`), and pin the rule with a `RESTRICTED_NAMES` entry in `scripts/check-crate-graph.py`.

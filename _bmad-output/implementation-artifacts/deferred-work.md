@@ -350,3 +350,11 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-5-3-connect-locally-on-windows-over-a-named-pipe.md`
   summary: `epic-5-context.md` does not record Story 5.3's decisions for Stories 5.4–5.8.
   evidence: Missing: the platform rule (UDS Unix-only, the pipe Windows-only, an unservable section skipped with a warning, nothing servable fails startup), the pipe policy (byte mode with the shared framing, first instance only, local only, default descriptor, the `ERROR_PIPE_BUSY` retry duty) and the `windows` CI job. The Spine amendment and AGENTS.md carry them meanwhile; refresh the context file when Story 5.4 is planned.
+
+- source_spec: `spec-5-4-behave-identically-no-matter-how-the-backend-connected.md`
+  summary: The conformance suite does not yet cover several envelope-level behaviours every Port shares — a reply too large to frame, a Backend `Error` reply to a `Call`, an `Authorize` answered `true` followed by its `Call`, several executions in flight on one connection, a reply carrying Value Secret holders and `modifications`, and `findings` under a check mode.
+  evidence: Review finding (blind-hunter). Story 5.4's intent contract fixed the case set to its I/O matrix. The frame-size path is where the adapters differ internally (WebSocket refuses an oversize send with `InvalidInput`; the byte streams refuse it in the shared framing), so it is the most valuable addition; completion-order replies need a construction that does not depend on timing. Add them as matrix rows in a later Epic 5 story (5.5–5.8 already add cases) or a dedicated follow-up.
+
+- source_spec: `spec-5-4-behave-identically-no-matter-how-the-backend-connected.md`
+  summary: The Named Pipe conformance run (`conformance::named_pipe`, and the Windows transcript equality against TCP+TLS and WebSocket) has never executed; it is compile-checked only.
+  evidence: Review finding (intent-alignment), unverified (medium if it fails). This machine cannot run Windows code; the `windows` CI job runs the `conformance` filter (now bounded by `timeout-minutes: 45`). One green run of that job showing both tests passing settles it.

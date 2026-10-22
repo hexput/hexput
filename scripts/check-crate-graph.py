@@ -160,6 +160,37 @@ RESTRICTED_NAMES = [
 
 TEST_CRATES = {"hexput-tests"}
 
+# Story 5.4 (AD-1): no core crate names a transport. `SOLE_DEPENDENTS` already keeps every crate
+# but the wiring root from *depending* on `hexput-transport`; this keeps them from naming, and so
+# from branching on, a transport at all. It scans every `*.rs` file (comments and docs included, as
+# `RESTRICTED_NAMES` does, because a doc that names a transport is where a branch starts) and the
+# `Cargo.toml` of every workspace crate but these:
+#
+# * `hexput-transport` holds the adapters;
+# * `hexput-daemon` is the wiring root and must name the adapters it binds;
+# * `hexput-config` parses System Config, which owns the `[transport.*]` sections (AD-7).
+#
+# `TEST_CRATES` are exempt too: the conformance suite names every transport it runs over.
+#
+# A name is matched however it is spelled: as a word, inside a snake_case or CamelCase identifier
+# (`uds_path`, `is_tls`, `TcpTlsPort`, `UdsInbound`, the `tcp_tls` module), or with a space, `_` or
+# `-` inside a compound (`web-socket`, `Named Pipe`, `UnixSocket`), plus `ws://`/`wss://` URLs.
+TRANSPORT_NAMES = re.compile(
+    r"web[\s_-]*socket"
+    r"|named[\s_-]*pipe"
+    r"|unix[\s_-]*(?:domain|socket|stream|listener|datagram)"
+    r"|tcp[\s_-]*(?:stream|listener)"
+    r"|rustls|tungstenite"
+    r"|wss?://",
+    re.IGNORECASE,
+)
+# The short names, matched as one part of an identifier: `[A-Z]+(?![a-z])` takes an acronym
+# (`TLS` in `TLSConfig`), `[A-Z]?[a-z]+` a CamelCase or lower-case part, so `_`, digits and case
+# changes all split a word.
+IDENTIFIER_PARTS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
+TRANSPORT_WORDS = {"uds", "tcp", "tls", "wss"}
+TRANSPORT_NAME_EXEMPT = {"hexput-transport", "hexput-daemon", "hexput-config"}
+
 
 def workspace_metadata() -> dict:
     """The workspace's `cargo metadata`, without external packages."""
@@ -226,6 +257,43 @@ def restricted_name_uses(meta: dict) -> list[str]:
     return failures
 
 
+def transport_names_in(line: str) -> list[str]:
+    """Every transport name in `line`, in order; a short name inside a longer match counts once."""
+    spans = [(match.start(), match.end(), match.group(0)) for match in TRANSPORT_NAMES.finditer(line)]
+    for part in IDENTIFIER_PARTS.finditer(line):
+        inside = any(start <= part.start() < end for start, end, _ in spans)
+        if part.group(0).lower() in TRANSPORT_WORDS and not inside:
+            spans.append((part.start(), part.end(), part.group(0)))
+    return [name for _, _, name in sorted(spans)]
+
+
+def transport_name_uses(meta: dict) -> list[str]:
+    """Every mention of a transport in a production crate other than the exempt ones (AD-1)."""
+    failures: list[str] = []
+    for pkg in meta["packages"]:
+        crate = pkg["name"]
+        if crate in TRANSPORT_NAME_EXEMPT or crate in TEST_CRATES:
+            continue
+        manifest = Path(pkg["manifest_path"])
+        root = manifest.parent
+        sources = [manifest] + [
+            source
+            for source in sorted(root.rglob("*.rs"))
+            if "target" not in source.relative_to(root).parts
+        ]
+        for source in sources:
+            text = source.read_text(encoding="utf-8")
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                for name in transport_names_in(line):
+                    failures.append(
+                        f"AD-1: `{crate}` names a transport (`{name}`) at "
+                        f"{source.relative_to(root.parent.parent)}:{line_no}; only "
+                        f"{sorted(TRANSPORT_NAME_EXEMPT)} may — no crate but the wiring root "
+                        f"may branch on a transport type"
+                    )
+    return failures
+
+
 def main() -> int:
     meta = workspace_metadata()
     graph = dependency_graph(meta)
@@ -271,6 +339,7 @@ def main() -> int:
             )
 
     failures.extend(restricted_name_uses(meta))
+    failures.extend(transport_name_uses(meta))
 
     if failures:
         print("Crate graph violates the Architecture Spine:\n", file=sys.stderr)
@@ -286,7 +355,8 @@ def main() -> int:
     edges = (len(FORBIDDEN_EDGES) + len(REQUIRED_EDGES)
              + len(SOLE_DEPENDENTS) + len(EXACT_DEPENDENCIES))
     print(f"Crate graph OK — {edges} Architecture Decision edges and "
-          f"{len(RESTRICTED_NAMES)} restricted names asserted.")
+          f"{len(RESTRICTED_NAMES)} restricted names asserted, and the transport-name guard "
+          f"held over every crate but {sorted(TRANSPORT_NAME_EXEMPT)}.")
     return 0
 
 

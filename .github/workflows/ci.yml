@@ -57,10 +57,14 @@ jobs:
 
   # The Named Pipe adapter (Story 5.3) is Windows-only, so its tests run on a Windows host. The
   # whole workspace is linted for Windows too, and the Named Pipe tests (adapter, Daemon, System
-  # Config) run; the full suite stays on the Linux job.
+  # Config) run, together with the Story 5.4 conformance suite (Named Pipe, TCP+TLS and WebSocket,
+  # and their transcript equality); the full suite stays on the Linux job.
   windows:
     name: windows clippy / named pipe tests
     runs-on: windows-latest
+    # The pipe client's reads are blocking with no timeout, so a missing reply would otherwise hang
+    # the job until GitHub's six-hour limit; a broken case fails here instead.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -72,5 +76,5 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Named Pipe tests
-        run: cargo test --locked -p hexput-tests --test transport --test daemon --test config -- named_pipe
+      - name: Named Pipe and conformance tests
+        run: cargo test --locked -p hexput-tests --test transport --test daemon --test config -- named_pipe conformance

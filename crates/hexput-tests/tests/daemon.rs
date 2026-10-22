@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use hexput_daemon::{Discovery, run_with};
 
+#[path = "daemon/conformance.rs"]
+mod conformance;
+
 struct Sandbox {
     dir: PathBuf,
 }
@@ -2615,241 +2618,17 @@ mod cache_win {
 /// described in `transport.rs`'s `fixture` doc comment.
 #[cfg(unix)]
 mod tls_serving {
-    use std::ffi::OsString;
     use std::io::{ErrorKind, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
-    use std::os::unix::net::UnixStream;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use hexput_daemon::run_with;
-    use hexput_port::{CorrelationId, Envelope, MessageType, Value, decode, encode, encode_frame};
-    use rustls::pki_types::ServerName;
-    use rustls::pki_types::pem::PemObject;
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
 
-    use super::{Run, Sandbox, SharedLog, daemon, nothing};
-
-    fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures")
-            .join("tls")
-            .join(name)
-    }
-
-    /// The `[transport.tcp]` section for `bind`, with the fixture leaf identity.
-    fn tcp_section(bind: &str) -> String {
-        tcp_section_with(bind, &fixture("server.pem"), &fixture("server.key"))
-    }
-
-    fn tcp_section_with(bind: &str, cert: &Path, key: &Path) -> String {
-        format!(
-            "[transport.tcp]\nbind = {bind:?}\ntls_cert = {:?}\ntls_key = {:?}\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap()
-        )
-    }
-
-    /// The `[transport.websocket]` section for `bind`, with the fixture leaf identity (Story 5.2).
-    fn websocket_section(bind: &str) -> String {
-        websocket_section_with(bind, &fixture("server.pem"), &fixture("server.key"))
-    }
-
-    fn websocket_section_with(bind: &str, cert: &Path, key: &Path) -> String {
-        format!(
-            "[transport.websocket]\nbind = {bind:?}\ntls_cert = {:?}\ntls_key = {:?}\n",
-            cert.to_str().unwrap(),
-            key.to_str().unwrap()
-        )
-    }
-
-    /// A Daemon running on its own thread until `stop`.
-    pub struct Daemon {
-        stop: tokio::sync::oneshot::Sender<()>,
-        thread: std::thread::JoinHandle<Run>,
-        log: SharedLog,
-    }
-
-    impl Daemon {
-        pub fn start(sandbox: &Sandbox, config_text: &str) -> Self {
-            let config = sandbox.file("config.toml", config_text);
-            let discovery = nothing(sandbox);
-            let log = SharedLog::default();
-            let thread_log = log.clone();
-            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-            let thread = std::thread::spawn(move || {
-                let argv: Vec<OsString> =
-                    vec!["hexput-daemon".into(), "--config".into(), config.into()];
-                let (mut out, mut err) = (Vec::new(), Vec::new());
-                let code = run_with(
-                    argv,
-                    &discovery,
-                    &mut out,
-                    &mut err,
-                    thread_log.clone(),
-                    async {
-                        let _ = stopped.await;
-                    },
-                );
-                Run {
-                    code: format!("{code:?}"),
-                    stdout: String::from_utf8(out).unwrap(),
-                    stderr: String::from_utf8(err).unwrap(),
-                    log: thread_log.text(),
-                }
-            });
-            Self { stop, thread, log }
-        }
-
-        /// The log, once `needle` appears in it; panics if the Daemon stops first.
-        pub fn log_with(&self, needle: &str) -> String {
-            let started = Instant::now();
-            loop {
-                let text = self.log.text();
-                if text.contains(needle) {
-                    return text;
-                }
-                assert!(
-                    started.elapsed() < Duration::from_secs(10) && !self.thread.is_finished(),
-                    "never logged `{needle}`; log:\n{text}"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-
-        /// The TCP listener's actual address, read from the startup log line.
-        pub fn tcp_address(&self) -> SocketAddr {
-            self.bound_address("TCP")
-        }
-
-        /// The actual address of the `transport` listener (`TCP`, `WebSocket`), read from its
-        /// `listening on <transport> with TLS` startup line.
-        pub fn bound_address(&self, transport: &str) -> SocketAddr {
-            let needle = format!("listening on {transport} with TLS");
-            let text = self.log_with(&needle);
-            let line = text
-                .lines()
-                .find(|line| line.contains(&needle))
-                .expect("the line");
-            let field = line
-                .split("address=")
-                .nth(1)
-                .expect("an address field")
-                .split_whitespace()
-                .next()
-                .expect("an address value");
-            field
-                .trim_matches('"')
-                .parse()
-                .unwrap_or_else(|error| panic!("{field}: {error}"))
-        }
-
-        /// A UDS client, waiting until the socket accepts.
-        pub fn uds(&self, socket: &Path) -> UnixStream {
-            let started = Instant::now();
-            loop {
-                match UnixStream::connect(socket) {
-                    Ok(stream) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(10)))
-                            .unwrap();
-                        return stream;
-                    }
-                    Err(error) => {
-                        assert!(
-                            started.elapsed() < Duration::from_secs(10)
-                                && !self.thread.is_finished(),
-                            "the socket never accepted: {error}"
-                        );
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-            }
-        }
-
-        pub fn stop(self) -> Run {
-            let _ = self.stop.send(());
-            self.thread.join().expect("the Daemon thread")
-        }
-    }
-
-    /// A blocking TLS client that trusts only the fixture CA, for the name `localhost`.
-    pub fn tls(addr: SocketAddr) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
-        let mut roots = rustls::RootCertStore::empty();
-        for certificate in rustls::pki_types::CertificateDer::pem_file_iter(fixture("ca.pem"))
-            .expect("the CA file")
-        {
-            roots.add(certificate.unwrap()).unwrap();
-        }
-        let config = Arc::new(
-            rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        );
-        let tcp = TcpStream::connect(addr).expect("connects");
-        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        // The handshake happens on the first read or write.
-        let connection =
-            rustls::ClientConnection::new(config, ServerName::try_from("localhost").unwrap())
-                .expect("a client connection");
-        rustls::StreamOwned::new(connection, tcp)
-    }
-
-    /// Framing for any byte stream, UDS or TLS alike.
-    mod frames {
-        use super::*;
-
-        pub fn init(id: u64) -> Envelope<Value> {
-            Envelope::new(
-                CorrelationId(id),
-                MessageType::Init,
-                Value::Map(vec![
-                    (Value::from("config"), Value::Map(vec![])),
-                    (Value::from("registrations"), Value::Array(vec![])),
-                ]),
-            )
-        }
-
-        pub fn request(id: u64, source: &str) -> Envelope<Value> {
-            Envelope::new(
-                CorrelationId(id),
-                MessageType::ExecutionStart,
-                Value::Map(vec![
-                    (Value::from("source"), Value::from(source)),
-                    (Value::from("variables"), Value::Map(vec![])),
-                ]),
-            )
-        }
-
-        pub fn send<S: Write>(stream: &mut S, envelope: &Envelope<Value>) {
-            let bytes = encode_frame(&encode(envelope).unwrap()).unwrap();
-            stream.write_all(&bytes).unwrap();
-        }
-
-        /// The next reply, or `None` once the peer has closed.
-        pub fn reply<S: Read>(stream: &mut S) -> Option<Envelope<Value>> {
-            let mut prefix = [0; 4];
-            match stream.read_exact(&mut prefix) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    return None;
-                }
-                Err(error) => panic!("no reply: {error}"),
-            }
-            let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
-            stream.read_exact(&mut body).unwrap();
-            Some(decode(&body).unwrap())
-        }
-    }
+    use super::conformance::harness::{
+        Daemon, Wss, fixture, frames, tcp_section, tcp_section_with, tls, websocket_section,
+        websocket_section_with,
+    };
+    use super::{Sandbox, daemon, nothing};
 
     /// The Client ID an Init reply carries.
     fn client_id(init: &Envelope<Value>) -> String {
@@ -3137,102 +2916,6 @@ mod tls_serving {
         );
         assert!(!sandbox.socket().exists(), "the UDS socket is removed");
         drop(holder);
-    }
-
-    // --- Story 5.2: WebSocket ---
-
-    /// A blocking WebSocket client: a current-thread runtime drives tokio-tungstenite over
-    /// tokio-rustls, trusting only the fixture CA, for the name `localhost`.
-    pub struct Wss {
-        runtime: tokio::runtime::Runtime,
-        socket: tokio_tungstenite::WebSocketStream<
-            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-        >,
-    }
-
-    impl Wss {
-        pub fn connect(addr: SocketAddr) -> Self {
-            let mut roots = rustls::RootCertStore::empty();
-            for certificate in rustls::pki_types::CertificateDer::pem_file_iter(fixture("ca.pem"))
-                .expect("the CA file")
-            {
-                roots.add(certificate.unwrap()).unwrap();
-            }
-            let config = Arc::new(
-                rustls::ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-            );
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("a runtime");
-            let socket = runtime.block_on(async {
-                let tcp = tokio::net::TcpStream::connect(addr)
-                    .await
-                    .expect("connects");
-                let tls = tokio_rustls::TlsConnector::from(config)
-                    .connect(ServerName::try_from("localhost").unwrap(), tcp)
-                    .await
-                    .expect("the TLS handshake succeeds");
-                let (socket, _response) = tokio_tungstenite::client_async("wss://localhost/", tls)
-                    .await
-                    .expect("the WebSocket upgrade succeeds");
-                socket
-            });
-            Self { runtime, socket }
-        }
-
-        /// Send one envelope as one binary message.
-        pub fn send(&mut self, envelope: &Envelope<Value>) {
-            use futures_util::SinkExt;
-            let bytes = encode(envelope).unwrap();
-            let socket = &mut self.socket;
-            self.runtime
-                .block_on(socket.send(tokio_tungstenite::tungstenite::Message::Binary(
-                    bytes.into(),
-                )))
-                .expect("the message is sent");
-        }
-
-        /// The next reply, decoded, or `None` once the Daemon has closed.
-        pub fn reply(&mut self) -> Option<Envelope<Value>> {
-            use futures_util::StreamExt;
-            use tokio_tungstenite::tungstenite::Message;
-            let socket = &mut self.socket;
-            self.runtime.block_on(async {
-                loop {
-                    match socket.next().await {
-                        None | Some(Err(_)) => return None,
-                        Some(Ok(Message::Binary(bytes))) => return Some(decode(&bytes).unwrap()),
-                        Some(Ok(Message::Close(_))) => return None,
-                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                        Some(Ok(other)) => panic!("expected a binary message, got {other:?}"),
-                    }
-                }
-            })
-        }
-
-        /// Send `text` as one WebSocket text message, which Hexput never accepts as a frame.
-        pub fn send_text(&mut self, text: &str) {
-            use futures_util::SinkExt;
-            let socket = &mut self.socket;
-            self.runtime
-                .block_on(socket.send(tokio_tungstenite::tungstenite::Message::Text(text.into())))
-                .expect("the message is sent");
-        }
-
-        /// Drop the TCP stream with no Close frame and no `close_notify` (an intermediary
-        /// dropping the connection).
-        pub fn vanish(self) {
-            let Self { runtime, socket } = self;
-            drop(socket);
-            drop(runtime);
-        }
     }
 
     /// Init, then `return 1 + 2;`, over a WebSocket client.
@@ -3702,7 +3385,7 @@ mod named_pipe_serving {
     const TIMEOUT: Duration = Duration::from_secs(10);
 
     /// A pipe name no other test, or process, uses.
-    fn pipe_name() -> String {
+    pub(super) fn pipe_name() -> String {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         format!(
             r"\\.\pipe\hexput-test-{}-{}",
@@ -3712,12 +3395,12 @@ mod named_pipe_serving {
     }
 
     /// One attempt at a blocking client on `pipe`, read and write.
-    fn open_once(pipe: &str) -> std::io::Result<File> {
+    pub(super) fn open_once(pipe: &str) -> std::io::Result<File> {
         OpenOptions::new().read(true).write(true).open(pipe)
     }
 
     /// Not listening yet, or every instance busy: both are for the client to retry.
-    fn retryable(error: &std::io::Error) -> bool {
+    pub(super) fn retryable(error: &std::io::Error) -> bool {
         error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(ERROR_PIPE_BUSY)
     }
 

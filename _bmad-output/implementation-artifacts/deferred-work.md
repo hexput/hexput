@@ -382,3 +382,11 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-6-1-parse-plugin-source-with-metadata-globals-and-event-handlers.md`
   summary: `tests/script.rs::a_removed_handle_is_unknown_and_its_program_is_released_at_once` failed once under parallel load (moka maintenance timing) and passed on reruns.
   evidence: Review finding (blind-hunter), low. Pre-existing Epic 4 AST Cache test, untouched by Story 6.1. Settle by making the test wait on moka's `run_pending_tasks` (or poll with a deadline) instead of relying on maintenance timing, then running the full suite repeatedly under load.
+
+- source_spec: `spec-6-2-register-a-plugin-as-its-own-kind-of-registration.md`
+  summary: The static check (FR-26, AD-8) does not run at Plugin registration yet; a `PluginRegister` under check mode `error` is accepted unchecked.
+  evidence: Decision 6 of Story 6.2's spec, medium. AD-8 names `hexput-plugin` as where the check runs at Plugin registration, and FR-26's Plugin-only findings (an `@Event` naming an undeclared Event, a `@Global` strategy the Backend forbids) need Story 6.3's Event declarations. Story 6.3's spec must add the check to `hexput_plugin::register` (crates/hexput-plugin/src/lib.rs), run under the Session's live check mode with the Plugin-only findings. Nothing can run a handler before Story 6.5, so nothing executes unchecked meanwhile.
+
+- source_spec: `spec-6-2-register-a-plugin-as-its-own-kind-of-registration.md`
+  summary: Nothing limits how many Plugins one Session (or the Daemon) holds; a Backend can register Plugins under fresh names until memory runs out.
+  evidence: Review of Story 6.2, medium. `hexput_plugin::Plugins` keeps every parsed `PluginProgram` with no per-Session or Daemon-wide limit, unlike the AST Cache's `ast_cache_capacity`. The same gap already exists for Sessions (every `Init` creates one, unbounded), so it is a Daemon-wide question of per-Backend resource limits, not this story's. Settle it with a System Config limit (e.g. `max_plugins_per_session`) refused as a new `protocol.*` code, in an Epic 6 story or the hardening work.

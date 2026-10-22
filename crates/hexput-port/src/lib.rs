@@ -42,7 +42,9 @@ pub use frame::{FrameDecoder, LENGTH_PREFIX_LEN, MAX_FRAME_LEN, encode_frame};
 pub use port::{Inbound, Outbound, Port, Received};
 pub use settings::{CheckMode, Feature, Features, OutOfRange, Setting, Settings, decode_settings};
 
-pub use hexput_shared::ids::{ClientId, ParseClientIdError, ParseScriptHandleError, ScriptHandle};
+pub use hexput_shared::ids::{
+    ClientId, ParseClientIdError, ParseScriptHandleError, PluginId, ScriptHandle,
+};
 pub use hexput_shared::wire::{CorrelationId, Envelope, MessageType};
 /// The untyped MessagePack value the Port uses as its payload type. Re-exported so consumers
 /// reach the same pinned `rmpv` without depending on it themselves.

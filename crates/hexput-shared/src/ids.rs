@@ -1,7 +1,7 @@
 //! Identifier newtypes — never bare strings or integers past the boundary.
 //!
-//! Story 2.2 lands [`ClientId`], Story 4.1 [`ScriptHandle`]. `SessionId` and `PluginId` land with
-//! the stories that need them.
+//! Story 2.2 lands [`ClientId`], Story 4.1 [`ScriptHandle`], Story 6.2 [`PluginId`]. `SessionId`
+//! lands with the story that needs it.
 
 use core::fmt;
 use core::str::FromStr;
@@ -206,5 +206,35 @@ impl<'de> Deserialize<'de> for ScriptHandle {
         }
 
         deserializer.deserialize_str(Visitor)
+    }
+}
+
+/// The identity of one registered Plugin within a Daemon run (Story 6.2).
+///
+/// 64 bits, issued in order by `hexput-session` from one counter per run, starting at 1, and
+/// never reused during that run. It never goes on the wire — a Backend addresses a Plugin by its
+/// metadata `name`, unique per Client ID — so it has no text parsing and no serde: it is the key
+/// the Session, the Plugin registry and the Global Variable store (`teardown(plugin_id)`, AD-4)
+/// share. `Display` is its decimal value, for logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PluginId(u64);
+
+impl PluginId {
+    /// Wrap a counter value as a Plugin id.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// The id's counter value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for PluginId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }

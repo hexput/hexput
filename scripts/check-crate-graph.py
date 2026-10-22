@@ -88,8 +88,27 @@ EXACT_DEPENDENCIES = {
     # Story 2.6: it routes `ExecutionStart` to `hexput-script` (`conn --> script`, amended
     # 2026-09-23) and executes nothing itself. Story 3.1: it holds one `hexput-rpc` call table,
     # writing its executions' host calls and routing their replies (`conn --> rpc`, amended
-    # 2026-09-24) — still never `hexput-enforce` (AD-3).
-    "hexput-connection": {"hexput-session", "hexput-port", "hexput-script", "hexput-rpc"},
+    # 2026-09-24) — still never `hexput-enforce` (AD-3). Story 6.2: it routes `PluginRegister` to
+    # `hexput-plugin` (`conn --> plugin`, amended 2026-10-22), as it routes Scripts.
+    "hexput-connection": {
+        "hexput-session",
+        "hexput-port",
+        "hexput-script",
+        "hexput-rpc",
+        "hexput-plugin",
+    },
+    # Story 6.2: the Plugin crate reaches the parser, the Global Variable store, the one Executor
+    # and the static check (the Spine's edges), plus the wire value and error shape of its
+    # registration payload (`plugin --> port`, amended 2026-10-22), as `hexput-script` does —
+    # never a transport, never `hexput-session` (which must not reach it either way), never
+    # `hexput-enforce` except through `hexput-exec` (AD-3).
+    "hexput-plugin": {
+        "hexput-parser",
+        "hexput-globalvar",
+        "hexput-exec",
+        "hexput-check",
+        "hexput-port",
+    },
     # Story 3.1: host-call correlation reaches the wire codec alone — never `hexput-enforce`
     # (AD-3), `hexput-exec` (which depends on it, not the reverse) or `hexput-globalvar` (AD-4).
     "hexput-rpc": {"hexput-port"},

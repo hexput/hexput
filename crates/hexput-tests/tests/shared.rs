@@ -311,6 +311,7 @@ fn message_types_spell_pascal_case_and_parse_exactly() {
             "CodeRegister",
             "CachedExecutionStart",
             "CodeUnregister",
+            "PluginRegister",
             "Result",
             "Call",
             "Authorize",
@@ -618,4 +619,22 @@ fn script_handle_serializes_as_a_string() {
     assert!(rmp_serde::from_slice::<ScriptHandle>(&malformed).is_err());
     let integer = rmp_serde::to_vec(&7_u64).unwrap();
     assert!(rmp_serde::from_slice::<ScriptHandle>(&integer).is_err());
+}
+
+// --- Story 6.2: the Plugin id ---
+
+#[test]
+fn plugin_id_is_a_copyable_ordered_key_with_a_decimal_display() {
+    use hexput_shared::ids::PluginId;
+    use std::collections::HashSet;
+    let first = PluginId::new(1);
+    let second = PluginId::new(2);
+    assert_eq!(first.get(), 1);
+    assert_eq!(first.to_string(), "1");
+    assert_eq!(PluginId::new(u64::MAX).to_string(), "18446744073709551615");
+    assert!(first < second);
+    let copied = first;
+    assert_eq!(copied, first, "Copy: the original is still usable");
+    let distinct: HashSet<PluginId> = [first, second, first].into_iter().collect();
+    assert_eq!(distinct.len(), 2);
 }

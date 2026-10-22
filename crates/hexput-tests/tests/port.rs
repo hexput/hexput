@@ -475,6 +475,7 @@ fn protocol_codes_are_stable_and_in_the_protocol_category() {
         "protocol.response_too_large",
         "protocol.unknown_script_handle",
         "protocol.reconnect_denied",
+        "protocol.duplicate_plugin_name",
     ];
     let actual: Vec<_> = ProtocolCode::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1108,4 +1109,28 @@ fn a_reconnect_envelope_is_spelled_reconnect_on_the_wire_and_its_denial_is_not_f
     assert_eq!(decode(&bytes).unwrap().message_type, MessageType::Reconnect);
     // A denied reconnect leaves the connection open: the code is not fatal.
     assert!(!hexput_port::ProtocolError::new(ProtocolCode::ReconnectDenied, "").is_fatal());
+}
+
+// --- Story 6.2: the duplicate-name code and the re-exported Plugin id ---
+
+#[test]
+fn duplicate_plugin_name_is_a_protocol_code_spelled_and_bodied_as_specified() {
+    let code = ProtocolCode::DuplicatePluginName;
+    assert_eq!(code.as_str(), "protocol.duplicate_plugin_name");
+    assert!(ProtocolCode::ALL.contains(&code));
+    assert!(!hexput_port::ProtocolError::new(code, "").is_fatal());
+    let body = ErrorBody::from(&hexput_port::ProtocolError::new(
+        code,
+        "this Session already has a Plugin named `x`; nothing was registered",
+    ));
+    assert_eq!(body.code, "protocol.duplicate_plugin_name");
+    assert_eq!(body.category, "protocol");
+    assert!(body.message.contains("`x`"));
+}
+
+#[test]
+fn the_port_re_exports_the_same_plugin_id_as_shared() {
+    let id: hexput_port::PluginId = hexput_shared::ids::PluginId::new(7);
+    assert_eq!(id.get(), 7);
+    assert_eq!(id.to_string(), "7");
 }

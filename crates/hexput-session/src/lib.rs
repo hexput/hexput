@@ -89,6 +89,19 @@
 //! down on the last detach at once, as before — the same path with no delay. There is no reaper:
 //! a countdown is one caller's timer.
 //!
+//! # What Story 6.2 adds
+//!
+//! A Session owns the set of its Plugins: their metadata names, each under a [`PluginId`].
+//! [`Sessions::register_plugin`] checks that a name is free *in this Session* and reserves it
+//! under a freshly issued id in one step, under the Session's shard lock, so two concurrent
+//! registrations of one name cannot both succeed; another Session's names are never consulted
+//! (names are unique per Client ID, not Daemon-wide) and compare exactly, by bytes. Ids come from
+//! one counter per registry, starting at 1 and never reused during a run.
+//! [`Sessions::plugins`] lists the set. The parsed Plugin itself lives in `hexput-plugin`'s
+//! registry, which this crate cannot name; the Daemon's teardown hook releases it. The set goes
+//! with the Session on the one teardown path, where Story 6.13 calls each id's
+//! `hexput_globalvar::teardown` first (AD-4).
+//!
 //! Nothing here is `async`, so no lock of this crate's can be held across an `.await`; nothing
 //! here writes to disk.
 //!
@@ -98,14 +111,14 @@ mod credential;
 mod init;
 mod reconnect;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-pub use hexput_shared::ids::ClientId;
+pub use hexput_shared::ids::{ClientId, PluginId};
 
 use credential::Credential;
 pub use credential::ReconnectSecret;
@@ -137,6 +150,9 @@ pub struct Session {
     credential: Credential,
     registrations: Vec<RegisteredFunction>,
     connections: HashSet<ConnectionId>,
+    /// The Session's Plugins (Story 6.2): each metadata name, unique in this Session, under the
+    /// id issued when it was reserved.
+    plugins: HashMap<Arc<str>, PluginId>,
     /// The generation of the running TTL countdown (Story 5.8), if one runs: set when the last
     /// Connection detaches, cleared when one attaches.
     expiring: Option<u64>,
@@ -168,6 +184,26 @@ impl Expiry {
     }
 }
 
+/// Why [`Sessions::register_plugin`] reserved nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginNameError {
+    /// This Session already holds a Plugin with exactly this name.
+    Taken,
+    /// No Session has this Client ID: never issued, or already torn down.
+    NoSession,
+}
+
+impl core::fmt::Display for PluginNameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Taken => "this Session already has a Plugin with that name",
+            Self::NoSession => "no Session has this Client ID",
+        })
+    }
+}
+
+impl core::error::Error for PluginNameError {}
+
 /// The registry of live Sessions, keyed by Client ID. One per Daemon run, shared by every
 /// Connection.
 ///
@@ -183,6 +219,8 @@ pub struct Sessions {
     next_generation: AtomicU64,
     /// Called with a Session's Client ID when it is torn down (Story 4.3), if set.
     on_teardown: Option<TeardownHook>,
+    /// The last Plugin id issued (Story 6.2); the next is one more, so the first is 1.
+    last_plugin: AtomicU64,
 }
 
 /// The function [`Sessions::with_teardown`] stores.
@@ -196,6 +234,7 @@ impl core::fmt::Debug for Sessions {
             .field("ttl", &self.ttl)
             .field("next_generation", &self.next_generation)
             .field("on_teardown", &self.on_teardown.is_some())
+            .field("last_plugin", &self.last_plugin)
             .finish()
     }
 }
@@ -268,6 +307,7 @@ impl Sessions {
             credential,
             registrations: init.registrations,
             connections: HashSet::from([connection]),
+            plugins: HashMap::new(),
             expiring: None,
         };
         loop {
@@ -507,6 +547,57 @@ impl Sessions {
             .map(|session| (session.registrations.clone(), session.config.settings()))
     }
 
+    /// Reserve the Plugin name `name` in the Session with this Client ID (Story 6.2), under a
+    /// freshly issued [`PluginId`], and return the id.
+    ///
+    /// The check that no Plugin of this Session already has exactly this name (bytes compared,
+    /// no case folding or trimming) and the reservation happen under one shard lock, so of two
+    /// concurrent registrations of one name exactly one succeeds. Only this Session's names are
+    /// consulted. An id is issued only for a reservation that succeeds; ids start at 1 and are
+    /// never reused during the registry's life.
+    ///
+    /// # Errors
+    ///
+    /// [`PluginNameError::Taken`] when the Session already holds the name, and
+    /// [`PluginNameError::NoSession`] when no Session has this Client ID. Either way nothing
+    /// changes.
+    pub fn register_plugin(
+        &self,
+        client_id: ClientId,
+        name: &str,
+    ) -> Result<PluginId, PluginNameError> {
+        let mut session = self
+            .sessions
+            .get_mut(&client_id)
+            .ok_or(PluginNameError::NoSession)?;
+        if session.plugins.contains_key(name) {
+            return Err(PluginNameError::Taken);
+        }
+        // Uniqueness is all that is needed; the shard lock orders the Session's own state.
+        let id = PluginId::new(self.last_plugin.fetch_add(1, Ordering::Relaxed) + 1);
+        session.plugins.insert(Arc::from(name), id);
+        Ok(id)
+    }
+
+    /// The Session's Plugins as `(name, id)` pairs, sorted by id (so in registration order);
+    /// `None` when the Session does not exist, an empty list when it holds none.
+    ///
+    /// A name is listed from the moment it is reserved, which is before its parsed Plugin is
+    /// stored in `hexput-plugin`'s registry: a listed id may have no body yet, and a reader of
+    /// both (Story 6.5's firing) must treat such an id as not ready.
+    #[must_use]
+    pub fn plugins(&self, client_id: ClientId) -> Option<Vec<(Arc<str>, PluginId)>> {
+        self.sessions.get(&client_id).map(|session| {
+            let mut listed: Vec<(Arc<str>, PluginId)> = session
+                .plugins
+                .iter()
+                .map(|(name, id)| (Arc::clone(name), *id))
+                .collect();
+            listed.sort_unstable_by_key(|(_, id)| *id);
+            listed
+        })
+    }
+
     /// How many Sessions are live.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -532,9 +623,10 @@ fn generate_client_id() -> ClientId {
 /// [`Sessions::expire`] (after the TTL, Story 5.8) once the Session is already out of the
 /// registry — never from a `Drop` impl, never under a lock.
 ///
-/// Today it releases the Config, the reconnect credential and the Registered Functions. When
-/// Plugins land (Epic 6), each of the Session's Plugins has its Global Variable store torn down
-/// here through `hexput_globalvar::teardown(plugin_id)` before its actor is dropped (AD-4). Story
+/// Today it releases the Config, the reconnect credential, the Registered Functions and the
+/// Session's Plugin names (Story 6.2). Story 6.13 calls `hexput_globalvar::teardown(plugin_id)`
+/// here for each of those Plugin ids first, before its actor is dropped (AD-4); the parsed
+/// Plugins themselves are released by the hook, which the Daemon wires to `hexput-plugin`. Story
 /// 5.8's TTL delays the call to this function, not moves it — and the teardown hook with it.
 ///
 /// The hook, when the registry has one, is called last, with the Session's Client ID (Story 4.3).
@@ -548,10 +640,11 @@ fn teardown(
         credential,
         registrations,
         connections,
+        plugins,
         expiring: _,
     } = session;
     debug_assert!(connections.is_empty(), "a Session is torn down unattached");
-    drop((config, credential, registrations));
+    drop((config, credential, registrations, plugins));
     if let Some(hook) = hook {
         hook(client_id);
     }

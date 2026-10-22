@@ -35,8 +35,8 @@ pub enum ProtocolCode {
     /// as a `Result` or `Error` answering nothing the Daemon asked.
     UnexpectedMessage,
     /// A request payload the Daemon cannot accept: an `Init`, `Reconnect`, `ConfigUpdate`,
-    /// `ExecutionStart`, `CodeRegister`, `CachedExecutionStart` or `CodeUnregister` with a
-    /// missing, mistyped, unknown or repeated key (a `Reconnect` carrying `config` or
+    /// `ExecutionStart`, `CodeRegister`, `CachedExecutionStart`, `CodeUnregister` or
+    /// `PluginRegister` with a missing, mistyped, unknown or repeated key (a `Reconnect` carrying `config` or
     /// `registrations` included, or a Client ID or secret not of its hex form), a malformed or
     /// duplicate registration, a starting variable that is not a §2 identifier, or a value with
     /// no lossless Hexput representation. The message names the offending key, index or path.
@@ -62,6 +62,10 @@ pub enum ProtocolCode {
     /// one identical message, so Client IDs cannot be enumerated. Nothing is attached; the
     /// connection stays open and unattached, free to retry or `Init`.
     ReconnectDenied,
+    /// A `PluginRegister` whose Plugin's metadata `name` this Session already holds (Story 6.2).
+    /// Names are unique per Client ID — compared exactly, by bytes — not Daemon-wide. Nothing is
+    /// registered and the Session's existing Plugin is untouched.
+    DuplicatePluginName,
 }
 
 impl ProtocolCode {
@@ -83,6 +87,7 @@ impl ProtocolCode {
         Self::ResponseTooLarge,
         Self::UnknownScriptHandle,
         Self::ReconnectDenied,
+        Self::DuplicatePluginName,
     ];
 
     /// The code's stable string form.
@@ -102,6 +107,7 @@ impl ProtocolCode {
             Self::ResponseTooLarge => "protocol.response_too_large",
             Self::UnknownScriptHandle => "protocol.unknown_script_handle",
             Self::ReconnectDenied => "protocol.reconnect_denied",
+            Self::DuplicatePluginName => "protocol.duplicate_plugin_name",
         }
     }
 }

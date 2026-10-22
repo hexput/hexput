@@ -98,6 +98,17 @@ pub enum MessageType {
     /// issued, another Session's, evicted or already removed), `protocol.invalid_payload` for a
     /// malformed payload, with nothing removed.
     CodeUnregister,
+    /// Request: register a Plugin under this Session (Story 6.2). The message type alone marks the
+    /// request as a Plugin registration — nothing is inferred from the payload's shape. The
+    /// payload is exactly `{source}`, a string of Plugin source (a `plugin { }` metadata block,
+    /// Global Variables and `@Event` handlers). Answered `Result {name}`, the metadata `name`
+    /// echoed — a Plugin is addressed by its name, unique per Client ID — or `Error`: the parser's
+    /// diagnostic (with span), `protocol.duplicate_plugin_name` for a name this Session already
+    /// holds, `protocol.invalid_payload` for a malformed payload, `protocol.init_not_completed`
+    /// when the Session has ended before the Plugin is stored, with nothing registered. The
+    /// static check (FR-26) does not run at Plugin registration yet: a Plugin is accepted
+    /// unchecked whatever the Session's check mode, until Story 6.3 adds it.
+    PluginRegister,
     /// Response: a request succeeded; the payload is its result.
     Result,
     /// Request, from the Daemon to the Backend: a Script called a Registered Function (Story
@@ -127,6 +138,7 @@ impl MessageType {
         Self::CodeRegister,
         Self::CachedExecutionStart,
         Self::CodeUnregister,
+        Self::PluginRegister,
         Self::Result,
         Self::Call,
         Self::Authorize,
@@ -144,6 +156,7 @@ impl MessageType {
             Self::CodeRegister => "CodeRegister",
             Self::CachedExecutionStart => "CachedExecutionStart",
             Self::CodeUnregister => "CodeUnregister",
+            Self::PluginRegister => "PluginRegister",
             Self::Result => "Result",
             Self::Call => "Call",
             Self::Authorize => "Authorize",

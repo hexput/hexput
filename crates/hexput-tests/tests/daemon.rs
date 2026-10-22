@@ -4669,3 +4669,112 @@ fn a_session_expires_one_ttl_after_its_last_connection_and_a_reconnect_before_th
     let run = serving.stop();
     run.exit(0);
 }
+
+// --- Story 6.2: a Plugin registration over the real socket ---
+
+/// Story 6.2: an `Init` with no Config and no registrations, as the Plugin socket tests send it.
+#[cfg(unix)]
+fn plugin_init(id: u64) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::Init,
+        Value::Map(vec![
+            (Value::from("config"), Value::Map(vec![])),
+            (Value::from("registrations"), Value::Array(vec![])),
+        ]),
+    )
+}
+
+/// Story 6.2: a `PluginRegister` request for `source`.
+#[cfg(unix)]
+fn plugin_register_envelope(id: u64, source: &str) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::PluginRegister,
+        Value::Map(vec![(Value::from("source"), Value::from(source))]),
+    )
+}
+
+/// Story 6.2: a successful `PluginRegister` reply, which must be exactly `{name}`; returns the
+/// name.
+#[cfg(unix)]
+fn plugin_name_reply(reply: &hexput_port::Envelope<hexput_port::Value>) -> String {
+    use hexput_port::{MessageType, Value};
+
+    assert_eq!(
+        reply.message_type,
+        MessageType::Result,
+        "{:?}",
+        reply.payload
+    );
+    let Value::Map(fields) = &reply.payload else {
+        panic!("a Result payload is a map");
+    };
+    assert_eq!(fields.len(), 1, "exactly `name`: {fields:?}");
+    assert_eq!(fields[0].0.as_str(), Some("name"));
+    fields[0].1.as_str().expect("a string name").to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_plugin_registration_over_the_socket_is_answered_with_its_name_and_names_are_per_session() {
+    use hexput_port::CorrelationId;
+
+    let source = "plugin { name = \"x\" }\n@Event(Ping) fn h(p) { return 1; }";
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+
+    let mut first = serving.connect();
+    wire::send(&mut first, &plugin_init(1));
+    assert_eq!(
+        wire::reply(&mut first).expect("a reply").message_type,
+        hexput_port::MessageType::Result
+    );
+    wire::send(&mut first, &plugin_register_envelope(2, source));
+    let reply = wire::reply(&mut first).expect("a reply");
+    assert_eq!(reply.id, Some(CorrelationId(2)));
+    assert_eq!(plugin_name_reply(&reply), "x");
+
+    // The same name again on the same Session is refused, and the first is unchanged.
+    wire::send(&mut first, &plugin_register_envelope(3, source));
+    assert_eq!(
+        wire::refusal(&mut first),
+        (Some(3), "protocol.duplicate_plugin_name".to_owned())
+    );
+
+    // Another Session may register the same name.
+    let mut second = serving.connect();
+    wire::send(&mut second, &plugin_init(1));
+    assert_eq!(
+        wire::reply(&mut second).expect("a reply").message_type,
+        hexput_port::MessageType::Result
+    );
+    wire::send(&mut second, &plugin_register_envelope(2, source));
+    assert_eq!(
+        plugin_name_reply(&wire::reply(&mut second).expect("a reply")),
+        "x"
+    );
+
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_plugin_registration_before_init_over_the_socket_is_init_not_completed() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let mut client = serving.connect();
+    wire::send(
+        &mut client,
+        &plugin_register_envelope(41, "plugin { name = \"x\" }"),
+    );
+    assert_eq!(
+        wire::refusal(&mut client),
+        (Some(41), "protocol.init_not_completed".to_owned())
+    );
+    serving.stop().exit(0);
+}

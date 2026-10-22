@@ -62,6 +62,17 @@
 //!   sent earlier on this connection — fetched its program at dispatch and finishes. A failure
 //!   is logged at `debug` as "an unregister failed", with its `code` and, when the payload names
 //!   a well-formed one, its `handle`.
+//! * `PluginRegister` — `protocol.init_not_completed` before init. After init, a Plugin
+//!   registration (FR-17, Story 6.2), marked as one by its message type alone:
+//!   [`hexput_plugin::register`] decodes `{source}`, parses the Plugin source, reserves its
+//!   metadata `name` in this Session through [`Sessions::register_plugin`] (unique per Client ID,
+//!   under a fresh `PluginId`) and stores the parsed Plugin in the Daemon's one [`Plugins`]
+//!   registry under this Session's Client ID; the connection answers `Result { name }`, or the
+//!   `Error` it returns — `protocol.invalid_payload`, the parser's diagnostic,
+//!   `protocol.duplicate_plugin_name` — with nothing registered. Dispatched as its own task, its
+//!   work on the blocking pool, so a large source never stalls the loop or an execution. Logged at
+//!   `debug`: "plugin registered" with its `plugin` name and `plugin_id`, or "a plugin
+//!   registration failed" with its `code`.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
@@ -79,10 +90,10 @@
 //!
 //! # Concurrency
 //!
-//! Every initialized `ExecutionStart`, `CachedExecutionStart` and `CodeRegister` is dispatched as
-//! its own task, owned by the connection; a registration's parse and check run on the blocking
-//! pool too (NFR5). An execution's task runs [`hexput_script::direct_execution`] or
-//! [`hexput_script::cached_execution`], which run every piece of Script work on the
+//! Every initialized `ExecutionStart`, `CachedExecutionStart`, `CodeRegister` and
+//! `PluginRegister` is dispatched as its own task, owned by the connection; a registration's parse
+//! and check run on the blocking pool too (NFR5). An execution's task runs
+//! [`hexput_script::direct_execution`] or [`hexput_script::cached_execution`], which run every piece of Script work on the
 //! shared runtime's blocking pool: runtime workers never run Script code, so a slow Script delays
 //! neither this connection's reads nor any other connection, even when slow Scripts outnumber the
 //! cores (AD-6, FR-16). A connection may have any number of executions in flight, and there is no
@@ -193,23 +204,28 @@
 use std::io;
 use std::sync::Arc;
 
+use hexput_plugin::{Plugins, Reservation};
 use hexput_port::{
-    CorrelationId, Envelope, ErrorBody, Inbound, MessageType, Outbound, Port, ProtocolCode,
-    ProtocolError, Received, ScriptHandle, Value, error_response,
+    CorrelationId, Envelope, ErrorBody, Inbound, MessageType, Outbound, PluginId, Port,
+    ProtocolCode, ProtocolError, Received, ScriptHandle, Value, error_response,
 };
 use hexput_rpc::{Call, Caller, Calls};
 use hexput_script::{AstCache, Registration};
 use hexput_session::{
-    ClientId, Config, ConnectionId, InitRequest, ReconnectRequest, Sessions, Settings,
+    ClientId, Config, ConnectionId, InitRequest, PluginNameError, ReconnectRequest, Sessions,
+    Settings,
 };
 use tokio::task::{JoinError, JoinSet};
 use tracing::{Instrument, Span};
 
 /// The one connection's identity and state, as the loop sees it.
 struct Connection<'s> {
-    sessions: &'s Sessions,
+    sessions: &'s Arc<Sessions>,
     /// The Daemon's one AST Cache, which a registration stores its Script in (Story 4.1).
     cache: &'s Arc<AstCache>,
+    /// The Daemon's one Plugin registry, which a Plugin registration stores its Plugin in (Story
+    /// 6.2).
+    plugins: &'s Arc<Plugins>,
     /// Issued when the connection opened; also its attachment once init completes.
     id: ConnectionId,
     /// The Client ID of the Session this connection is attached to, once init completes. Never a
@@ -223,14 +239,20 @@ struct Connection<'s> {
 /// it, then detach it from its Session if it completed init. Never panics on anything the peer
 /// sends; failures are logged at `debug`, since a peer leaving is routine.
 ///
-/// `sessions` and `cache` are the Daemon run's one Session registry and one AST Cache, shared by
-/// every connection. When `sessions` has a TTL (Story 5.8), the runtime must have timers enabled
-/// (the Daemon's does): the countdown that expires a Session is a Tokio sleep.
-pub async fn serve<P: Port>(port: P, sessions: Arc<Sessions>, cache: Arc<AstCache>) {
+/// `sessions`, `cache` and `plugins` are the Daemon run's one Session registry, one AST Cache and
+/// one Plugin registry (Story 6.2), shared by every connection. When `sessions` has a TTL
+/// (Story 5.8), the runtime must have timers enabled (the Daemon's does): the countdown that expires a Session is a Tokio sleep.
+pub async fn serve<P: Port>(
+    port: P,
+    sessions: Arc<Sessions>,
+    cache: Arc<AstCache>,
+    plugins: Arc<Plugins>,
+) {
     let id = sessions.connect();
     let mut connection = Connection {
         sessions: &sessions,
         cache: &cache,
+        plugins: &plugins,
         id,
         attached: None,
         span: connection_span(id, None),
@@ -415,6 +437,20 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         );
                         continue;
                     }
+                    Answer::RegisterPlugin(id, payload, client_id) => {
+                        // Like a Script registration: its own task, carrying the request's span.
+                        running.spawn(
+                            register_plugin(
+                                id,
+                                payload,
+                                client_id,
+                                Arc::clone(connection.sessions),
+                                Arc::clone(connection.plugins),
+                            )
+                            .instrument(span),
+                        );
+                        continue;
+                    }
                 }
             }
             Event::Received(Received::Malformed(failure)) => {
@@ -586,6 +622,9 @@ enum Answer {
     /// By a Cached Execution of this payload for the Session with this Client ID, dispatched as
     /// its own task, replying to this id (Story 4.2).
     CachedExecute(Option<CorrelationId>, Value, ClientId),
+    /// By a Plugin registration of this payload for the Session with this Client ID, dispatched
+    /// as its own task, replying to this id (Story 6.2).
+    RegisterPlugin(Option<CorrelationId>, Value, ClientId),
 }
 
 /// How a connection came to be attached to its Session.
@@ -608,7 +647,8 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
         | MessageType::ConfigUpdate
         | MessageType::CodeRegister
         | MessageType::CachedExecutionStart
-        | MessageType::CodeUnregister => {}
+        | MessageType::CodeUnregister
+        | MessageType::PluginRegister => {}
         other => {
             // A stray reply's id is the Daemon's call id, not a Backend request id: echoing it
             // would fail whatever Backend request shares the number. Nil is allowed on `Error`.
@@ -637,14 +677,17 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
         ));
     };
 
-    // Past the gate: a `ConfigUpdate` or a `CodeUnregister`, answered inline, a registration, a
-    // Cached Execution or a Direct Execution.
+    // Past the gate: a `ConfigUpdate` or a `CodeUnregister`, answered inline, a registration (of
+    // a Script or a Plugin), a Cached Execution or a Direct Execution.
     match request.message_type {
         MessageType::ConfigUpdate => Answer::Reply(config_update(&request, connection)),
         MessageType::CodeUnregister => {
             Answer::Reply(code_unregister(&request, client_id, connection))
         }
         MessageType::CodeRegister => Answer::Register(request.id, request.payload, client_id),
+        MessageType::PluginRegister => {
+            Answer::RegisterPlugin(request.id, request.payload, client_id)
+        }
         MessageType::CachedExecutionStart => {
             Answer::CachedExecute(request.id, request.payload, client_id)
         }
@@ -831,6 +874,73 @@ async fn register(
     }
 }
 
+/// Run one Plugin registration to its reply (Story 6.2). Decoding, parsing, reserving the name in
+/// the Session and storing the Plugin all run on the blocking pool; this task only waits. A panic
+/// there continues here, ending this task alone.
+async fn register_plugin(
+    id: Option<CorrelationId>,
+    payload: Value,
+    client_id: ClientId,
+    sessions: Arc<Sessions>,
+    plugins: Arc<Plugins>,
+) -> Envelope<Value> {
+    let work = move || {
+        // What the success log names: the reserved id and the name, bounded like every name a
+        // message echoes, since only the frame limit bounds the Backend's.
+        let mut reserved: Option<(PluginId, String)> = None;
+        let reply = hexput_plugin::register(&payload, client_id, &plugins, |name| {
+            match sessions.register_plugin(client_id, name) {
+                Ok(plugin_id) => {
+                    reserved = Some((plugin_id, logged_name(name)));
+                    Reservation::Reserved(plugin_id)
+                }
+                Err(PluginNameError::Taken) => Reservation::NameTaken,
+                Err(PluginNameError::NoSession) => Reservation::SessionEnded,
+            }
+        });
+        reply.map(|payload| (payload, reserved))
+    };
+    let outcome = match tokio::task::spawn_blocking(work).await {
+        Ok(outcome) => outcome,
+        Err(error) => match error.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // Only a runtime shutting down cancels a blocking task, and it is dropping this
+            // future too.
+            Err(error) => panic!("a Plugin registration was cancelled: {error}"),
+        },
+    };
+    match outcome {
+        Ok((payload, reserved)) => {
+            // A successful registration always reserved its name.
+            if let Some((plugin_id, name)) = reserved {
+                tracing::debug!(plugin = name, plugin_id = %plugin_id, "plugin registered");
+            }
+            Envelope {
+                id,
+                message_type: MessageType::Result,
+                payload,
+            }
+        }
+        Err(body) => {
+            tracing::debug!(code = %body.code, "a plugin registration failed");
+            error_response(id, &body)
+        }
+    }
+}
+
+/// How many characters of a Plugin's name its success log keeps — the same bound
+/// `hexput_exec::wire::bounded` gives every name a message echoes.
+const LOGGED_NAME_CHARS: usize = 64;
+
+/// `name` as the success log records it: its first [`LOGGED_NAME_CHARS`] characters, with `…`
+/// marking a cut, so one huge name from the Backend cannot flood the log.
+fn logged_name(name: &str) -> String {
+    match name.char_indices().nth(LOGGED_NAME_CHARS) {
+        Some((end, _)) => format!("{}…", &name[..end]),
+        None => name.to_owned(),
+    }
+}
+
 /// Serve `Init`: decode the payload, create the Session with this connection attached, and
 /// answer its Client ID. The caller records the attachment and logs the completed init in the
 /// new connection span.
@@ -868,8 +978,10 @@ fn init(request: &Envelope<Value>, connection: &Connection<'_>) -> Answer {
         ]);
         (client_id, payload)
     };
-    // The cache accepts this Session's registrations from now until its teardown closes it.
+    // The cache and the Plugin registry accept this Session's registrations from now until its
+    // teardown closes them.
     connection.cache.open(client_id);
+    connection.plugins.open(client_id);
     Answer::Attached(
         Attach::Init,
         client_id,

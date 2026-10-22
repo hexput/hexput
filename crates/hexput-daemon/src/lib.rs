@@ -228,18 +228,27 @@ where
 /// descriptors) cannot spin a core.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// The Daemon's Session registry over `cache`: a Session's teardown releases its cache entries
-/// through the registry's hook, so `hexput-session` never reaches `hexput-script` (Story 4.3). The
-/// one place this pairing is made — the connection opens a Session in the cache at init, and this
-/// hook closes it — so a test can check the Daemon's own wiring. `ttl` is how long a Session
+/// The Daemon's Session registry over `cache` and `plugins`: a Session's teardown releases its
+/// cache entries (Story 4.3) and then its parsed Plugins (Story 6.2) through the registry's hook,
+/// so `hexput-session` never reaches `hexput-script` or `hexput-plugin`. The one place this
+/// pairing is made — the connection opens a Session in both at init, and this hook closes it,
+/// the cache first — so a test can check the Daemon's own wiring. `ttl` is how long a Session
 /// outlives its last Connection before that teardown (Story 5.8): System Config's
 /// `session_ttl_secs`, at least one second, so the Daemon never tears down at the last detach.
-fn registry(cache: &Arc<hexput_script::AstCache>, ttl: Duration) -> Arc<Sessions> {
+fn registry(
+    cache: &Arc<hexput_script::AstCache>,
+    plugins: &Arc<hexput_plugin::Plugins>,
+    ttl: Duration,
+) -> Arc<Sessions> {
     let released = Arc::clone(cache);
+    let plugins = Arc::clone(plugins);
     Arc::new(
         Sessions::new()
             .with_ttl(ttl)
-            .with_teardown(move |client_id| released.close(client_id)),
+            .with_teardown(move |client_id| {
+                released.close(client_id);
+                plugins.close(client_id);
+            }),
     )
 }
 
@@ -267,9 +276,12 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
         let cache = Arc::new(hexput_script::AstCache::with_capacity(
             loaded.config.ast_cache_capacity,
         ));
-        // One Session registry per Daemon run beside it, shared by every connection.
+        // One Plugin registry per Daemon run beside it (Story 6.2), keyed by Client ID like the
+        // cache.
+        let plugins = Arc::new(hexput_plugin::Plugins::new());
+        // One Session registry per Daemon run beside them, shared by every connection.
         // Its TTL (Story 5.8) is System Config's.
-        let sessions = registry(&cache, loaded.config.session_ttl);
+        let sessions = registry(&cache, &plugins, loaded.config.session_ttl);
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -291,6 +303,7 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                             port,
                             Arc::clone(&sessions),
                             Arc::clone(&cache),
+                            Arc::clone(&plugins),
                         ));
                     }
                     Err(error) => {
@@ -304,13 +317,16 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                 },
                 accepted = accept(listeners.tcp.as_ref(), TcpTlsListener::accept) => match accepted {
                     Ok(handshake) => {
-                        let (sessions, cache) = (Arc::clone(&sessions), Arc::clone(&cache));
+                        let (sessions, cache, plugins) =
+                            (Arc::clone(&sessions), Arc::clone(&cache), Arc::clone(&plugins));
                         // The handshake runs in the connection's own task, never here, so a slow
                         // or silent peer cannot stall the next accept.
                         connections.spawn(async move {
                             let peer = handshake.peer_addr();
                             match handshake.finish().await {
-                                Ok(port) => hexput_connection::serve(port, sessions, cache).await,
+                                Ok(port) => {
+                                    hexput_connection::serve(port, sessions, cache, plugins).await;
+                                }
                                 Err(error) => {
                                     tracing::debug!(%peer, %error, "TLS handshake failed");
                                 }
@@ -324,12 +340,15 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
                 },
                 accepted = accept(listeners.websocket.as_ref(), WebSocketListener::accept) => match accepted {
                     Ok(handshake) => {
-                        let (sessions, cache) = (Arc::clone(&sessions), Arc::clone(&cache));
+                        let (sessions, cache, plugins) =
+                            (Arc::clone(&sessions), Arc::clone(&cache), Arc::clone(&plugins));
                         // The TLS handshake and the upgrade run in the connection's own task.
                         connections.spawn(async move {
                             let peer = handshake.peer_addr();
                             match handshake.finish().await {
-                                Ok(port) => hexput_connection::serve(port, sessions, cache).await,
+                                Ok(port) => {
+                                    hexput_connection::serve(port, sessions, cache, plugins).await;
+                                }
                                 Err(error) => {
                                     tracing::debug!(%peer, %error, "WebSocket handshake failed");
                                 }
@@ -673,8 +692,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use hexput_plugin::{Plugins, Reservation};
     use hexput_script::AstCache;
-    use hexput_session::{InitRequest, Settings};
+    use hexput_session::{InitRequest, PluginNameError, Settings};
     use rmpv::Value;
 
     use super::registry;
@@ -703,7 +723,21 @@ mod tests {
             ))
         };
         let cache = Arc::new(AstCache::with_capacity(16));
-        let sessions = registry(&cache, Duration::from_secs(300));
+        let plugins = Arc::new(Plugins::new());
+        let sessions = registry(&cache, &plugins, Duration::from_secs(300));
+        // As `hexput-connection` registers a Plugin (Story 6.2).
+        let register_plugin = |client_id| {
+            hexput_plugin::register(
+                &map(vec![("source", Value::from("plugin { name = \"p\" }"))]),
+                client_id,
+                &plugins,
+                |name| match sessions.register_plugin(client_id, name) {
+                    Ok(id) => Reservation::Reserved(id),
+                    Err(PluginNameError::Taken) => Reservation::NameTaken,
+                    Err(PluginNameError::NoSession) => Reservation::SessionEnded,
+                },
+            )
+        };
         let init = map(vec![
             ("config", map(Vec::new())),
             ("registrations", Value::Array(Vec::new())),
@@ -715,7 +749,9 @@ mod tests {
                 sessions.create(InitRequest::from_value(&init).unwrap(), connection);
             // As `hexput-connection`'s init does.
             cache.open(client_id);
+            plugins.open(client_id);
             register(&cache, client_id).unwrap();
+            register_plugin(client_id).unwrap();
             sessions_made.push((client_id, connection));
         }
         let [(ended, connection), (kept, _)] = sessions_made[..] else {
@@ -728,14 +764,23 @@ mod tests {
         // Nothing is released while the countdown runs (Story 5.8)...
         assert_eq!(cache.handles(ended).len(), 1);
         assert_eq!(cache.entry_count(), 2);
+        assert_eq!(plugins.ids(ended).len(), 1);
+        assert_eq!(plugins.len(), 2);
         // ...and everything once it expires.
         assert!(sessions.expire(&expiry));
         assert!(cache.handles(ended).is_empty());
         assert_eq!(cache.handles(kept).len(), 1);
         assert_eq!(cache.entry_count(), 1);
+        // The Plugins with it (Story 6.2), and no other Session's.
+        assert!(plugins.ids(ended).is_empty());
+        assert_eq!(plugins.ids(kept).len(), 1);
+        assert_eq!(plugins.len(), 1);
         // And a registration arriving after the teardown leaves nothing behind.
         let late = register(&cache, ended).unwrap_err();
         assert_eq!(late.code, "protocol.init_not_completed");
         assert_eq!(cache.entry_count(), 1);
+        let late = register_plugin(ended).unwrap_err();
+        assert_eq!(late.code, "protocol.init_not_completed");
+        assert_eq!(plugins.len(), 1);
     }
 }

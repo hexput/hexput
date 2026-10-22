@@ -3,6 +3,7 @@
 //! Story 5.5: the reconnect credential issued at init, and verifying a presented secret.
 //! Story 5.6: reconnecting a Connection to a live Session, and decoding a `Reconnect` payload.
 //! Story 5.8: a Session outlives its last Connection by the TTL, and expires only if still unattached.
+//! Story 6.2: the Session owns the names of its Plugins, each under a fresh `PluginId`.
 
 use std::collections::HashSet;
 use std::sync::Barrier;
@@ -10,9 +11,10 @@ use std::time::Duration;
 
 use hexput_port::Value;
 use hexput_session::{
-    ClientId, Config, ConnectionId, Expiry, InitRequest, ReconnectRequest, ReconnectSecret,
-    Sessions, Setting, Settings,
+    ClientId, Config, ConnectionId, Expiry, InitRequest, PluginNameError, ReconnectRequest,
+    ReconnectSecret, Sessions, Setting, Settings,
 };
+use hexput_shared::ids::PluginId;
 
 fn s(text: &str) -> Value {
     Value::from(text)
@@ -1614,4 +1616,164 @@ fn concurrent_detaches_and_stale_expiries_never_tear_down_by_the_old_countdown()
         assert!(!sessions.contains(id));
     }
     assert!(sessions.is_empty());
+}
+
+// --- Story 6.2: the Session owns the names of its Plugins ---
+
+/// A Session's Plugin names as `(name, id)` pairs, in the order `plugins` lists them.
+fn plugin_names(sessions: &Sessions, id: ClientId) -> Option<Vec<(String, PluginId)>> {
+    sessions.plugins(id).map(|listed| {
+        listed
+            .iter()
+            .map(|(name, plugin)| (name.to_string(), *plugin))
+            .collect()
+    })
+}
+
+/// A client ID that no Session was ever created under.
+fn unknown_client() -> ClientId {
+    "00000000000000000000000000000001".parse().unwrap()
+}
+
+#[test]
+fn a_registered_name_gets_a_fresh_id_and_the_session_lists_them_by_id() {
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, valid(&[]));
+    let a = sessions.register_plugin(id, "a").unwrap();
+    let b = sessions.register_plugin(id, "b").unwrap();
+    assert_eq!(a, PluginId::new(1));
+    assert_eq!(b, PluginId::new(2));
+    assert_eq!(
+        plugin_names(&sessions, id),
+        Some(vec![("a".to_owned(), a), ("b".to_owned(), b)])
+    );
+}
+
+#[test]
+fn a_session_with_no_plugins_lists_none_and_is_not_missing() {
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, valid(&[]));
+    assert_eq!(plugin_names(&sessions, id), Some(vec![]));
+}
+
+#[test]
+fn a_name_the_session_already_holds_is_taken_and_the_first_registration_stands() {
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, valid(&[]));
+    let first = sessions.register_plugin(id, "x").unwrap();
+    assert!(matches!(
+        sessions.register_plugin(id, "x"),
+        Err(PluginNameError::Taken)
+    ));
+    assert_eq!(
+        plugin_names(&sessions, id),
+        Some(vec![("x".to_owned(), first)])
+    );
+}
+
+#[test]
+fn plugin_names_compare_exactly_by_bytes_with_no_case_folding_or_trimming() {
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, valid(&[]));
+    // Composed and decomposed forms of one visible name are different bytes.
+    let names = ["x", "X", " x", "x ", "caf\u{e9}", "cafe\u{301}"];
+    let ids: Vec<PluginId> = names
+        .iter()
+        .map(|name| sessions.register_plugin(id, name).unwrap())
+        .collect();
+    assert_eq!(ids.len(), names.len(), "every spelling registers");
+    for name in names {
+        assert!(matches!(
+            sessions.register_plugin(id, name),
+            Err(PluginNameError::Taken)
+        ));
+    }
+    assert_eq!(plugin_names(&sessions, id).unwrap().len(), names.len());
+}
+
+#[test]
+fn another_session_never_consults_these_names() {
+    let sessions = Sessions::new();
+    let (a, _) = create(&sessions, valid(&[]));
+    let (b, _) = create(&sessions, valid(&[]));
+    let on_a = sessions.register_plugin(a, "x").unwrap();
+    let on_b = sessions.register_plugin(b, "x").unwrap();
+    assert_ne!(on_a, on_b, "the same name under its own id on each Session");
+    assert_eq!(
+        plugin_names(&sessions, a),
+        Some(vec![("x".to_owned(), on_a)])
+    );
+    assert_eq!(
+        plugin_names(&sessions, b),
+        Some(vec![("x".to_owned(), on_b)])
+    );
+}
+
+#[test]
+fn registering_on_an_unknown_or_torn_down_session_is_no_session() {
+    let sessions = Sessions::new();
+    assert!(matches!(
+        sessions.register_plugin(unknown_client(), "x"),
+        Err(PluginNameError::NoSession)
+    ));
+    let (id, connection) = create(&sessions, valid(&[]));
+    sessions.detach(id, connection);
+    assert!(matches!(
+        sessions.register_plugin(id, "x"),
+        Err(PluginNameError::NoSession)
+    ));
+    assert_eq!(plugin_names(&sessions, id), None);
+}
+
+#[test]
+fn the_plugin_id_counter_starts_at_one_and_an_id_is_never_reused_within_a_run() {
+    let sessions = Sessions::new();
+    let (a, a_connection) = create(&sessions, valid(&[]));
+    assert_eq!(sessions.register_plugin(a, "x").unwrap(), PluginId::new(1));
+    assert_eq!(sessions.register_plugin(a, "y").unwrap(), PluginId::new(2));
+    sessions.detach(a, a_connection);
+    let (b, _) = create(&sessions, valid(&[]));
+    let fresh = sessions.register_plugin(b, "x").unwrap();
+    assert_eq!(
+        fresh,
+        PluginId::new(3),
+        "a torn-down Session's ids are not handed out again"
+    );
+}
+
+#[test]
+fn tearing_a_session_down_releases_its_plugin_names_with_it() {
+    let sessions = Sessions::new();
+    let (id, connection) = create(&sessions, valid(&[]));
+    sessions.register_plugin(id, "x").unwrap();
+    sessions.detach(id, connection);
+    assert!(!sessions.contains(id));
+    assert_eq!(plugin_names(&sessions, id), None);
+}
+
+#[test]
+fn concurrent_registrations_of_one_name_on_one_session_let_exactly_one_succeed() {
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, valid(&[]));
+    let barrier = Barrier::new(8);
+    let outcomes: Vec<Result<PluginId, PluginNameError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    sessions.register_plugin(id, "x")
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let won = outcomes.iter().filter(|o| o.is_ok()).count();
+    assert_eq!(won, 1, "exactly one registration of `x` succeeds");
+    assert!(
+        outcomes
+            .iter()
+            .filter(|o| o.is_err())
+            .all(|o| matches!(o, Err(PluginNameError::Taken)))
+    );
+    assert_eq!(plugin_names(&sessions, id).unwrap().len(), 1);
 }

@@ -10,13 +10,14 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use hexput_plugin::Plugins;
 use hexput_port::{
     CorrelationId, Envelope, Inbound, MessageType, Outbound, Port, ProtocolCode, ProtocolError,
     ProtocolFailure, Received, Value,
 };
 use hexput_script::AstCache;
 use hexput_session::{ClientId, ReconnectSecret, Sessions, Setting, Settings};
-use hexput_shared::ids::ScriptHandle;
+use hexput_shared::ids::{PluginId, ScriptHandle};
 
 /// Everything the core wrote.
 #[derive(Clone, Default)]
@@ -152,6 +153,25 @@ fn run_timed_with_cache(
     fail: Option<(usize, io::ErrorKind)>,
     probe: Option<Probe>,
 ) -> (Vec<Envelope<Value>>, usize, Duration) {
+    run_timed_with_plugins(
+        sessions,
+        cache,
+        &Arc::new(Plugins::new()),
+        script,
+        fail,
+        probe,
+    )
+}
+
+/// [`run_timed_with_cache`] sharing `plugins` (Story 6.2), which the test keeps to inspect.
+fn run_timed_with_plugins(
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    plugins: &Arc<Plugins>,
+    script: Vec<Received>,
+    fail: Option<(usize, io::ErrorKind)>,
+    probe: Option<Probe>,
+) -> (Vec<Envelope<Value>>, usize, Duration) {
     let script = Arc::new(Mutex::new(VecDeque::from(script)));
     let sent = Sent::default();
     let port = Scripted {
@@ -174,6 +194,7 @@ fn run_timed_with_cache(
             port,
             Arc::clone(sessions),
             Arc::clone(cache),
+            Arc::clone(plugins),
         ));
     });
     let elapsed = started.elapsed();
@@ -1090,6 +1111,7 @@ fn at_a_quiet_level_a_warning_keeps_its_span_fields() {
             port,
             Arc::clone(&sessions),
             Arc::new(AstCache::with_capacity(10_000)),
+            Arc::new(Plugins::new()),
         ));
     });
     assert!(sessions.is_empty(), "the connection detached");
@@ -1350,6 +1372,24 @@ async fn connect_on(
     init_payload: Value,
     refuse_calls: bool,
 ) -> (Backend, tokio::task::JoinHandle<()>, ClientId) {
+    connect_with_plugins(
+        sessions,
+        cache,
+        &Arc::new(Plugins::new()),
+        init_payload,
+        refuse_calls,
+    )
+    .await
+}
+
+/// [`connect_on`] sharing `plugins` (Story 6.2), which the test keeps to inspect.
+async fn connect_with_plugins(
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    plugins: &Arc<Plugins>,
+    init_payload: Value,
+    refuse_calls: bool,
+) -> (Backend, tokio::task::JoinHandle<()>, ClientId) {
     let (to_daemon, from_test) = tokio::sync::mpsc::unbounded_channel();
     let (to_test, from_daemon) = tokio::sync::mpsc::unbounded_channel();
     let port = Wired {
@@ -1361,6 +1401,7 @@ async fn connect_on(
         port,
         Arc::clone(sessions),
         Arc::clone(cache),
+        Arc::clone(plugins),
     ));
     let mut backend = Backend {
         to_daemon: Some(to_daemon),
@@ -5357,6 +5398,15 @@ fn open_bare(
     sessions: &Arc<Sessions>,
     cache: &Arc<AstCache>,
 ) -> (Backend, tokio::task::JoinHandle<()>) {
+    open_bare_with_plugins(sessions, cache, &Arc::new(Plugins::new()))
+}
+
+/// [`open_bare`] over a given Plugin registry, so several connections can share one.
+fn open_bare_with_plugins(
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    plugins: &Arc<Plugins>,
+) -> (Backend, tokio::task::JoinHandle<()>) {
     let (to_daemon, from_test) = tokio::sync::mpsc::unbounded_channel();
     let (to_test, from_daemon) = tokio::sync::mpsc::unbounded_channel();
     let port = Wired {
@@ -5368,6 +5418,7 @@ fn open_bare(
         port,
         Arc::clone(sessions),
         Arc::clone(cache),
+        Arc::clone(plugins),
     ));
     (
         Backend {
@@ -6558,4 +6609,444 @@ fn the_countdown_and_the_expiry_are_logged_at_debug_with_the_ttl_and_the_client_
     assert_eq!(expired.len(), 1, "{text}");
     assert_eq!(expired[0]["level"], "DEBUG", "{}", expired[0]);
     assert_eq!(expired[0]["span"]["client_id"], client_id, "{}", expired[0]);
+}
+
+// --- Story 6.2: a Plugin is its own kind of registration ---
+
+/// [`serve`]'s run against `plugins` as well as `sessions` and `cache`, which the test keeps.
+fn serve_plugins(
+    sessions: &Arc<Sessions>,
+    cache: &Arc<AstCache>,
+    plugins: &Arc<Plugins>,
+    script: Vec<Received>,
+) -> (Vec<Envelope<Value>>, usize) {
+    let (written, left, _) = run_timed_with_plugins(sessions, cache, plugins, script, None, None);
+    (written, left)
+}
+
+/// A `PluginRegister` request for `source`.
+fn plugin_register(id: u64, source: &str) -> Received {
+    plugin_register_payload(id, Value::Map(vec![(string("source"), string(source))]))
+}
+
+/// A `PluginRegister` request carrying `payload`, whatever it is.
+fn plugin_register_payload(id: u64, payload: Value) -> Received {
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::PluginRegister,
+        payload,
+    ))
+}
+
+/// A valid Plugin source named `name`, with one `@Event` handler.
+fn plugin_source(name: &str) -> String {
+    format!("plugin {{ name = \"{name}\" }}\n@Event(Ping) fn h(p) {{ return 1; }}")
+}
+
+/// The `name` of a successful `PluginRegister` reply: exactly `name`.
+fn name_of(response: &Envelope<Value>) -> String {
+    assert_eq!(
+        response.message_type,
+        MessageType::Result,
+        "{:?}",
+        response.payload
+    );
+    let Value::Map(fields) = &response.payload else {
+        panic!("a Result payload is a map: {:?}", response.payload);
+    };
+    assert_eq!(fields.len(), 1, "exactly `name`: {fields:?}");
+    assert_eq!(fields[0].0.as_str(), Some("name"));
+    fields[0].1.as_str().expect("a string name").to_owned()
+}
+
+/// Whether an `Error` reply carries a `span` map (its diagnostic's location).
+fn has_span(response: &Envelope<Value>) -> bool {
+    let Value::Map(fields) = &response.payload else {
+        return false;
+    };
+    fields
+        .iter()
+        .any(|(key, value)| key.as_str() == Some("span") && matches!(value, Value::Map(_)))
+}
+
+/// The id `sessions` lists `name` under for `client_id`, if it lists it.
+fn plugin_id_of(sessions: &Sessions, client_id: ClientId, name: &str) -> Option<PluginId> {
+    sessions
+        .plugins(client_id)?
+        .into_iter()
+        .find(|(listed, _)| &**listed == name)
+        .map(|(_, id)| id)
+}
+
+/// The payloads a `PluginRegister` must refuse, each with the key its message names (none when
+/// the payload is not a map, which names no key).
+fn bad_plugin_payloads() -> Vec<(Value, Option<&'static str>)> {
+    let source = plugin_source("x");
+    vec![
+        // nil reads as missing, so the message names `source`.
+        (Value::Nil, Some("source")),
+        (Value::Map(vec![]), Some("source")),
+        (
+            Value::Map(vec![(string("source"), Value::from(1))]),
+            Some("source"),
+        ),
+        (
+            Value::Map(vec![
+                (string("source"), string(&source)),
+                (string("events"), Value::Array(vec![])),
+            ]),
+            Some("events"),
+        ),
+        (
+            Value::Map(vec![
+                (string("source"), string(&source)),
+                (string("source"), string(&source)),
+            ]),
+            Some("source"),
+        ),
+        (Value::from(1), None),
+        (Value::Map(vec![(Value::from(1), string(&source))]), None),
+    ]
+}
+
+#[test]
+fn a_plugin_registration_is_answered_with_its_name_and_held_by_its_session() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        backend.send(plugin_register(2, &plugin_source("x")));
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(name_of(&reply), "x");
+        let id = plugin_id_of(&sessions, client_id, "x").expect("the Session holds x");
+        let plugin = plugins.get(client_id, id).expect("the Plugin is held");
+        assert_eq!(plugin.name(), "x");
+        assert_eq!(plugin.program().handlers.len(), 1);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_bad_plugin_payload_is_refused_naming_its_key_and_nothing_is_held() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        for (n, (payload, key)) in bad_plugin_payloads().into_iter().enumerate() {
+            let id = 2 + n as u64;
+            backend.send(plugin_register_payload(id, payload.clone()));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(id)), "{payload:?}");
+            assert_eq!(code_of(&reply), "protocol.invalid_payload", "{payload:?}");
+            if let Some(key) = key {
+                assert!(
+                    message_of(&reply).contains(key),
+                    "{payload:?}: {}",
+                    message_of(&reply)
+                );
+            }
+        }
+        assert_eq!(sessions.plugins(client_id), Some(vec![]));
+        backend.close();
+        finished(serving).await;
+    });
+    assert_eq!(plugins.len(), 0);
+}
+
+#[test]
+fn a_plugin_that_does_not_parse_is_its_diagnostic_with_a_span_and_registers_nothing() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        backend.send(plugin_register(2, "let x = 1;"));
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(code_of(&reply), "syntax.plugin_block_required");
+        assert!(has_span(&reply), "{:?}", reply.payload);
+        assert_eq!(sessions.plugins(client_id), Some(vec![]));
+        backend.close();
+        finished(serving).await;
+    });
+    assert_eq!(plugins.len(), 0);
+}
+
+#[test]
+fn a_duplicate_plugin_name_in_one_session_is_refused_naming_it_and_the_first_is_unchanged() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        backend.send(plugin_register(2, &plugin_source("x")));
+        assert_eq!(name_of(&backend.next().await), "x");
+        let first = plugin_id_of(&sessions, client_id, "x").expect("x is listed");
+        backend.send(plugin_register(3, &plugin_source("x")));
+        let refusal = backend.next().await;
+        assert_eq!(refusal.id, Some(CorrelationId(3)));
+        assert_eq!(code_of(&refusal), "protocol.duplicate_plugin_name");
+        assert!(
+            message_of(&refusal).contains("`x`"),
+            "{}",
+            message_of(&refusal)
+        );
+        assert_eq!(
+            sessions.plugins(client_id),
+            Some(vec![(Arc::<str>::from("x"), first)]),
+            "the first registration is untouched"
+        );
+        assert_eq!(plugins.ids(client_id), vec![first]);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn the_same_name_on_another_connection_is_a_different_session_and_a_different_plugin() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut first, serving_first, first_client) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let (mut second, serving_second, second_client) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        first.send(plugin_register(2, &plugin_source("x")));
+        assert_eq!(name_of(&first.next().await), "x");
+        second.send(plugin_register(2, &plugin_source("x")));
+        assert_eq!(name_of(&second.next().await), "x");
+        let on_first = plugin_id_of(&sessions, first_client, "x").expect("first holds x");
+        let on_second = plugin_id_of(&sessions, second_client, "x").expect("second holds x");
+        assert_ne!(on_first, on_second);
+        first.close();
+        second.close();
+        finished(serving_first).await;
+        finished(serving_second).await;
+    });
+}
+
+#[test]
+fn several_plugins_on_one_session_are_each_listed_and_retrievable_as_distinct_plugins() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        for (n, name) in ["a", "b", "c"].into_iter().enumerate() {
+            backend.send(plugin_register(2 + n as u64, &plugin_source(name)));
+            assert_eq!(name_of(&backend.next().await), name);
+        }
+        let listed = sessions.plugins(client_id).expect("the Session is live");
+        let names: Vec<&str> = listed.iter().map(|(name, _)| &**name).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        let ids: Vec<PluginId> = listed.iter().map(|(_, id)| *id).collect();
+        assert!(ids[0] < ids[1] && ids[1] < ids[2], "listed by id");
+        let held: Vec<_> = ids
+            .iter()
+            .map(|id| plugins.get(client_id, *id).expect("each is held"))
+            .collect();
+        assert_eq!(held[0].name(), "a");
+        assert_ne!(held[0].program(), held[1].program());
+        assert_ne!(held[1].program(), held[2].program());
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_plugin_registration_before_init_is_init_not_completed_and_holds_nothing() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let (sent, left) = serve_plugins(
+        &sessions,
+        &cache,
+        &plugins,
+        vec![plugin_register(1, &plugin_source("x"))],
+    );
+    assert_eq!(left, 0);
+    assert_eq!(code_of(&sent[0]), "protocol.init_not_completed");
+    assert_eq!(plugins.len(), 0);
+}
+
+#[test]
+fn a_plugin_held_by_a_session_is_released_when_its_session_ends_through_the_teardown_hook() {
+    let plugins = Arc::new(Plugins::new());
+    let hook = Arc::clone(&plugins);
+    let sessions = Arc::new(Sessions::new().with_teardown(move |client_id| hook.close(client_id)));
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        backend.send(plugin_register(2, &plugin_source("x")));
+        assert_eq!(name_of(&backend.next().await), "x");
+        assert_eq!(plugins.ids(client_id).len(), 1);
+        backend.close();
+        finished(serving).await;
+        assert!(plugins.ids(client_id).is_empty());
+        assert!(sessions.plugins(client_id).is_none());
+    });
+    assert_eq!(plugins.len(), 0);
+}
+
+#[test]
+fn plugin_code_cached_and_direct_requests_on_one_connection_are_each_answered() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        backend.send(plugin_register(2, &plugin_source("mixed")));
+        assert_eq!(name_of(&backend.next().await), "mixed");
+        backend.send(register(3, "return 1 + 1;"));
+        let handle = handle_of(&backend.next().await).to_string();
+        backend.send(cached_run(4, &handle, vec![]));
+        assert_eq!(value_of(&backend.next().await), Value::from(2));
+        backend.send(execution(5, "return 3;"));
+        assert_eq!(value_of(&backend.next().await), Value::from(3));
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_reconnected_connection_registers_plugins_in_its_session_and_names_stay_unique_across_its_connections()
+ {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let registry = Arc::clone(&sessions);
+    let held = Arc::clone(&plugins);
+    on_runtime(async move {
+        let (mut a, serving_a) = open_bare_with_plugins(&registry, &cache, &held);
+        a.reply(CorrelationId(1), MessageType::Init, init_payload(&[]));
+        let (client_id, secret) = init_reply_of(&a.next().await);
+        a.send(plugin_register(2, &plugin_source("x")));
+        assert_eq!(name_of(&a.next().await), "x");
+
+        // A Connection attached by `Reconnect` registers into the same Session: a name the
+        // Session holds through another Connection is taken, a new one is held beside it.
+        let (mut b, serving_b) = open_bare_with_plugins(&registry, &cache, &held);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        resumed(&mut b, 2, client_id).await;
+        b.send(plugin_register(3, &plugin_source("x")));
+        refused_with(&mut b, 3, "protocol.duplicate_plugin_name").await;
+        b.send(plugin_register(4, &plugin_source("y")));
+        assert_eq!(name_of(&b.next().await), "y");
+
+        let listed: Vec<String> = registry
+            .plugins(client_id)
+            .expect("the Session is live")
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert_eq!(listed, ["x", "y"]);
+        assert_eq!(held.ids(client_id).len(), 2);
+
+        b.close();
+        finished(serving_b).await;
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_large_plugin_does_not_hold_back_a_fast_execution_on_its_connection() {
+    let mut source = String::from("plugin { name = \"big\" }\n");
+    source.extend((0..LARGE_REGISTRATION_STATEMENTS).map(|n| format!("let v{n} = {n};\n")));
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let (sent, left) = serve_plugins(
+        &sessions,
+        &cache,
+        &plugins,
+        vec![
+            init(1, init_payload(&[])),
+            plugin_register(2, &source),
+            execution(3, "return 3;"),
+        ],
+    );
+    assert_eq!(left, 0);
+    assert_eq!(ids(&sent), [1, 3, 2], "the Plugin completes last");
+    assert_eq!(
+        sent[1].payload,
+        Value::Map(vec![(string("value"), Value::from(3))])
+    );
+    assert_eq!(name_of(&sent[2]), "big");
+    assert_eq!(plugins.len(), 1);
+}
+
+#[test]
+fn a_plugin_registration_is_logged_at_debug_under_its_request_and_a_failure_names_its_code() {
+    let log = Captured::default();
+    let writer = log.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(writer))
+            .finish(),
+    );
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let runtime = wired_runtime();
+    let mut registered = None;
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let (mut backend, serving, client_id) =
+                connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+            backend.send(plugin_register(7, &plugin_source("x")));
+            assert_eq!(name_of(&backend.next().await), "x");
+            registered = plugin_id_of(&sessions, client_id, "x");
+            backend.send(plugin_register(8, "let x = 1;"));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "syntax.plugin_block_required"
+            );
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    let id = registered.expect("the registration was answered");
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    let success: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "plugin registered")
+        .collect();
+    assert_eq!(success.len(), 1, "{text}");
+    let event = success[0];
+    assert_eq!(event["level"], "DEBUG", "{event}");
+    assert_eq!(event["fields"]["plugin"], "x", "{event}");
+    assert_eq!(event["fields"]["plugin_id"], id.to_string(), "{event}");
+    assert_eq!(event["span"]["name"], "request", "{event}");
+    assert_eq!(event["span"]["id"], "7", "{event}");
+    let failure: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "a plugin registration failed")
+        .collect();
+    assert_eq!(failure.len(), 1, "{text}");
+    assert_eq!(
+        failure[0]["fields"]["code"], "syntax.plugin_block_required",
+        "{}",
+        failure[0]
+    );
+    assert_eq!(failure[0]["span"]["id"], "8", "{}", failure[0]);
 }

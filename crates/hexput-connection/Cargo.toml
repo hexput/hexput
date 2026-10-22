@@ -20,6 +20,8 @@ hexput-session = { path = "../hexput-session" }
 hexput-port = { path = "../hexput-port" }
 hexput-script = { path = "../hexput-script" }
 hexput-rpc = { path = "../hexput-rpc" }
+# Routes `PluginRegister` to its registration (Story 6.2), as `hexput-script` serves Scripts.
+hexput-plugin = { path = "../hexput-plugin" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

@@ -12,6 +12,8 @@ hexput-parser = { path = "../hexput-parser" }
 hexput-globalvar = { path = "../hexput-globalvar" }
 hexput-exec = { path = "../hexput-exec" }
 hexput-check = { path = "../hexput-check" }
+# The `PluginRegister` payload, `Value` and `ErrorBody` (Story 6.2), as `hexput-script` uses it.
+hexput-port = { path = "../hexput-port" }
 
 [lints]
 workspace = true

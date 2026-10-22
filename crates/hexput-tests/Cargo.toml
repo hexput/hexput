@@ -32,6 +32,7 @@ hexput-exec = { path = "../hexput-exec" }
 hexput-script = { path = "../hexput-script" }
 hexput-rpc = { path = "../hexput-rpc" }
 hexput-enforce = { path = "../hexput-enforce" }
+hexput-plugin = { path = "../hexput-plugin" }
 # Third-party, for building and inspecting raw MessagePack in the wire tests.
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }

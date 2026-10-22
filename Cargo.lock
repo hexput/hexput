@@ -536,6 +536,7 @@ dependencies = [
 name = "hexput-connection"
 version = "0.1.0"
 dependencies = [
+ "hexput-plugin",
  "hexput-port",
  "hexput-rpc",
  "hexput-script",
@@ -632,6 +633,7 @@ dependencies = [
  "hexput-exec",
  "hexput-globalvar",
  "hexput-parser",
+ "hexput-port",
 ]
 
 [[package]]
@@ -703,6 +705,7 @@ dependencies = [
  "hexput-interpreter",
  "hexput-lexer",
  "hexput-parser",
+ "hexput-plugin",
  "hexput-port",
  "hexput-rpc",
  "hexput-script",

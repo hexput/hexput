@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-18-2026 11:43
-last_updated: 10-22-2026 17:00
+last_updated: 10-22-2026 18:00
 project: hexput
 project_key: NOKEY
 tracking_system: file-system
@@ -77,7 +77,7 @@ development_status:
 
   epic-4: in-progress
   4-1-register-a-script-once-for-repeated-use: review
-  4-2-re-run-a-registered-script-with-fresh-variables: backlog
+  4-2-re-run-a-registered-script-with-fresh-variables: review
   4-3-keep-the-cache-bounded-and-clean-it-up-with-the-session: backlog
   4-4-measure-the-cache-win: backlog
   4-5-compare-the-hot-path-against-rhai: backlog

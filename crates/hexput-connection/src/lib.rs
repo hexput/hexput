@@ -32,6 +32,14 @@
 //!   (with `findings` when the check found anything) or the `Error` it returns, with no entry
 //!   created. Dispatched as its own task, like an execution, so a large source never stalls the
 //!   loop. Logged at `debug`: "script registered" with its `handle`, or the failure.
+//! * `CachedExecutionStart` — `protocol.init_not_completed` before init. After init, a Cached
+//!   Execution (FR-5, Story 4.2): [`hexput_script::cached_execution`] looks the payload's handle up
+//!   in the [`AstCache`] under this Session's Client ID and runs the registered Script with the
+//!   payload's fresh variables through the one Executor, with nothing parsed and no static check,
+//!   and the connection answers exactly as for a Direct Execution — `Result { value,
+//!   modifications? }` or the `Error` — or `protocol.unknown_script_handle` for a handle this
+//!   Session has no entry under. A failure is logged at `debug` as "a Cached Execution failed",
+//!   with its `code` and, when the payload names a well-formed one, its `handle`.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
@@ -49,9 +57,10 @@
 //!
 //! # Concurrency
 //!
-//! Every initialized `ExecutionStart` and `CodeRegister` is dispatched as its own task, owned by
-//! the connection; a registration's parse and check run on the blocking pool too (NFR5). The
-//! task runs [`hexput_script::direct_execution`], which runs every piece of Script work on the
+//! Every initialized `ExecutionStart`, `CachedExecutionStart` and `CodeRegister` is dispatched as
+//! its own task, owned by the connection; a registration's parse and check run on the blocking
+//! pool too (NFR5). An execution's task runs [`hexput_script::direct_execution`] or
+//! [`hexput_script::cached_execution`], which run every piece of Script work on the
 //! shared runtime's blocking pool: runtime workers never run Script code, so a slow Script delays
 //! neither this connection's reads nor any other connection, even when slow Scripts outnumber the
 //! cores (AD-6, FR-16). A connection may have any number of executions in flight, and there is no
@@ -135,7 +144,7 @@ use std::sync::Arc;
 
 use hexput_port::{
     CorrelationId, Envelope, ErrorBody, Inbound, MessageType, Outbound, Port, ProtocolCode,
-    ProtocolError, Received, Value, error_response,
+    ProtocolError, Received, ScriptHandle, Value, error_response,
 };
 use hexput_rpc::{Call, Caller, Calls};
 use hexput_script::{AstCache, Registration};
@@ -289,6 +298,24 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         );
                         continue;
                     }
+                    Answer::CachedExecute(id, payload, client_id) => {
+                        let (registrations, settings) = session_now(connection);
+                        // Exactly like a Direct Execution: its own task, carrying the request's
+                        // span, its calls naming this request as their execution.
+                        running.spawn(
+                            cached_execute(
+                                id,
+                                payload,
+                                client_id,
+                                Arc::clone(connection.cache),
+                                registrations,
+                                settings,
+                                caller.for_execution(id),
+                            )
+                            .instrument(span),
+                        );
+                        continue;
+                    }
                     Answer::Register(id, payload, client_id) => {
                         let (registrations, settings) = session_now(connection);
                         // Like an execution: its own task, carrying the request's span.
@@ -366,7 +393,7 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
             Event::Finished(Err(error)) => {
                 // A task that panicked has no id left to answer with. It ends only itself.
                 connection.span.in_scope(|| {
-                    tracing::error!(%error, "a Direct Execution or registration task failed; its request goes unanswered");
+                    tracing::error!(%error, "an execution or registration task failed; its request goes unanswered");
                 });
                 continue;
             }
@@ -473,6 +500,9 @@ enum Answer {
     /// By a registration of this payload for the Session with this Client ID, dispatched as its
     /// own task, replying to this id (Story 4.1).
     Register(Option<CorrelationId>, Value, ClientId),
+    /// By a Cached Execution of this payload for the Session with this Client ID, dispatched as
+    /// its own task, replying to this id (Story 4.2).
+    CachedExecute(Option<CorrelationId>, Value, ClientId),
 }
 
 /// Answer one well-formed message. Takes it by value so an execution's payload — up to a whole
@@ -481,7 +511,10 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
     // Messages that need no Session.
     match request.message_type {
         MessageType::Init => return init(&request, connection),
-        MessageType::ExecutionStart | MessageType::ConfigUpdate | MessageType::CodeRegister => {}
+        MessageType::ExecutionStart
+        | MessageType::ConfigUpdate
+        | MessageType::CodeRegister
+        | MessageType::CachedExecutionStart => {}
         other => {
             // A stray reply's id is the Daemon's call id, not a Backend request id: echoing it
             // would fail whatever Backend request shares the number. Nil is allowed on `Error`.
@@ -510,10 +543,14 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
         ));
     };
 
-    // Past the gate: a `ConfigUpdate`, answered inline, a registration or a Direct Execution.
+    // Past the gate: a `ConfigUpdate`, answered inline, a registration, a Cached Execution or a
+    // Direct Execution.
     match request.message_type {
         MessageType::ConfigUpdate => Answer::Reply(config_update(&request, connection)),
         MessageType::CodeRegister => Answer::Register(request.id, request.payload, client_id),
+        MessageType::CachedExecutionStart => {
+            Answer::CachedExecute(request.id, request.payload, client_id)
+        }
         _ => Answer::Execute(request.id, request.payload),
     }
 }
@@ -589,6 +626,61 @@ async fn execute(
             error_response(id, &body)
         }
     }
+}
+
+/// Run one Cached Execution to its reply (Story 4.2). Like [`execute`], this task only waits: the
+/// lookup and the Script's own work run on the blocking pool.
+async fn cached_execute(
+    id: Option<CorrelationId>,
+    payload: Value,
+    client_id: ClientId,
+    cache: Arc<AstCache>,
+    registrations: Vec<Registration>,
+    settings: Settings,
+    caller: Caller,
+) -> Envelope<Value> {
+    // Read before the payload moves, so an operator can tell which handle failed. Only a
+    // well-formed handle is logged; a malformed one is the `invalid_payload` the reply names.
+    let handle = handle_of(&payload);
+    match hexput_script::cached_execution(
+        payload,
+        client_id,
+        cache,
+        registrations,
+        settings,
+        caller,
+    )
+    .await
+    {
+        Ok(payload) => Envelope {
+            id,
+            message_type: MessageType::Result,
+            payload,
+        },
+        Err(body) => {
+            match handle {
+                Some(handle) => tracing::debug!(
+                    code = %body.code,
+                    handle = %handle,
+                    "a Cached Execution failed"
+                ),
+                None => tracing::debug!(code = %body.code, "a Cached Execution failed"),
+            }
+            error_response(id, &body)
+        }
+    }
+}
+
+/// The well-formed `handle` a `CachedExecutionStart` payload names, if it names one.
+fn handle_of(payload: &Value) -> Option<ScriptHandle> {
+    payload
+        .as_map()?
+        .iter()
+        .find(|(key, _)| key.as_str() == Some("handle"))?
+        .1
+        .as_str()?
+        .parse()
+        .ok()
 }
 
 /// Run one registration to its reply (Story 4.1). Parsing and checking run on the blocking pool;

@@ -473,6 +473,7 @@ fn protocol_codes_are_stable_and_in_the_protocol_category() {
         "protocol.already_initialized",
         "protocol.result_too_deep",
         "protocol.response_too_large",
+        "protocol.unknown_script_handle",
     ];
     let actual: Vec<_> = ProtocolCode::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);

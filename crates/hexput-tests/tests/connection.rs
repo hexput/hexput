@@ -4484,3 +4484,292 @@ fn a_successful_registration_is_logged_at_debug_under_its_request() {
         "{event}"
     );
 }
+
+// --- Story 4.2: re-run a registered Script with fresh variables ---
+
+/// A `CachedExecutionStart` request for `handle` (16 hex characters) with `variables`.
+fn cached_run(id: u64, handle: &str, variables: Vec<(&str, Value)>) -> Received {
+    cached_run_with(id, handle, variables, None)
+}
+
+/// [`cached_run`] with `overrides` when given.
+fn cached_run_with(
+    id: u64,
+    handle: &str,
+    variables: Vec<(&str, Value)>,
+    overrides: Option<Value>,
+) -> Received {
+    let mut fields = vec![
+        (string("handle"), string(handle)),
+        (
+            string("variables"),
+            Value::Map(
+                variables
+                    .into_iter()
+                    .map(|(name, value)| (string(name), value))
+                    .collect(),
+            ),
+        ),
+    ];
+    if let Some(overrides) = overrides {
+        fields.push((string("overrides"), overrides));
+    }
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::CachedExecutionStart,
+        Value::Map(fields),
+    ))
+}
+
+#[test]
+fn a_cached_run_is_answered_with_its_value_and_its_entry_is_reused() {
+    hosted(&wired_runtime(), &[], false, |mut backend| async move {
+        backend.send(register(2, "return grade >= 50;"));
+        let handle = handle_of(&backend.next().await).to_string();
+        backend.send(cached_run(3, &handle, vec![("grade", Value::from(72))]));
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(3)));
+        assert_eq!(value_of(&reply), Value::Boolean(true));
+        backend.send(cached_run(4, &handle, vec![("grade", Value::from(12))]));
+        assert_eq!(value_of(&backend.next().await), Value::Boolean(false));
+        backend.close();
+    });
+}
+
+#[test]
+fn a_cached_run_before_init_is_refused_as_init_not_completed() {
+    let (sent, _) = serve(vec![cached_run(1, "0000000000000001", vec![])], None);
+    assert_eq!(code_of(&sent[0]), "protocol.init_not_completed");
+}
+
+#[test]
+fn a_cached_run_of_an_unknown_handle_names_it_and_says_to_register_again() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_payload(&[])),
+            cached_run(2, "00000000000000ff", vec![]),
+        ],
+    );
+    assert_eq!(sent[1].id, Some(CorrelationId(2)));
+    assert_eq!(code_of(&sent[1]), "protocol.unknown_script_handle");
+    assert!(message_of(&sent[1]).contains("00000000000000ff"));
+    assert!(message_of(&sent[1]).contains("CodeRegister"));
+    assert_eq!(cache.entry_count(), 0);
+}
+
+#[test]
+fn a_handle_another_session_registered_is_unknown_here() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let (registered_by_a, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![init(1, init_payload(&[])), register(2, "return 1;")],
+    );
+    let theirs = handle_of(&registered_by_a[1]).to_string();
+    let (mut by_b, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_payload(&[])),
+            cached_run(2, &theirs, vec![]),
+            cached_run(3, "00000000000000ff", vec![]),
+        ],
+    );
+    by_b.sort_by_key(|reply| reply.id.map(|id| id.0));
+    assert_eq!(by_b[1].id, Some(CorrelationId(2)));
+    assert_eq!(code_of(&by_b[1]), "protocol.unknown_script_handle");
+    assert_eq!(code_of(&by_b[2]), "protocol.unknown_script_handle");
+    assert_eq!(
+        message_of(&by_b[1]).replace(&theirs, "HANDLE"),
+        message_of(&by_b[2]).replace("00000000000000ff", "HANDLE"),
+    );
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn a_malformed_cached_run_is_answered_as_invalid_payload_and_the_connection_keeps_serving() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::new());
+    let source = Received::Message(Envelope::new(
+        CorrelationId(2),
+        MessageType::CachedExecutionStart,
+        Value::Map(vec![
+            (string("handle"), string("0000000000000001")),
+            (string("variables"), Value::Map(vec![])),
+            (string("source"), string("1;")),
+        ]),
+    ));
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_payload(&[])),
+            source,
+            execution(3, "return 1;"),
+        ],
+    );
+    let refused = sent
+        .iter()
+        .find(|reply| reply.id == Some(CorrelationId(2)))
+        .expect("answered");
+    assert_eq!(code_of(refused), "protocol.invalid_payload");
+    assert!(message_of(refused).contains("`source`"));
+    let ran = sent
+        .iter()
+        .find(|reply| reply.id == Some(CorrelationId(3)))
+        .expect("answered");
+    assert_eq!(value_of(ran), Value::from(1));
+}
+
+#[test]
+fn a_fast_cached_run_is_answered_before_a_slow_one_submitted_earlier() {
+    let slow_source = format!("let i = 0; while (i < {SLOW_TURNS}) {{ i = i + 1; }}; return i;");
+    hosted(&wired_runtime(), &[], false, |mut backend| async move {
+        backend.send(register(2, &slow_source));
+        let slow = handle_of(&backend.next().await).to_string();
+        backend.send(register(3, "return 3;"));
+        let fast = handle_of(&backend.next().await).to_string();
+        backend.send(cached_run(10, &slow, vec![]));
+        backend.send(cached_run(11, &fast, vec![]));
+        let first = backend.next().await;
+        assert_eq!(first.id, Some(CorrelationId(11)), "completion order");
+        assert_eq!(value_of(&first), Value::from(3));
+        let second = backend.next().await;
+        assert_eq!(second.id, Some(CorrelationId(10)));
+        assert_eq!(value_of(&second), Value::from(SLOW_TURNS));
+        backend.close();
+    });
+}
+
+#[test]
+fn a_cached_run_under_a_config_update_sees_the_live_budget_and_toggles() {
+    hosted(
+        &wired_runtime(),
+        &[("getOrder", true)],
+        false,
+        |mut backend| async move {
+            backend.send(register(2, "return getOrder(1);"));
+            let calls = handle_of(&backend.next().await).to_string();
+            backend.send(config_update(3, budget_of("rpc_calls", 0)));
+            assert_updated(&backend.next().await, 3);
+            backend.send(cached_run(4, &calls, vec![]));
+            assert_eq!(code_of(&backend.next().await), "budget.rpc_calls_exceeded");
+            backend.close();
+        },
+    );
+    hosted(&wired_runtime(), &[], false, |mut backend| async move {
+        backend.send(register(2, COUNTED_LOOP_SOURCE));
+        let looping = handle_of(&backend.next().await).to_string();
+        backend.send(config_update(3, feature_of("loops", false)));
+        assert_updated(&backend.next().await, 3);
+        backend.send(cached_run(4, &looping, vec![]));
+        assert_eq!(code_of(&backend.next().await), "policy.construct_disabled");
+        // An override lifts the toggle for this run alone.
+        backend.send(cached_run_with(
+            5,
+            &looping,
+            vec![],
+            Some(feature_of("loops", true)),
+        ));
+        assert_eq!(value_of(&backend.next().await), Value::from(2));
+        backend.send(cached_run(6, &looping, vec![]));
+        assert_eq!(code_of(&backend.next().await), "policy.construct_disabled");
+        backend.close();
+    });
+}
+
+/// The counted loop of [`a_cached_run_under_a_config_update_sees_the_live_budget_and_toggles`].
+const COUNTED_LOOP_SOURCE: &str = "let n = 0; while (n < 2) { n = n + 1; }; return n;";
+
+#[test]
+fn a_cached_run_is_checked_by_registration_only_and_an_override_check_is_refused() {
+    hosted(&wired_runtime(), &[], false, |mut backend| async move {
+        // Registered with the check off: the error finding sits on a path that never runs.
+        backend.send(register(2, "if (false) { return z; }; return 1;"));
+        let handle = handle_of(&backend.next().await).to_string();
+        backend.send(config_update(3, check_of(string("error"))));
+        assert_updated(&backend.next().await, 3);
+        backend.send(cached_run(4, &handle, vec![]));
+        assert_eq!(value_of(&backend.next().await), Value::from(1));
+        backend.send(cached_run_with(
+            5,
+            &handle,
+            vec![],
+            Some(check_of(string("warn"))),
+        ));
+        let refused = backend.next().await;
+        assert_eq!(code_of(&refused), "protocol.invalid_payload");
+        assert!(message_of(&refused).contains("`overrides.check`"));
+        assert!(message_of(&refused).contains("CodeRegister"));
+        backend.close();
+    });
+}
+
+#[test]
+fn a_cached_run_makes_its_call_with_its_own_request_id_as_the_execution() {
+    hosted(
+        &wired_runtime(),
+        &[("echo", true)],
+        false,
+        |mut backend| async move {
+            backend.send(register(2, "return echo(1);"));
+            let handle = handle_of(&backend.next().await).to_string();
+            backend.send(cached_run(10, &handle, vec![]));
+            let (call, name, _, from) = backend.request_from(MessageType::Call).await;
+            assert_eq!((name.as_str(), from), ("echo", 10));
+            backend.reply(
+                call,
+                MessageType::Result,
+                Value::Map(vec![(string("value"), Value::from(5))]),
+            );
+            assert_eq!(value_of(&backend.next().await), Value::from(5));
+            backend.close();
+        },
+    );
+}
+
+#[test]
+fn a_failed_cached_run_is_logged_at_debug_under_its_request() {
+    let log = Captured::default();
+    let writer = log.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(writer))
+            .finish(),
+    );
+    let runtime = wired_runtime();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let sessions = Arc::new(Sessions::new());
+            let (mut backend, serving) = connect(&sessions, init_payload(&[]), false).await;
+            backend.send(cached_run(7, "00000000000000ff", vec![]));
+            let reply = backend.next().await;
+            assert_eq!(code_of(&reply), "protocol.unknown_script_handle");
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["message"] == "a Cached Execution failed")
+        .collect();
+    assert_eq!(events.len(), 1, "{text}");
+    let event = &events[0];
+    assert_eq!(event["level"], "DEBUG", "{event}");
+    assert_eq!(
+        event["fields"]["code"], "protocol.unknown_script_handle",
+        "{event}"
+    );
+    assert_eq!(event["fields"]["handle"], "00000000000000ff", "{event}");
+    assert_eq!(event["span"]["name"], "request", "{event}");
+    assert_eq!(event["span"]["id"], "7", "{event}");
+}

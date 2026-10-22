@@ -1432,3 +1432,82 @@ fn a_registration_over_the_socket_is_answered_with_a_handle_from_one_counter_per
     assert_eq!(handles, ["0000000000000001", "0000000000000002"]);
     serving.stop().exit(0);
 }
+
+// --- Story 4.2: a registered Script re-run over the socket with fresh variables ---
+
+#[cfg(unix)]
+#[test]
+fn a_cached_execution_over_the_socket_runs_the_registered_script_with_fresh_variables() {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let mut client = serving.connect();
+    let init = Envelope::new(
+        CorrelationId(1),
+        MessageType::Init,
+        Value::Map(vec![
+            (Value::from("config"), Value::Map(vec![])),
+            (Value::from("registrations"), Value::Array(vec![])),
+        ]),
+    );
+    wire::send(&mut client, &init);
+    assert_eq!(
+        wire::reply(&mut client).expect("a reply").message_type,
+        MessageType::Result
+    );
+    let register = Envelope::new(
+        CorrelationId(2),
+        MessageType::CodeRegister,
+        Value::Map(vec![(
+            Value::from("source"),
+            Value::from("return grade >= 50;"),
+        )]),
+    );
+    wire::send(&mut client, &register);
+    let reply = wire::reply(&mut client).expect("a reply");
+    assert_eq!(
+        reply.message_type,
+        MessageType::Result,
+        "{:?}",
+        reply.payload
+    );
+    let handle = reply
+        .payload
+        .as_map()
+        .expect("a map payload")
+        .iter()
+        .find(|(key, _)| key.as_str() == Some("handle"))
+        .expect("a `handle` key")
+        .1
+        .as_str()
+        .expect("a string handle")
+        .to_owned();
+    for (id, grade, expected) in [(3u64, 72i64, true), (4, 12, false)] {
+        let run = Envelope::new(
+            CorrelationId(id),
+            MessageType::CachedExecutionStart,
+            Value::Map(vec![
+                (Value::from("handle"), Value::from(handle.as_str())),
+                (
+                    Value::from("variables"),
+                    Value::Map(vec![(Value::from("grade"), Value::from(grade))]),
+                ),
+            ]),
+        );
+        wire::send(&mut client, &run);
+        let reply = wire::reply(&mut client).expect("a reply");
+        assert_eq!(reply.id, Some(CorrelationId(id)));
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        assert_eq!(
+            reply.payload,
+            Value::Map(vec![(Value::from("value"), Value::Boolean(expected))])
+        );
+    }
+    serving.stop().exit(0);
+}

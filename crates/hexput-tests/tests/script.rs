@@ -150,8 +150,14 @@ fn a_starting_variable_the_script_declares_is_a_duplicate_declaration() {
 #[test]
 fn a_malformed_payload_is_refused_naming_the_key() {
     let cases: Vec<(Value, &str)> = vec![
-        (Value::Nil, "missing `source` and `variables`"),
-        (Value::Map(vec![]), "missing `source` and `variables`"),
+        (
+            Value::Nil,
+            "the `ExecutionStart` payload is missing `source` and `variables`",
+        ),
+        (
+            Value::Map(vec![]),
+            "the `ExecutionStart` payload is missing `source` and `variables`",
+        ),
         (map(vec![("variables", map(vec![]))]), "missing `source`"),
         (
             map(vec![("source", Value::Nil), ("variables", map(vec![]))]),
@@ -1388,4 +1394,636 @@ fn two_clients_registering_the_same_source_are_scoped_apart() {
     assert!(cache.get(client(2), a).is_none());
     assert_eq!(cache.handles(client(1)), vec![a]);
     assert_eq!(cache.handles(client(2)), vec![b]);
+}
+
+// --- Story 4.2: re-run a registered Script with fresh variables ---
+
+/// Run `payload` as a Cached Execution for `client` against `cache`, on a runtime of its own, with
+/// `registrations` and `settings`. Its call table is dropped at once, as in
+/// [`direct_execution_with`], so a call that is sent fails with `host.no_reply`.
+fn cached_with(
+    payload: &Value,
+    client: hexput_shared::ids::ClientId,
+    cache: &Arc<AstCache>,
+    registrations: Vec<Registration>,
+    settings: Settings,
+) -> Result<Value, Box<ErrorBody>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let (calls, caller) = hexput_rpc::Calls::new();
+    drop(calls);
+    runtime.block_on(hexput_script::cached_execution(
+        payload.clone(),
+        client,
+        Arc::clone(cache),
+        registrations,
+        settings,
+        caller,
+    ))
+}
+
+/// [`cached_with`] for `client` with no registrations and the Daemon's default settings.
+fn cached(
+    payload: &Value,
+    client: hexput_shared::ids::ClientId,
+    cache: &Arc<AstCache>,
+) -> Result<Value, Box<ErrorBody>> {
+    cached_with(payload, client, cache, vec![], Settings::new())
+}
+
+/// A `CachedExecutionStart` payload running `handle` with `variables`, and `overrides` when given.
+fn cached_payload(
+    handle: hexput_shared::ids::ScriptHandle,
+    variables: Vec<(&str, Value)>,
+    overrides: Option<Value>,
+) -> Value {
+    let mut fields = vec![
+        ("handle", s(&handle.to_string())),
+        ("variables", map(variables)),
+    ];
+    if let Some(overrides) = overrides {
+        fields.push(("overrides", overrides));
+    }
+    map(fields)
+}
+
+/// Register `source` for `client` into `cache` with no starting-variable names, returning its handle.
+fn handle_of_registration(
+    source: &str,
+    client: hexput_shared::ids::ClientId,
+    cache: &Arc<AstCache>,
+) -> hexput_shared::ids::ScriptHandle {
+    handle_in(
+        &registered(
+            &registration(source, None),
+            client,
+            cache,
+            vec![],
+            Settings::new(),
+        )
+        .unwrap(),
+    )
+}
+
+/// The `value` of a successful Cached Execution, asserting its reply is exactly `{value}`.
+fn cached_value(reply: &Value) -> Value {
+    assert_eq!(reply_keys(reply), ["value"], "{reply:?}");
+    reply.as_map().unwrap()[0].1.clone()
+}
+
+/// A Script with a counted loop, which a loops-off toggle refuses.
+const COUNTED_LOOP: &str = "let n = 0; while (n < 2) { n = n + 1; }; return n;";
+
+#[test]
+fn a_registered_script_runs_with_fresh_variables_and_its_entry_is_untouched() {
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration("return grade >= 50;", client(1), &cache);
+    let reply = cached(
+        &cached_payload(handle, vec![("grade", int(72))], None),
+        client(1),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(cached_value(&reply), Value::Boolean(true));
+    // The same handle, with other variables, gives the other result.
+    let reply = cached(
+        &cached_payload(handle, vec![("grade", int(12))], None),
+        client(1),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(cached_value(&reply), Value::Boolean(false));
+    assert_eq!(cache.entry_count(), 1, "a run neither inserts nor removes");
+    assert_eq!(cache.handles(client(1)), vec![handle]);
+}
+
+#[test]
+fn a_run_never_parses_so_a_registered_entry_is_the_one_it_runs() {
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration("return 1 + x;", client(1), &cache);
+    let before = cache.get(client(1), handle).expect("the entry");
+    cached(
+        &cached_payload(handle, vec![("x", int(2))], None),
+        client(1),
+        &cache,
+    )
+    .unwrap();
+    let after = cache.get(client(1), handle).expect("still the entry");
+    assert!(Arc::ptr_eq(&before, &after), "the same cached Arc<Program>");
+    assert_eq!(*after, hexput_parser::parse("return 1 + x;").unwrap());
+}
+
+#[test]
+fn a_mutated_object_does_not_bleed_into_the_next_run() {
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration("o.n = o.n + 1; return o.n;", client(1), &cache);
+    for _ in 0..2 {
+        let reply = cached(
+            &cached_payload(handle, vec![("o", map(vec![("n", int(1))]))], None),
+            client(1),
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(cached_value(&reply), int(2));
+    }
+}
+
+#[test]
+fn top_level_state_does_not_bleed_into_the_next_run() {
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration("let c = 0; c = c + x; return c;", client(1), &cache);
+    for _ in 0..2 {
+        let reply = cached(
+            &cached_payload(handle, vec![("x", int(5))], None),
+            client(1),
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(cached_value(&reply), int(5));
+    }
+}
+
+#[test]
+fn a_cached_run_replies_with_the_same_bytes_as_a_direct_execution() {
+    let source = "let t = x * 2; return t;";
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration(source, client(1), &cache);
+    let cached_reply = cached(
+        &cached_payload(handle, vec![("x", int(3))], None),
+        client(1),
+        &cache,
+    )
+    .unwrap();
+    let direct_reply = direct_execution(&payload(source, vec![("x", int(3))])).unwrap();
+    assert_eq!(cached_reply, direct_reply);
+    let encode_result = |reply: Value| {
+        encode(&Envelope::new(CorrelationId(1), MessageType::Result, reply)).unwrap()
+    };
+    assert_eq!(encode_result(cached_reply), encode_result(direct_reply));
+}
+
+#[test]
+fn an_unknown_handle_is_answered_with_the_re_register_error_and_nothing_runs() {
+    let cache = Arc::new(AstCache::new());
+    handle_of_registration("return 1;", client(1), &cache);
+    let unknown: hexput_shared::ids::ScriptHandle = "00000000000000ff".parse().unwrap();
+    let body = *cached(&cached_payload(unknown, vec![], None), client(1), &cache)
+        .expect_err("an unknown handle");
+    assert_eq!(body.code, "protocol.unknown_script_handle");
+    assert_eq!(body.category, "protocol");
+    assert_eq!(body.severity, "error");
+    assert!(body.span.is_none(), "a request error, not a Script error");
+    assert!(
+        body.message.contains("00000000000000ff"),
+        "{}",
+        body.message
+    );
+    assert!(body.message.contains("CodeRegister"), "{}", body.message);
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn handle_zero_is_well_formed_but_never_issued_so_it_is_unknown() {
+    // Handles count from 1, so `0000000000000000` parses yet can name no entry: it is the
+    // re-register error, never a malformed request.
+    let cache = Arc::new(AstCache::new());
+    handle_of_registration("return 1;", client(1), &cache);
+    let body = *cached(
+        &map(vec![
+            ("handle", s("0000000000000000")),
+            ("variables", map(vec![])),
+        ]),
+        client(1),
+        &cache,
+    )
+    .expect_err("handle zero");
+    assert_eq!(
+        body.code, "protocol.unknown_script_handle",
+        "{}",
+        body.message
+    );
+    assert!(
+        body.message.contains("0000000000000000"),
+        "{}",
+        body.message
+    );
+}
+
+#[test]
+fn another_sessions_handle_gets_the_same_error_shape_as_a_handle_never_issued() {
+    let cache = Arc::new(AstCache::new());
+    let theirs = handle_of_registration("return 1;", client(1), &cache);
+    let foreign = *cached(&cached_payload(theirs, vec![], None), client(2), &cache)
+        .expect_err("another Session's handle");
+    let never = *cached(
+        &cached_payload("00000000000000ff".parse().unwrap(), vec![], None),
+        client(2),
+        &cache,
+    )
+    .expect_err("a handle never issued");
+    assert_eq!(foreign.code, "protocol.unknown_script_handle");
+    assert_eq!(
+        (&foreign.severity, &foreign.category, &foreign.span),
+        (&never.severity, &never.category, &never.span)
+    );
+    assert_eq!(
+        foreign.message.replace(&theirs.to_string(), "HANDLE"),
+        never.message.replace("00000000000000ff", "HANDLE"),
+        "the message names only the handle asked for"
+    );
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn a_malformed_payload_is_refused_naming_the_key_and_runs_nothing() {
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration("return 1;", client(1), &cache);
+    let text = handle.to_string();
+    let cases: Vec<(Value, &[&str])> = vec![
+        (
+            Value::Nil,
+            &[
+                "the `CachedExecutionStart` payload",
+                "`handle`",
+                "`variables`",
+            ],
+        ),
+        (
+            map(vec![]),
+            &[
+                "the `CachedExecutionStart` payload",
+                "`handle`",
+                "`variables`",
+            ],
+        ),
+        (
+            map(vec![("handle", int(1)), ("variables", map(vec![]))]),
+            &["`handle`"],
+        ),
+        (
+            map(vec![("handle", s("ABC")), ("variables", map(vec![]))]),
+            &["`handle`", "ABC"],
+        ),
+        // A handle parses strictly: uppercase, padding or one character too many is a malformed
+        // request (`invalid_payload`), never an unknown handle to re-register.
+        (
+            map(vec![
+                ("handle", s("00000000000000FF")),
+                ("variables", map(vec![])),
+            ]),
+            &["`handle`", "00000000000000FF"],
+        ),
+        (
+            map(vec![
+                ("handle", s(&format!(" {text} "))),
+                ("variables", map(vec![])),
+            ]),
+            &["`handle`"],
+        ),
+        (
+            map(vec![
+                ("handle", s(&format!("{text}0"))),
+                ("variables", map(vec![])),
+            ]),
+            &["`handle`"],
+        ),
+        (
+            map(vec![("handle", s(&text))]),
+            &["the `CachedExecutionStart` payload", "missing `variables`"],
+        ),
+        (
+            map(vec![("handle", s(&text)), ("variables", int(1))]),
+            &["`variables`"],
+        ),
+        (
+            map(vec![
+                ("handle", s(&text)),
+                ("variables", map(vec![])),
+                ("source", s("1;")),
+            ]),
+            &["the `CachedExecutionStart` payload", "unknown key `source`"],
+        ),
+        (
+            map(vec![
+                ("handle", s(&text)),
+                ("variables", map(vec![])),
+                ("x", int(1)),
+            ]),
+            &["the `CachedExecutionStart` payload", "unknown key `x`"],
+        ),
+        (
+            map(vec![
+                ("handle", s(&text)),
+                ("variables", map(vec![])),
+                ("overrides", map(vec![("check", s("warn"))])),
+            ]),
+            &["`overrides.check`", "CodeRegister"],
+        ),
+        // Any `check` is refused, `off` included: the pass never runs here, so no value of it
+        // can mean anything on this request.
+        (
+            map(vec![
+                ("handle", s(&text)),
+                ("variables", map(vec![])),
+                ("overrides", map(vec![("check", s("off"))])),
+            ]),
+            &["`overrides.check`", "CodeRegister"],
+        ),
+        (
+            Value::Map(vec![
+                (s("handle"), s(&text)),
+                (s("handle"), s(&text)),
+                (s("variables"), map(vec![])),
+            ]),
+            &[
+                "the `CachedExecutionStart` payload",
+                "repeats the key `handle`",
+            ],
+        ),
+    ];
+    for (payload, mentions) in cases {
+        let body = *cached(&payload, client(1), &cache).expect_err("refused");
+        assert_eq!(body.code, "protocol.invalid_payload", "{payload:?}");
+        assert!(
+            mentions.iter().all(|m| body.message.contains(m)),
+            "{payload:?} refused as {:?}, naming {mentions:?}",
+            body.message
+        );
+    }
+    assert_eq!(cache.entry_count(), 1);
+}
+
+#[test]
+fn an_invalid_payload_takes_precedence_over_an_unknown_handle() {
+    let cache = Arc::new(AstCache::new());
+    let body = *cached(
+        &map(vec![
+            ("handle", s("00000000000000ff")),
+            ("variables", map(vec![])),
+            ("source", s("1;")),
+        ]),
+        client(1),
+        &cache,
+    )
+    .expect_err("refused");
+    assert_eq!(body.code, "protocol.invalid_payload");
+}
+
+#[test]
+fn an_overlong_handle_is_echoed_bounded_in_its_refusal() {
+    let cache = Arc::new(AstCache::new());
+    let long = "A".repeat(4096);
+    let body = *cached(
+        &map(vec![("handle", s(&long)), ("variables", map(vec![]))]),
+        client(1),
+        &cache,
+    )
+    .expect_err("refused");
+    assert_eq!(body.code, "protocol.invalid_payload");
+    assert!(body.message.contains("`handle`"), "{}", body.message);
+    assert!(
+        body.message.len() < 1024,
+        "bounded, not {} bytes",
+        body.message.len()
+    );
+}
+
+#[test]
+fn a_registration_with_findings_runs_with_a_reply_of_exactly_value() {
+    use hexput_port::CheckMode;
+    let cache = Arc::new(AstCache::new());
+    let reply = registered(
+        &registration("let unused = 1; return x;", Some(vec!["x"])),
+        client(1),
+        &cache,
+        vec![],
+        checked(CheckMode::Warn),
+    )
+    .unwrap();
+    assert_eq!(reply_keys(&reply), ["handle", "findings"]);
+    let handle = handle_in(&reply);
+    let reply = cached(
+        &cached_payload(handle, vec![("x", int(2))], None),
+        client(1),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        reply_keys(&reply),
+        ["value"],
+        "never `findings` on a Cached Execution"
+    );
+    assert_eq!(cached_value(&reply), int(2));
+}
+
+#[test]
+fn the_check_is_not_run_at_a_cached_execution_whatever_the_live_mode() {
+    use hexput_port::CheckMode;
+    // Registered with the check off, so nothing is rejected. The error finding (`z` is never
+    // bound) sits on a path that never runs, so only the check could object.
+    let source = "if (false) { return z; }; return 1;";
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration(source, client(1), &cache);
+    let reply = cached_with(
+        &cached_payload(handle, vec![], None),
+        client(1),
+        &cache,
+        vec![],
+        checked(CheckMode::Error),
+    )
+    .unwrap();
+    assert_eq!(cached_value(&reply), int(1));
+    // Contrast: Direct Execution under the same mode rejects the same Script before it runs.
+    let body =
+        *direct_execution_configured(&payload(source, vec![]), vec![], checked(CheckMode::Error))
+            .expect_err("Direct Execution checks");
+    assert_eq!(body.code, "reference.undeclared_identifier");
+}
+
+#[test]
+fn registered_variable_names_are_neither_enforced_nor_stored() {
+    let cache = Arc::new(AstCache::new());
+    let handle = registered(
+        &registration("return x;", Some(vec!["x"])),
+        client(1),
+        &cache,
+        vec![],
+        Settings::new(),
+    )
+    .map(|reply| handle_in(&reply))
+    .unwrap();
+    let body = *cached(&cached_payload(handle, vec![], None), client(1), &cache)
+        .expect_err("x is not supplied");
+    assert_eq!(body.code, "reference.undeclared_identifier");
+    let reply = cached(
+        &cached_payload(handle, vec![("x", int(3)), ("extra", int(1))], None),
+        client(1),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        cached_value(&reply),
+        int(3),
+        "an extra variable simply binds"
+    );
+}
+
+#[test]
+fn a_starting_variable_the_script_redeclares_is_a_duplicate_declaration() {
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration("let x = 1; return x;", client(1), &cache);
+    let body = *cached(
+        &cached_payload(handle, vec![("x", int(3))], None),
+        client(1),
+        &cache,
+    )
+    .expect_err("redeclared");
+    assert_eq!(body.code, "syntax.duplicate_declaration");
+}
+
+#[test]
+fn a_live_config_limit_applies_to_a_cached_run() {
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration("return getOrder(1);", client(1), &cache);
+    let body = *cached_with(
+        &cached_payload(handle, vec![], None),
+        client(1),
+        &cache,
+        get_order().into_iter().map(Registration::from).collect(),
+        setting(Setting::RpcCalls, 0),
+    )
+    .expect_err("no host calls allowed");
+    assert_eq!(body.code, "budget.rpc_calls_exceeded");
+}
+
+#[test]
+fn a_live_feature_toggle_refuses_a_construct_at_a_cached_run() {
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration(COUNTED_LOOP, client(1), &cache);
+    let mut loops_off = Settings::new();
+    loops_off.set_feature(hexput_port::Feature::Loops, false);
+    let body = *cached_with(
+        &cached_payload(handle, vec![], None),
+        client(1),
+        &cache,
+        vec![],
+        loops_off,
+    )
+    .expect_err("loops are disabled");
+    assert_eq!(body.code, "policy.construct_disabled");
+}
+
+#[test]
+fn overrides_apply_to_one_run_alone() {
+    let cache = Arc::new(AstCache::new());
+    let looping = handle_of_registration(COUNTED_LOOP, client(1), &cache);
+    let loops_off = map(vec![(
+        "features",
+        map(vec![("loops", Value::Boolean(false))]),
+    )]);
+    let body = *cached(
+        &cached_payload(looping, vec![], Some(loops_off)),
+        client(1),
+        &cache,
+    )
+    .expect_err("the override disables loops for this run");
+    assert_eq!(body.code, "policy.construct_disabled");
+    let reply = cached(&cached_payload(looping, vec![], None), client(1), &cache).unwrap();
+    assert_eq!(
+        cached_value(&reply),
+        int(2),
+        "the next run is back under the Config"
+    );
+
+    let long = handle_of_registration("return \"a long enough result\";", client(1), &cache);
+    let tight = map(vec![("budget", map(vec![("output_size_bytes", int(8))]))]);
+    let body = *cached(
+        &cached_payload(long, vec![], Some(tight)),
+        client(1),
+        &cache,
+    )
+    .expect_err("the output budget is 8 bytes for this run");
+    assert_eq!(body.code, "budget.output_size_exceeded");
+    let reply = cached(&cached_payload(long, vec![], None), client(1), &cache).unwrap();
+    assert_eq!(cached_value(&reply), s("a long enough result"));
+
+    let bounded = handle_of_registration(
+        "let n = 0; while (n < limit) { n = n + 1; }; return n;",
+        client(1),
+        &cache,
+    );
+    let one_ms = map(vec![("budget", map(vec![("cpu_time_ms", int(1))]))]);
+    let body = *cached(
+        &cached_payload(bounded, vec![("limit", int(1_000_000_000))], Some(one_ms)),
+        client(1),
+        &cache,
+    )
+    .expect_err("the CPU budget is 1 ms for this run");
+    assert_eq!(body.code, "budget.cpu_time_exceeded");
+    let reply = cached(
+        &cached_payload(bounded, vec![("limit", int(50_000))], None),
+        client(1),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        cached_value(&reply),
+        int(50_000),
+        "the next run is back under the Config's CPU budget"
+    );
+}
+
+#[test]
+fn a_holder_the_script_writes_comes_back_as_a_modification_as_on_direct_execution() {
+    let source = "n = v; return 0;";
+    let cache = Arc::new(AstCache::new());
+    let handle = handle_of_registration(source, client(1), &cache);
+    let n = map(vec![
+        ("__secret", map(vec![("ref", s("r1"))])),
+        ("value", int(1)),
+    ]);
+    let reply = cached(
+        &cached_payload(handle, vec![("n", n.clone()), ("v", int(7))], None),
+        client(1),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(reply_keys(&reply), ["value", "modifications"]);
+    assert_eq!(
+        reply.as_map().unwrap()[1].1,
+        Value::Array(vec![map(vec![("ref", s("r1")), ("value", int(7))])])
+    );
+    let direct = direct_execution(&payload(source, vec![("n", n), ("v", int(7))])).unwrap();
+    assert_eq!(reply, direct);
+}
+
+#[test]
+fn a_blanket_granted_call_is_made_and_an_unregistered_one_is_refused() {
+    let cache = Arc::new(AstCache::new());
+    let granted = handle_of_registration("return f(1);", client(1), &cache);
+    let ungranted = handle_of_registration("return g(1);", client(1), &cache);
+    let registrations =
+        || -> Vec<Registration> { vec![Registration::from(("f".to_owned(), true))] };
+    // The call table is gone, so a call that is sent fails with `host.no_reply`: it passed the
+    // capability decision and reached the wire.
+    let body = *cached_with(
+        &cached_payload(granted, vec![], None),
+        client(1),
+        &cache,
+        registrations(),
+        Settings::new(),
+    )
+    .expect_err("no connection to answer the call");
+    assert_eq!(body.code, "host.no_reply");
+    let body = *cached_with(
+        &cached_payload(ungranted, vec![], None),
+        client(1),
+        &cache,
+        registrations(),
+        Settings::new(),
+    )
+    .expect_err("g is not registered");
+    assert_eq!(body.code, "capability.unknown_function");
 }

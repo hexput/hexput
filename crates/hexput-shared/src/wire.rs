@@ -48,7 +48,7 @@ impl fmt::Display for CorrelationId {
 ///
 /// Names are PascalCase on the wire, matching the PRD's `ExecutionStart`. A response is not
 /// per-request-type — a Backend knows what a `Result` answers from its id. `#[non_exhaustive]`
-/// because later epics add to this vocabulary (`CachedExecutionStart`, `HealthCheck`, …).
+/// because later epics add to this vocabulary (`HealthCheck`, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MessageType {
@@ -69,6 +69,15 @@ pub enum MessageType {
     /// mode ran the static check and it found anything; or `Error` (a parse diagnostic, a
     /// rejection under check mode `error`, `protocol.invalid_payload`), with no entry created.
     CodeRegister,
+    /// Request: run a Script registered with `CodeRegister` with fresh starting variables (Story
+    /// 4.2). The payload is `{handle, variables}`, plus optionally `overrides`: `handle` is the
+    /// registration's 16-lowercase-hex-character handle, looked up under this Session's Client ID,
+    /// and `variables` and `overrides` are exactly `ExecutionStart`'s — except that
+    /// `overrides.check` is refused, since the static check runs at registration. Nothing is
+    /// parsed. Answered like a Direct Execution — `Result {value}`, with `modifications` when the
+    /// Script wrote a referenced place, never `findings` — or `Error`, including
+    /// `protocol.unknown_script_handle` for a handle this Session has no entry under.
+    CachedExecutionStart,
     /// Response: a request succeeded; the payload is its result.
     Result,
     /// Request, from the Daemon to the Backend: a Script called a Registered Function (Story
@@ -95,6 +104,7 @@ impl MessageType {
         Self::ExecutionStart,
         Self::ConfigUpdate,
         Self::CodeRegister,
+        Self::CachedExecutionStart,
         Self::Result,
         Self::Call,
         Self::Authorize,
@@ -109,6 +119,7 @@ impl MessageType {
             Self::ExecutionStart => "ExecutionStart",
             Self::ConfigUpdate => "ConfigUpdate",
             Self::CodeRegister => "CodeRegister",
+            Self::CachedExecutionStart => "CachedExecutionStart",
             Self::Result => "Result",
             Self::Call => "Call",
             Self::Authorize => "Authorize",

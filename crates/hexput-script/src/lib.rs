@@ -67,8 +67,22 @@
 //! registration leaves the cache exactly as it was. Direct Execution never touches the cache
 //! (FR-4).
 //!
-//! Not yet: Cached Execution (Story 4.2), and the cache's capacity, eviction, unregister and
-//! Session-teardown cleanup (Story 4.3) — until then an entry lives until the Daemon exits.
+//! [`cached_execution`] serves one `CachedExecutionStart` (FR-5, Story 4.2): decode
+//! `{handle, variables, overrides?}`, look the handle up in the [`AstCache`] under the caller's
+//! Client ID, and run the cached `Arc<Program>` with fresh starting variables through exactly the
+//! path a Direct Execution takes after parsing — the same Executor, registrations, limits and
+//! reply conversion, one private helper shared by both (AD-3). Nothing is parsed and the static
+//! check does not run: it ran at registration (AD-8), so `overrides.check` is refused and the
+//! Session's live check mode is not consulted, while the feature toggles are still enforced at
+//! runtime. The registrations and settings are the Session's live ones, read at dispatch (AD-5).
+//! The cached program is immutable and shared; every run builds its own heap, scopes and budget,
+//! so nothing one run writes is visible to another. A handle this Session has no entry under —
+//! never issued, another Session's, or no longer cached — is `protocol.unknown_script_handle`,
+//! telling the Backend to register again; the payload is decoded fully first, so a malformed
+//! one is `protocol.invalid_payload` whatever its handle.
+//!
+//! Not yet: the cache's capacity, eviction, unregister and Session-teardown cleanup (Story 4.3) —
+//! until then an entry lives until the Daemon exits.
 //!
 //! Binds: AD-3, AD-6, AD-8.
 
@@ -203,7 +217,30 @@ pub async fn direct_execution(
     })
     .await?;
     let findings = passed(checked.unwrap_or(Ok(Vec::new())))?;
-    let limits = Limits::from_settings(&effective);
+    run(
+        program,
+        variables,
+        &effective,
+        findings,
+        registrations,
+        caller,
+    )
+    .await
+}
+
+/// Run a parsed Script to its reply: the one path every execution takes after its program is in
+/// hand, shared by Direct and Cached Execution (AD-3). The Executor runs `program` under the limits
+/// `effective` describes, with the Host `registrations` and `caller` make, and its result becomes
+/// the `Result` payload (with `findings`, when there are any) or the `Error` body.
+async fn run(
+    program: Arc<Program>,
+    variables: Vec<(Arc<str>, Held)>,
+    effective: &Settings,
+    findings: Vec<ErrorBody>,
+    registrations: Vec<Registration>,
+    caller: Caller,
+) -> Result<Value, Box<ErrorBody>> {
+    let limits = Limits::from_settings(effective);
     let result =
         hexput_exec::execute_held(program, variables, Host::new(registrations, caller), limits)
             .await;
@@ -213,6 +250,102 @@ pub async fn direct_execution(
         Err(diagnostic) => Err(with_findings(ErrorBody::from(&diagnostic), findings)),
     })
     .await
+}
+
+/// Serve one Cached Execution (FR-5, Story 4.2): `payload` is a `CachedExecutionStart` payload, a
+/// map with the keys `handle` (the 16-lowercase-hex-character handle a `CodeRegister` was answered
+/// with), `variables` (its starting variables, exactly as `ExecutionStart`'s, holders included;
+/// `{}` is valid) and optionally `overrides` (exactly as `ExecutionStart`'s, except that `check`
+/// is refused). The Script registered under `handle` by the Session `client_id` names is taken
+/// from `cache` and run with those variables; nothing is parsed.
+///
+/// It runs exactly as a Direct Execution does once parsed: through the one Executor, under
+/// `settings` — the Session's Config settings as they were when the execution was dispatched
+/// (AD-5) — overlaid with the payload's `overrides`, with the Registered Functions and Methods in
+/// `registrations` callable through `caller` as the Executor allows. The static check does not run
+/// (AD-8): it ran at registration, so whatever the live `check` mode, the reply never carries
+/// `findings`. The feature toggles are enforced at runtime as always.
+///
+/// Every run is fresh: the cached program is shared and immutable, and each run builds its own
+/// heap, scopes and Resource Budget, so nothing one run writes is visible to another. A run holds
+/// its own handle on the program, so it finishes safely even if the entry is removed meanwhile.
+///
+/// Returns the `Result` payload `{value}`, with `modifications` after `value` when the Script
+/// wrote a referenced place or collection — exactly as [`direct_execution`] does.
+///
+/// Must run inside a Tokio runtime: the work runs on its blocking pool. Its timers must be enabled
+/// when a registration lacks a blanket grant.
+///
+/// # Errors
+///
+/// The `Error` payload, each exactly one of:
+///
+/// * `protocol.invalid_payload` — the payload is not a map; `handle` or `variables` is missing
+///   (absent or nil; both named together when both are); a key is unknown (`source` included:
+///   nothing is parsed), repeated or not a string; `handle` is not a string or not a Script
+///   handle (echoed bounded); `variables` is malformed exactly as for [`direct_execution`]; an
+///   override is unknown, mistyped or out of its range; or `overrides.check` is given. Nothing
+///   runs, and the handle is not looked up.
+/// * `protocol.unknown_script_handle` — a well-formed handle with no entry under `client_id`:
+///   never issued, registered by another Session (the same message, so nothing reveals that it
+///   exists), or no longer cached. The message names the handle and says to register the Script
+///   again with `CodeRegister`. Nothing runs.
+/// * The interpreter's or Executor's [`Diagnostic`], exactly as for [`direct_execution`]:
+///   `syntax.duplicate_declaration` for a starting variable the Script also declares, every
+///   `reference`, `type`, `capability`, `host`, `budget` and `policy` error.
+/// * `protocol.result_too_deep` or `protocol.response_too_large`, exactly as for
+///   [`direct_execution`].
+///
+/// # Panics
+///
+/// If the work on the blocking pool panics, the panic continues here.
+pub async fn cached_execution(
+    payload: Value,
+    client_id: ClientId,
+    cache: Arc<AstCache>,
+    registrations: Vec<Registration>,
+    settings: Settings,
+    caller: Caller,
+) -> Result<Value, Box<ErrorBody>> {
+    let (program, variables, effective) = blocking(move || {
+        let (handle, variables, overrides) =
+            decode(&payload, Request::CachedExecution).map_err(invalid_payload)?;
+        let handle: ScriptHandle = handle.parse().map_err(|_| {
+            invalid_payload(format!(
+                "`{HANDLE}` is not a Script handle ({} lowercase hex characters); found {:?}",
+                ScriptHandle::TEXT_LEN,
+                wire::bounded(handle)
+            ))
+        })?;
+        // Only now, with the whole payload accepted, is the handle looked up: a malformed request
+        // is answered as one whatever its handle names.
+        let program = cache
+            .get(client_id, handle)
+            .ok_or_else(|| unknown_handle(handle))?;
+        Ok::<_, Box<ErrorBody>>((program, variables, settings.overlay(&overrides)))
+    })
+    .await?;
+    run(
+        program,
+        variables,
+        &effective,
+        Vec::new(),
+        registrations,
+        caller,
+    )
+    .await
+}
+
+/// The `protocol.unknown_script_handle` body for `handle`. It names only the handle asked for, so
+/// a handle another Session registered reads exactly like one never issued.
+fn unknown_handle(handle: ScriptHandle) -> Box<ErrorBody> {
+    Box::new(ErrorBody::from(&ProtocolError::new(
+        ProtocolCode::UnknownScriptHandle,
+        format!(
+            "no Script is registered under handle `{handle}` for this Session; register it again \
+             with `CodeRegister`"
+        ),
+    )))
 }
 
 /// The AST Cache (Story 4.1): every registered Script's parsed AST, keyed by the registering
@@ -596,7 +729,8 @@ type Prepared = (Arc<Program>, Vec<(Arc<str>, Held)>, Settings);
 
 /// Decode the payload and parse its source.
 fn prepare(payload: &Value) -> Result<Prepared, Box<ErrorBody>> {
-    let (source, variables, overrides) = decode(payload).map_err(invalid_payload)?;
+    let (source, variables, overrides) =
+        decode(payload, Request::DirectExecution).map_err(invalid_payload)?;
     let program = hexput_parser::parse(source).map_err(|d| Box::new(ErrorBody::from(&d)))?;
     Ok((Arc::new(program), variables, overrides))
 }
@@ -671,46 +805,74 @@ fn reply(finished: &Finished, findings: Vec<ErrorBody>) -> Result<Value, Box<Err
     }
 }
 
-/// A decoded `ExecutionStart`: the source, the starting variables in the order given, and the
-/// overrides (none set when the payload has none).
+/// The two requests that run a Script with starting variables, whose payloads share one decoder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Request {
+    /// `ExecutionStart`: `{source, variables, overrides?}`.
+    DirectExecution,
+    /// `CachedExecutionStart`: `{handle, variables, overrides?}` (Story 4.2).
+    CachedExecution,
+}
+
+impl Request {
+    /// The message type's name, as the payload's refusals spell it.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::DirectExecution => "ExecutionStart",
+            Self::CachedExecution => "CachedExecutionStart",
+        }
+    }
+
+    /// The key naming what to run: the source, or the registered Script's handle.
+    const fn first(self) -> &'static str {
+        match self {
+            Self::DirectExecution => SOURCE,
+            Self::CachedExecution => HANDLE,
+        }
+    }
+}
+
+/// A decoded `ExecutionStart` or `CachedExecutionStart`: the source or the handle text, the
+/// starting variables in the order given, and the overrides (none set when the payload has none).
 type Decoded<'a> = (&'a str, Vec<(Arc<str>, Held)>, Settings);
 
-/// Decode an `ExecutionStart` payload by hand, like `Init`'s: a Backend is owed the exact key,
-/// name or path that was wrong.
-fn decode(payload: &Value) -> Result<Decoded<'_>, String> {
+/// Decode an `ExecutionStart` or `CachedExecutionStart` payload by hand, like `Init`'s: a Backend
+/// is owed the exact key, name or path that was wrong.
+fn decode(payload: &Value, request: Request) -> Result<Decoded<'_>, String> {
+    let (name, first_key) = (request.name(), request.first());
     let fields: &[(Value, Value)] = match payload {
         Value::Nil => &[],
         Value::Map(fields) => fields,
         _ => {
             return Err(format!(
-                "the `ExecutionStart` payload must be a map with `{SOURCE}` and `{VARIABLES}`"
+                "the `{name}` payload must be a map with `{first_key}` and `{VARIABLES}`"
             ));
         }
     };
 
-    let mut source = None;
+    let mut first = None;
     let mut variables = None;
     let mut overrides = None;
     for (key, value) in fields {
         let slot = match key.as_str() {
-            Some(SOURCE) => &mut source,
+            Some(key) if key == first_key => &mut first,
             Some(VARIABLES) => &mut variables,
             Some(OVERRIDES) => &mut overrides,
             Some(other) => {
                 return Err(format!(
-                    "the `ExecutionStart` payload has an unknown key `{}`",
+                    "the `{name}` payload has an unknown key `{}`",
                     wire::bounded(other)
                 ));
             }
             None => {
-                return Err(
-                    "the `ExecutionStart` payload has a key that is not a string".to_owned(),
-                );
+                return Err(format!(
+                    "the `{name}` payload has a key that is not a string"
+                ));
             }
         };
         if slot.is_some() {
             return Err(format!(
-                "the `ExecutionStart` payload repeats the key `{}`",
+                "the `{name}` payload repeats the key `{}`",
                 key.as_str().unwrap_or_default()
             ));
         }
@@ -718,15 +880,15 @@ fn decode(payload: &Value) -> Result<Decoded<'_>, String> {
     }
 
     // Absent or nil is missing; both missing keys are named together. Empty is not missing.
-    let (source, variables) = match (present(source), present(variables)) {
-        (Some(source), Some(variables)) => (source, variables),
-        (None, Some(_)) => return Err(missing(&[SOURCE])),
-        (Some(_), None) => return Err(missing(&[VARIABLES])),
-        (None, None) => return Err(missing(&[SOURCE, VARIABLES])),
+    let (first, variables) = match (present(first), present(variables)) {
+        (Some(first), Some(variables)) => (first, variables),
+        (None, Some(_)) => return Err(missing(name, &[first_key])),
+        (Some(_), None) => return Err(missing(name, &[VARIABLES])),
+        (None, None) => return Err(missing(name, &[first_key, VARIABLES])),
     };
 
-    let Some(source) = source.as_str() else {
-        return Err(format!("`{SOURCE}` is not a string"));
+    let Some(first) = first.as_str() else {
+        return Err(format!("`{first_key}` is not a string"));
     };
     let Value::Map(entries) = variables else {
         return Err(format!("`{VARIABLES}` is not a map"));
@@ -737,6 +899,14 @@ fn decode(payload: &Value) -> Result<Decoded<'_>, String> {
         None => Settings::new(),
         Some(overrides) => decode_settings(overrides, OVERRIDES)?,
     };
+    // The static check runs at registration and never again (AD-8): asking for one here would be
+    // silently ignored, which would mislead the Backend, so it is refused.
+    if request == Request::CachedExecution && overrides.check_setting().is_some() {
+        return Err(format!(
+            "`{OVERRIDES}.check` cannot be set on a `{name}`: the static check runs once, at \
+             registration (`CodeRegister`), under the Session's check mode"
+        ));
+    }
 
     let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
     let mut bound = Vec::with_capacity(entries.len());
@@ -760,7 +930,7 @@ fn decode(payload: &Value) -> Result<Decoded<'_>, String> {
         let value = wire::to_hexput(value, &mut wire::Path::variable(name))?;
         bound.push((Arc::from(name), value));
     }
-    Ok((source, bound, overrides))
+    Ok((first, bound, overrides))
 }
 
 /// A key that is absent or nil is missing.
@@ -768,10 +938,7 @@ fn present(value: Option<&Value>) -> Option<&Value> {
     value.filter(|v| !v.is_nil())
 }
 
-fn missing(keys: &[&str]) -> String {
+fn missing(request: &str, keys: &[&str]) -> String {
     let names: Vec<String> = keys.iter().map(|k| format!("`{k}`")).collect();
-    format!(
-        "the `ExecutionStart` payload is missing {}",
-        names.join(" and ")
-    )
+    format!("the `{request}` payload is missing {}", names.join(" and "))
 }

@@ -41,7 +41,14 @@ tokio = { version = "1.53.1", features = [
     "sync",
 ] }
 tokio-tungstenite = "0.30.0"
-rustls = "0.23.45"
+# Story 5.1: TLS for the TCP adapter. The `ring` provider rather than rustls's default `aws-lc-rs`:
+# a much smaller build (no cmake, no large C library) and no FIPS ambition. `std` for the PEM
+# loader and the `ServerConfig`, `tls12` so TLS 1.2 clients are served alongside TLS 1.3.
+# Resolved at exactly 0.23.45 (`cargo update -p rustls --precise 0.23.45`); `aws-lc-rs` must
+# never appear in `Cargo.lock`.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+# Story 5.1: rustls over tokio's `AsyncRead`/`AsyncWrite`, with the same provider and versions.
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 # System Config's file format (Story 2.1). Parsing only: `display` (the serializer) is left out
 # because `hexput-config` exposes no write API.

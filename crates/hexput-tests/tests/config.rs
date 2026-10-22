@@ -706,3 +706,86 @@ fn the_example_file_documents_the_ast_cache_capacity() {
         "the example documents it"
     );
 }
+
+// --- Story 5.1: the TCP bind may omit its port (FR-29: 7476) ---
+
+/// A `[transport.tcp]` section whose only variable is the bind value.
+fn tcp_bind(bind: &str) -> String {
+    format!("[transport.tcp]\nbind = \"{bind}\"\ntls_cert = \"/c.pem\"\ntls_key = \"/k.pem\"\n")
+}
+
+#[test]
+fn the_default_tcp_port_is_7476() {
+    assert_eq!(hexput_config::DEFAULT_TCP_PORT, 7476);
+}
+
+#[test]
+fn a_bare_ip_bind_gets_the_default_tcp_port() {
+    for (bind, expected) in [
+        ("0.0.0.0", "0.0.0.0:7476"),
+        ("::", "[::]:7476"),
+        ("::1", "[::1]:7476"),
+        ("[::1]", "[::1]:7476"),
+        ("[::]", "[::]:7476"),
+        ("127.0.0.1", "127.0.0.1:7476"),
+    ] {
+        let config = parse(&tcp_bind(bind)).unwrap_or_else(|error| panic!("{bind}: {error:?}"));
+        let tcp = config.transports.tcp.expect("a TCP transport");
+        assert_eq!(
+            tcp.bind,
+            expected.parse::<SocketAddr>().unwrap(),
+            "{bind} means {expected}"
+        );
+    }
+}
+
+#[test]
+fn an_explicit_tcp_port_is_kept_and_port_zero_stays_valid() {
+    for (bind, expected) in [
+        ("0.0.0.0:7400", "0.0.0.0:7400"),
+        ("[::1]:7400", "[::1]:7400"),
+        ("127.0.0.1:0", "127.0.0.1:0"),
+        ("[::]:0", "[::]:0"),
+    ] {
+        let config = parse(&tcp_bind(bind)).unwrap_or_else(|error| panic!("{bind}: {error:?}"));
+        let tcp = config.transports.tcp.expect("a TCP transport");
+        assert_eq!(tcp.bind, expected.parse::<SocketAddr>().unwrap());
+    }
+}
+
+#[test]
+fn an_unparsable_tcp_bind_names_the_field_and_says_the_port_is_optional() {
+    for bind in [
+        "not-an-address",
+        "localhost",
+        "127.0.0.1:notaport",
+        "999.1.1.1",
+        // Brackets hold only an IPv6 address.
+        "[127.0.0.1]",
+        "[0.0.0.0]",
+    ] {
+        match parse_err(&tcp_bind(bind)) {
+            Problem::InvalidValue { field, message, .. } => {
+                assert_eq!(field, "transport.tcp.bind", "{bind}");
+                assert!(
+                    message.to_lowercase().contains("optional"),
+                    "{bind}: the message says the port is optional: {message}"
+                );
+            }
+            other => panic!("{bind}: expected an invalid bind, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_bare_ip_websocket_bind_still_needs_a_port() {
+    // Story 5.2 owns the WebSocket default (7478); until then the port stays required.
+    for bind in ["127.0.0.1", "::1"] {
+        match parse_err(&format!("[transport.websocket]\nbind = \"{bind}\"\n")) {
+            Problem::InvalidValue { field, .. } => {
+                assert_eq!(field, "transport.websocket.bind", "{bind}");
+            }
+            other => panic!("{bind}: expected an invalid bind, got {other:?}"),
+        }
+    }
+}

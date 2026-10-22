@@ -21,15 +21,11 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hexput_port::{
-    Envelope, FrameDecoder, Inbound, Outbound, Port, Received, Value, decode, encode, encode_frame,
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use hexput_port::Port;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
-/// How many bytes one read from the socket asks for.
-const READ_CHUNK: usize = 8 * 1024;
+use crate::framed::{FramedInbound, FramedOutbound};
 
 /// A listening Unix Domain Socket and the file it owns.
 #[derive(Debug)]
@@ -238,79 +234,14 @@ impl Port for UdsPort {
 
     fn split(self) -> (UdsInbound, UdsOutbound) {
         let (read, write) = self.stream.into_split();
-        (
-            UdsInbound {
-                read,
-                decoder: FrameDecoder::new(),
-                buffer: vec![0; READ_CHUNK].into_boxed_slice(),
-                closed: false,
-            },
-            UdsOutbound { write },
-        )
+        (FramedInbound::new(read), FramedOutbound::new(write))
     }
 }
 
-/// The reading half of a [`UdsPort`].
-#[derive(Debug)]
-pub struct UdsInbound {
-    read: OwnedReadHalf,
-    decoder: FrameDecoder,
-    buffer: Box<[u8]>,
-    closed: bool,
-}
+/// The reading half of a [`UdsPort`]: the shared length-prefixed framing over the socket's
+/// owned read half.
+pub type UdsInbound = FramedInbound<OwnedReadHalf>;
 
-impl Inbound for UdsInbound {
-    async fn recv(&mut self) -> Received {
-        loop {
-            if self.closed {
-                return Received::Closed(None);
-            }
-            match self.decoder.next_frame() {
-                Ok(Some(frame)) => {
-                    return match decode(&frame) {
-                        Ok(envelope) => Received::Message(envelope),
-                        Err(failure) => Received::Malformed(failure),
-                    };
-                }
-                Ok(None) => {}
-                Err(failure) => {
-                    // Only an oversized frame fails here, and the stream cannot resync after it.
-                    self.closed = true;
-                    return Received::Malformed(failure);
-                }
-            }
-            match self.read.read(&mut self.buffer).await {
-                // A peer that closed mid-frame has left; it is owed no reply.
-                Ok(0) => {
-                    self.closed = true;
-                    return Received::Closed(None);
-                }
-                Ok(read) => self.decoder.push(&self.buffer[..read]),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    self.closed = true;
-                    return Received::Closed(Some(error));
-                }
-            }
-        }
-    }
-}
-
-/// The writing half of a [`UdsPort`].
-#[derive(Debug)]
-pub struct UdsOutbound {
-    write: OwnedWriteHalf,
-}
-
-impl Outbound for UdsOutbound {
-    /// # Errors
-    ///
-    /// Besides a failed write, `InvalidInput` when the envelope cannot be encoded as a frame
-    /// (too large); nothing was written then.
-    async fn send(&mut self, envelope: Envelope<Value>) -> io::Result<()> {
-        let frame = encode(&envelope)
-            .and_then(|body| encode_frame(&body))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        self.write.write_all(&frame).await
-    }
-}
+/// The writing half of a [`UdsPort`]. Besides a failed write, a send fails with `InvalidInput`
+/// when the envelope cannot be encoded as a frame (too large); nothing was written then.
+pub type UdsOutbound = FramedOutbound<OwnedWriteHalf>;

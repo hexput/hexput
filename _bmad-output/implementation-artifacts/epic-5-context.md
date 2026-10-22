@@ -1,0 +1,49 @@
+# Epic 5 Context: Connect from anywhere, survive disconnects
+
+<!-- Generated from planning artifacts. Regenerate with compile-epic-context if planning docs change. -->
+
+## Goal
+
+A Backend reaches the Daemon over TCP+TLS, WebSocket or a Windows Named Pipe with protocol behaviour identical to the Unix Domain Socket path, and can reconnect on a previously issued Client ID — proving it owns the Session, not merely knowing the ID — resuming its stored Config and registrations without resending them, with several Connections live under one Client ID at once. A Session outlives its Connections and expires only after a TTL that starts when the last one leaves. This takes the Daemon from a local-only service to one remote Backends can depend on, and realizes the Session/Connection cardinality the architecture was built around.
+
+## Stories
+
+- Story 5.1: Connect remotely over TCP with mandatory TLS
+- Story 5.2: Connect over WebSocket
+- Story 5.3: Connect locally on Windows over a Named Pipe
+- Story 5.4: Behave identically no matter how the backend connected
+- Story 5.5: Issue a reconnect credential at first connect
+- Story 5.6: Reconnect without resending configuration
+- Story 5.7: Run several connections under one client ID
+- Story 5.8: Expire a session only after the last connection is gone
+- Story 5.9: Benchmark the remote path separately from the local one
+
+## Requirements & Constraints
+
+- Four transports — UDS, Named Pipe, TCP+TLS, WebSocket — with identical protocol behaviour: the same request produces the same result and the same error codes on each, modulo latency.
+- TLS is mandatory, never optional or negotiable, for every non-local transport (TCP, WebSocket). UDS and Named Pipe are local and need no TLS. A plaintext attempt on a TLS listener is refused.
+- Fixed default ports, used whenever System Config enables a transport without naming a port: **7476** TCP+TLS, **7478** WebSocket (7477 is reserved for the local playground of a later epic).
+- System Config (file-based, read once at startup) carries bind addresses/ports and TLS certificate/key paths. The Daemon fails to start with a clear error naming the file and the problem when a certificate or key is missing, unreadable or malformed — it never silently listens without TLS.
+- On a non-Windows host the Named Pipe adapter is cleanly absent rather than failing startup.
+- Reconnect protection (decided): on first init the Daemon draws a reconnect secret of at least 256 bits from the OS CSPRNG and returns it with the Client ID exactly once; the Session stores only a salted hash, never the secret, and never logs it. A reconnect carries Client ID + secret; a wrong secret and an unknown Client ID are rejected with one identical reconnect-denied error, so IDs cannot be enumerated. Comparison is constant time. The secret lives as long as the Session; no rotation.
+- A reconnect attaches the new Connection to the existing Session; Config and registrations are not resent, and the stored Config stays authoritative if a reconnect carries one.
+- Several Connections may be attached to one Session concurrently. Each request's response returns only to the Connection that sent it (no cross-Connection broadcast); Session-owned state changes (Config updates, registrations) are visible to all of them.
+- A Session's TTL (System Config `session_ttl_secs`) starts only when its last Connection detaches; a reconnect before it elapses stops the countdown with state intact; after expiry the Session, its Config, registrations and AST Cache entries are torn down, and a reconnect is rejected exactly like an unknown Client ID.
+- Benchmarks report UDS and TCP/TLS figures separately — never merged — with each leg's transport and machine topology recorded.
+
+## Technical Decisions
+
+- **AD-1:** every transport is an adapter in `hexput-transport` implementing the one `Port` trait from `hexput-port` (`split()` into `Inbound`/`Outbound`); only `hexput-daemon` depends on `hexput-transport`, and no other crate names or branches on a transport. `hexput-transport`'s only workspace edge is `hexput-port`; `scripts/check-crate-graph.py` pins it.
+- **AD-2:** the reconnect credential is validated once, in `hexput-session`, before a reconnect is accepted; adapters forward it unchanged and validate nothing. A Session has zero or more attached Connections, never exactly one.
+- **AD-5/AD-7:** System Config (`hexput-config`) is the only source of operational settings, resolved by flag → `HEXPUT_CONFIG` → default path; per-backend Config never touches disk.
+- Session teardown is the one private `teardown` path in `hexput-session` (with its teardown hook releasing AST Cache entries); the TTL delays that same path rather than adding a second one.
+- Pinned stack relevant here: tokio 1.53.1, rustls 0.23.45, tokio-tungstenite 0.30.0, getrandom 0.4.3 (the one CSPRNG source, shared with Client IDs). A new dependency or feature is pinned once in `[workspace.dependencies]` and recorded in the Spine's Stack table by dated amendment. rustls's crypto provider is still to be chosen by the first story that consumes it.
+- No lock is held across an `.await`; every execution remains its own task (AD-6); a failing or slow connection disturbs no other.
+- Known open hardening items that grow in weight once the Daemon is network-reachable: no cap on concurrent connections, and decoded frame size bounded only by `MAX_FRAME_LEN`.
+
+## Cross-Story Dependencies
+
+- 5.1 and 5.2 add network adapters; 5.3 adds the Windows local adapter; 5.4's conformance suite runs over all four and needs them.
+- 5.5 (credential issue) precedes 5.6 (reconnect), which 5.7 (several Connections) and 5.8 (TTL expiry) build on.
+- 5.9 extends Epic 4's Criterion `cache` bench with a TCP+TLS leg and needs 5.1.
+- Epic 6's Plugin lifetime (survives reconnect, torn down on TTL) and Epic 8's SDK reconnect depend on 5.5–5.8.

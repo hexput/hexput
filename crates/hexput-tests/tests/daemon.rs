@@ -1062,19 +1062,12 @@ fn every_startup_failure_exits_one_naming_the_cause_and_touches_nothing() {
         run.stderr
     );
 
-    // Transports no adapter serves yet, alone or beside UDS.
-    for (name, extra, expected) in [
-        (
-            "tcp.toml",
-            "[transport.tcp]\nbind = \"127.0.0.1:7400\"\ntls_cert = \"c\"\ntls_key = \"k\"\n",
-            "[transport.tcp] not supported yet",
-        ),
-        (
-            "ws.toml",
-            "[transport.websocket]\nbind = \"127.0.0.1:7401\"\n",
-            "[transport.websocket] not supported yet",
-        ),
-    ] {
+    // Transports no adapter serves yet, alone or beside UDS. (TCP+TLS is served: Story 5.1.)
+    for (name, extra, expected) in [(
+        "ws.toml",
+        "[transport.websocket]\nbind = \"127.0.0.1:7401\"\n",
+        "[transport.websocket] not supported yet",
+    )] {
         for text in [extra.to_owned(), format!("{}{extra}", sandbox.valid())] {
             let config = sandbox.file(name, &text);
             let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
@@ -2626,5 +2619,517 @@ mod cache_win {
             assert!(driven.budget.is_none());
             assert_eq!(driven.calls, HOST_CALLS_PER_RUN);
         }
+    }
+}
+
+// --- Story 5.1: TCP served with mandatory TLS, beside the Unix Domain Socket ---
+
+/// A Daemon serving TCP+TLS (and UDS, where its config names it) over real sockets. The TLS
+/// client is a blocking rustls stream trusting the fixture CA; the fixtures are generated as
+/// described in `transport.rs`'s `fixture` doc comment.
+#[cfg(unix)]
+mod tls_serving {
+    use std::ffi::OsString;
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use hexput_daemon::run_with;
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value, decode, encode, encode_frame};
+    use rustls::pki_types::ServerName;
+    use rustls::pki_types::pem::PemObject;
+
+    use super::{Run, Sandbox, SharedLog, daemon, nothing};
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("tls")
+            .join(name)
+    }
+
+    /// The `[transport.tcp]` section for `bind`, with the fixture leaf identity.
+    fn tcp_section(bind: &str) -> String {
+        tcp_section_with(bind, &fixture("server.pem"), &fixture("server.key"))
+    }
+
+    fn tcp_section_with(bind: &str, cert: &Path, key: &Path) -> String {
+        format!(
+            "[transport.tcp]\nbind = {bind:?}\ntls_cert = {:?}\ntls_key = {:?}\n",
+            cert.to_str().unwrap(),
+            key.to_str().unwrap()
+        )
+    }
+
+    /// A Daemon running on its own thread until `stop`.
+    pub struct Daemon {
+        stop: tokio::sync::oneshot::Sender<()>,
+        thread: std::thread::JoinHandle<Run>,
+        log: SharedLog,
+    }
+
+    impl Daemon {
+        pub fn start(sandbox: &Sandbox, config_text: &str) -> Self {
+            let config = sandbox.file("config.toml", config_text);
+            let discovery = nothing(sandbox);
+            let log = SharedLog::default();
+            let thread_log = log.clone();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                let argv: Vec<OsString> =
+                    vec!["hexput-daemon".into(), "--config".into(), config.into()];
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let code = run_with(
+                    argv,
+                    &discovery,
+                    &mut out,
+                    &mut err,
+                    thread_log.clone(),
+                    async {
+                        let _ = stopped.await;
+                    },
+                );
+                Run {
+                    code: format!("{code:?}"),
+                    stdout: String::from_utf8(out).unwrap(),
+                    stderr: String::from_utf8(err).unwrap(),
+                    log: thread_log.text(),
+                }
+            });
+            Self { stop, thread, log }
+        }
+
+        /// The log, once `needle` appears in it; panics if the Daemon stops first.
+        pub fn log_with(&self, needle: &str) -> String {
+            let started = Instant::now();
+            loop {
+                let text = self.log.text();
+                if text.contains(needle) {
+                    return text;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(10) && !self.thread.is_finished(),
+                    "never logged `{needle}`; log:\n{text}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// The TCP listener's actual address, read from the startup log line.
+        pub fn tcp_address(&self) -> SocketAddr {
+            let text = self.log_with("listening on TCP with TLS");
+            let line = text
+                .lines()
+                .find(|line| line.contains("listening on TCP with TLS"))
+                .expect("the line");
+            let field = line
+                .split("address=")
+                .nth(1)
+                .expect("an address field")
+                .split_whitespace()
+                .next()
+                .expect("an address value");
+            field
+                .trim_matches('"')
+                .parse()
+                .unwrap_or_else(|error| panic!("{field}: {error}"))
+        }
+
+        /// A UDS client, waiting until the socket accepts.
+        pub fn uds(&self, socket: &Path) -> UnixStream {
+            let started = Instant::now();
+            loop {
+                match UnixStream::connect(socket) {
+                    Ok(stream) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        return stream;
+                    }
+                    Err(error) => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(10)
+                                && !self.thread.is_finished(),
+                            "the socket never accepted: {error}"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+
+        pub fn stop(self) -> Run {
+            let _ = self.stop.send(());
+            self.thread.join().expect("the Daemon thread")
+        }
+    }
+
+    /// A blocking TLS client that trusts only the fixture CA, for the name `localhost`.
+    pub fn tls(addr: SocketAddr) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in rustls::pki_types::CertificateDer::pem_file_iter(fixture("ca.pem"))
+            .expect("the CA file")
+        {
+            roots.add(certificate.unwrap()).unwrap();
+        }
+        let config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        );
+        let tcp = TcpStream::connect(addr).expect("connects");
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // The handshake happens on the first read or write.
+        let connection =
+            rustls::ClientConnection::new(config, ServerName::try_from("localhost").unwrap())
+                .expect("a client connection");
+        rustls::StreamOwned::new(connection, tcp)
+    }
+
+    /// Framing for any byte stream, UDS or TLS alike.
+    mod frames {
+        use super::*;
+
+        pub fn init(id: u64) -> Envelope<Value> {
+            Envelope::new(
+                CorrelationId(id),
+                MessageType::Init,
+                Value::Map(vec![
+                    (Value::from("config"), Value::Map(vec![])),
+                    (Value::from("registrations"), Value::Array(vec![])),
+                ]),
+            )
+        }
+
+        pub fn request(id: u64, source: &str) -> Envelope<Value> {
+            Envelope::new(
+                CorrelationId(id),
+                MessageType::ExecutionStart,
+                Value::Map(vec![
+                    (Value::from("source"), Value::from(source)),
+                    (Value::from("variables"), Value::Map(vec![])),
+                ]),
+            )
+        }
+
+        pub fn send<S: Write>(stream: &mut S, envelope: &Envelope<Value>) {
+            let bytes = encode_frame(&encode(envelope).unwrap()).unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+
+        /// The next reply, or `None` once the peer has closed.
+        pub fn reply<S: Read>(stream: &mut S) -> Option<Envelope<Value>> {
+            let mut prefix = [0; 4];
+            match stream.read_exact(&mut prefix) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    return None;
+                }
+                Err(error) => panic!("no reply: {error}"),
+            }
+            let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut body).unwrap();
+            Some(decode(&body).unwrap())
+        }
+    }
+
+    /// The Client ID an Init reply carries.
+    fn client_id(init: &Envelope<Value>) -> String {
+        assert_eq!(init.message_type, MessageType::Result, "{:?}", init.payload);
+        let fields = init.payload.as_map().expect("a map payload");
+        assert_eq!(fields.len(), 1, "exactly `client_id`: {fields:?}");
+        fields[0].1.as_str().expect("a string Client ID").to_owned()
+    }
+
+    /// The integer under `value` in a `Result` payload.
+    fn value_of(reply: &Envelope<Value>) -> i64 {
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        reply
+            .payload
+            .as_map()
+            .and_then(|fields| {
+                fields
+                    .iter()
+                    .find(|(key, _)| key.as_str() == Some("value"))
+                    .and_then(|(_, value)| value.as_i64())
+            })
+            .unwrap_or_else(|| panic!("a `value` integer in {:?}", reply.payload))
+    }
+
+    /// Init, then `return 1 + 2;`: the two replies a client gets.
+    fn init_and_run<S: Read + Write>(stream: &mut S) -> (Envelope<Value>, Envelope<Value>) {
+        frames::send(stream, &frames::init(1));
+        let init = frames::reply(stream).expect("an Init reply");
+        frames::send(stream, &frames::request(2, "return 1 + 2;"));
+        let run = frames::reply(stream).expect("an execution reply");
+        (init, run)
+    }
+
+    #[test]
+    fn a_tls_client_gets_the_same_replies_as_a_uds_client() {
+        let sandbox = Sandbox::new();
+        let config = format!("{}{}", sandbox.valid(), tcp_section("127.0.0.1:0"));
+        let daemon = Daemon::start(&sandbox, &config);
+        let addr = daemon.tcp_address();
+        assert_ne!(addr.port(), 0, "the actual bound address is logged");
+
+        let (uds_init, uds_run) = init_and_run(&mut daemon.uds(&sandbox.socket()));
+        let (tls_init, tls_run) = init_and_run(&mut tls(addr));
+
+        assert_eq!(value_of(&uds_run), 3);
+        assert_eq!(value_of(&tls_run), 3);
+        assert_eq!(tls_run.id, Some(CorrelationId(2)));
+        assert_eq!(tls_run.id, uds_run.id);
+        assert_eq!(tls_run.message_type, uds_run.message_type);
+        assert_eq!(tls_run.payload, uds_run.payload, "identical to UDS");
+        assert_eq!(tls_init.message_type, uds_init.message_type);
+        assert_eq!(client_id(&tls_init).len(), 32);
+        assert_ne!(
+            client_id(&tls_init),
+            client_id(&uds_init),
+            "one Session each"
+        );
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn a_bare_ip_bind_listens_on_the_default_port_7476() {
+        // The one test that needs a fixed port: skipped, not failed, when something else on the
+        // machine (a running Daemon, another test run) already holds it.
+        if let Err(error) = TcpListener::bind(("127.0.0.1", 7476)) {
+            eprintln!("skipped: 127.0.0.1:7476 is unavailable: {error}");
+            return;
+        }
+        let sandbox = Sandbox::new();
+        let daemon = Daemon::start(&sandbox, &tcp_section("127.0.0.1"));
+        let addr = daemon.tcp_address();
+        assert_eq!(addr.port(), 7476, "{addr}");
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert!(
+            daemon
+                .log_with("listening on TCP with TLS")
+                .lines()
+                .any(|line| line.contains("address=127.0.0.1:7476")),
+            "the log names the default port"
+        );
+
+        let (init, run) = init_and_run(&mut tls(SocketAddr::from(([127, 0, 0, 1], 7476))));
+        assert_eq!(client_id(&init).len(), 32);
+        assert_eq!(value_of(&run), 3);
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn a_plaintext_probe_is_never_answered_is_logged_at_debug_and_disturbs_no_tls_client() {
+        let sandbox = Sandbox::new();
+        let config = format!("log_level = \"debug\"\n{}", tcp_section("127.0.0.1:0"));
+        let daemon = Daemon::start(&sandbox, &config);
+        let addr = daemon.tcp_address();
+
+        let mut plain = TcpStream::connect(addr).unwrap();
+        plain
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let probe_addr = plain.local_addr().unwrap();
+        frames::send(&mut plain, &frames::init(1));
+
+        // No Hexput frame ever comes back; the socket is closed. At most a TLS alert record
+        // (content type 0x15) is sent.
+        let mut bytes = Vec::new();
+        match plain.read_to_end(&mut bytes) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("the socket was not closed: {error}"),
+        }
+        assert!(bytes.is_empty() || bytes[0] == 0x15, "{bytes:02x?}");
+
+        let log = daemon.log_with("TLS handshake failed");
+        let line = log
+            .lines()
+            .find(|line| line.contains("TLS handshake failed"))
+            .unwrap();
+        assert!(line.contains(" DEBUG "), "{line}");
+        assert!(
+            line.contains(&probe_addr.to_string()),
+            "the peer address is logged: {line}"
+        );
+
+        // The Daemon is unaffected: a TLS client still completes Init and a run.
+        let (init, run) = init_and_run(&mut tls(addr));
+        assert_eq!(init.message_type, MessageType::Result);
+        assert_eq!(value_of(&run), 3);
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn a_silent_tcp_peer_stalls_no_accept_on_either_transport() {
+        // The handshake runs in the connection's task, never in the accept loop: while one peer
+        // sits connected and silent for the whole 10 s handshake timeout, TLS and UDS clients
+        // are served at once.
+        let sandbox = Sandbox::new();
+        let config = format!("{}{}", sandbox.valid(), tcp_section("127.0.0.1:0"));
+        let daemon = Daemon::start(&sandbox, &config);
+        let addr = daemon.tcp_address();
+
+        let _silent = TcpStream::connect(addr).unwrap();
+        let started = Instant::now();
+        let (_, tls_run) = init_and_run(&mut tls(addr));
+        let (_, uds_run) = init_and_run(&mut daemon.uds(&sandbox.socket()));
+        assert_eq!(value_of(&tls_run), 3);
+        assert_eq!(value_of(&uds_run), 3);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "served while the silent peer's handshake is pending: {:?}",
+            started.elapsed()
+        );
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn a_tls_client_that_stops_sending_still_gets_its_replies() {
+        // As on a Unix Domain Socket, a Backend that sends its request and then ends its side
+        // — with `close_notify` or with a bare TCP FIN — is a clean close: the execution in
+        // flight still finishes and its reply is written.
+        let slow = "let i = 0; while (i < 50000) { i = i + 1; }; return i;";
+        let sandbox = Sandbox::new();
+        let daemon = Daemon::start(&sandbox, &tcp_section("127.0.0.1:0"));
+        let addr = daemon.tcp_address();
+
+        for close_notify in [true, false] {
+            let mut stream = tls(addr);
+            frames::send(&mut stream, &frames::init(1));
+            assert_eq!(
+                frames::reply(&mut stream)
+                    .expect("an Init reply")
+                    .message_type,
+                MessageType::Result
+            );
+            frames::send(&mut stream, &frames::request(2, slow));
+            stream.flush().unwrap();
+            if close_notify {
+                stream.conn.send_close_notify();
+                stream.flush().unwrap();
+            }
+            stream.sock.shutdown(std::net::Shutdown::Write).unwrap();
+
+            let reply = frames::reply(&mut stream).expect("the reply is still written");
+            assert_eq!(
+                reply.id,
+                Some(CorrelationId(2)),
+                "close_notify: {close_notify}"
+            );
+            assert_eq!(value_of(&reply), 50_000, "close_notify: {close_notify}");
+        }
+        daemon.stop().exit(0);
+    }
+
+    #[test]
+    fn shutdown_stops_every_listener_and_removes_the_socket() {
+        let sandbox = Sandbox::new();
+        let config = format!("{}{}", sandbox.valid(), tcp_section("127.0.0.1:0"));
+        let daemon = Daemon::start(&sandbox, &config);
+        let addr = daemon.tcp_address();
+        let _uds = daemon.uds(&sandbox.socket());
+        let (_, run) = init_and_run(&mut tls(addr));
+        assert_eq!(value_of(&run), 3);
+
+        daemon.stop().exit(0);
+        assert!(
+            TcpStream::connect(addr).is_err(),
+            "no longer listening on TCP"
+        );
+        assert!(!sandbox.socket().exists(), "the socket is removed");
+    }
+
+    #[test]
+    fn every_tls_startup_failure_exits_one_naming_the_file_and_leaves_nothing_behind() {
+        let sandbox = Sandbox::new();
+        let (cert, key) = (fixture("server.pem"), fixture("server.key"));
+        let key_text = std::fs::read_to_string(&key).unwrap();
+        let cert_text = std::fs::read_to_string(&cert).unwrap();
+        let no_certificate = sandbox.file("no-certificate.pem", &key_text);
+        let no_key = sandbox.file("no-key.key", &cert_text);
+        let malformed = sandbox.file(
+            "malformed.pem",
+            "-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n",
+        );
+        let absent_cert = sandbox.dir.join("absent.pem");
+        let absent_key = sandbox.dir.join("absent.key");
+        let other_key = fixture("other.key");
+
+        // (certificate, key, the file the error must name)
+        let cases = [
+            (absent_cert.clone(), key.clone(), absent_cert.clone()),
+            (cert.clone(), absent_key.clone(), absent_key.clone()),
+            (sandbox.dir.clone(), key.clone(), sandbox.dir.clone()),
+            (no_certificate.clone(), key.clone(), no_certificate.clone()),
+            (cert.clone(), no_key.clone(), no_key.clone()),
+            (malformed.clone(), key.clone(), malformed.clone()),
+            (cert.clone(), other_key.clone(), other_key.clone()),
+        ];
+        for (cert_path, key_path, named) in cases {
+            let config = sandbox.file(
+                "tls.toml",
+                &format!(
+                    "{}{}",
+                    sandbox.valid(),
+                    tcp_section_with("127.0.0.1:0", &cert_path, &key_path)
+                ),
+            );
+            let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+            run.exit(1);
+            assert!(
+                run.stderr
+                    .starts_with(&format!("error: {}: ", named.display())),
+                "{}: {}",
+                named.display(),
+                run.stderr
+            );
+            assert_eq!(run.stderr.lines().count(), 1, "one line: {}", run.stderr);
+            assert!(!run.log.contains("listening on TCP"), "{}", run.log);
+            assert!(
+                !sandbox.socket().exists(),
+                "nothing is bound: {}",
+                named.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_tcp_address_in_use_exits_one_and_removes_the_socket_bound_before_it() {
+        let sandbox = Sandbox::new();
+        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = holder.local_addr().unwrap();
+        let config = sandbox.file(
+            "config.toml",
+            &format!("{}{}", sandbox.valid(), tcp_section(&addr.to_string())),
+        );
+        let run = daemon(&["--config", config.to_str().unwrap()], &nothing(&sandbox));
+        run.exit(1);
+        assert!(
+            run.stderr
+                .starts_with(&format!("error: {addr}: cannot listen for TCP: ")),
+            "{}",
+            run.stderr
+        );
+        assert!(!sandbox.socket().exists(), "the UDS socket is removed");
+        drop(holder);
     }
 }

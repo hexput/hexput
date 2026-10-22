@@ -33,18 +33,19 @@
 //! mode = "0660"               # optional: the socket's permission bits — default: the umask
 //!
 //! [transport.tcp]             # TCP always uses TLS: both paths are required
-//! bind = "0.0.0.0:7400"
+//! bind = "0.0.0.0"            # an IP, with an optional port — default port 7476
 //! tls_cert = "/etc/hexput/tls/cert.pem"
 //! tls_key = "/etc/hexput/tls/key.pem"
 //!
 //! [transport.websocket]       # TLS optional, but tls_cert and tls_key come together or not at all
-//! bind = "0.0.0.0:7401"
+//! bind = "0.0.0.0:7478"
 //! ```
 //!
 //! `crates/hexput-config/config.example.toml` documents every field, and a test parses it so the
 //! example cannot drift from this parser. Every field inside a present transport section is
-//! required; only `log_level`, `log_format`, `session_ttl_secs` and `ast_cache_capacity` have
-//! defaults, and all four are stated above.
+//! required, except that a TCP `bind` may leave out its port, which is then
+//! [`DEFAULT_TCP_PORT`]; only `log_level`, `log_format`, `session_ttl_secs` and
+//! `ast_cache_capacity` have defaults, and all four are stated above.
 //! Unknown keys are rejected, so a typo cannot silently drop a setting. Paths are kept exactly as
 //! written; a relative path is relative to the Daemon's working directory, not to the file.
 //!
@@ -86,6 +87,10 @@ pub const DEFAULT_PATH: &str = r"C:\ProgramData\hexput\config.toml";
 
 /// `session_ttl_secs` when the file does not set it.
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(300);
+
+/// The port `[transport.tcp]` listens on when its `bind` names an IP without a port (FR-29,
+/// Story 5.1). Fixed and documented, so a Backend can rely on it.
+pub const DEFAULT_TCP_PORT: u16 = 7476;
 
 /// `ast_cache_capacity` when the file does not set it: the most registered Scripts the AST Cache
 /// holds at once, across every Session (Story 4.3).
@@ -152,7 +157,8 @@ pub struct UdsTransport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TcpTransport {
-    /// The address and port to listen on.
+    /// The address and port to listen on. The file may give an IP alone; the port is then
+    /// [`DEFAULT_TCP_PORT`].
     pub bind: SocketAddr,
     /// The certificate and key. Required: TCP is never plaintext.
     pub tls: Tls,

@@ -43,6 +43,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Story 2.3: the Port's halves are async; the adapter and connection tests run them on tokio.
 tokio = { workspace = true }
+# Story 5.1: the TLS adapter tests drive a real rustls client (tokio-rustls over tokio, and a
+# blocking rustls stream for the Daemon tests), trusting the checked-in fixture CA.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+
 # Story 4.4: the `cache` bench's cold/warm/direct figures.
 criterion = { workspace = true }
 # Story 4.5: the `cache` bench's Rhai comparator (server over UDS and in-process engine). Dev-only:

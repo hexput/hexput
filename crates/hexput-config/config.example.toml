@@ -50,17 +50,25 @@ path = "/run/hexput/hexput.sock"
 # decides.
 mode = "0660"
 
-# TCP and WebSocket are not served yet: their adapters arrive with Epic 5, and until then the
-# Daemon refuses to start when either section is present rather than silently not listening.
-#
-# TCP. Always TLS: both the certificate and the key are required.
+# TCP. Always TLS — there is no plaintext option: every connection completes a TLS handshake
+# (TLS 1.2 or 1.3) before a single Hexput frame is read, so both the certificate and the key are
+# required. `bind` is an IP address with an optional port: "0.0.0.0", "::" or "[::1]" listen on
+# the default port 7476, "0.0.0.0:7400" on the port given. The Daemon reads both PEM files at
+# startup and refuses to start, naming the file, when either is missing, unreadable or malformed,
+# or when the key does not match the certificate. `tls_cert` holds the certificate chain, leaf
+# first; `tls_key` the leaf's private key (PKCS#8, PKCS#1 or SEC1). Restart the Daemon to load a
+# renewed certificate.
 [transport.tcp]
-bind = "0.0.0.0:7400"
+bind = "0.0.0.0"
 tls_cert = "/etc/hexput/tls/cert.pem"
 tls_key = "/etc/hexput/tls/key.pem"
 
+# WebSocket is not served yet: its adapter arrives with Story 5.2, and until then the Daemon
+# refuses to start when this section is present rather than silently not listening.
+#
 # WebSocket. TLS is optional here, but tls_cert and tls_key are given together or not at all.
+# 7478 is WebSocket's fixed port; until Story 5.2 makes it the default, `bind` names it.
 [transport.websocket]
-bind = "0.0.0.0:7401"
+bind = "0.0.0.0:7478"
 tls_cert = "/etc/hexput/tls/cert.pem"
 tls_key = "/etc/hexput/tls/key.pem"

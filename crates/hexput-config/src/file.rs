@@ -6,7 +6,7 @@
 //! `0` would not name the field or list what is accepted. Every value is read as a `Spanned` so
 //! that second layer can point at it too.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -14,8 +14,9 @@ use serde::Deserialize;
 use toml::Spanned;
 
 use crate::{
-    DEFAULT_AST_CACHE_CAPACITY, DEFAULT_SESSION_TTL, Location, LogFormat, LogLevel, Problem,
-    SystemConfig, TcpTransport, Tls, Transports, UdsTransport, WebSocketTransport,
+    DEFAULT_AST_CACHE_CAPACITY, DEFAULT_SESSION_TTL, DEFAULT_TCP_PORT, Location, LogFormat,
+    LogLevel, Problem, SystemConfig, TcpTransport, Tls, Transports, UdsTransport,
+    WebSocketTransport,
 };
 
 #[derive(Deserialize)]
@@ -186,7 +187,7 @@ impl Validator<'_> {
         let tcp = match raw.tcp {
             None => None,
             Some(tcp) => Some(TcpTransport {
-                bind: self.bind("transport.tcp.bind", &tcp.bind)?,
+                bind: self.bind("transport.tcp.bind", &tcp.bind, Some(DEFAULT_TCP_PORT))?,
                 tls: Tls {
                     cert: self.path("transport.tcp.tls_cert", &tcp.tls_cert)?,
                     key: self.path("transport.tcp.tls_key", &tcp.tls_key)?,
@@ -217,7 +218,7 @@ impl Validator<'_> {
             (None, Some(_)) => return Err(self.half_tls_pair(table.start, "tls_key", "tls_cert")),
         };
         Ok(WebSocketTransport {
-            bind: self.bind("transport.websocket.bind", &raw.bind)?,
+            bind: self.bind("transport.websocket.bind", &raw.bind, None)?,
             tls,
         })
     }
@@ -233,18 +234,43 @@ impl Validator<'_> {
         }
     }
 
-    fn bind(&self, field: &str, bind: &Spanned<String>) -> Result<SocketAddr, Problem> {
-        bind.get_ref().parse().map_err(|_| {
-            self.invalid(
-                field,
-                bind,
-                format!(
-                    "expected an IP address and port such as \"127.0.0.1:7400\" or \
-                     \"[::1]:7400\", got {:?}",
-                    bind.get_ref()
-                ),
-            )
-        })
+    /// A listener's address. With a `default_port`, the port may be left out — a bare IP
+    /// (`0.0.0.0`, `::`, `::1` or `[::1]`) listens on that port; without one, `IP:port` is
+    /// required. Port `0` (an ephemeral port) is valid either way.
+    fn bind(
+        &self,
+        field: &str,
+        bind: &Spanned<String>,
+        default_port: Option<u16>,
+    ) -> Result<SocketAddr, Problem> {
+        let text = bind.get_ref();
+        if let Ok(addr) = text.parse::<SocketAddr>() {
+            return Ok(addr);
+        }
+        if let Some(port) = default_port {
+            let bare = text
+                .strip_prefix('[')
+                .and_then(|inner| inner.strip_suffix(']'))
+                .unwrap_or(text);
+            if let Ok(ip) = bare.parse::<IpAddr>() {
+                // `[...]` brackets only an IPv6 address.
+                if ip.is_ipv6() || bare.len() == text.len() {
+                    return Ok(SocketAddr::new(ip, port));
+                }
+            }
+        }
+        let message = match default_port {
+            Some(port) => format!(
+                "expected an IP address with an optional port such as \"0.0.0.0\", \
+                 \"127.0.0.1:{port}\" or \"[::1]:{port}\" (the port is optional and defaults \
+                 to {port}), got {text:?}"
+            ),
+            None => format!(
+                "expected an IP address and port such as \"127.0.0.1:7478\" or \
+                 \"[::1]:7478\", got {text:?}"
+            ),
+        };
+        Err(self.invalid(field, bind, message))
     }
 
     /// A permission mode written as a string of three or four octal digits — `"660"` or

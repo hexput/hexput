@@ -123,7 +123,8 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 | Rust | 1.98.1 (2024 edition) |
 | tokio | 1.53.1 |
 | tokio-tungstenite | 0.30.0 |
-| rustls | 0.23.45 |
+| rustls (`ring`, `std`, `tls12`; no default features — the `ring` crypto provider, never `aws-lc-rs`) | 0.23.45 |
+| tokio-rustls (`ring`, `tls12`; no default features) | 0.26.6 |
 | serde | 1.0.229 |
 | rmp-serde | 1.3.1 |
 | rmpv (`with-serde`) | 1.3.1 |
@@ -149,6 +150,8 @@ Dependency direction: Adapters depend on the Core `Port`; the Core never imports
 **[Amended 2026-09-23, Epic 2 Story 2.8]** `tracing-subscriber` gains its `json` feature, on the same 0.3.23 pin. System Config's `log_format = "json"` makes `hexput-daemon` write one JSON object per event, with the fields of every enclosing span — a connection's `connection` and `client_id`, a request's `id` — as JSON fields; plain text stays the default. The feature brings `serde_json` and `tracing-serde` in transitively; `serde_json` is also pinned — here and in `[workspace.dependencies]` — as a test-only dependency of `hexput-tests`, which parses those lines; no production crate depends on it directly. No crate edge changes.
 
 **[Amended 2026-10-22, Epic 4 Story 4.5]** `rhai` is added at 1.26.1 (default features), the latest release out for more than a month, as the like-for-like comparator SM-1 and NFR3 name. It is a dev-dependency of `hexput-tests` alone — the `cache` bench runs the same rule on a bench-local Rhai server over the same UDS framing and Backend client, and on Rhai's engine in-process — so no production crate can reach it, no crate edge changes, and `check-crate-graph.py` (which governs normal dependencies) is unchanged. The budget-enforcement overhead line is measured in-process (the interpreter with and without the Executor's synchronous enforcement) because the Daemon has no budget off switch and none is added: the UDS headline figures always run with the full default Resource Budget (SM-C1/SM-C2).
+
+**[Amended 2026-10-22, Epic 5 Story 5.1]** `tokio-rustls` is added at 0.26.6, and `rustls` takes the `ring` crypto provider (features `ring`, `std`, `tls12`, no defaults), resolved at exactly 0.23.45; `aws-lc-rs` never appears in `Cargo.lock` — `ring` is a far smaller build (no cmake, no large C library) and Hexput has no FIPS ambition. Both are normal dependencies of `hexput-transport` only (and dev-dependencies of `hexput-tests`, for its TLS client); no workspace crate edge changes. The TCP+TLS adapter (`hexput_transport::tcp_tls`) fixes the TLS policy: TLS is mandatory on every TCP connection with no option to disable it; the handshake runs in the per-connection task the Daemon spawns, never in the accept loop, bounded at 10 s (`HANDSHAKE_TIMEOUT`); rustls's safe default protocol versions (TLS 1.2 + 1.3); no client authentication — a Backend's credential is the init/reconnect protocol (OQ-2, Story 5.5), the same on every transport (AD-2) — and no ALPN. The certificate chain and key are read as PEM through `rustls-pki-types`' `PemObject` (no `rustls-pemfile`), once at startup; a restart is the reload. System Config's `[transport.tcp] bind` may name an IP alone, which listens on the default port 7476 (FR-29). UDS and TCP+TLS share one length-prefixed framing implementation inside `hexput-transport`.
 
 ## Structural Seed
 

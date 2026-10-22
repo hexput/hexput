@@ -88,7 +88,7 @@ development_status:
   5-2-connect-over-websocket: review
   5-3-connect-locally-on-windows-over-a-named-pipe: review
   5-4-behave-identically-no-matter-how-the-backend-connected: review
-  5-5-issue-a-reconnect-credential-at-first-connect: backlog
+  5-5-issue-a-reconnect-credential-at-first-connect: review
   5-6-reconnect-without-resending-configuration: backlog
   5-7-run-several-connections-under-one-client-id: backlog
   5-8-expire-a-session-only-after-the-last-connection-is-gone: backlog

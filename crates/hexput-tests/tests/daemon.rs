@@ -642,6 +642,7 @@ fn init_over_the_socket_answers_a_client_id() {
         )
     };
     let mut issued = Vec::new();
+    let mut secrets = Vec::new();
     for id in [11, 12] {
         let mut client = serving.connect();
         wire::send(&mut client, &init(id));
@@ -654,8 +655,14 @@ fn init_over_the_socket_answers_a_client_id() {
             reply.payload
         );
         let fields = reply.payload.as_map().expect("a map payload");
-        assert_eq!(fields.len(), 1, "exactly `client_id`: {fields:?}");
+        // Story 5.5: exactly `client_id` then `reconnect_secret`.
+        assert_eq!(
+            fields.len(),
+            2,
+            "exactly `client_id` and `reconnect_secret`: {fields:?}"
+        );
         assert_eq!(fields[0].0.as_str(), Some("client_id"));
+        assert_eq!(fields[1].0.as_str(), Some("reconnect_secret"));
         let client_id = fields[0].1.as_str().expect("a string Client ID").to_owned();
         assert_eq!(client_id.len(), 32);
         assert!(
@@ -664,6 +671,15 @@ fn init_over_the_socket_answers_a_client_id() {
                 .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
             "{client_id}"
         );
+        let secret = fields[1].1.as_str().expect("a string reconnect secret");
+        assert_eq!(secret.len(), 64, "{secret}");
+        assert!(
+            secret
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{secret}"
+        );
+        secrets.push(secret.to_owned());
         // Initialized: execution is now past the gate, and its payload is what is judged.
         wire::send(&mut client, &wire::request(id + 10));
         assert_eq!(
@@ -673,6 +689,7 @@ fn init_over_the_socket_answers_a_client_id() {
         issued.push(client_id);
     }
     assert_ne!(issued[0], issued[1]);
+    assert_ne!(secrets[0], secrets[1]);
     serving.stop().exit(0);
 }
 
@@ -1164,6 +1181,60 @@ fn json_events(log: &str) -> Vec<JsonEvent> {
             JsonEvent(value)
         })
         .collect()
+}
+
+/// Story 5.5: at `trace` in JSON, the most the Daemon logs, the reconnect secret reaches no log
+/// line — while the Client ID the connection's spans carry does, so the log is not empty of it.
+#[cfg(unix)]
+#[test]
+fn the_reconnect_secret_is_never_logged_even_at_trace_in_json() {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let sandbox = Sandbox::new();
+    let config = format!(
+        "log_level = \"trace\"\nlog_format = \"json\"\n{}",
+        sandbox.valid()
+    );
+    let serving = Serving::start(&sandbox, &config);
+    let mut client = serving.connect();
+    let init = Envelope::new(
+        CorrelationId(1),
+        MessageType::Init,
+        Value::Map(vec![
+            (Value::from("config"), Value::Map(vec![])),
+            (Value::from("registrations"), Value::Array(vec![])),
+        ]),
+    );
+    wire::send(&mut client, &init);
+    let reply = wire::reply(&mut client).expect("an init reply");
+    assert_eq!(
+        reply.message_type,
+        MessageType::Result,
+        "{:?}",
+        reply.payload
+    );
+    let fields = reply.payload.as_map().expect("a map payload");
+    let client_id = fields[0].1.as_str().expect("a Client ID").to_owned();
+    let secret = fields[1].1.as_str().expect("a reconnect secret").to_owned();
+    assert_eq!(secret.len(), 64);
+
+    wire::send(&mut client, &traced_execution(2, "return 1 + 1;"));
+    let answer = wire::reply(&mut client).expect("an execution reply");
+    assert_eq!(answer.message_type, MessageType::Result);
+
+    let run = serving.stop();
+    run.exit(0);
+    assert!(
+        json_events(&run.log)
+            .iter()
+            .any(|e| e.connection().is_some())
+    );
+    assert!(run.log.contains(&client_id), "the spans name the Client ID");
+    assert!(
+        !run.log.contains(&secret),
+        "the log carries the reconnect secret: {}",
+        run.log
+    );
 }
 
 /// Story 2.8, the matrix's pre-init, init, execution, two-connection and JSON rows over the real
@@ -2630,11 +2701,18 @@ mod tls_serving {
     };
     use super::{Sandbox, daemon, nothing};
 
-    /// The Client ID an Init reply carries.
+    /// The Client ID an Init reply carries (its `reconnect_secret`, Story 5.5, is checked by the
+    /// connection and conformance tests; here it must merely follow the Client ID).
     fn client_id(init: &Envelope<Value>) -> String {
         assert_eq!(init.message_type, MessageType::Result, "{:?}", init.payload);
         let fields = init.payload.as_map().expect("a map payload");
-        assert_eq!(fields.len(), 1, "exactly `client_id`: {fields:?}");
+        assert_eq!(
+            fields.len(),
+            2,
+            "`client_id` then `reconnect_secret`: {fields:?}"
+        );
+        assert_eq!(fields[0].0.as_str(), Some("client_id"));
+        assert_eq!(fields[1].0.as_str(), Some("reconnect_secret"));
         fields[0].1.as_str().expect("a string Client ID").to_owned()
     }
 
@@ -3553,8 +3631,13 @@ mod named_pipe_serving {
             reply.payload
         );
         let fields = reply.payload.as_map().expect("a map payload");
-        assert_eq!(fields.len(), 1, "exactly `client_id`: {fields:?}");
+        assert_eq!(
+            fields.len(),
+            2,
+            "`client_id` then `reconnect_secret`: {fields:?}"
+        );
         assert_eq!(fields[0].0.as_str(), Some("client_id"));
+        assert_eq!(fields[1].0.as_str(), Some("reconnect_secret"));
         let client_id = fields[0].1.as_str().expect("a string Client ID").to_owned();
         assert_eq!(client_id.len(), 32);
         client_id

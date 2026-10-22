@@ -698,7 +698,8 @@ mod tests {
         let mut sessions_made = Vec::new();
         for _ in 0..2 {
             let connection = sessions.connect();
-            let client_id = sessions.create(InitRequest::from_value(&init).unwrap(), connection);
+            let (client_id, _secret) =
+                sessions.create(InitRequest::from_value(&init).unwrap(), connection);
             // As `hexput-connection`'s init does.
             cache.open(client_id);
             register(&cache, client_id).unwrap();

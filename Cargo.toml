@@ -64,9 +64,12 @@ rmp-serde = "1.3.1"
 # `rmpv::ext::from_value` — which is what `with-serde` provides.
 rmpv = { version = "1.3.1", features = ["with-serde"] }
 dashmap = "6.2.1"
-# The OS CSPRNG (Story 2.4): Client IDs are 128 unguessable bits. OQ-2's reconnect secret will
-# draw from the same source. `fill` needs no feature.
+# The OS CSPRNG (Story 2.4): Client IDs are 128 unguessable bits. OQ-2's reconnect secret (Story 5.5)
+# draws from the same source. `fill` needs no feature.
 getrandom = "0.4.3"
+# Story 5.5: HMAC-SHA256 and its constant-time verify for the reconnect credential. Default
+# features — exactly the set rustls's `ring` provider already builds, so nothing new compiles.
+ring = "0.17.14"
 # The AST Cache (Story 4.1): `sync::Cache` keyed by `(Client ID, Script handle)`.
 moka = { version = "0.12.16", features = ["sync"] }
 # Story 4.4's `cache` bench in `hexput-tests`. `cargo_bench_support` alone: no `plotters`,

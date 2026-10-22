@@ -203,10 +203,17 @@ fn serve(stream: UnixStream, number: u64) {
         };
         let id = request.id.expect("a request carries its id");
         let reply = match request.message_type {
-            MessageType::Init => Value::Map(vec![(
-                Value::from("client_id"),
-                Value::from(format!("{number:032x}")),
-            )]),
+            // The Daemon's Init reply shape; the bench never presents the secret back.
+            MessageType::Init => Value::Map(vec![
+                (
+                    Value::from("client_id"),
+                    Value::from(format!("{number:032x}")),
+                ),
+                (
+                    Value::from("reconnect_secret"),
+                    Value::from(format!("{number:064x}")),
+                ),
+            ]),
             MessageType::CodeRegister => {
                 let source = field(&request.payload, "source")
                     .as_str()

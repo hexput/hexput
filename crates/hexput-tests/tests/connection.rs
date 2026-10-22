@@ -15,7 +15,7 @@ use hexput_port::{
     ProtocolFailure, Received, Value,
 };
 use hexput_script::AstCache;
-use hexput_session::{ClientId, Sessions, Setting, Settings};
+use hexput_session::{ClientId, ReconnectSecret, Sessions, Setting, Settings};
 use hexput_shared::ids::ScriptHandle;
 
 /// Everything the core wrote.
@@ -237,6 +237,12 @@ fn init(id: u64, payload: Value) -> Received {
 
 /// The Client ID a `Result` reply to `Init` carries.
 fn client_id_of(response: &Envelope<Value>) -> ClientId {
+    init_reply_of(response).0
+}
+
+/// The Client ID and the reconnect secret a `Result` reply to `Init` carries (Story 5.5): exactly
+/// `client_id` then `reconnect_secret`, the secret 64 lowercase hex characters.
+fn init_reply_of(response: &Envelope<Value>) -> (ClientId, String) {
     assert_eq!(
         response.message_type,
         MessageType::Result,
@@ -246,15 +252,28 @@ fn client_id_of(response: &Envelope<Value>) -> ClientId {
     let Value::Map(fields) = &response.payload else {
         panic!("a Result payload is a map: {:?}", response.payload);
     };
-    assert_eq!(fields.len(), 1, "exactly `client_id`: {fields:?}");
+    assert_eq!(
+        fields.len(),
+        2,
+        "exactly `client_id` and `reconnect_secret`: {fields:?}"
+    );
     assert_eq!(fields[0].0.as_str(), Some("client_id"));
+    assert_eq!(fields[1].0.as_str(), Some("reconnect_secret"));
     let text = fields[0].1.as_str().expect("a string Client ID");
     assert_eq!(text.len(), 32);
     assert!(
         text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
         "{text}"
     );
-    text.parse().unwrap()
+    let secret = fields[1].1.as_str().expect("a string reconnect secret");
+    assert_eq!(secret.len(), 64, "{secret}");
+    assert!(
+        secret
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{secret}"
+    );
+    (text.parse().unwrap(), secret.to_owned())
 }
 
 /// The `message` of an `Error` response's payload.
@@ -5158,4 +5177,123 @@ fn a_cached_run_dispatched_before_an_unregister_of_its_handle_still_runs() {
         );
         backend.close();
     });
+}
+
+// --- Story 5.5: the reconnect credential issued at init ---
+
+#[test]
+fn a_valid_init_answers_client_id_then_reconnect_secret_in_that_order() {
+    let sessions = Arc::new(Sessions::new());
+    let verified = Arc::new(Mutex::new(None));
+    let sent = {
+        let (sessions, verified) = (Arc::clone(&sessions), Arc::clone(&verified));
+        serve_probed(
+            &Arc::clone(&sessions),
+            vec![init(1, init_payload(&[("getUser", true)]))],
+            // While the connection is still attached: the secret on the wire is the very one
+            // the Session's stored hash verifies, and nothing else is.
+            move |sent| {
+                let (client_id, secret) = init_reply_of(&sent[0]);
+                let parsed = ReconnectSecret::from_hex(&secret).expect("64 lowercase hex");
+                let mut flipped = secret.clone().into_bytes();
+                flipped[0] = if flipped[0] == b'0' { b'1' } else { b'0' };
+                let flipped = ReconnectSecret::from_hex(std::str::from_utf8(&flipped).unwrap())
+                    .expect("still 64 lowercase hex");
+                *verified.lock().unwrap() = Some((
+                    sessions.verify_reconnect(client_id, &parsed),
+                    sessions.verify_reconnect(client_id, &flipped),
+                ));
+            },
+        )
+    };
+    assert_eq!(sent.len(), 1);
+    // `init_reply_of` asserts the two keys in order and the 64 lowercase hex secret.
+    let (_, secret) = init_reply_of(&sent[0]);
+    assert_eq!(secret.len(), 64);
+    assert_eq!(
+        verified.lock().unwrap().take().expect("the probe ran"),
+        (true, false)
+    );
+}
+
+#[test]
+fn two_connections_initing_get_different_client_ids_and_different_secrets() {
+    let sessions = Arc::new(Sessions::new());
+    let (first, _) = serve_with(&sessions, vec![init(1, init_payload(&[]))], None);
+    let (second, _) = serve_with(&sessions, vec![init(1, init_payload(&[]))], None);
+    let (first_id, first_secret) = init_reply_of(&first[0]);
+    let (second_id, second_secret) = init_reply_of(&second[0]);
+    assert_ne!(first_id, second_id);
+    assert_ne!(first_secret, second_secret);
+}
+
+#[test]
+fn no_reply_after_init_on_that_connection_carries_the_reconnect_secret() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let (sent, _) = serve_cached(
+        &sessions,
+        &cache,
+        vec![
+            init(1, init_payload(&[("getUser", true)])),
+            execution(2, "return 1;"),
+            execution(3, "return 1 / 0;"),
+            config_update(4, Value::Map(vec![])),
+            register(5, "return 1;"),
+            init(6, init_payload(&[])),
+        ],
+    );
+    let (_, secret) = init_reply_of(&sent[0]);
+    // Six replies in all: the init, two executions (one failing), the ConfigUpdate, the
+    // CodeRegister and the refused second Init.
+    assert_eq!(sent.len(), 6, "{sent:?}");
+    // Executions answer in completion order, so the later replies are matched by content.
+    let mut outcomes: Vec<String> = sent[1..].iter().map(outcome).collect();
+    outcomes.sort();
+    assert_eq!(
+        outcomes,
+        [
+            "Result",
+            "Result",
+            "Result",
+            "arithmetic.division_by_zero",
+            "protocol.already_initialized",
+        ],
+        "{sent:?}"
+    );
+    assert!(
+        sent.iter().any(|reply| keys_of(reply) == ["handle"]),
+        "the CodeRegister was answered: {sent:?}"
+    );
+    for reply in &sent[1..] {
+        let shown = format!("{reply:?}");
+        assert!(
+            !shown.contains(&secret),
+            "a later reply carries the reconnect secret: {shown}"
+        );
+    }
+}
+
+#[test]
+fn an_invalid_init_answers_no_reconnect_secret_and_creates_no_session() {
+    let sessions = Arc::new(Sessions::new());
+    let (sent, _) = serve_with(
+        &sessions,
+        vec![init(
+            1,
+            Value::Map(vec![(string("registrations"), Value::Array(vec![]))]),
+        )],
+        None,
+    );
+    assert_eq!(code_of(&sent[0]), "protocol.invalid_payload");
+    let Value::Map(fields) = &sent[0].payload else {
+        panic!("an error payload is a map: {:?}", sent[0].payload);
+    };
+    assert!(
+        fields
+            .iter()
+            .all(|(key, _)| key.as_str() != Some("reconnect_secret")),
+        "{fields:?}"
+    );
+    assert!(sessions.is_empty());
 }

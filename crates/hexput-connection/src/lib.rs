@@ -775,7 +775,20 @@ fn init(request: &Envelope<Value>, connection: &Connection<'_>) -> Answer {
             ));
         }
     };
-    let client_id = connection.sessions.create(init, connection.id);
+    // The one place the reconnect secret leaves the Daemon (Story 5.5): its text goes into this
+    // reply and nowhere else — no span, no event. The secret value is dropped once the reply is
+    // built, but its hex text lives on in the reply until it is sent; neither is zeroed.
+    let (client_id, payload) = {
+        let (client_id, secret) = connection.sessions.create(init, connection.id);
+        let payload = Value::Map(vec![
+            (Value::from("client_id"), Value::from(client_id.to_string())),
+            (
+                Value::from("reconnect_secret"),
+                Value::from(secret.to_hex()),
+            ),
+        ]);
+        (client_id, payload)
+    };
     // The cache accepts this Session's registrations from now until its teardown closes it.
     connection.cache.open(client_id);
     Answer::Initialized(
@@ -783,10 +796,7 @@ fn init(request: &Envelope<Value>, connection: &Connection<'_>) -> Answer {
         Envelope {
             id: request.id,
             message_type: MessageType::Result,
-            payload: Value::Map(vec![(
-                Value::from("client_id"),
-                Value::from(client_id.to_string()),
-            )]),
+            payload,
         },
     )
 }

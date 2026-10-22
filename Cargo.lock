@@ -676,6 +676,7 @@ dependencies = [
  "hexput-globalvar",
  "hexput-port",
  "hexput-shared",
+ "ring",
 ]
 
 [[package]]

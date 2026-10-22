@@ -1,10 +1,13 @@
 //! Stories 2.4 + 2.5: decoding an `Init` payload, and the Session registry it creates into.
 //! Stories 3.7 + 3.8: the Config's execution limits, and replacing the Config at runtime.
+//! Story 5.5: the reconnect credential issued at init, and verifying a presented secret.
 
 use std::collections::HashSet;
 
 use hexput_port::Value;
-use hexput_session::{ClientId, Config, ConnectionId, InitRequest, Sessions, Setting, Settings};
+use hexput_session::{
+    ClientId, Config, ConnectionId, InitRequest, ReconnectSecret, Sessions, Setting, Settings,
+};
 
 fn s(text: &str) -> Value {
     Value::from(text)
@@ -372,7 +375,8 @@ fn a_duplicate_method_under_one_key_is_named() {
 /// A Connection opening and completing init: what `hexput-connection` does, in that order.
 fn create(sessions: &Sessions, init: InitRequest) -> (ClientId, ConnectionId) {
     let connection = sessions.connect();
-    (sessions.create(init, connection), connection)
+    let (id, _secret) = sessions.create(init, connection);
+    (id, connection)
 }
 
 #[test]
@@ -383,7 +387,7 @@ fn a_connection_id_is_issued_before_init_and_becomes_its_attachment() {
     assert_ne!(first, second);
     // Connecting creates no Session.
     assert!(sessions.is_empty());
-    let id = sessions.create(valid(&[]), second);
+    let (id, _secret) = sessions.create(valid(&[]), second);
     assert_eq!(sessions.attached(id), Some(1));
     // Detaching under the id it was created with is what removes it.
     sessions.detach(id, first);
@@ -844,4 +848,127 @@ fn a_detach_of_an_unknown_session_does_not_call_the_hook() {
     let connection = sessions.connect();
     sessions.detach(ClientId::from_bytes([9; 16]), connection);
     assert!(torn.lock().unwrap().is_empty());
+}
+
+// --- Story 5.5: the reconnect credential issued at init ---
+
+/// A Session created with its Connection attached, and the reconnect secret issued with it.
+fn created(sessions: &Sessions) -> (ClientId, ReconnectSecret) {
+    let connection = sessions.connect();
+    sessions.create(valid(&[]), connection)
+}
+
+/// Whether `text` is exactly 64 lowercase hex characters.
+fn is_lower_hex_64(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+#[test]
+fn a_created_session_issues_a_reconnect_secret_of_64_lowercase_hex_characters() {
+    let sessions = Sessions::new();
+    let (_, secret) = created(&sessions);
+    let text = secret.to_hex();
+    assert!(is_lower_hex_64(&text), "{text:?}");
+    // The text form is the secret itself: parsing it back gives the same text.
+    let parsed = ReconnectSecret::from_hex(&text).expect("its own text parses");
+    assert_eq!(parsed.to_hex(), text);
+}
+
+#[test]
+fn two_sessions_get_different_client_ids_and_different_secrets() {
+    let sessions = Sessions::new();
+    let (first_id, first) = created(&sessions);
+    let (second_id, second) = created(&sessions);
+    assert_ne!(first_id, second_id);
+    assert_ne!(first.to_hex(), second.to_hex());
+}
+
+#[test]
+fn verify_reconnect_accepts_exactly_the_issued_secret_for_its_client_id() {
+    let sessions = Sessions::new();
+    let (id, secret) = created(&sessions);
+    // A presented secret arrives as text, so the parsed form must verify as well.
+    let presented = ReconnectSecret::from_hex(&secret.to_hex()).expect("parses");
+    assert!(sessions.verify_reconnect(id, &secret));
+    assert!(sessions.verify_reconnect(id, &presented));
+}
+
+#[test]
+fn verify_reconnect_refuses_a_secret_that_differs_in_one_character() {
+    let sessions = Sessions::new();
+    let (id, secret) = created(&sessions);
+    let text = secret.to_hex();
+    let other = if text.ends_with('0') { '1' } else { '0' };
+    let altered = format!("{}{other}", &text[..63]);
+    let altered = ReconnectSecret::from_hex(&altered).expect("still 64 lowercase hex");
+    assert!(!sessions.verify_reconnect(id, &altered));
+    assert!(sessions.verify_reconnect(id, &secret));
+}
+
+#[test]
+fn verify_reconnect_refuses_another_sessions_secret() {
+    let sessions = Sessions::new();
+    let (first_id, first) = created(&sessions);
+    let (second_id, second) = created(&sessions);
+    assert!(!sessions.verify_reconnect(first_id, &second));
+    assert!(!sessions.verify_reconnect(second_id, &first));
+    assert!(sessions.verify_reconnect(first_id, &first));
+    assert!(sessions.verify_reconnect(second_id, &second));
+}
+
+#[test]
+fn verify_reconnect_refuses_an_unknown_client_id_for_any_secret() {
+    let sessions = Sessions::new();
+    let (_, secret) = created(&sessions);
+    assert!(!sessions.verify_reconnect(ClientId::from_bytes([9; 16]), &secret));
+}
+
+#[test]
+fn a_torn_down_session_no_longer_verifies_its_secret() {
+    let sessions = Sessions::new();
+    let connection = sessions.connect();
+    let (id, secret) = sessions.create(valid(&[]), connection);
+    assert!(sessions.verify_reconnect(id, &secret));
+    sessions.detach(id, connection);
+    assert!(!sessions.verify_reconnect(id, &secret));
+}
+
+#[test]
+fn a_secret_parses_only_as_exactly_64_lowercase_hex_characters() {
+    let good = "0123456789abcdef".repeat(4);
+    let parsed = ReconnectSecret::from_hex(&good).expect("64 lowercase hex parses");
+    assert_eq!(parsed.to_hex(), good);
+    let refused: Vec<(String, &str)> = vec![
+        (good.to_uppercase(), "uppercase"),
+        (good[..63].to_owned(), "63 characters"),
+        (format!("{good}0"), "65 characters"),
+        (format!("{}g", &good[..63]), "a non-hex character"),
+        (format!("{} ", &good[..63]), "a space"),
+        ("é".repeat(32), "64 bytes that are not hex"),
+        (String::new(), "empty"),
+    ];
+    for (text, why) in refused {
+        assert!(
+            ReconnectSecret::from_hex(&text).is_none(),
+            "refused ({why}): {text:?}"
+        );
+    }
+}
+
+#[test]
+fn the_secret_debug_and_the_sessions_debug_never_show_the_secret() {
+    let sessions = Sessions::new();
+    let (id, secret) = created(&sessions);
+    let text = secret.to_hex();
+    let shown = format!("{secret:?}");
+    assert!(!shown.contains(&text), "{shown}");
+    assert!(!shown.contains(&text[..16]), "{shown}");
+    let registry = format!("{sessions:?}");
+    assert!(!registry.contains(&text), "{registry}");
+    assert!(!registry.contains(&text[..16]), "{registry}");
+    // Formatting changes nothing: the secret still verifies.
+    assert!(sessions.verify_reconnect(id, &secret));
 }

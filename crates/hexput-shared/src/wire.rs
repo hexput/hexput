@@ -53,6 +53,9 @@ impl fmt::Display for CorrelationId {
 #[non_exhaustive]
 pub enum MessageType {
     /// Request: the init handshake carrying per-backend Config and registrations (Story 2.4).
+    /// Answered `Result {client_id, reconnect_secret}`, in that order (Story 5.5): the Client ID
+    /// as 32 lowercase hex characters and the Session's reconnect secret as 64, sent this once
+    /// and in no later response.
     Init,
     /// Request: run a Script (Story 2.6).
     ExecutionStart,

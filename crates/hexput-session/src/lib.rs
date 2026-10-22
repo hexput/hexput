@@ -31,11 +31,24 @@
 //! Session's cached Scripts go with it without this crate reaching `hexput-script`. When Story
 //! 5.8 delays teardown behind a TTL, the hook is delayed with it.
 //!
+//! # What Story 5.5 adds
+//!
+//! [`Sessions::create`] also issues the Session's reconnect credential (FR-13): a 256-bit
+//! [`ReconnectSecret`] from the OS CSPRNG, returned once with the Client ID for the `Init` reply
+//! to carry. The Session keeps only a per-Session random salt and the HMAC-SHA256 of the secret
+//! keyed by it — never the secret, which is never logged and whose `Debug` is redacted.
+//! [`Sessions::verify_reconnect`] checks a presented secret against that hash in constant time;
+//! an unknown Client ID is checked against a fixed dummy credential, so either way one HMAC verify
+//! runs and gives `false` (not a promise of equal timing: the registry lookup is not constant
+//! time). The credential is defined here alone, whatever carried the
+//! Connection; Story 5.6 builds reconnect on it.
+//!
 //! Nothing here is `async`, so no lock of this crate's can be held across an `.await`; nothing
 //! here writes to disk.
 //!
-//! Binds: AD-2, AD-4, AD-5.
+//! Binds: AD-2, AD-4, AD-5, FR-13.
 
+mod credential;
 mod init;
 
 use std::collections::HashSet;
@@ -46,6 +59,8 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 pub use hexput_shared::ids::ClientId;
 
+use credential::Credential;
+pub use credential::ReconnectSecret;
 pub use hexput_port::{Setting, Settings};
 pub use init::{Config, InitError, InitRequest, RegisteredFunction};
 
@@ -65,10 +80,12 @@ impl ConnectionId {
 }
 
 /// A Backend's Session: the single live copy of its Config (AD-5), its Registered Functions,
-/// and the Connections attached to it right now.
+/// the Connections attached to it right now, and the salted hash of its reconnect secret (never
+/// the secret).
 #[derive(Debug)]
 pub struct Session {
     config: Config,
+    credential: Credential,
     registrations: Vec<RegisteredFunction>,
     connections: HashSet<ConnectionId>,
 }
@@ -128,23 +145,30 @@ impl Sessions {
 
     /// Create a Session from a decoded `Init`, with one Connection attached: `connection`, the
     /// one that sent it (issued by [`connect`](Self::connect)). Returns the Session's newly
-    /// issued Client ID.
+    /// issued Client ID and its reconnect secret — the one time the secret exists outside the
+    /// caller's reply: the Session keeps only its salted hash.
     ///
     /// Precondition, not checked: `connection` came from [`connect`](Self::connect) on this
     /// registry and is attached to at most one Session, once — this call or one
     /// [`attach`](Self::attach), never both, never twice.
     ///
     /// The Client ID is 128 bits from the OS CSPRNG. A collision with a live Session draws again
-    /// rather than overwriting it.
+    /// rather than overwriting it. The reconnect secret is 256 bits from the same source.
     ///
     /// # Panics
     ///
     /// If the OS CSPRNG cannot be read. A Daemon that cannot issue unguessable identifiers must
     /// not issue guessable ones; the panic stays within the calling Connection's task.
     #[must_use]
-    pub fn create(&self, init: InitRequest, connection: ConnectionId) -> ClientId {
+    pub fn create(
+        &self,
+        init: InitRequest,
+        connection: ConnectionId,
+    ) -> (ClientId, ReconnectSecret) {
+        let (credential, secret) = Credential::issue();
         let session = Session {
             config: init.config,
+            credential,
             registrations: init.registrations,
             connections: HashSet::from([connection]),
         };
@@ -154,7 +178,7 @@ impl Sessions {
             if let Entry::Vacant(vacant) = self.sessions.entry(generate_client_id()) {
                 let client_id = *vacant.key();
                 vacant.insert(session);
-                return client_id;
+                return (client_id, secret);
             }
         }
     }
@@ -193,6 +217,25 @@ impl Sessions {
         });
         if let Some((client_id, session)) = removed {
             teardown(client_id, session, self.on_teardown.as_deref());
+        }
+    }
+
+    /// Whether `secret` is the reconnect secret issued with this Client ID's Session, compared in
+    /// constant time against the salted hash the Session keeps. An unknown Client ID is checked
+    /// against a fixed dummy credential — one HMAC verify either way, though the registry lookup
+    /// itself is not constant time — and gives `false`, like a wrong secret.
+    #[must_use]
+    pub fn verify_reconnect(&self, client_id: ClientId, secret: &ReconnectSecret) -> bool {
+        match self.sessions.get(&client_id) {
+            Some(session) => session.credential.verify(secret),
+            None => {
+                // The result is discarded — an unknown Client ID never verifies — but kept opaque to
+                // the optimizer so the dummy verify is not elided.
+                let _ = core::hint::black_box(
+                    Credential::dummy().verify(core::hint::black_box(secret)),
+                );
+                false
+            }
         }
     }
 
@@ -282,10 +325,11 @@ fn generate_client_id() -> ClientId {
 /// The one teardown path for a Session, called only by [`Sessions::detach`] once the Session is
 /// already out of the registry — never from a `Drop` impl, never under a lock.
 ///
-/// Today it releases the Config and the Registered Functions. When Plugins land (Epic 6), each
-/// of the Session's Plugins has its Global Variable store torn down here through
-/// `hexput_globalvar::teardown(plugin_id)` before its actor is dropped (AD-4); when TTLs land
-/// (Story 5.8), the call to this function is delayed, not moved — and the teardown hook with it.
+/// Today it releases the Config, the reconnect credential and the Registered Functions. When
+/// Plugins land (Epic 6), each of the Session's Plugins has its Global Variable store torn down
+/// here through `hexput_globalvar::teardown(plugin_id)` before its actor is dropped (AD-4); when
+/// TTLs land (Story 5.8), the call to this function is delayed, not moved — and the teardown hook
+/// with it.
 ///
 /// The hook, when the registry has one, is called last, with the Session's Client ID (Story 4.3).
 fn teardown(
@@ -295,11 +339,12 @@ fn teardown(
 ) {
     let Session {
         config,
+        credential,
         registrations,
         connections,
     } = session;
     debug_assert!(connections.is_empty(), "a Session is torn down unattached");
-    drop((config, registrations));
+    drop((config, credential, registrations));
     if let Some(hook) = hook {
         hook(client_id);
     }

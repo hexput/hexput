@@ -18,6 +18,8 @@ hexput-globalvar = { path = "../hexput-globalvar" }
 dashmap = { workspace = true }
 # Client IDs come from the OS CSPRNG.
 getrandom = { workspace = true }
+# Story 5.5: the reconnect credential's salted hash (HMAC-SHA256) and its constant-time verify.
+ring = { workspace = true }
 
 [lints]
 workspace = true

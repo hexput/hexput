@@ -16,6 +16,8 @@
 //! assertions have run on the real values:
 //!
 //! - a `client_id` becomes `<client-id>` (asserted to be 32 lowercase hex characters first);
+//! - a `reconnect_secret` becomes `<reconnect-secret>` (asserted to be 64 lowercase hex characters
+//!   first; Story 5.5 — the credential is issued identically on every transport);
 //! - a `handle` becomes `<handle>` (asserted to be 16 lowercase hex characters first);
 //! - a generated Reference ID (`hx:<16 hex>:…`) has its nonce replaced by `*`;
 //! - nothing else is rewritten.
@@ -682,8 +684,9 @@ impl Transcript {
     }
 }
 
-/// The transcript form of a value: a `client_id` and a `handle` are checked for shape and replaced
-/// by placeholders, and a generated Reference ID's nonce becomes `*`. Nothing else changes.
+/// The transcript form of a value: a `client_id`, a `reconnect_secret` and a `handle` are checked
+/// for shape and replaced by placeholders, and a generated Reference ID's nonce becomes `*`.
+/// Nothing else changes.
 fn normalize(value: &Value) -> Value {
     match value {
         Value::Map(entries) => Value::Map(
@@ -694,6 +697,10 @@ fn normalize(value: &Value) -> Value {
                         (Some("client_id"), Some(text)) => {
                             assert_lower_hex(text, 32, "client_id");
                             Value::from("<client-id>")
+                        }
+                        (Some("reconnect_secret"), Some(text)) => {
+                            assert_lower_hex(text, 64, "reconnect_secret");
+                            Value::from("<reconnect-secret>")
                         }
                         (Some("handle"), Some(text)) => {
                             assert_lower_hex(text, 16, "handle");
@@ -1032,12 +1039,18 @@ fn budget(dimension: &str, limit: u64) -> Value {
     map(vec![("budget", map(vec![(dimension, Value::from(limit))]))])
 }
 
-/// `Init` as `id`, answered with `Result {client_id}`, the Client ID a string of 32 lowercase hex
-/// characters; returns the reply's payload.
+/// `Init` as `id`, answered with `Result {client_id, reconnect_secret}`: the Client ID a string of
+/// 32 lowercase hex characters and the reconnect secret one of 64 (Story 5.5); returns the reply's
+/// payload.
 fn init_result(client: &mut dyn Client, t: &mut Transcript, id: u64) -> Value {
     t.send(client, &init_envelope(id));
     let payload = expect_result(client, t, id);
     assert_lower_hex(text_of(&payload, "client_id"), 32, "client_id");
+    assert_lower_hex(
+        text_of(&payload, "reconnect_secret"),
+        64,
+        "reconnect_secret",
+    );
     payload
 }
 
@@ -1183,14 +1196,14 @@ fn answer(client: &mut dyn Client, t: &mut Transcript, id: CorrelationId, value:
 
 fn init(client: &mut dyn Client, t: &mut Transcript) {
     let payload = begin(client, t);
-    assert_keys(&payload, &["client_id"]);
+    assert_keys(&payload, &["client_id", "reconnect_secret"]);
 }
 
 fn uninitialized(client: &mut dyn Client, t: &mut Transcript) {
     t.send(client, &run_request(1, "return 1;"));
     expect_error(client, t, 1, "protocol.init_not_completed");
     let payload = init_result(client, t, 2);
-    assert_keys(&payload, &["client_id"]);
+    assert_keys(&payload, &["client_id", "reconnect_secret"]);
 }
 
 fn init_twice(client: &mut dyn Client, t: &mut Transcript) {

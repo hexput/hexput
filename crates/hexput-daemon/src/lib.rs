@@ -49,7 +49,10 @@
 //! `hexput_transport::tcp_tls::HANDSHAKE_TIMEOUT`, so a slow peer never stalls the accept loop;
 //! a failed handshake closes that socket and is logged at `debug` with the peer's address
 //! (`"TLS handshake failed"` / `"WebSocket handshake failed"`). Every connection shares the run's
-//! one Session registry (`hexput-session`), which is where an `Init` creates a Session. On
+//! one Session registry (`hexput-session`), which is where an `Init` creates a Session. The
+//! registry carries System Config's `session_ttl_secs` (Story 5.8): a Session whose last
+//! Connection detached stays resumable by `Reconnect` for that long, then is torn down — Config,
+//! registrations and AST Cache entries — unless a Connection reconnected first. On
 //! shutdown the Daemon stops accepting on every listener and removes the socket file it created;
 //! a Named Pipe has no file and is gone once its listener is dropped.
 
@@ -228,10 +231,16 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// The Daemon's Session registry over `cache`: a Session's teardown releases its cache entries
 /// through the registry's hook, so `hexput-session` never reaches `hexput-script` (Story 4.3). The
 /// one place this pairing is made — the connection opens a Session in the cache at init, and this
-/// hook closes it — so a test can check the Daemon's own wiring.
-fn registry(cache: &Arc<hexput_script::AstCache>) -> Arc<Sessions> {
+/// hook closes it — so a test can check the Daemon's own wiring. `ttl` is how long a Session
+/// outlives its last Connection before that teardown (Story 5.8): System Config's
+/// `session_ttl_secs`, at least one second, so the Daemon never tears down at the last detach.
+fn registry(cache: &Arc<hexput_script::AstCache>, ttl: Duration) -> Arc<Sessions> {
     let released = Arc::clone(cache);
-    Arc::new(Sessions::new().with_teardown(move |client_id| released.close(client_id)))
+    Arc::new(
+        Sessions::new()
+            .with_ttl(ttl)
+            .with_teardown(move |client_id| released.close(client_id)),
+    )
 }
 
 /// The Daemon proper: announce the System Config, bind every listener, serve connections until
@@ -259,7 +268,8 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
             loaded.config.ast_cache_capacity,
         ));
         // One Session registry per Daemon run beside it, shared by every connection.
-        let sessions = registry(&cache);
+        // Its TTL (Story 5.8) is System Config's.
+        let sessions = registry(&cache, loaded.config.session_ttl);
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -334,7 +344,9 @@ async fn serve<S: Future<Output = ()>>(loaded: &Loaded, shutdown: S) -> Result<(
             }
         }
         // Aborted connection tasks never reach their detach, so no Session is torn down one by
-        // one here: the registry, and every Session in it, is dropped with this run. Nothing a
+        // one here. A pending TTL countdown (Story 5.8) holds the registry until the run's
+        // runtime drops right after this returns, which cancels it unrun: the registry, and every
+        // Session in it, is dropped with this run. Nothing a
         // Session holds is on disk or outlives the process, so there is nothing to release.
         connections.abort_all();
     }
@@ -659,6 +671,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use hexput_script::AstCache;
     use hexput_session::{InitRequest, Settings};
@@ -690,7 +703,7 @@ mod tests {
             ))
         };
         let cache = Arc::new(AstCache::with_capacity(16));
-        let sessions = registry(&cache);
+        let sessions = registry(&cache, Duration::from_secs(300));
         let init = map(vec![
             ("config", map(Vec::new())),
             ("registrations", Value::Array(Vec::new())),
@@ -708,7 +721,15 @@ mod tests {
         let [(ended, connection), (kept, _)] = sessions_made[..] else {
             unreachable!("two Sessions were made");
         };
-        sessions.detach(ended, connection);
+        let expiry = sessions
+            .detach(ended, connection)
+            .expect("the last Connection starts the TTL countdown");
+        assert_eq!(expiry.ttl(), Duration::from_secs(300));
+        // Nothing is released while the countdown runs (Story 5.8)...
+        assert_eq!(cache.handles(ended).len(), 1);
+        assert_eq!(cache.entry_count(), 2);
+        // ...and everything once it expires.
+        assert!(sessions.expire(&expiry));
         assert!(cache.handles(ended).is_empty());
         assert_eq!(cache.handles(kept).len(), 1);
         assert_eq!(cache.entry_count(), 1);

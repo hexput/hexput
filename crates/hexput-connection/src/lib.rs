@@ -152,10 +152,22 @@
 //! executions carry on.
 //!
 //! However the connection ends — the peer closing, a lost stream, a failed write, a fatal frame —
-//! [`serve`] detaches it from its Session, and detaching the last Connection tears the Session down
-//! — whether it attached by `Init` or by `Reconnect`. The detach is an explicit call on the one
-//! exit path rather than a `Drop` guard, so teardown is never implied by `Drop` (AD-4); a panic
-//! inside `serve` skips it.
+//! [`serve`] detaches it from its Session — whether it attached by `Init` or by `Reconnect`. The
+//! detach is an explicit call on the one exit path rather than a `Drop` guard, so teardown is never
+//! implied by `Drop` (AD-4); a panic inside `serve` skips it.
+//!
+//! # Session TTL (Story 5.8)
+//!
+//! Detaching the last Connection does not tear the Session down when the registry has a TTL (the
+//! Daemon's always does, from System Config): the registry starts the Session's countdown and
+//! hands [`serve`] an [`Expiry`](hexput_session::Expiry). While any Connection is attached no
+//! countdown runs. [`serve`] spawns one detached task that sleeps the TTL and then asks the
+//! registry to [`expire`](Sessions::expire) the Session, which tears it down — through the
+//! registry's one teardown path, AST Cache hook included — only if no Connection reconnected in
+//! the meantime and no newer countdown replaced this one. The registry stays synchronous; this
+//! crate owns the timer. The task holds only the registry and the `Expiry`, and a runtime shutting
+//! down cancels it with the rest. A registry with no TTL tears down at the last detach, as
+//! before.
 //!
 //! # Logging
 //!
@@ -212,7 +224,8 @@ struct Connection<'s> {
 /// sends; failures are logged at `debug`, since a peer leaving is routine.
 ///
 /// `sessions` and `cache` are the Daemon run's one Session registry and one AST Cache, shared by
-/// every connection.
+/// every connection. When `sessions` has a TTL (Story 5.8), the runtime must have timers enabled
+/// (the Daemon's does): the countdown that expires a Session is a Tokio sleep.
 pub async fn serve<P: Port>(port: P, sessions: Arc<Sessions>, cache: Arc<AstCache>) {
     let id = sessions.connect();
     let mut connection = Connection {
@@ -229,10 +242,29 @@ pub async fn serve<P: Port>(port: P, sessions: Arc<Sessions>, cache: Arc<AstCach
     // The one exit path: however `exchange` ended — its executions finished or abandoned — a
     // completed init is undone here.
     if let Some(client_id) = connection.attached {
-        sessions.detach(client_id, id);
+        let expiry = sessions.detach(client_id, id);
         connection
             .span
             .in_scope(|| tracing::debug!("connection detached from its Session"));
+        if let Some(expiry) = expiry {
+            connection.span.in_scope(|| {
+                tracing::debug!(
+                    ttl_secs = expiry.ttl().as_secs_f64(),
+                    "last connection detached; the Session expires after its TTL unless a \
+                     Connection reconnects"
+                );
+            });
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(
+                async move {
+                    tokio::time::sleep(expiry.ttl()).await;
+                    if sessions.expire(&expiry) {
+                        tracing::debug!("Session expired after its TTL; torn down");
+                    }
+                }
+                .instrument(connection.span),
+            );
+        }
     }
 }
 

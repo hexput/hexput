@@ -366,3 +366,11 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-5-7-run-several-connections-under-one-client-id.md`
   summary: AGENTS.md's Build, Lint, Test section lists only debug-profile cargo commands, while the maintainer requires every build on this machine to use `--release` (disk is scarce).
   evidence: Review finding (blind-hunter), medium. Only Story 5.7's spec records the rule, so the next story's agent following AGENTS.md builds in debug. Routed to defer because the fix edits an agent-context file. Settle with a machine-local note, or an AGENTS.md line saying local runs use the `--release` form while CI keeps its own profile.
+
+- source_spec: `spec-5-8-expire-a-session-only-after-the-last-connection-is-gone.md`
+  summary: A Session now outlives its last Connection by `session_ttl_secs` (default 300 s), so a peer looping connect → `Init` → `CodeRegister` → disconnect holds about one TTL's worth of orphaned Sessions (Config, registrations, AST Cache entries, one timer task each) with no cap; the earlier "Session registry is unbounded" entry assumed a Session lasts only while connected.
+  evidence: Review finding (blind-hunter), medium. Required behaviour of FR-2/FR-21 (the TTL), not a defect of the implementation; the exposure is the pre-existing uncapped registry and connection count, now lengthened by the TTL. Settle with the registry/connection caps already deferred (a per-Daemon Session cap, or counting orphaned Sessions toward it), before a release exposes TCP/WebSocket beyond trusted peers.
+
+- source_spec: `spec-5-8-expire-a-session-only-after-the-last-connection-is-gone.md`
+  summary: The Story 2.4 entry "a panic inside `serve` skips the detach and leaks the Session" stays open after Story 5.8: the TTL countdown starts only from `detach`, so a panicking attached connection still never gets an `Expiry` and its Session lives until the Daemon stops.
+  evidence: Review finding (blind-hunter), medium. Pre-existing; Story 5.8 delays teardown but adds no supervisor. Nothing in `serve` is known to panic on peer input. Settle with a supervisor in `hexput-daemon` that, on a connection task's joined panic, detaches it and runs the returned `Expiry` (needs `serve` to expose its Client ID/Connection ID to the supervisor), or a guard that detaches without implying teardown by `Drop`.

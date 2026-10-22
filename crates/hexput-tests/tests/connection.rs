@@ -6320,3 +6320,242 @@ fn a_connection_whose_stream_is_lost_mid_flight_abandons_only_its_own_execution(
     });
     assert!(sessions.is_empty());
 }
+
+// --- Story 5.8: a Session outlives its last Connection by the TTL ---
+
+/// The TTL a wired test configures when nothing must happen *inside* it: short, so a test can wait
+/// out several of them.
+const SHORT_TTL: Duration = Duration::from_millis(200);
+
+/// The TTL a wired test configures when it must act or assert inside the countdown (reconnect,
+/// "still held"): long enough that a loaded runner's scheduling delay never outlasts it.
+const RESUMABLE_TTL: Duration = Duration::from_secs(1);
+
+/// A registry with `ttl` whose teardown releases the Session's entries in `cache`, wired the way
+/// the Daemon wires it.
+fn torn_down_after(cache: &Arc<AstCache>, ttl: Duration) -> Arc<Sessions> {
+    let cache = Arc::clone(cache);
+    Arc::new(
+        Sessions::new()
+            .with_ttl(ttl)
+            .with_teardown(move |client_id| cache.close(client_id)),
+    )
+}
+
+/// Waits until `client_id` is no longer in `registry`, failing the test after `limit`.
+async fn until_gone(registry: &Sessions, client_id: ClientId, limit: Duration) {
+    let started = Instant::now();
+    while registry.contains(client_id) {
+        assert!(started.elapsed() < limit, "the Session never expired");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[test]
+fn a_reconnect_within_the_ttl_resumes_the_session_and_its_cached_handles_and_the_countdown_never_fires()
+ {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = torn_down_after(&cache, RESUMABLE_TTL);
+    let outside = Arc::clone(&cache);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[("getUser", true)])).await;
+        a.send(register_with(2, "return n * 2;", Some(&["n"])));
+        let handle = handle_of(&a.next().await);
+        a.close();
+        finished(serving_a).await;
+        assert!(registry.contains(client_id), "the countdown has started");
+
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        resumed(&mut b, 2, client_id).await;
+        // Well past the TTL the first countdown would have expired at: the reconnect stopped it.
+        tokio::time::sleep(RESUMABLE_TTL * 3 / 2).await;
+        assert!(
+            registry.contains(client_id),
+            "the earlier countdown never tears it down"
+        );
+        assert_eq!(cache.handles(client_id), vec![handle]);
+        b.send(cached_run(
+            3,
+            &handle.to_string(),
+            vec![("n", Value::from(21u64))],
+        ));
+        let reply = b.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(3)));
+        assert_eq!(value_of(&reply), Value::from(42u64));
+        // The registrations survived too: a host call to the blanket-granted function goes out.
+        b.send(execution(4, "return getUser(5) + 1;"));
+        let (call, name, arguments) = b.call().await;
+        assert_eq!(name, "getUser");
+        assert_eq!(arguments, vec![Value::from(5u64)]);
+        b.reply(call, MessageType::Result, answer(10));
+        let reply = b.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(4)));
+        assert_eq!(value_of(&reply), Value::from(11u64));
+
+        b.close();
+        finished(serving_b).await;
+        until_gone(&registry, client_id, RESUMABLE_TTL * 10).await;
+        assert!(cache.handles(client_id).is_empty());
+    });
+    assert_eq!(outside.entry_count(), 0);
+}
+
+#[test]
+fn two_attached_connections_keep_their_session_live_past_several_ttls() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = torn_down_after(&cache, SHORT_TTL);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[("getUser", true)])).await;
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        resumed(&mut b, 2, client_id).await;
+
+        // A leaves while B is attached: no countdown starts.
+        a.close();
+        finished(serving_a).await;
+        tokio::time::sleep(SHORT_TTL * 3).await;
+        assert!(registry.contains(client_id));
+        assert_eq!(registry.attached(client_id), Some(1));
+        assert_eq!(registry.expiring(client_id), Some(false));
+
+        b.send(execution(3, "return 1 + 1;"));
+        assert_eq!(value_of(&b.next().await), Value::from(2u64));
+        b.close();
+        finished(serving_b).await;
+        until_gone(&registry, client_id, SHORT_TTL * 50).await;
+    });
+}
+
+#[test]
+fn the_last_close_with_no_reconnect_expires_the_session_and_its_handles_then_a_reconnect_is_denied()
+{
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = torn_down_after(&cache, RESUMABLE_TTL);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[])).await;
+        a.send(register(2, "return 1;"));
+        let handle = handle_of(&a.next().await);
+        a.close();
+        finished(serving_a).await;
+        // Still held during the countdown.
+        assert!(registry.contains(client_id));
+        assert_eq!(cache.handles(client_id), vec![handle]);
+
+        until_gone(&registry, client_id, RESUMABLE_TTL * 10).await;
+        assert!(
+            cache.handles(client_id).is_empty(),
+            "its cache handles are released"
+        );
+        assert_eq!(cache.entry_count(), 0);
+
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        let torn = refused_with(&mut b, 2, "protocol.reconnect_denied").await;
+        b.send(reconnect(3, UNKNOWN_CLIENT_ID, &secret));
+        let unknown = refused_with(&mut b, 3, "protocol.reconnect_denied").await;
+        assert_eq!(
+            torn.payload, unknown.payload,
+            "identical to an unknown Client ID"
+        );
+
+        // Not fatal: the same connection may now `Init` a fresh Session.
+        b.reply(CorrelationId(4), MessageType::Init, init_payload(&[]));
+        let (fresh, _) = init_reply_of(&b.next().await);
+        assert_ne!(fresh, client_id);
+        assert_eq!(registry.attached(fresh), Some(1));
+
+        b.close();
+        finished(serving_b).await;
+    });
+}
+
+#[test]
+fn a_wrong_secret_during_the_countdown_is_denied_and_the_session_still_expires() {
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = torn_down_after(&cache, RESUMABLE_TTL);
+    on_runtime(async move {
+        let (mut a, serving_a, client_id, secret) =
+            issued(&registry, &cache, init_payload(&[])).await;
+        a.close();
+        finished(serving_a).await;
+
+        let (mut b, serving_b) = open_bare(&registry, &cache);
+        b.send(reconnect(
+            2,
+            &client_id.to_string(),
+            &altered_secret(&secret),
+        ));
+        refused_with(&mut b, 2, "protocol.reconnect_denied").await;
+        assert!(registry.contains(client_id), "a denial changes nothing");
+        b.close();
+        finished(serving_b).await;
+
+        until_gone(&registry, client_id, RESUMABLE_TTL * 10).await;
+    });
+}
+
+#[test]
+fn the_countdown_and_the_expiry_are_logged_at_debug_with_the_ttl_and_the_client_id() {
+    let log = Captured::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(log.clone()))
+            .finish(),
+    );
+    let worker = dispatch.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .on_thread_start(move || {
+            std::mem::forget(tracing::dispatcher::set_default(&worker));
+        })
+        .build()
+        .unwrap();
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let registry = torn_down_after(&cache, SHORT_TTL);
+    let issued_id = tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let (mut a, serving_a, client_id, _) =
+                issued(&registry, &cache, init_payload(&[])).await;
+            a.close();
+            finished(serving_a).await;
+            until_gone(&registry, client_id, SHORT_TTL * 50).await;
+            client_id
+        })
+    });
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    let named = |message: &str| -> Vec<&serde_json::Value> {
+        events
+            .iter()
+            .filter(|event| event["fields"]["message"] == message)
+            .collect()
+    };
+    let client_id = issued_id.to_string();
+
+    let started = named(
+        "last connection detached; the Session expires after its TTL unless a Connection reconnects",
+    );
+    assert_eq!(started.len(), 1, "{text}");
+    assert_eq!(started[0]["level"], "DEBUG", "{}", started[0]);
+    assert_eq!(
+        started[0]["fields"]["ttl_secs"],
+        SHORT_TTL.as_secs_f64(),
+        "{}",
+        started[0]
+    );
+    assert_eq!(started[0]["span"]["client_id"], client_id, "{}", started[0]);
+
+    let expired = named("Session expired after its TTL; torn down");
+    assert_eq!(expired.len(), 1, "{text}");
+    assert_eq!(expired[0]["level"], "DEBUG", "{}", expired[0]);
+    assert_eq!(expired[0]["span"]["client_id"], client_id, "{}", expired[0]);
+}

@@ -12,9 +12,9 @@
 //! when it opens, before init; [`Sessions::create`] turns a decoded [`InitRequest`] into a
 //! Session keyed by a freshly issued [`ClientId`], born with its creating Connection attached.
 //! A Session holds a *set* of attached Connections — zero or more, never "exactly one" (AD-2).
-//! [`Sessions::detach`] removes one; detaching the last removes the Session from the registry in
-//! the same step and then tears it down through the one explicit teardown path, which Story 5.8
-//! will delay behind a TTL rather than relocate.
+//! [`Sessions::detach`] removes one; detaching the last hands the Session to the one explicit
+//! teardown path — at once on a registry with no TTL, or after the TTL Story 5.8 adds, which
+//! delays that path rather than relocating it.
 //!
 //! # What Story 3.8 adds
 //!
@@ -28,8 +28,8 @@
 //! [`Sessions::with_teardown`] gives the registry a teardown hook: a function called with the
 //! Client ID of every Session the one teardown path releases, last, after the Config and the
 //! registrations are released and outside any lock. The Daemon wires it to the AST Cache, so a
-//! Session's cached Scripts go with it without this crate reaching `hexput-script`. When Story
-//! 5.8 delays teardown behind a TTL, the hook is delayed with it.
+//! Session's cached Scripts go with it without this crate reaching `hexput-script`. Story 5.8
+//! delays teardown behind a TTL, and the hook with it.
 //!
 //! # What Story 5.5 adds
 //!
@@ -47,9 +47,10 @@
 //!
 //! [`Sessions::reconnect`] is the one wire path that attaches a further Connection to a live
 //! Session: it verifies the presented secret with the Session's credential (constant time) and,
-//! when it matches, inserts the Connection under the same shard lock — so a racing
-//! [`Sessions::detach`] either tears the Session down first (and the reconnect is denied) or sees
-//! the new attachment. An unknown Client ID runs the same dummy verify as
+//! when it matches, inserts the Connection under the same shard lock — so whatever removes the
+//! Session (a [`Sessions::detach`] on a registry with no TTL, or [`Sessions::expire`] once Story
+//! 5.8's TTL ran out) either removes it first (and the reconnect is denied) or sees the new
+//! attachment. An unknown Client ID runs the same dummy verify as
 //! [`Sessions::verify_reconnect`] and is denied identically. [`ReconnectRequest`] decodes a
 //! `Reconnect` payload — exactly `client_id` and `reconnect_secret` — from the payload alone,
 //! before any lookup; a carried Config or registrations list is refused, never applied, since the
@@ -67,7 +68,26 @@
 //! its AST Cache entries. What a Connection owns — its request ids, its replies, its host-call
 //! correlation — is never here, so nothing in this crate can deliver one Connection's reply to
 //! another, and no change made through one is announced to the others. [`Sessions::detach`]
-//! removes one Connection alone; the Session goes only with the last one, in any detach order.
+//! removes one Connection alone; the Session can go only once the last one has, in any detach
+//! order (at once with no TTL, else after Story 5.8's countdown).
+//!
+//! # What Story 5.8 adds
+//!
+//! A Session outlives its last Connection by a TTL. [`Sessions::with_ttl`] sets it (the Daemon
+//! passes System Config's `session_ttl_secs`); the registry stays synchronous, so it owns *what*
+//! expires and the caller owns *when*. When the last Connection detaches, [`Sessions::detach`]
+//! marks the Session expiring under a fresh countdown generation and returns an [`Expiry`]; the
+//! caller waits [`Expiry::ttl`] and then calls [`Sessions::expire`], which removes the Session —
+//! under the shard lock, through the same private teardown path and hook as before — only if it
+//! is still unattached *and* still under that generation. A [`Sessions::reconnect`] (or
+//! [`Sessions::attach`]) during the countdown attaches and stops it under the same shard lock, the
+//! Session's Config, registrations, AST Cache entries and reconnect secret untouched; an `Expiry`
+//! from before is stale from then on, even if the Session is orphaned again (each orphaning draws
+//! a new generation). Once expired, the Session is gone from the registry, so a reconnect with its
+//! Client ID is denied exactly like one with an unknown Client ID. While any Connection is
+//! attached no countdown runs. A registry with no TTL ([`Sessions::new`], or a zero TTL) tears
+//! down on the last detach at once, as before — the same path with no delay. There is no reaper:
+//! a countdown is one caller's timer.
 //!
 //! Nothing here is `async`, so no lock of this crate's can be held across an `.await`; nothing
 //! here writes to disk.
@@ -81,6 +101,7 @@ mod reconnect;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -116,6 +137,35 @@ pub struct Session {
     credential: Credential,
     registrations: Vec<RegisteredFunction>,
     connections: HashSet<ConnectionId>,
+    /// The generation of the running TTL countdown (Story 5.8), if one runs: set when the last
+    /// Connection detaches, cleared when one attaches.
+    expiring: Option<u64>,
+}
+
+/// A Session's TTL countdown, started when its last Connection detached (Story 5.8) and returned
+/// by [`Sessions::detach`] — the only way to make one. The holder waits [`ttl`](Self::ttl) and
+/// then hands it to [`Sessions::expire`], which tears the Session down only if this countdown is
+/// still the one running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expiry {
+    client_id: ClientId,
+    ttl: Duration,
+    generation: u64,
+}
+
+impl Expiry {
+    /// The Session this countdown belongs to.
+    #[must_use]
+    pub const fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    /// How long to wait before [`Sessions::expire`]: the registry's TTL when the countdown
+    /// started.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        self.ttl
+    }
 }
 
 /// The registry of live Sessions, keyed by Client ID. One per Daemon run, shared by every
@@ -127,6 +177,10 @@ pub struct Session {
 pub struct Sessions {
     sessions: DashMap<ClientId, Session>,
     next_connection: AtomicU64,
+    /// How long a Session outlives its last Connection (Story 5.8); zero tears down at once.
+    ttl: Duration,
+    /// The next countdown generation; every orphaning draws a new one.
+    next_generation: AtomicU64,
     /// Called with a Session's Client ID when it is torn down (Story 4.3), if set.
     on_teardown: Option<TeardownHook>,
 }
@@ -139,13 +193,16 @@ impl core::fmt::Debug for Sessions {
         f.debug_struct("Sessions")
             .field("sessions", &self.sessions)
             .field("next_connection", &self.next_connection)
+            .field("ttl", &self.ttl)
+            .field("next_generation", &self.next_generation)
             .field("on_teardown", &self.on_teardown.is_some())
             .finish()
     }
 }
 
 impl Sessions {
-    /// An empty registry, with no teardown hook.
+    /// An empty registry, with no teardown hook and no TTL: a Session is torn down when its last
+    /// Connection detaches.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -159,6 +216,18 @@ impl Sessions {
     #[must_use]
     pub fn with_teardown(mut self, hook: impl Fn(ClientId) + Send + Sync + 'static) -> Self {
         self.on_teardown = Some(Arc::new(hook));
+        self
+    }
+
+    /// This registry, keeping a Session whose last Connection detached for `ttl` before it may be
+    /// torn down (Story 5.8): [`detach`](Self::detach) then returns an [`Expiry`] carrying `ttl`
+    /// for the caller to wait out before [`expire`](Self::expire). A zero `ttl` is the default:
+    /// teardown at the last detach, with no `Expiry`. Chains with
+    /// [`with_teardown`](Self::with_teardown) in either order; a later call replaces an earlier
+    /// TTL.
+    #[must_use]
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
         self
     }
 
@@ -199,6 +268,7 @@ impl Sessions {
             credential,
             registrations: init.registrations,
             connections: HashSet::from([connection]),
+            expiring: None,
         };
         loop {
             // The entry holds its shard's lock, so no racing `create` can claim the same id
@@ -222,31 +292,90 @@ impl Sessions {
     /// Nothing on the wire reaches this: the wire path is [`reconnect`](Self::reconnect), which
     /// verifies the reconnect secret first. This unverified form stays for tests and for a
     /// Session with several attachments to be a state the registry supports directly (AD-2).
+    ///
+    /// Attaching to a Session whose TTL countdown runs stops it, under the same shard lock.
     #[must_use]
     pub fn attach(&self, client_id: ClientId, connection: ConnectionId) -> bool {
         match self.sessions.get_mut(&client_id) {
             Some(mut session) => {
                 session.connections.insert(connection);
+                session.expiring = None;
                 true
             }
             None => false,
         }
     }
 
-    /// Detach a Connection from its Session. When it was the last one attached, the Session is
-    /// removed from the registry under the same shard lock as the detach — so no racing
-    /// [`attach`](Self::attach) or [`reconnect`](Self::reconnect) can find a Session on its way
-    /// out — and then torn down, outside any lock.
+    /// Detach a Connection from its Session.
     ///
-    /// Detaching a Connection that is not attached, or from a Session that no longer exists, does
-    /// nothing.
-    pub fn detach(&self, client_id: ClientId, connection: ConnectionId) {
-        let removed = self.sessions.remove_if_mut(&client_id, |_, session| {
-            session.connections.remove(&connection) && session.connections.is_empty()
-        });
-        if let Some((client_id, session)) = removed {
-            teardown(client_id, session, self.on_teardown.as_deref());
+    /// When it was the last one attached and the registry has a TTL (Story 5.8), the Session
+    /// stays live and unattached, its TTL countdown starts under a fresh generation in the same
+    /// shard lock, and the returned [`Expiry`] is the caller's to wait out and hand to
+    /// [`expire`](Self::expire). With no TTL, the Session is removed from the registry under the
+    /// same shard lock as the detach — so no racing [`attach`](Self::attach) or
+    /// [`reconnect`](Self::reconnect) can find a Session on its way out — and then torn down,
+    /// outside any lock; nothing is returned.
+    ///
+    /// Detaching a Connection that is not the last, or is not attached, or from a Session that no
+    /// longer exists, returns `None` and starts no countdown.
+    ///
+    /// Dropping a returned [`Expiry`] instead of handing it to [`expire`](Self::expire) leaves the
+    /// Session unattached and expiring for the registry's whole life: nothing else ends a
+    /// countdown but a reconnect. (Not `#[must_use]`, since on a registry with no TTL nothing is
+    /// ever returned and many callers detach as a statement.)
+    pub fn detach(&self, client_id: ClientId, connection: ConnectionId) -> Option<Expiry> {
+        if self.ttl.is_zero() {
+            let removed = self.sessions.remove_if_mut(&client_id, |_, session| {
+                session.connections.remove(&connection) && session.connections.is_empty()
+            });
+            if let Some((client_id, session)) = removed {
+                teardown(client_id, session, self.on_teardown.as_deref());
+            }
+            return None;
         }
+        let mut session = self.sessions.get_mut(&client_id)?;
+        if !(session.connections.remove(&connection) && session.connections.is_empty()) {
+            return None;
+        }
+        // Uniqueness is all that is needed; the shard lock orders the Session's own state.
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        session.expiring = Some(generation);
+        Some(Expiry {
+            client_id,
+            ttl: self.ttl,
+            generation,
+        })
+    }
+
+    /// End the TTL countdown `expiry` names (Story 5.8): when its Session is still unattached and
+    /// still under that countdown, remove it from the registry under the shard lock and tear it
+    /// down — through the one teardown path and its hook, outside any lock — and return `true`.
+    ///
+    /// Otherwise nothing changes and this returns `false`: the Session was reconnected (so the
+    /// countdown stopped, even if a newer one has since started), or it is already gone. The
+    /// caller decides when the TTL has elapsed; this checks only that the countdown is current.
+    #[must_use]
+    pub fn expire(&self, expiry: &Expiry) -> bool {
+        let removed = self.sessions.remove_if(&expiry.client_id, |_, session| {
+            session.connections.is_empty() && session.expiring == Some(expiry.generation)
+        });
+        match removed {
+            Some((client_id, session)) => {
+                teardown(client_id, session, self.on_teardown.as_deref());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the Session's TTL countdown runs (Story 5.8): `Some(true)` from its last
+    /// Connection's detach until a Connection attaches or it expires; `None` when it does not
+    /// exist.
+    #[must_use]
+    pub fn expiring(&self, client_id: ClientId) -> Option<bool> {
+        self.sessions
+            .get(&client_id)
+            .map(|session| session.expiring.is_some())
     }
 
     /// Whether `secret` is the reconnect secret issued with this Client ID's Session, compared in
@@ -272,12 +401,17 @@ impl Sessions {
     /// secret (Story 5.6), and return whether it did.
     ///
     /// The secret is verified with the Session's credential in constant time, and the Connection
-    /// is inserted under the same shard lock, so a racing [`detach`](Self::detach) of the
-    /// Session's last Connection either removes the Session first — this returns `false` — or
-    /// finds the new attachment and leaves the Session live. An unknown Client ID (never issued,
+    /// is inserted under the same shard lock, so whatever removes the Session — a racing
+    /// [`detach`](Self::detach) of its last Connection on a registry with no TTL, or
+    /// [`expire`](Self::expire) — either removes it first — this returns `false` — or finds the
+    /// new attachment and leaves the Session live. An unknown Client ID (never issued,
     /// or already torn down) is checked against the fixed dummy credential, as in
     /// [`verify_reconnect`](Self::verify_reconnect), and gives `false` like a wrong secret: one
     /// HMAC verify per attempt either way. When this returns `false`, nothing changes.
+    ///
+    /// A reconnect to a Session whose TTL countdown runs (Story 5.8) stops it in the same shard
+    /// lock as the verify; a wrong secret leaves it running. A Session already expired is gone,
+    /// and so denied like an unknown Client ID.
     ///
     /// What is identical between the two denials is the outcome, and so the reply; the timing is
     /// not guaranteed to be — a live Client ID takes its shard's write lock and may wait on it —
@@ -295,6 +429,7 @@ impl Sessions {
             Some(mut session) => {
                 if session.credential.verify(secret) {
                     session.connections.insert(connection);
+                    session.expiring = None;
                     true
                 } else {
                     false
@@ -393,14 +528,14 @@ fn generate_client_id() -> ClientId {
     ClientId::from_bytes(bytes)
 }
 
-/// The one teardown path for a Session, called only by [`Sessions::detach`] once the Session is
-/// already out of the registry — never from a `Drop` impl, never under a lock.
+/// The one teardown path for a Session, called only by [`Sessions::detach`] (no TTL) or
+/// [`Sessions::expire`] (after the TTL, Story 5.8) once the Session is already out of the
+/// registry — never from a `Drop` impl, never under a lock.
 ///
 /// Today it releases the Config, the reconnect credential and the Registered Functions. When
 /// Plugins land (Epic 6), each of the Session's Plugins has its Global Variable store torn down
-/// here through `hexput_globalvar::teardown(plugin_id)` before its actor is dropped (AD-4); when
-/// TTLs land (Story 5.8), the call to this function is delayed, not moved — and the teardown hook
-/// with it.
+/// here through `hexput_globalvar::teardown(plugin_id)` before its actor is dropped (AD-4). Story
+/// 5.8's TTL delays the call to this function, not moves it — and the teardown hook with it.
 ///
 /// The hook, when the registry has one, is called last, with the Session's Client ID (Story 4.3).
 fn teardown(
@@ -413,6 +548,7 @@ fn teardown(
         credential,
         registrations,
         connections,
+        expiring: _,
     } = session;
     debug_assert!(connections.is_empty(), "a Session is torn down unattached");
     drop((config, credential, registrations));

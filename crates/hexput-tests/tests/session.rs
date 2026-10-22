@@ -2,14 +2,16 @@
 //! Stories 3.7 + 3.8: the Config's execution limits, and replacing the Config at runtime.
 //! Story 5.5: the reconnect credential issued at init, and verifying a presented secret.
 //! Story 5.6: reconnecting a Connection to a live Session, and decoding a `Reconnect` payload.
+//! Story 5.8: a Session outlives its last Connection by the TTL, and expires only if still unattached.
 
 use std::collections::HashSet;
 use std::sync::Barrier;
+use std::time::Duration;
 
 use hexput_port::Value;
 use hexput_session::{
-    ClientId, Config, ConnectionId, InitRequest, ReconnectRequest, ReconnectSecret, Sessions,
-    Setting, Settings,
+    ClientId, Config, ConnectionId, Expiry, InitRequest, ReconnectRequest, ReconnectSecret,
+    Sessions, Setting, Settings,
 };
 
 fn s(text: &str) -> Value {
@@ -1334,4 +1336,282 @@ fn a_connection_of_another_session_never_attaches_here() {
     assert!(!sessions.reconnect(id, &other_secret, stranger));
     assert_eq!(sessions.attached(id), Some(3));
     assert_eq!(sessions.attached(other), Some(1));
+}
+
+// --- Story 5.8: a Session outlives its last Connection by the TTL ---
+
+/// The TTL these tests configure. Nothing sleeps: the registry tests call `expire` themselves.
+const TTL: Duration = Duration::from_secs(300);
+
+/// A registry with [`TTL`] whose teardown hook records the Client IDs it is called with.
+fn expiring(torn: &Torn) -> Sessions {
+    let torn = std::sync::Arc::clone(torn);
+    Sessions::new()
+        .with_ttl(TTL)
+        .with_teardown(move |id| torn.lock().unwrap().push(id))
+}
+
+#[test]
+fn a_detach_with_another_connection_still_attached_starts_no_countdown() {
+    // Matrix: busy Session, and a non-last Connection leaving.
+    let torn = Torn::default();
+    let sessions = expiring(&torn);
+    let (id, first) = create(&sessions, valid(&[("getUser", true)]));
+    let second = sessions.connect();
+    assert!(sessions.attach(id, second));
+
+    assert!(
+        sessions.detach(id, first).is_none(),
+        "not the last Connection"
+    );
+    assert!(sessions.contains(id));
+    assert_eq!(sessions.attached(id), Some(1));
+    assert_eq!(sessions.expiring(id), Some(false), "no countdown ever runs");
+    assert!(torn.lock().unwrap().is_empty());
+
+    let expiry = sessions
+        .detach(id, second)
+        .expect("the last Connection leaves");
+    assert_eq!(expiry.client_id(), id);
+}
+
+#[test]
+fn the_last_detach_returns_an_expiry_and_starts_the_countdown_without_tearing_down() {
+    let torn = Torn::default();
+    let sessions = expiring(&torn);
+    let (id, connection) = create(&sessions, valid(&[("getUser", true)]));
+
+    let expiry = sessions
+        .detach(id, connection)
+        .expect("the last Connection leaves");
+    assert_eq!(expiry.client_id(), id);
+    assert_eq!(expiry.ttl(), TTL);
+    assert!(sessions.contains(id), "the Session lives until the TTL");
+    assert_eq!(sessions.expiring(id), Some(true));
+    assert_eq!(sessions.attached(id), Some(0));
+    assert!(torn.lock().unwrap().is_empty(), "no teardown yet");
+    assert_eq!(
+        registrations(&sessions, id),
+        Some(vec![("getUser".to_owned(), true)]),
+        "its state is kept for a reconnect"
+    );
+}
+
+#[test]
+fn expire_tears_the_session_down_once_through_the_hook_and_a_second_expire_is_false() {
+    let torn = Torn::default();
+    let sessions = expiring(&torn);
+    let (id, connection) = create(&sessions, valid(&[]));
+    let expiry = sessions.detach(id, connection).expect("an expiry");
+
+    assert!(sessions.expire(&expiry), "true: torn down now");
+    assert!(!sessions.contains(id));
+    assert_eq!(sessions.expiring(id), None);
+    assert_eq!(sessions.attached(id), None);
+    assert_eq!(registrations(&sessions, id), None);
+    assert_eq!(*torn.lock().unwrap(), vec![id], "the hook is called once");
+
+    assert!(!sessions.expire(&expiry), "a second expire does nothing");
+    assert_eq!(*torn.lock().unwrap(), vec![id]);
+}
+
+#[test]
+fn a_reconnect_during_the_countdown_attaches_stops_it_and_keeps_the_state() {
+    let torn = Torn::default();
+    let sessions = expiring(&torn);
+    let creator = sessions.connect();
+    let (id, secret) = sessions.create(configured(rpc_calls(7)), creator);
+    let settings_before = sessions.settings(id).unwrap();
+    let registrations_before = registrations(&sessions, id);
+    let expiry = sessions.detach(id, creator).expect("an expiry");
+
+    let joiner = sessions.connect();
+    assert!(sessions.reconnect(id, &secret, joiner), "a valid reconnect");
+    assert_eq!(sessions.expiring(id), Some(false), "the countdown stopped");
+    assert_eq!(sessions.attached(id), Some(1));
+    assert_eq!(sessions.settings(id), Some(settings_before), "same Config");
+    assert_eq!(registrations(&sessions, id), registrations_before);
+    assert!(
+        sessions.verify_reconnect(id, &secret),
+        "same reconnect secret"
+    );
+
+    assert!(!sessions.expire(&expiry), "the old countdown does nothing");
+    assert!(sessions.contains(id));
+    assert!(torn.lock().unwrap().is_empty());
+    sessions.detach(id, joiner);
+}
+
+#[test]
+fn a_stale_expiry_from_an_earlier_orphaning_does_nothing_and_the_newer_one_expires() {
+    let sessions = expiring(&Torn::default());
+    let creator = sessions.connect();
+    let (id, secret) = sessions.create(valid(&[]), creator);
+    let first = sessions.detach(id, creator).expect("the first orphaning");
+
+    let joiner = sessions.connect();
+    assert!(sessions.reconnect(id, &secret, joiner));
+    let second = sessions.detach(id, joiner).expect("the second orphaning");
+
+    assert!(!sessions.expire(&first), "a stale generation is refused");
+    assert!(sessions.contains(id), "Session live");
+    assert_eq!(
+        sessions.expiring(id),
+        Some(true),
+        "the newer countdown runs"
+    );
+    assert!(sessions.expire(&second), "the current generation expires");
+    assert!(!sessions.contains(id));
+}
+
+#[test]
+fn a_wrong_secret_during_the_countdown_is_refused_and_the_countdown_keeps_running() {
+    let sessions = expiring(&Torn::default());
+    let creator = sessions.connect();
+    let (id, secret) = sessions.create(valid(&[]), creator);
+    let expiry = sessions.detach(id, creator).expect("an expiry");
+
+    let stranger = sessions.connect();
+    assert!(!sessions.reconnect(id, &altered(&secret), stranger));
+    assert_eq!(
+        sessions.expiring(id),
+        Some(true),
+        "the countdown is untouched"
+    );
+    assert_eq!(sessions.attached(id), Some(0));
+    assert!(sessions.expire(&expiry), "the Session still expires");
+    assert!(!sessions.contains(id));
+}
+
+#[test]
+fn a_session_expired_by_its_ttl_is_refused_a_reconnect_exactly_like_an_unknown_one() {
+    let sessions = expiring(&Torn::default());
+    let creator = sessions.connect();
+    let (id, secret) = sessions.create(valid(&[]), creator);
+    let expiry = sessions.detach(id, creator).expect("an expiry");
+    assert!(sessions.expire(&expiry));
+
+    let stranger = sessions.connect();
+    assert!(!sessions.reconnect(id, &secret, stranger));
+    assert!(!sessions.verify_reconnect(id, &secret));
+    assert!(!sessions.reconnect(ClientId::from_bytes([9; 16]), &secret, stranger));
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_zero_ttl_tears_down_on_the_last_detach_at_once_as_before() {
+    for sessions in [Sessions::new(), Sessions::new().with_ttl(Duration::ZERO)] {
+        let (id, connection) = create(&sessions, valid(&[]));
+        assert!(
+            sessions.detach(id, connection).is_none(),
+            "no countdown, no Expiry"
+        );
+        assert!(!sessions.contains(id));
+        assert_eq!(sessions.expiring(id), None);
+    }
+}
+
+#[test]
+fn with_ttl_and_with_teardown_chain_in_either_order() {
+    let torn = Torn::default();
+    let hook = std::sync::Arc::clone(&torn);
+    let sessions = Sessions::new()
+        .with_teardown(move |id| hook.lock().unwrap().push(id))
+        .with_ttl(TTL);
+    let (id, connection) = create(&sessions, valid(&[]));
+    let expiry = sessions.detach(id, connection).expect("an expiry");
+    assert_eq!(expiry.ttl(), TTL);
+    assert!(torn.lock().unwrap().is_empty());
+    assert!(sessions.expire(&expiry));
+    assert_eq!(*torn.lock().unwrap(), vec![id]);
+}
+
+#[test]
+fn concurrent_reconnects_and_expiries_never_tear_down_an_attached_session() {
+    // Each round: the orphaned Session's countdown fires while a reconnect is in flight. Exactly
+    // one lands: the reconnect (the Session survives, attached) or the expiry (the reconnect is
+    // refused). Never both, never neither, and never a torn-down Session that is attached.
+    let sessions = expiring(&Torn::default());
+    for _ in 0..300 {
+        let creator = sessions.connect();
+        let (id, secret) = sessions.create(valid(&[]), creator);
+        let expiry: Expiry = sessions.detach(id, creator).expect("an expiry");
+        let joiner = sessions.connect();
+        let barrier = Barrier::new(2);
+        let (attached, expired) = std::thread::scope(|scope| {
+            let expirer = scope.spawn(|| {
+                barrier.wait();
+                sessions.expire(&expiry)
+            });
+            barrier.wait();
+            let attached = sessions.reconnect(id, &secret, joiner);
+            (attached, expirer.join().unwrap())
+        });
+        assert!(
+            attached != expired,
+            "exactly one of the reconnect and the expiry lands"
+        );
+        if attached {
+            assert!(sessions.contains(id), "the reconnect won: Session live");
+            assert_eq!(sessions.attached(id), Some(1));
+            let last = sessions.detach(id, joiner).expect("an expiry");
+            assert!(sessions.expire(&last));
+        }
+        assert!(!sessions.contains(id));
+    }
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn an_attach_during_the_countdown_stops_it_too() {
+    let torn = Torn::default();
+    let sessions = expiring(&torn);
+    let (id, creator) = create(&sessions, valid(&[]));
+    let expiry = sessions.detach(id, creator).expect("an expiry");
+
+    let joiner = sessions.connect();
+    assert!(sessions.attach(id, joiner));
+    assert_eq!(sessions.expiring(id), Some(false), "the countdown stopped");
+    assert!(!sessions.expire(&expiry), "the old countdown does nothing");
+    assert!(sessions.contains(id));
+    assert!(torn.lock().unwrap().is_empty());
+
+    let last = sessions.detach(id, joiner).expect("a new countdown");
+    assert!(sessions.expire(&last));
+}
+
+#[test]
+fn concurrent_detaches_and_stale_expiries_never_tear_down_by_the_old_countdown() {
+    // Each round: a stale countdown (its Session since reconnected) fires while the reconnected
+    // Connection detaches, orphaning the Session again. The stale one never lands, whichever runs
+    // first; only the new orphaning's countdown tears the Session down, exactly once.
+    let torn = Torn::default();
+    let sessions = expiring(&torn);
+    for round in 0..300 {
+        let creator = sessions.connect();
+        let (id, secret) = sessions.create(valid(&[]), creator);
+        let stale: Expiry = sessions.detach(id, creator).expect("the first orphaning");
+        let joiner = sessions.connect();
+        assert!(sessions.reconnect(id, &secret, joiner));
+        let barrier = Barrier::new(2);
+        let (fresh, expired) = std::thread::scope(|scope| {
+            let expirer = scope.spawn(|| {
+                barrier.wait();
+                sessions.expire(&stale)
+            });
+            barrier.wait();
+            let fresh = sessions.detach(id, joiner);
+            (fresh, expirer.join().unwrap())
+        });
+        assert!(!expired, "a stale countdown never tears down");
+        assert!(
+            sessions.contains(id),
+            "the Session waits on its new countdown"
+        );
+        assert_eq!(torn.lock().unwrap().len(), round);
+        assert!(sessions.expire(&fresh.expect("the second orphaning")));
+        assert_eq!(torn.lock().unwrap().len(), round + 1);
+        assert!(!sessions.contains(id));
+    }
+    assert!(sessions.is_empty());
 }

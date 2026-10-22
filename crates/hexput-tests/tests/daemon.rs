@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use hexput_daemon::{Discovery, run_with};
 
@@ -484,6 +486,8 @@ struct Serving {
     stop: tokio::sync::oneshot::Sender<()>,
     thread: std::thread::JoinHandle<Run>,
     socket: PathBuf,
+    /// The Daemon's log, readable while it runs (Story 5.8 waits on a line of it).
+    log: SharedLog,
 }
 
 #[cfg(unix)]
@@ -492,25 +496,50 @@ impl Serving {
         let config = sandbox.file("config.toml", config_text);
         let discovery = nothing(sandbox);
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let log = SharedLog::default();
+        let thread_log = log.clone();
         let thread = std::thread::spawn(move || {
             let argv: Vec<OsString> =
                 vec!["hexput-daemon".into(), "--config".into(), config.into()];
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let log = SharedLog::default();
-            let code = run_with(argv, &discovery, &mut out, &mut err, log.clone(), async {
-                let _ = stopped.await;
-            });
+            let code = run_with(
+                argv,
+                &discovery,
+                &mut out,
+                &mut err,
+                thread_log.clone(),
+                async {
+                    let _ = stopped.await;
+                },
+            );
             Run {
                 code: format!("{code:?}"),
                 stdout: String::from_utf8(out).unwrap(),
                 stderr: String::from_utf8(err).unwrap(),
-                log: log.text(),
+                log: thread_log.text(),
             }
         });
         Self {
             stop,
             thread,
             socket: sandbox.socket(),
+            log,
+        }
+    }
+
+    /// The log, once `needle` appears in it; panics if the Daemon stops first or after 10 s.
+    fn log_with(&self, needle: &str) -> String {
+        let started = Instant::now();
+        loop {
+            let text = self.log.text();
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10) && !self.thread.is_finished(),
+                "never logged `{needle}`; log:\n{text}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -3975,4 +4004,162 @@ mod named_pipe_serving {
         );
         assert!(!sandbox.socket().exists(), "nothing is bound");
     }
+}
+
+// --- Story 5.8: a Session outlives its last Connection by session_ttl_secs ---
+
+/// An `Init` envelope's reply payload carries the Client ID and the reconnect secret, in order.
+#[cfg(unix)]
+fn credentials_of(reply: &hexput_port::Envelope<hexput_port::Value>) -> (String, String) {
+    use hexput_port::MessageType;
+
+    assert_eq!(
+        reply.message_type,
+        MessageType::Result,
+        "{:?}",
+        reply.payload
+    );
+    let fields = reply.payload.as_map().expect("a map payload");
+    (
+        fields[0].1.as_str().expect("a Client ID").to_owned(),
+        fields[1].1.as_str().expect("a reconnect secret").to_owned(),
+    )
+}
+
+/// A `Reconnect` request as `id` carrying `client_id` and `secret`.
+#[cfg(unix)]
+fn reconnect_request(
+    id: u64,
+    client_id: &str,
+    secret: &str,
+) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::Reconnect,
+        Value::Map(vec![
+            (Value::from("client_id"), Value::from(client_id)),
+            (Value::from("reconnect_secret"), Value::from(secret)),
+        ]),
+    )
+}
+
+/// Story 5.8, over the socket: with `session_ttl_secs = 2` a Session whose last Connection left
+/// stays resumable for two seconds. A reconnect inside them resumes it with its cached Script
+/// intact, and the first countdown never tears it down while that Connection is attached. Once the Session expires, a reconnect is `protocol.reconnect_denied` exactly like an
+/// unknown Client ID, and an `Init` on that same connection creates a fresh Session.
+#[cfg(unix)]
+#[test]
+fn a_session_expires_one_ttl_after_its_last_connection_and_a_reconnect_before_that_resumes_it() {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let sandbox = Sandbox::new();
+    let config = format!(
+        "log_level = \"debug\"\nsession_ttl_secs = 2\n{}",
+        sandbox.valid()
+    );
+    let serving = Serving::start(&sandbox, &config);
+
+    let mut first = serving.connect();
+    wire::send(&mut first, &init_envelope(1));
+    let (client_id, secret) = credentials_of(&wire::reply(&mut first).expect("an init reply"));
+
+    let register = Envelope::new(
+        CorrelationId(2),
+        MessageType::CodeRegister,
+        Value::Map(vec![(Value::from("source"), Value::from("return 42;"))]),
+    );
+    wire::send(&mut first, &register);
+    let registered = wire::reply(&mut first).expect("a registration reply");
+    let handle = registered
+        .payload
+        .as_map()
+        .expect("a map payload")
+        .iter()
+        .find(|(key, _)| key.as_str() == Some("handle"))
+        .and_then(|(_, value)| value.as_str())
+        .expect("a handle")
+        .to_owned();
+
+    // The last Connection leaves: the countdown starts.
+    drop(first);
+    serving.log_with("the Session expires after its TTL unless a Connection reconnects");
+
+    // Inside the TTL, a reconnect resumes the Session and its cached Script still runs.
+    let mut second = serving.connect();
+    wire::send(&mut second, &reconnect_request(3, &client_id, &secret));
+    let resumed = wire::reply(&mut second).expect("a reconnect reply");
+    assert_eq!(
+        resumed.message_type,
+        MessageType::Result,
+        "{:?}",
+        resumed.payload
+    );
+    wire::send(&mut second, &cached_run_request(4, &handle));
+    let answer = wire::reply(&mut second).expect("an execution reply");
+    assert_eq!(
+        answer.message_type,
+        MessageType::Result,
+        "{:?}",
+        answer.payload
+    );
+    // Past the first countdown's end, while `second` is attached: it did nothing.
+    const EXPIRED: &str = "Session expired after its TTL; torn down";
+    const STARTED: &str = "the Session expires after its TTL unless a Connection reconnects";
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert!(
+        !serving.log.text().contains(EXPIRED),
+        "the first countdown tore down an attached Session"
+    );
+    wire::send(&mut second, &cached_run_request(8, &handle));
+    let again = wire::reply(&mut second).expect("an execution reply");
+    assert_eq!(
+        again.message_type,
+        MessageType::Result,
+        "{:?}",
+        again.payload
+    );
+
+    // The last Connection leaves again: a new countdown, which is the one that expires it.
+    drop(second);
+    let log = serving.log_with(EXPIRED);
+    assert_eq!(log.matches(EXPIRED).count(), 1, "{log}");
+    assert_eq!(log.matches(STARTED).count(), 2, "{log}");
+    assert!(
+        log.rfind(STARTED) < log.find(EXPIRED),
+        "the expiry follows the second countdown's start: {log}"
+    );
+
+    let mut third = serving.connect();
+    wire::send(&mut third, &reconnect_request(5, &client_id, &secret));
+    let torn = wire::reply(&mut third).expect("a denial");
+    wire::send(
+        &mut third,
+        &reconnect_request(6, "00000000000000000000000000000000", &secret),
+    );
+    let unknown = wire::reply(&mut third).expect("a denial");
+    assert_eq!(torn.message_type, MessageType::Error);
+    assert_eq!(
+        torn.payload, unknown.payload,
+        "identical to an unknown Client ID"
+    );
+    let code = torn
+        .payload
+        .as_map()
+        .expect("an error payload is a map")
+        .iter()
+        .find(|(key, _)| key.as_str() == Some("code"))
+        .and_then(|(_, value)| value.as_str())
+        .expect("a code");
+    assert_eq!(code, "protocol.reconnect_denied");
+
+    // Not fatal: the same connection may `Init` a fresh Session.
+    wire::send(&mut third, &init_envelope(7));
+    let (fresh, _) = credentials_of(&wire::reply(&mut third).expect("an init reply"));
+    assert_ne!(fresh, client_id);
+    drop(third);
+
+    let run = serving.stop();
+    run.exit(0);
 }

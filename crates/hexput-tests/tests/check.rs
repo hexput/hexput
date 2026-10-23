@@ -3,8 +3,8 @@
 //! The pass promises no false positives: if it reports something, that code really does fail
 //! when it is reached. Half the tests here exist to pin the cases where it must stay quiet.
 
-use hexput_check::{Code, Environment, Findings, Outcome, Policy, Severity, check};
-use hexput_parser::parse;
+use hexput_check::{Code, Environment, Findings, Outcome, Policy, Severity, check, check_plugin};
+use hexput_parser::{parse, parse_plugin};
 
 /// Environments and policies the sweep below borrows by reference. The environments are
 /// `LazyLock` statics rather than consts because `Environment::new` is not a `const fn`.
@@ -1168,4 +1168,168 @@ mod method_toggle {
             &NO_RPC
         ));
     }
+}
+
+// --- Story 6.3: the Plugin-only pass (`check_plugin`, AD-8) ---
+
+/// Check the Plugin `source` as a registration does: `events` the declared Event names (`None`:
+/// no list supplied), `callables` the Registered Function names, and `policy` the toggles.
+fn plugin_findings(
+    source: &str,
+    events: Option<&[&str]>,
+    callables: &[&str],
+    policy: &Policy,
+) -> Findings {
+    let program = parse_plugin(source).expect("the Plugin source parses");
+    let mut environment =
+        Environment::new().with_callables(callables.iter().map(|name| (*name).to_owned()));
+    if let Some(events) = events {
+        environment = environment.with_events(events.iter().map(|name| (*name).to_owned()));
+    }
+    check_plugin(&program, &environment, policy)
+}
+
+/// A Plugin named `x` whose handler for `Ping` is `body` after its parameter `p`.
+fn handler(body: &str) -> String {
+    format!("plugin {{ name = \"x\" }}\n@Event(Ping) fn h(p) {{ {body} }}")
+}
+
+#[test]
+fn a_global_nothing_reads_is_exempt_from_unused_under_the_plugin_check() {
+    let found = plugin_findings(
+        "plugin { name = \"x\" }\nlet a = 1;\n@Event(Ping) fn h(p) { return 1; }",
+        Some(&["Ping"]),
+        &[],
+        &Policy::new(),
+    );
+    assert_eq!(codes(&found), Vec::<&str>::new());
+    assert_eq!(found.outcome(), Outcome::Clean);
+}
+
+#[test]
+fn a_handler_nothing_calls_is_exempt_from_unused_under_the_plugin_check() {
+    let found = plugin_findings(&handler("return 1;"), Some(&["Ping"]), &[], &Policy::new());
+    assert_eq!(codes(&found), Vec::<&str>::new());
+}
+
+#[test]
+fn a_helper_nothing_reads_is_still_unused_under_the_plugin_check() {
+    let found = plugin_findings(
+        "plugin { name = \"x\" }\n@Event(Ping) fn h(p) { return 1; };\nfn helper() { return 2; }",
+        Some(&["Ping"]),
+        &[],
+        &Policy::new(),
+    );
+    assert_eq!(codes(&found), ["reference.unused_variable"]);
+    assert!(!found.has_errors());
+}
+
+#[test]
+fn an_undeclared_event_finding_takes_its_place_in_source_order_among_the_others() {
+    let found = plugin_findings(
+        "plugin { name = \"x\" }\n@Event(Typo) fn a(p) { return 1; };\nfn helper() { return 2; }",
+        Some(&["Ping"]),
+        &[],
+        &Policy::new(),
+    );
+    assert_eq!(
+        codes(&found),
+        ["reference.undeclared_event", "reference.unused_variable"]
+    );
+}
+
+#[test]
+fn an_unused_local_inside_a_handler_is_still_reported() {
+    let found = plugin_findings(
+        &handler("let u = 1; return 1;"),
+        Some(&["Ping"]),
+        &[],
+        &Policy::new(),
+    );
+    assert_eq!(codes(&found), ["reference.unused_variable"]);
+}
+
+#[test]
+fn a_handler_for_an_undeclared_event_is_a_warning_spanned_on_its_name() {
+    let source = handler("return 1;").replace("Ping", "Typo");
+    let found = plugin_findings(&source, Some(&["OrderPlaced"]), &[], &Policy::new());
+    assert_eq!(codes(&found), ["reference.undeclared_event"]);
+    let finding = &found.diagnostics()[0];
+    assert_eq!(finding.severity, Severity::Warning);
+    assert_eq!(
+        finding.message,
+        "`Typo` is not an Event the Backend declared; this handler never runs"
+    );
+    assert_eq!(finding.span.offset, source.find("Typo").unwrap());
+    assert_eq!(found.outcome(), Outcome::Warnings);
+    assert!(!found.has_errors(), "a warning can never reject a Plugin");
+}
+
+#[test]
+fn a_handler_for_a_declared_event_is_silent() {
+    let found = plugin_findings(&handler("return 1;"), Some(&["Ping"]), &[], &Policy::new());
+    assert_eq!(codes(&found), Vec::<&str>::new());
+}
+
+#[test]
+fn no_events_list_suppresses_the_undeclared_event_finding_entirely() {
+    let source = handler("return 1;").replace("Ping", "Typo");
+    let found = plugin_findings(&source, None, &[], &Policy::new());
+    assert_eq!(codes(&found), Vec::<&str>::new());
+    assert_eq!(found.outcome(), Outcome::Clean);
+}
+
+#[test]
+fn an_empty_events_list_declares_nothing_so_every_ordinary_handler_is_undeclared() {
+    let found = plugin_findings(&handler("return 1;"), Some(&[]), &[], &Policy::new());
+    assert_eq!(codes(&found), ["reference.undeclared_event"]);
+}
+
+#[test]
+fn backend_registered_init_is_never_reported_as_undeclared() {
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return 1; }";
+    let found = plugin_findings(source, Some(&[]), &[], &Policy::new());
+    assert_eq!(codes(&found), Vec::<&str>::new());
+}
+
+#[test]
+fn an_unknown_call_in_a_handler_is_an_error_against_a_listed_callable_set() {
+    let source = handler("return g();");
+    let found = plugin_findings(&source, Some(&["Ping"]), &["warn"], &Policy::new());
+    assert_eq!(codes(&found), ["capability.unknown_function"]);
+    assert!(found.has_errors());
+
+    // An empty list is "nothing but local functions is callable", not "no list".
+    let empty = plugin_findings(&source, Some(&["Ping"]), &[], &Policy::new());
+    assert_eq!(codes(&empty), ["capability.unknown_function"]);
+
+    // A listed name is silent.
+    let listed = plugin_findings(&source, Some(&["Ping"]), &["g"], &Policy::new());
+    assert_eq!(codes(&listed), Vec::<&str>::new());
+}
+
+#[test]
+fn an_undeclared_identifier_in_a_handler_is_the_same_pass_as_a_script() {
+    let found = plugin_findings(&handler("return x;"), Some(&["Ping"]), &[], &Policy::new());
+    assert_eq!(codes(&found), ["reference.undeclared_identifier"]);
+    assert!(found.has_errors());
+}
+
+#[test]
+fn a_global_read_by_a_handler_is_clean() {
+    let source = "plugin { name = \"x\" }\nlet total = 1;\n@Event(Ping) fn h(p) { return total; }";
+    let found = plugin_findings(source, Some(&["Ping"]), &[], &Policy::new());
+    assert_eq!(codes(&found), Vec::<&str>::new());
+}
+
+#[test]
+fn a_construct_the_policy_disables_is_reported_inside_a_handler() {
+    let found = plugin_findings(
+        &handler("while (false) { }; return 1;"),
+        Some(&["Ping"]),
+        &[],
+        &NO_LOOPS,
+    );
+    assert_eq!(codes(&found), ["policy.construct_disabled"]);
+    assert!(found.has_errors());
 }

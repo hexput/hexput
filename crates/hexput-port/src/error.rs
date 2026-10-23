@@ -36,9 +36,11 @@ pub enum ProtocolCode {
     UnexpectedMessage,
     /// A request payload the Daemon cannot accept: an `Init`, `Reconnect`, `ConfigUpdate`,
     /// `ExecutionStart`, `CodeRegister`, `CachedExecutionStart`, `CodeUnregister` or
-    /// `PluginRegister` with a missing, mistyped, unknown or repeated key (a `Reconnect` carrying `config` or
-    /// `registrations` included, or a Client ID or secret not of its hex form), a malformed or
-    /// duplicate registration, a starting variable that is not a §2 identifier, or a value with
+    /// `PluginRegister` with a missing, mistyped, unknown or repeated key (a `Reconnect` carrying
+    /// `config` or `registrations` included, or a Client ID or secret not of its hex form), a
+    /// malformed or duplicate registration, a malformed `PluginRegister.events` declaration (a
+    /// name that is not a §2 identifier, repeated or reserved, or a `returns` that is not a return
+    /// shape), a starting variable that is not a §2 identifier, or a value with
     /// no lossless Hexput representation. The message names the offending key, index or path.
     /// Nothing runs, and a refused `ConfigUpdate` changes nothing.
     InvalidPayload,
@@ -66,6 +68,10 @@ pub enum ProtocolCode {
     /// Names are unique per Client ID — compared exactly, by bytes — not Daemon-wide. Nothing is
     /// registered and the Session's existing Plugin is untouched.
     DuplicatePluginName,
+    /// A fire of an Event the Plugin's registration did not declare (Story 6.3, FR-19), naming
+    /// the Event (bounded) — or of `BackendRegisteredInit`, which is reserved and which a Backend
+    /// can never fire. Nothing runs.
+    UndeclaredEvent,
 }
 
 impl ProtocolCode {
@@ -88,6 +94,7 @@ impl ProtocolCode {
         Self::UnknownScriptHandle,
         Self::ReconnectDenied,
         Self::DuplicatePluginName,
+        Self::UndeclaredEvent,
     ];
 
     /// The code's stable string form.
@@ -108,6 +115,7 @@ impl ProtocolCode {
             Self::UnknownScriptHandle => "protocol.unknown_script_handle",
             Self::ReconnectDenied => "protocol.reconnect_denied",
             Self::DuplicatePluginName => "protocol.duplicate_plugin_name",
+            Self::UndeclaredEvent => "protocol.undeclared_event",
         }
     }
 }

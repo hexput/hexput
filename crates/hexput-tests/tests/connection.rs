@@ -6624,9 +6624,20 @@ fn serve_plugins(
     (written, left)
 }
 
-/// A `PluginRegister` request for `source`.
+/// A `PluginRegister` request for `source` declaring no custom Events (`events: {}`).
 fn plugin_register(id: u64, source: &str) -> Received {
-    plugin_register_payload(id, Value::Map(vec![(string("source"), string(source))]))
+    plugin_register_declaring(id, source, Value::Map(vec![]))
+}
+
+/// A `PluginRegister` request for `source` declaring `events`.
+fn plugin_register_declaring(id: u64, source: &str, events: Value) -> Received {
+    plugin_register_payload(
+        id,
+        Value::Map(vec![
+            (string("source"), string(source)),
+            (string("events"), events),
+        ]),
+    )
 }
 
 /// A `PluginRegister` request carrying `payload`, whatever it is.
@@ -6706,6 +6717,44 @@ fn bad_plugin_payloads() -> Vec<(Value, Option<&'static str>)> {
         ),
         (Value::from(1), None),
         (Value::Map(vec![(Value::from(1), string(&source))]), None),
+        // Story 6.3: `events` is required, and a declaration is refused naming its path.
+        (
+            Value::Map(vec![(string("source"), string(&source))]),
+            Some("events"),
+        ),
+        (
+            Value::Map(vec![
+                (string("source"), string(&source)),
+                (string("events"), Value::Nil),
+            ]),
+            Some("events"),
+        ),
+        (
+            Value::Map(vec![
+                (string("source"), string(&source)),
+                (
+                    string("events"),
+                    Value::Map(vec![(
+                        string("OrderPlaced"),
+                        Value::Map(vec![(string("returns"), string("{ a: f() }"))]),
+                    )]),
+                ),
+            ]),
+            Some("events.OrderPlaced.returns"),
+        ),
+        (
+            Value::Map(vec![
+                (string("source"), string(&source)),
+                (
+                    string("events"),
+                    Value::Map(vec![(
+                        string("BackendRegisteredInit"),
+                        Value::Map(vec![(string("returns"), string("null"))]),
+                    )]),
+                ),
+            ]),
+            Some("BackendRegisteredInit"),
+        ),
     ]
 }
 
@@ -7049,4 +7098,345 @@ fn a_plugin_registration_is_logged_at_debug_under_its_request_and_a_failure_name
         failure[0]
     );
     assert_eq!(failure[0]["span"]["id"], "8", "{}", failure[0]);
+}
+
+// --- Story 6.3: Event declarations, and the static check at Plugin registration ---
+
+/// The codes of the `findings` a reply carries, in order; empty when it carries none.
+fn finding_codes(response: &Envelope<Value>) -> Vec<String> {
+    let Some(Value::Array(findings)) = field_of(response, "findings") else {
+        return Vec::new();
+    };
+    findings
+        .iter()
+        .map(|finding| {
+            let Value::Map(fields) = finding else {
+                panic!("a finding is a map: {finding:?}");
+            };
+            fields
+                .iter()
+                .find(|(key, _)| key.as_str() == Some("code"))
+                .and_then(|(_, value)| value.as_str())
+                .expect("a finding has a code")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// `events` declaring `Ping` (the Event every [`plugin_source`] handler binds) and `OrderPlaced`
+/// keyed.
+fn declared_events() -> Value {
+    Value::Map(vec![
+        (
+            string("OrderPlaced"),
+            Value::Map(vec![
+                (string("returns"), string("{ points: 0 }")),
+                (string("keyed"), Value::Boolean(true)),
+            ]),
+        ),
+        (
+            string("Ping"),
+            Value::Map(vec![(string("returns"), string("null"))]),
+        ),
+    ])
+}
+
+/// A Plugin named `x` whose `Ping` handler calls `g`, which no Session registers.
+fn calling_unregistered() -> String {
+    "plugin { name = \"x\" }\n@Event(Ping) fn h(p) { return g(); }".to_owned()
+}
+
+#[test]
+fn a_plugin_without_events_is_refused_naming_events_and_no_name_is_reserved() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        backend.send(plugin_register_payload(
+            2,
+            Value::Map(vec![(string("source"), string(&plugin_source("x")))]),
+        ));
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(code_of(&reply), "protocol.invalid_payload");
+        assert!(
+            message_of(&reply).contains("events"),
+            "{}",
+            message_of(&reply)
+        );
+        assert_eq!(plugin_id_of(&sessions, client_id, "x"), None);
+        assert_eq!(sessions.plugins(client_id), Some(vec![]));
+        backend.close();
+        finished(serving).await;
+    });
+    assert_eq!(plugins.len(), 0);
+}
+
+#[test]
+fn a_plugin_declaring_its_events_is_held_with_them() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        backend.send(plugin_register_declaring(
+            2,
+            &plugin_source("x"),
+            declared_events(),
+        ));
+        let reply = backend.next().await;
+        assert_eq!(name_of(&reply), "x");
+        let id = plugin_id_of(&sessions, client_id, "x").expect("the Session holds x");
+        let plugin = plugins.get(client_id, id).expect("the Plugin is held");
+        assert_eq!(plugin.events().len(), 2);
+        assert!(plugin.event("OrderPlaced").unwrap().keyed);
+        assert!(!plugin.event("Ping").unwrap().keyed);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn check_warn_answers_the_name_with_its_findings_and_a_later_off_registration_answers_the_name_alone()
+ {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_configured(check_of(string("warn")), &[]),
+            false,
+        )
+        .await;
+        let typo = plugin_source("x").replace("Ping", "Typo");
+        backend.send(plugin_register_declaring(
+            2,
+            &typo,
+            Value::Map(vec![(
+                string("Ping"),
+                Value::Map(vec![(string("returns"), string("null"))]),
+            )]),
+        ));
+        let reply = backend.next().await;
+        assert_eq!(
+            reply.message_type,
+            MessageType::Result,
+            "{:?}",
+            reply.payload
+        );
+        assert_eq!(field_of(&reply, "name"), Some(string("x")));
+        assert_eq!(finding_codes(&reply), ["reference.undeclared_event"]);
+
+        // The Session's live Config is read per registration: `off` answers the name alone.
+        backend.send(config_update(3, check_of(string("off"))));
+        assert_eq!(backend.next().await.message_type, MessageType::Result);
+        backend.send(plugin_register_declaring(
+            4,
+            &typo.replace("\"x\"", "\"y\""),
+            Value::Map(vec![(
+                string("Ping"),
+                Value::Map(vec![(string("returns"), string("null"))]),
+            )]),
+        ));
+        assert_eq!(name_of(&backend.next().await), "y");
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn check_error_after_a_config_update_rejects_then_an_off_update_accepts_the_same_source() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        // Init leaves the check off; the Config is updated to `error` afterwards.
+        backend.send(config_update(2, check_of(string("error"))));
+        assert_eq!(backend.next().await.message_type, MessageType::Result);
+
+        backend.send(plugin_register_declaring(
+            3,
+            &calling_unregistered(),
+            declared_events(),
+        ));
+        let refusal = backend.next().await;
+        assert_eq!(refusal.id, Some(CorrelationId(3)));
+        assert_eq!(code_of(&refusal), "capability.unknown_function");
+        assert_eq!(finding_codes(&refusal), ["capability.unknown_function"]);
+        assert_eq!(
+            plugin_id_of(&sessions, client_id, "x"),
+            None,
+            "a rejected Plugin reserves nothing"
+        );
+
+        backend.send(config_update(4, check_of(string("off"))));
+        assert_eq!(backend.next().await.message_type, MessageType::Result);
+        backend.send(plugin_register_declaring(
+            5,
+            &calling_unregistered(),
+            declared_events(),
+        ));
+        assert_eq!(name_of(&backend.next().await), "x");
+        assert!(plugin_id_of(&sessions, client_id, "x").is_some());
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn check_off_answers_the_name_alone_for_a_handler_of_an_undeclared_event() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let typo = plugin_source("x").replace("Ping", "Typo");
+        backend.send(plugin_register(2, &typo));
+        let reply = backend.next().await;
+        assert_eq!(name_of(&reply), "x");
+        assert_eq!(field_of(&reply, "findings"), None);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+/// The reply to registering [`calling_unregistered`]'s Plugin on a Session initialized with
+/// `init_payload`, under check `error`.
+fn plugin_calling_g_under(init_payload: Value) -> Envelope<Value> {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let mut answered = None;
+    on_runtime(async {
+        let (mut backend, serving, _client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload, false).await;
+        backend.send(plugin_register_declaring(
+            2,
+            &calling_unregistered(),
+            declared_events(),
+        ));
+        answered = Some(backend.next().await);
+        backend.close();
+        finished(serving).await;
+    });
+    answered.expect("the registration was answered")
+}
+
+#[test]
+fn a_registered_function_of_the_session_is_callable_under_the_plugin_check() {
+    let reply = plugin_calling_g_under(init_configured(check_of(string("error")), &[("g", false)]));
+    assert_eq!(reply.message_type, MessageType::Result, "{reply:?}");
+    assert_eq!(name_of(&reply), "x");
+    assert_eq!(field_of(&reply, "findings"), None);
+}
+
+#[test]
+fn a_registered_method_of_the_same_name_is_not_callable_under_the_plugin_check() {
+    let method = Value::Map(vec![
+        (string("name"), string("g")),
+        (string("key"), string("User")),
+    ]);
+    let reply = plugin_calling_g_under(Value::Map(vec![
+        (string("config"), check_of(string("error"))),
+        (string("registrations"), Value::Array(vec![method])),
+    ]));
+    assert_eq!(reply.message_type, MessageType::Error, "{reply:?}");
+    assert_eq!(code_of(&reply), "capability.unknown_function");
+}
+
+#[test]
+fn the_sessions_feature_toggles_reach_the_plugin_check() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let config = by_key(&[
+            ("check", string("error")),
+            ("features", by_key(&[("loops", Value::Boolean(false))])),
+        ]);
+        let (mut backend, serving, _client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_configured(config, &[]),
+            false,
+        )
+        .await;
+        let looping =
+            "plugin { name = \"x\" }\n@Event(Ping) fn h(p) { while (false) {}; return 1; }";
+        backend.send(plugin_register_declaring(2, looping, declared_events()));
+        let refusal = backend.next().await;
+        assert_eq!(
+            code_of(&refusal),
+            "policy.construct_disabled",
+            "{refusal:?}"
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_plugin_rejected_by_the_static_check_is_logged_at_debug_under_its_request_with_its_findings() {
+    let log = Captured::default();
+    let writer = log.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(writer))
+            .finish(),
+    );
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let runtime = wired_runtime();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let (mut backend, serving, _client_id) = connect_with_plugins(
+                &sessions,
+                &cache,
+                &plugins,
+                init_configured(check_of(string("error")), &[]),
+                false,
+            )
+            .await;
+            backend.send(plugin_register_declaring(
+                9,
+                &calling_unregistered(),
+                declared_events(),
+            ));
+            assert_eq!(
+                code_of(&backend.next().await),
+                "capability.unknown_function"
+            );
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let rejected: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["message"] == "rejected by the static check")
+        .collect();
+    assert_eq!(rejected.len(), 1, "{text}");
+    let event = &rejected[0];
+    assert_eq!(event["level"], "DEBUG", "{event}");
+    assert_eq!(
+        event["fields"]["code"], "capability.unknown_function",
+        "{event}"
+    );
+    assert_eq!(event["fields"]["findings"], 1, "{event}");
+    assert_eq!(event["span"]["name"], "request", "{event}");
+    assert_eq!(event["span"]["id"], "9", "{event}");
 }

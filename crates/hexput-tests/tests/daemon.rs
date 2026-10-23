@@ -4687,7 +4687,8 @@ fn plugin_init(id: u64) -> hexput_port::Envelope<hexput_port::Value> {
     )
 }
 
-/// Story 6.2: a `PluginRegister` request for `source`.
+/// Story 6.2: a `PluginRegister` request for `source`, declaring no custom Events (Story 6.3:
+/// `events` is required, so `{}` is the explicit "none").
 #[cfg(unix)]
 fn plugin_register_envelope(id: u64, source: &str) -> hexput_port::Envelope<hexput_port::Value> {
     use hexput_port::{CorrelationId, Envelope, MessageType, Value};
@@ -4695,7 +4696,10 @@ fn plugin_register_envelope(id: u64, source: &str) -> hexput_port::Envelope<hexp
     Envelope::new(
         CorrelationId(id),
         MessageType::PluginRegister,
-        Value::Map(vec![(Value::from("source"), Value::from(source))]),
+        Value::Map(vec![
+            (Value::from("source"), Value::from(source)),
+            (Value::from("events"), Value::Map(vec![])),
+        ]),
     )
 }
 

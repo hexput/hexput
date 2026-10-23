@@ -1,5 +1,5 @@
 use hexput_ast::*;
-use hexput_parser::{parse, parse_plugin};
+use hexput_parser::{parse, parse_plugin, parse_shape};
 use hexput_shared::diagnostics::{Category, Code, Diagnostic};
 
 fn root(p: &Program) -> ExprId {
@@ -2306,4 +2306,174 @@ fn every_plugin_code_spans_the_offending_source() {
         rejected(source, Code::DUPLICATE_METADATA_KEY).span.offset,
         source.rfind("name").unwrap()
     );
+}
+
+// --- Story 6.3: return shapes are Hexput literals used as templates (Decision 2) ---
+
+/// The node `id` names in `shape`. The only place these tests depend on how `ShapeId` is spelled.
+fn node(shape: &Shape, id: ShapeId) -> &ShapeNode {
+    &shape.nodes[id.index()]
+}
+
+/// Parses `source` as a return shape, which must be accepted.
+fn shape(source: &str) -> Shape {
+    match parse_shape(source) {
+        Ok(shape) => shape,
+        Err(d) => panic!("{source:?}: {d}"),
+    }
+}
+
+/// Refuses `source` as a return shape, returning the diagnostic.
+fn shape_refused(source: &str) -> Diagnostic {
+    match parse_shape(source) {
+        Ok(_) => panic!("{source:?}: accepted, expected a refusal"),
+        Err(d) => d,
+    }
+}
+
+#[test]
+fn every_literal_and_collection_form_of_a_shape_is_accepted() {
+    for source in [
+        "null",
+        "true",
+        "false",
+        "\"\"",
+        "0",
+        "-1",
+        "1.5",
+        "{}",
+        "[]",
+        "[null]",
+        "[{ a: 1 }]",
+        "{ points: 0, tags: [\"\"], note: null }",
+        "{ a: { b: { c: true } } }",
+    ] {
+        shape(source);
+    }
+}
+
+#[test]
+fn a_literal_says_its_type_null_says_any_and_brackets_say_arrays_and_objects() {
+    let any = shape("null");
+    assert!(matches!(node(&any, any.root), ShapeNode::Any));
+
+    let string = shape("\"\"");
+    assert!(matches!(node(&string, string.root), ShapeNode::String));
+
+    let number = shape("-1");
+    assert!(matches!(node(&number, number.root), ShapeNode::Number));
+
+    let boolean = shape("false");
+    assert!(matches!(node(&boolean, boolean.root), ShapeNode::Boolean));
+
+    let empty_array = shape("[]");
+    assert!(matches!(
+        node(&empty_array, empty_array.root),
+        ShapeNode::Array(None)
+    ));
+
+    let typed_array = shape("[true]");
+    let ShapeNode::Array(Some(element)) = node(&typed_array, typed_array.root) else {
+        panic!("[t] is an array of t");
+    };
+    assert!(matches!(node(&typed_array, *element), ShapeNode::Boolean));
+
+    let empty_object = shape("{}");
+    assert!(matches!(
+        node(&empty_object, empty_object.root),
+        ShapeNode::Object(fields) if fields.is_empty()
+    ));
+}
+
+#[test]
+fn a_shape_is_a_flat_arena_whose_object_keys_keep_their_source_order() {
+    let s = shape("{ points: 0, tags: [\"\"], note: null }");
+    let ShapeNode::Object(fields) = node(&s, s.root) else {
+        panic!("an object shape");
+    };
+    let keys: Vec<&str> = fields.iter().map(|(key, _)| key.as_str()).collect();
+    assert_eq!(keys, ["points", "tags", "note"]);
+    assert!(matches!(node(&s, fields[0].1), ShapeNode::Number));
+    let ShapeNode::Array(Some(element)) = node(&s, fields[1].1) else {
+        panic!("tags is [t]");
+    };
+    assert!(matches!(node(&s, *element), ShapeNode::String));
+    assert!(matches!(node(&s, fields[2].1), ShapeNode::Any));
+}
+
+#[test]
+fn a_node_that_is_not_a_literal_or_collection_is_syntax_invalid_shape_on_that_node() {
+    let call = shape_refused("{ a: f() }");
+    assert_eq!(call.category, Category::Syntax);
+    assert_eq!(call.code, Code::INVALID_SHAPE);
+    assert_eq!(call.span.offset, 5, "spanned on the call `f()`");
+
+    for source in [
+        "x",
+        "1 + 2",
+        "f()",
+        "\"a\" + \"b\"",
+        "[1, 2]",
+        "{ a: x }",
+        "[[1], x]",
+    ] {
+        let d = shape_refused(source);
+        assert_eq!(d.code, Code::INVALID_SHAPE, "{source:?}: {d}");
+        assert_eq!(d.category, Category::Syntax, "{source:?}");
+    }
+    let bare = shape_refused("x");
+    assert_eq!(bare.span.offset, 0, "spanned on the offending identifier");
+
+    // An operator other than `-` before a number literal, a group, and a function are refused.
+    for source in ["-x", "-\"a\"", "-(1)", "!true", "(1)", "fn() {}"] {
+        let d = shape_refused(source);
+        assert_eq!(d.code, Code::INVALID_SHAPE, "{source:?}: {d}");
+    }
+    assert!(
+        shape_refused("-x")
+            .message
+            .contains("`-` directly before a number literal"),
+        "the message says what a negation may hold"
+    );
+
+    // Each refusal is spanned on its node: a tuple on the whole array, which starts before any of
+    // its elements, so it is the first node in source order that is not a shape.
+    for (source, offset) in [
+        ("{ a: [1, 2] }", 5),
+        ("[f(), 2]", 0),
+        ("[[1], x]", 0),
+        ("{ a: -x }", 5),
+        ("{ a: !true }", 5),
+        ("{ a: (1) }", 5),
+        ("[[x]]", 2),
+    ] {
+        assert_eq!(shape_refused(source).span.offset, offset, "{source:?}");
+    }
+}
+
+#[test]
+fn trailing_tokens_repeated_keys_and_lexical_errors_are_refused_by_the_language_codes() {
+    for source in ["{ a: 1 } 2", "1 2", "{ a: 1, a: 2 }"] {
+        let d = shape_refused(source);
+        assert!(d.code.as_str().starts_with("syntax."), "{source:?}: {d}");
+    }
+    let d = shape_refused("\"unterminated");
+    assert!(d.code.as_str().starts_with("lex."), "{d}");
+}
+
+#[test]
+fn a_hundred_thousand_levels_of_shape_neither_panic_nor_overflow() {
+    const LEVELS: usize = 100_000;
+    // Arrays: each level is `[t]` around the next, the innermost `[]`.
+    let arrays = format!("{}{}", "[".repeat(LEVELS), "]".repeat(LEVELS));
+    match parse_shape(&arrays) {
+        Ok(parsed) => assert_eq!(parsed.depth(), LEVELS),
+        Err(d) => assert!(d.code.as_str().starts_with("syntax."), "{d}"),
+    }
+    // Objects: each level is `{ a: ... }` around `null`.
+    let objects = format!("{}null{}", "{ a: ".repeat(LEVELS), " }".repeat(LEVELS));
+    match parse_shape(&objects) {
+        Ok(parsed) => assert_eq!(parsed.depth(), LEVELS),
+        Err(d) => assert!(d.code.as_str().starts_with("syntax."), "{d}"),
+    }
 }

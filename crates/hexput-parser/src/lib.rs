@@ -23,11 +23,18 @@ pub use hexput_ast::{
     Spanned,
 };
 
+/// An Event's return shape [`parse_shape`] returns (Story 6.3), and the reserved Event name,
+/// re-exported so `hexput-plugin` — and Story 6.6's conformance check — reach them through this
+/// crate alone.
+pub use hexput_ast::{BACKEND_REGISTERED_INIT, Shape, ShapeId, ShapeNode};
+
 mod expressions;
 mod plugin;
+mod shape;
 mod statements;
 use expressions::{ExpressionState, Pending};
 use plugin::PluginState;
+pub use shape::parse_shape;
 
 /// Parse an entire file, preserving grouping, optional access links, and source locations.
 ///

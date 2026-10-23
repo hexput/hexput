@@ -206,6 +206,8 @@ fn every_code_is_enumerated_exactly_once() {
         "capability.unknown_function",
         "capability.method_override",
         "policy.construct_disabled",
+        "syntax.invalid_shape",
+        "reference.undeclared_event",
     ];
 
     let mut all: Vec<&str> = Code::ALL.iter().map(|code| code.as_str()).collect();
@@ -243,6 +245,27 @@ fn every_code_is_enumerated_exactly_once() {
         assert!(categories.contains(&prefix), "`{code}` has no §7 category");
         assert!(!rest.is_empty(), "`{code}` has an empty name");
     }
+}
+
+/// Story 6.3: the Event declaration's shape code and the Plugin-only warning are stable and
+/// distinct, and the shape code is a `syntax` code.
+#[test]
+fn plugin_declaration_codes_are_stable_and_distinct() {
+    use hexput_shared::diagnostics::Code;
+    let codes = [
+        (Code::INVALID_SHAPE, "syntax.invalid_shape"),
+        (Code::UNDECLARED_EVENT, "reference.undeclared_event"),
+    ];
+    for (i, (code, text)) in codes.iter().enumerate() {
+        assert_eq!(code.as_str(), *text);
+        for (other, _) in &codes[i + 1..] {
+            assert_ne!(code, other);
+        }
+    }
+    assert!(Code::INVALID_SHAPE.as_str().starts_with("syntax."));
+    assert!(Code::UNDECLARED_EVENT.as_str().starts_with("reference."));
+    assert!(Code::ALL.contains(&Code::INVALID_SHAPE));
+    assert!(Code::ALL.contains(&Code::UNDECLARED_EVENT));
 }
 
 // --- Story 2.2: Client ID and the wire envelope ---

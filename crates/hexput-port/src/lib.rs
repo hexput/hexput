@@ -25,6 +25,10 @@
 //!   an `Init`'s `config`, a `ConfigUpdate`'s `config` (Story 3.8) and an `ExecutionStart`'s
 //!   `overrides` so they can never disagree on a key, a type or a range. [`Settings`] and [`Setting`] are re-exported from `hexput-shared`.
 //!
+//! * [`findings`] is the one rule static check findings travel by (Stories 3.10, 4.1, 6.3) —
+//!   bounded to [`MAX_FINDINGS`], shaped into a rejection under check mode `error`, fitted to a
+//!   frame — shared by every submission path so they can never disagree (AD-8).
+//!
 //! * [`ClientId`] and [`ScriptHandle`] (Story 4.1) are re-exported from `hexput-shared`, so every
 //!   crate past the Port names an id the one way it is defined.
 //!
@@ -32,12 +36,14 @@
 
 mod codec;
 mod error;
+pub mod findings;
 mod frame;
 mod port;
 mod settings;
 
 pub use codec::{EncodeError, MAX_NESTING_DEPTH, ProtocolFailure, decode, encode};
 pub use error::{ErrorBody, ProtocolCode, ProtocolError, WireSpan, error_response, findings_value};
+pub use findings::MAX_FINDINGS;
 pub use frame::{FrameDecoder, LENGTH_PREFIX_LEN, MAX_FRAME_LEN, encode_frame};
 pub use port::{Inbound, Outbound, Port, Received};
 pub use settings::{CheckMode, Feature, Features, OutOfRange, Setting, Settings, decode_settings};

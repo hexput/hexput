@@ -74,10 +74,13 @@ enum Job<'p> {
 /// No seed, spelled once so `Open` can borrow it.
 const NO_SEED: &[Identifier] = &[];
 
+/// `exempt` names root-scope bindings never reported unused: a Plugin's Global Variables and
+/// handlers (Story 6.3), which the Daemon reads and calls; empty for a Script.
 pub(crate) fn run(
     program: &Program,
     environment: &Environment,
     policy: &Policy,
+    exempt: &HashSet<&str>,
 ) -> Vec<Diagnostic> {
     let reassigned = reassigned_names(program);
     let keyed = keyed_variables(program, environment, &reassigned);
@@ -89,6 +92,7 @@ pub(crate) fn run(
             .map(|names| names.iter().map(String::as_str).collect()),
         reassigned,
         keyed,
+        exempt,
         scopes: Vec::new(),
         findings: Vec::new(),
     };
@@ -195,6 +199,8 @@ fn keyed_variables<'e>(
 
 struct Walk<'p> {
     program: &'p Program,
+    /// Root-scope names never reported unused (a Plugin's Global Variables and handlers).
+    exempt: &'p HashSet<&'p str>,
     policy: &'p Policy,
     /// Keyed starting variables no scope shadows, with their Registered Methods (Story 3.12).
     keyed: HashMap<&'p str, HashSet<&'p str>>,
@@ -325,10 +331,14 @@ impl<'p> Walk<'p> {
         let Some(scope) = self.scopes.pop() else {
             return;
         };
+        let root = self.scopes.is_empty();
         for name in scope.order {
             let Some(binding) = scope.bindings.get(name) else {
                 continue;
             };
+            if root && self.exempt.contains(name) {
+                continue;
+            }
             if binding.report_unused && !binding.read {
                 self.findings.push(Diagnostic::warning(
                     Category::Reference,

@@ -725,10 +725,13 @@ mod tests {
         let cache = Arc::new(AstCache::with_capacity(16));
         let plugins = Arc::new(Plugins::new());
         let sessions = registry(&cache, &plugins, Duration::from_secs(300));
-        // As `hexput-connection` registers a Plugin (Story 6.2).
+        // As `hexput-connection` registers a Plugin (Stories 6.2, 6.3: `events` is required).
         let register_plugin = |client_id| {
             hexput_plugin::register(
-                &map(vec![("source", Value::from("plugin { name = \"p\" }"))]),
+                &map(vec![
+                    ("source", Value::from("plugin { name = \"p\" }")),
+                    ("events", map(Vec::new())),
+                ]),
                 client_id,
                 &plugins,
                 |name| match sessions.register_plugin(client_id, name) {
@@ -736,6 +739,8 @@ mod tests {
                     Err(PluginNameError::Taken) => Reservation::NameTaken,
                     Err(PluginNameError::NoSession) => Reservation::SessionEnded,
                 },
+                &[],
+                &Settings::default(),
             )
         };
         let init = map(vec![

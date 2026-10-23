@@ -185,6 +185,14 @@ impl Code {
     /// A Global Variable's initializer is not an expression over literals: it names a variable,
     /// calls a function or holds a function. Spanned on the identifier, call or `fn` expression.
     pub const INVALID_GLOBAL_INITIALIZER: Self = Self::new("syntax.invalid_global_initializer");
+    /// An Event's declared return shape (Story 6.3) holds something other than a literal, a
+    /// negated number, or an array or object literal of shapes — a name, an operator, a call, a
+    /// function, a group — or an array literal of two or more elements. Spanned on the offending
+    /// node of the shape's source. `hexput_parser::parse_shape` returns it; a `PluginRegister`
+    /// declaring such a shape is answered `protocol.invalid_payload` naming
+    /// `events.<name>.returns`, whose message carries this diagnostic's message and location — the
+    /// code itself is not a wire code.
+    pub const INVALID_SHAPE: Self = Self::new("syntax.invalid_shape");
 
     // --- `lexical` codes (Story 1.2) ---
 
@@ -329,6 +337,11 @@ impl Code {
     /// A language construct the active policy disables (FR-3), named by its toggle. Category
     /// `policy`.
     pub const CONSTRUCT_DISABLED: Self = Self::new("policy.construct_disabled");
+    /// A Plugin's `@Event` handler names an Event the Backend did not declare at registration
+    /// (Story 6.3): it can never run, and so can never fail. A [`Severity::Warning`], found only
+    /// by the static check at Plugin registration. Spanned on the Event's name in the
+    /// annotation. Category `reference`.
+    pub const UNDECLARED_EVENT: Self = Self::new("reference.undeclared_event");
 
     /// Every code the workspace defines, so a test can assert that each one is covered rather
     /// than trusting a hand-maintained list to have kept up. Add a new code here in the same
@@ -386,6 +399,8 @@ impl Code {
         Self::UNKNOWN_FUNCTION,
         Self::METHOD_OVERRIDE,
         Self::CONSTRUCT_DISABLED,
+        Self::INVALID_SHAPE,
+        Self::UNDECLARED_EVENT,
     ];
 }
 

@@ -63,16 +63,21 @@
 //!   is logged at `debug` as "an unregister failed", with its `code` and, when the payload names
 //!   a well-formed one, its `handle`.
 //! * `PluginRegister` — `protocol.init_not_completed` before init. After init, a Plugin
-//!   registration (FR-17, Story 6.2), marked as one by its message type alone:
-//!   [`hexput_plugin::register`] decodes `{source}`, parses the Plugin source, reserves its
+//!   registration (FR-17, FR-19, Stories 6.2, 6.3), marked as one by its message type alone:
+//!   [`hexput_plugin::try_register`] decodes `{source, events}` (the Event declarations with
+//!   their return shapes), parses the Plugin source, runs the static check when the Session's
+//!   Config — read at dispatch like a `CodeRegister`'s (AD-5) — sets a check mode other than
+//!   `off`, with the Session's Registered Function names as the callable list, then reserves its
 //!   metadata `name` in this Session through [`Sessions::register_plugin`] (unique per Client ID,
-//!   under a fresh `PluginId`) and stores the parsed Plugin in the Daemon's one [`Plugins`]
-//!   registry under this Session's Client ID; the connection answers `Result { name }`, or the
-//!   `Error` it returns — `protocol.invalid_payload`, the parser's diagnostic,
+//!   under a fresh `PluginId`) and stores the Plugin in the Daemon's one [`Plugins`] registry
+//!   under this Session's Client ID; the connection answers `Result { name }` (with `findings`
+//!   when the pass found anything), or the `Error` it returns — `protocol.invalid_payload`, the
+//!   parser's diagnostic, a static check rejection with its `findings`,
 //!   `protocol.duplicate_plugin_name` — with nothing registered. Dispatched as its own task, its
 //!   work on the blocking pool, so a large source never stalls the loop or an execution. Logged at
 //!   `debug`: "plugin registered" with its `plugin` name and `plugin_id`, or "a plugin
-//!   registration failed" with its `code`.
+//!   registration failed" with its `code` — after "rejected by the static check" with its `code`
+//!   and `findings` count for a rejection.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
@@ -204,7 +209,7 @@
 use std::io;
 use std::sync::Arc;
 
-use hexput_plugin::{Plugins, Reservation};
+use hexput_plugin::{Plugins, Refusal, Reservation};
 use hexput_port::{
     CorrelationId, Envelope, ErrorBody, Inbound, MessageType, Outbound, PluginId, Port,
     ProtocolCode, ProtocolError, Received, ScriptHandle, Value, error_response,
@@ -438,6 +443,14 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         continue;
                     }
                     Answer::RegisterPlugin(id, payload, client_id) => {
+                        // The Session's live Config and Registered Functions, read at dispatch
+                        // like a Script registration's (AD-5), for the static check (Story 6.3).
+                        let (registrations, settings) = session_now(connection);
+                        let callables = registrations
+                            .into_iter()
+                            .filter(|r| r.key.is_none())
+                            .map(|r| r.name)
+                            .collect();
                         // Like a Script registration: its own task, carrying the request's span.
                         running.spawn(
                             register_plugin(
@@ -446,6 +459,8 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                                 client_id,
                                 Arc::clone(connection.sessions),
                                 Arc::clone(connection.plugins),
+                                callables,
+                                settings,
                             )
                             .instrument(span),
                         );
@@ -883,21 +898,28 @@ async fn register_plugin(
     client_id: ClientId,
     sessions: Arc<Sessions>,
     plugins: Arc<Plugins>,
+    callables: Vec<String>,
+    settings: Settings,
 ) -> Envelope<Value> {
     let work = move || {
         // What the success log names: the reserved id and the name, bounded like every name a
         // message echoes, since only the frame limit bounds the Backend's.
         let mut reserved: Option<(PluginId, String)> = None;
-        let reply = hexput_plugin::register(&payload, client_id, &plugins, |name| {
-            match sessions.register_plugin(client_id, name) {
+        let reply = hexput_plugin::try_register(
+            &payload,
+            client_id,
+            &plugins,
+            |name| match sessions.register_plugin(client_id, name) {
                 Ok(plugin_id) => {
                     reserved = Some((plugin_id, logged_name(name)));
                     Reservation::Reserved(plugin_id)
                 }
                 Err(PluginNameError::Taken) => Reservation::NameTaken,
                 Err(PluginNameError::NoSession) => Reservation::SessionEnded,
-            }
-        });
+            },
+            &callables,
+            &settings,
+        );
         reply.map(|payload| (payload, reserved))
     };
     let outcome = match tokio::task::spawn_blocking(work).await {
@@ -921,7 +943,16 @@ async fn register_plugin(
                 payload,
             }
         }
-        Err(body) => {
+        Err(refusal) => {
+            // Logged here, on the async task, so the event carries the request span.
+            if let Refusal::Rejected(rejection) = &refusal {
+                tracing::debug!(
+                    code = %rejection.body.code,
+                    findings = rejection.found,
+                    "rejected by the static check"
+                );
+            }
+            let body = refusal.into_body();
             tracing::debug!(code = %body.code, "a plugin registration failed");
             error_response(id, &body)
         }

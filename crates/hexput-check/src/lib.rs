@@ -16,6 +16,10 @@
 //! environment declares a starting variable keyed ([`Environment::with_keyed`]), a write that
 //! would override one of its Registered Methods (`capability.method_override`, Story 3.12).
 //!
+//! [`check_plugin`] runs the same pass over a Plugin (Story 6.3), never reporting its Global
+//! Variables or handlers unused, and adds the Plugin-only warning `reference.undeclared_event`
+//! for a handler bound to an Event the Backend did not declare ([`Environment::with_events`]).
+//!
 //! # What it deliberately does not report
 //!
 //! * **Duplicate `let` and `break`/`continue` outside a loop.** `hexput-parser` rejects both, so
@@ -39,7 +43,9 @@
 mod operands;
 mod pass;
 
-use hexput_ast::{Feature, Features, Program};
+use std::collections::HashSet;
+
+use hexput_ast::{BACKEND_REGISTERED_INIT, Feature, Features, PluginProgram, Program};
 
 /// The diagnostics shape and its rendering, re-exported so a consumer of the check pass can
 /// report findings without a `hexput-shared` edge the Spine's crate graph does not list.
@@ -122,6 +128,7 @@ pub struct Environment {
     variables: Vec<String>,
     callables: Option<Vec<String>>,
     keyed: Vec<(String, Vec<String>)>,
+    events: Option<Vec<String>>,
 }
 
 impl Environment {
@@ -189,6 +196,28 @@ impl Environment {
             methods.into_iter().map(Into::into).collect(),
         ));
         self
+    }
+
+    /// Supply the names of the Events the Backend declared for a Plugin (Story 6.3), which only
+    /// [`check_plugin`] reads. Like the callable list, a **missing** list suppresses
+    /// [`Code::UNDECLARED_EVENT`] entirely, while an **empty** one declares no Event at all, so
+    /// every handler but a `BackendRegisteredInit` one is reported.
+    ///
+    /// **Replaces** any list set before.
+    #[must_use]
+    pub fn with_events<I, N>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<String>,
+    {
+        self.events = Some(names.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// The declared Event names, or `None` when the caller supplied none.
+    #[must_use]
+    pub fn events(&self) -> Option<&[String]> {
+        self.events.as_deref()
     }
 
     /// The keyed starting variables, each with its Registered Methods, in the order supplied.
@@ -291,6 +320,62 @@ impl Findings {
 #[must_use]
 pub fn check(program: &Program, environment: &Environment, policy: &Policy) -> Findings {
     Findings {
-        diagnostics: pass::run(program, environment, policy),
+        diagnostics: pass::run(program, environment, policy, &HashSet::new()),
     }
+}
+
+/// Check a parsed Plugin (Story 6.3, AD-8): the very pass [`check`] runs, over the Plugin's
+/// program, plus the Plugin-only finding.
+///
+/// * Its Global Variables and `@Event` handler functions are never reported unused: the Daemon
+///   reads and calls them across invocations, never the source itself. Helpers and locals are
+///   reported as in a Script.
+/// * When `environment` supplies the declared Event names ([`Environment::with_events`]), a
+///   handler bound to an Event outside them is [`Code::UNDECLARED_EVENT`], a warning spanned on
+///   the Event's name in the annotation: it can never run, and so can never fail. A handler for
+///   `BackendRegisteredInit`, the reserved initialization Event, is never reported.
+///
+/// Findings come back in source order. Pure, and as free of host recursion as [`check`].
+///
+/// # Panics
+/// As [`check`], for a hand-built program with out-of-range or cyclic ids.
+#[must_use]
+pub fn check_plugin(
+    plugin: &PluginProgram,
+    environment: &Environment,
+    policy: &Policy,
+) -> Findings {
+    let exempt: HashSet<&str> = plugin
+        .global_variables
+        .iter()
+        .map(|global| global.name.name.as_str())
+        .chain(
+            plugin
+                .handlers
+                .iter()
+                .map(|handler| handler.function.name.as_str()),
+        )
+        .collect();
+    let mut diagnostics = pass::run(&plugin.program, environment, policy, &exempt);
+    if let Some(events) = environment.events() {
+        let declared: HashSet<&str> = events.iter().map(String::as_str).collect();
+        let undeclared = plugin.handlers.iter().filter(|handler| {
+            handler.event.name != BACKEND_REGISTERED_INIT
+                && !declared.contains(handler.event.name.as_str())
+        });
+        for handler in undeclared {
+            diagnostics.push(Diagnostic::warning(
+                Category::Reference,
+                Code::UNDECLARED_EVENT,
+                format!(
+                    "`{}` is not an Event the Backend declared; this handler never runs",
+                    handler.event.name
+                ),
+                handler.event.span,
+            ));
+        }
+        // Stable, so findings at one offset keep the order they were produced in.
+        diagnostics.sort_by_key(|finding| finding.span.offset);
+    }
+    Findings { diagnostics }
 }

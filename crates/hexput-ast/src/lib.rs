@@ -389,3 +389,89 @@ pub struct EventHandler {
     /// The `async` value's span, when present.
     pub async_span: Option<Span>,
 }
+
+/// The reserved Event every Plugin's initialization handlers bind (LANGUAGE-REFERENCE §9): a
+/// Backend can neither declare nor fire it.
+pub const BACKEND_REGISTERED_INIT: &str = "BackendRegisteredInit";
+
+// --- Event return shapes (Story 6.3, LANGUAGE-REFERENCE §9) ---
+
+/// An index into [`Shape::nodes`]; never mix ids between shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShapeId(pub usize);
+
+impl ShapeId {
+    /// The index into [`Shape::nodes`].
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// An Event's declared return shape: a Hexput literal used as a template, held as a flat arena
+/// so dropping, cloning and walking an adversarially nested one never recurses.
+///
+/// A shape `hexput_parser::parse_shape` returns is well formed: every id is an index of
+/// `nodes`, `root` is `ShapeId(0)`, each node is the child of exactly one parent, and a child's
+/// id is always greater than its parent's. The fields are public data; a shape built by hand
+/// that breaks those rules makes [`Shape::node`] panic and [`Shape::depth`] meaningless (it
+/// reads an out-of-range child as depth `0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shape {
+    /// Every node; `nodes[root]` is the whole shape.
+    pub nodes: Vec<ShapeNode>,
+    /// The outermost node.
+    pub root: ShapeId,
+}
+
+/// One node of a [`Shape`]. What a result must be to conform is Story 6.6's to enforce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShapeNode {
+    /// A string literal: any string.
+    String,
+    /// A number literal, negated or not: any number.
+    Number,
+    /// `true` or `false`: any boolean.
+    Boolean,
+    /// `null`: any value, `null` included.
+    Any,
+    /// `[]`: any array (`None`); `[t]`: an array whose every element conforms to `t`.
+    Array(Option<ShapeId>),
+    /// An object literal: exactly these keys, in source order, each conforming; no other key.
+    Object(Vec<(String, ShapeId)>),
+}
+
+impl Shape {
+    /// The node `id` names.
+    ///
+    /// # Panics
+    /// When `id` is not an index of this shape's arena.
+    #[must_use]
+    pub fn node(&self, id: ShapeId) -> &ShapeNode {
+        &self.nodes[id.0]
+    }
+
+    /// How many arrays and objects nest along the deepest path: `0` for a scalar, `1` for `[]`
+    /// or `{ a: 1 }`, `2` for `[[]]` — the same count as a result's nesting depth. Computed
+    /// without recursion, children before parents.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        let mut depths = vec![0_usize; self.nodes.len()];
+        for (index, node) in self.nodes.iter().enumerate().rev() {
+            depths[index] = match node {
+                ShapeNode::Array(element) => {
+                    1 + element.map_or(0, |child| depths.get(child.0).copied().unwrap_or(0))
+                }
+                ShapeNode::Object(fields) => {
+                    1 + fields
+                        .iter()
+                        .map(|(_, child)| depths.get(child.0).copied().unwrap_or(0))
+                        .max()
+                        .unwrap_or(0)
+                }
+                _ => 0,
+            };
+        }
+        depths.get(self.root.0).copied().unwrap_or(0)
+    }
+}

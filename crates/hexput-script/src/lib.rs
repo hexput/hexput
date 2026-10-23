@@ -100,7 +100,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use hexput_check::{Environment, Policy, Severity};
+use hexput_check::{Environment, Policy};
 /// A Session's registration as Direct Execution takes it — a Registered Function, or a
 /// Registered Method under an object key (Story 3.12) — re-exported so the connection, which
 /// reads the Session's registrations, can hand them over without an edge to the Executor.
@@ -108,9 +108,10 @@ pub use hexput_exec::Registration;
 use hexput_exec::wire;
 use hexput_exec::{Caller, Finished, Host, Limits};
 use hexput_interpreter::{Category, Code, Diagnostic, Held, Program, Span};
+use hexput_port::findings::{self, Rejection, encoded_len, fitted, push_findings, with_findings};
 use hexput_port::{
     CheckMode, ClientId, ErrorBody, MAX_FRAME_LEN, ProtocolCode, ProtocolError, ScriptHandle,
-    Settings, Value, decode_settings, findings_value,
+    Settings, Value, decode_settings,
 };
 
 pub use hexput_exec::wire::{MAX_MODIFICATION_DEPTH, MAX_RESULT_DEPTH};
@@ -119,17 +120,15 @@ const SOURCE: &str = "source";
 const VARIABLES: &str = "variables";
 const OVERRIDES: &str = "overrides";
 const VALUE: &str = "value";
-const FINDINGS: &str = "findings";
 const HANDLE: &str = "handle";
 
 /// The most static check findings one reply carries, in source order (Story 3.10). A Script with
 /// more has the rest dropped — except that a rejection's first error is always kept, in place of
-/// the last one, so the rejection's own body is always among its `findings`.
-pub const MAX_FINDINGS: usize = 100;
+/// the last one, so the rejection's own body is always among its `findings`. Defined, with the
+/// rest of how findings travel, in `hexput_port::findings` (Story 6.3), which every submission
+/// path shares.
+pub use hexput_port::MAX_FINDINGS;
 
-/// Room left in a frame for everything around a reply's payload: the envelope map, its `id`,
-/// `type` and `payload` keys, the largest id and the longest type name, with margin.
-const ENVELOPE_ROOM: usize = 64;
 /// Serve one Direct Execution: `payload` is an `ExecutionStart` payload, a map with the keys
 /// `source` (the Script, a string), `variables` (its starting variables, a map from §2
 /// identifier to value) and optionally `overrides` (execution limits for this execution alone,
@@ -816,52 +815,6 @@ fn decode_registration(payload: &Value) -> Result<(&str, Vec<String>), String> {
     Ok((source, names))
 }
 
-/// A Script the static check rejected: the reply's body, and how many findings the pass made
-/// (before [`MAX_FINDINGS`] applied).
-struct Rejection {
-    body: Box<ErrorBody>,
-    found: usize,
-}
-
-/// `body` carrying `findings`, fitted to a frame.
-fn with_findings(mut body: ErrorBody, findings: Vec<ErrorBody>) -> Box<ErrorBody> {
-    body.findings = findings;
-    fitted(Box::new(body))
-}
-
-/// `body` as it can be sent: without its `findings` when with them it would not fit a frame.
-fn fitted(mut body: Box<ErrorBody>) -> Box<ErrorBody> {
-    if !body.findings.is_empty() && encoded_len(&body.to_value()) > MAX_FRAME_LEN - ENVELOPE_ROOM {
-        body.findings.clear();
-    }
-    body
-}
-
-/// Append `findings` to a successful reply's `fields` under `findings`, unless the reply — `size`
-/// bytes without them — would then not fit a frame. The one fitting rule for every successful
-/// reply that carries findings (Direct Execution's `{value}`, a registration's `{handle}`).
-fn push_findings(fields: &mut Vec<(Value, Value)>, size: usize, findings: &[ErrorBody]) {
-    if findings.is_empty() {
-        return;
-    }
-    let listed = findings_value(findings);
-    // The `findings` key and value, beside the payload without them.
-    let size = size
-        .saturating_add(FINDINGS.len() + 1)
-        .saturating_add(encoded_len(&listed));
-    if size <= MAX_FRAME_LEN - ENVELOPE_ROOM {
-        fields.push((Value::from(FINDINGS), listed));
-    }
-}
-
-/// The MessagePack length of `value`.
-fn encoded_len(value: &Value) -> usize {
-    let mut bytes = Vec::new();
-    // Writing to a `Vec` cannot fail.
-    let _ = hexput_port::rmpv::encode::write_value(&mut bytes, value);
-    bytes.len()
-}
-
 /// The findings of a pass that let the Script through, or — logged at `debug` — the rejection's
 /// body, fitted to a frame.
 ///
@@ -933,28 +886,7 @@ fn static_check(
         &environment,
         &Policy::from_features(effective.features()),
     );
-    let all = findings.diagnostics();
-    let mut bodies: Vec<ErrorBody> = all.iter().take(MAX_FINDINGS).map(ErrorBody::from).collect();
-    if mode == CheckMode::Error
-        && let Some(at) = all
-            .iter()
-            .position(|finding| finding.severity == Severity::Error)
-    {
-        let first = ErrorBody::from(&all[at]);
-        if at >= MAX_FINDINGS {
-            // Every finding before it was kept up to the cap; it replaces the last, so source
-            // order holds and the rejection is among its own findings.
-            bodies.pop();
-            bodies.push(first.clone());
-        }
-        let mut body = first;
-        body.findings = bodies;
-        return Err(Rejection {
-            body: Box::new(body),
-            found: all.len(),
-        });
-    }
-    Ok(bodies)
+    findings::shape(findings.diagnostics(), mode == CheckMode::Error)
 }
 
 /// Run `work` on the blocking pool and wait for it.

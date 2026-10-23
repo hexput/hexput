@@ -98,16 +98,22 @@ pub enum MessageType {
     /// issued, another Session's, evicted or already removed), `protocol.invalid_payload` for a
     /// malformed payload, with nothing removed.
     CodeUnregister,
-    /// Request: register a Plugin under this Session (Story 6.2). The message type alone marks the
-    /// request as a Plugin registration — nothing is inferred from the payload's shape. The
-    /// payload is exactly `{source}`, a string of Plugin source (a `plugin { }` metadata block,
-    /// Global Variables and `@Event` handlers). Answered `Result {name}`, the metadata `name`
-    /// echoed — a Plugin is addressed by its name, unique per Client ID — or `Error`: the parser's
-    /// diagnostic (with span), `protocol.duplicate_plugin_name` for a name this Session already
-    /// holds, `protocol.invalid_payload` for a malformed payload, `protocol.init_not_completed`
-    /// when the Session has ended before the Plugin is stored, with nothing registered. The
-    /// static check (FR-26) does not run at Plugin registration yet: a Plugin is accepted
-    /// unchecked whatever the Session's check mode, until Story 6.3 adds it.
+    /// Request: register a Plugin under this Session (Stories 6.2, 6.3). The message type alone
+    /// marks the request as a Plugin registration — nothing is inferred from the payload's shape.
+    /// The payload is exactly `{source, events}`: a string of Plugin source (a `plugin { }`
+    /// metadata block, Global Variables and `@Event` handlers), and the Events the Backend may
+    /// fire — a map from Event name (a §2 identifier, never `BackendRegisteredInit`) to
+    /// `{returns, keyed?}`, `returns` the Event's return shape written as a Hexput literal used
+    /// as a template, `keyed` whether a fire carries a partition key (absent or nil: `false`);
+    /// `events: {}` declares none, and `events` is required. Answered `Result {name}`, the
+    /// metadata `name` echoed — a Plugin is addressed by its name, unique per Client ID — with
+    /// `findings` after it when the Session's check mode ran the static check and it found
+    /// anything; or `Error`: the parser's diagnostic (with span), a static check rejection under
+    /// check mode `error` (the first error finding's body, every finding under `findings`),
+    /// `protocol.duplicate_plugin_name` for a name this Session already holds,
+    /// `protocol.invalid_payload` for a malformed payload or declaration (naming its path),
+    /// `protocol.init_not_completed` when the Session has ended before the Plugin is stored, with
+    /// nothing registered.
     PluginRegister,
     /// Response: a request succeeded; the payload is its result.
     Result,

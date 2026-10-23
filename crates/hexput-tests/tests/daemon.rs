@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hexput_daemon::{Discovery, run_with};
+#[cfg(unix)]
+use hexput_port::Value;
 
 #[path = "daemon/conformance.rs"]
 mod conformance;
@@ -3289,6 +3291,7 @@ mod cache_win {
                     }
                     Outcome::OutOfMemory(_) => panic!("the rule ran out of memory"),
                     Outcome::AllocationsExceeded(_) => panic!("the rule made too many allocations"),
+                    Outcome::GlobalWrite(_) => panic!("a Script has no Global Variables"),
                 }
             }
         }
@@ -4779,6 +4782,865 @@ fn a_plugin_registration_before_init_over_the_socket_is_init_not_completed() {
     assert_eq!(
         wire::refusal(&mut client),
         (Some(41), "protocol.init_not_completed".to_owned())
+    );
+    serving.stop().exit(0);
+}
+
+// --- Story 6.7: Global Variables persist across fires and are shared by a Session's Connections ---
+
+/// An `Init` request as `id` carrying `config` and one blanket-granted registration per name in
+/// `registrations`.
+#[cfg(unix)]
+fn init_granting(
+    id: u64,
+    config: hexput_port::Value,
+    registrations: &[&str],
+) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let registrations = registrations
+        .iter()
+        .map(|name| {
+            Value::Map(vec![
+                (Value::from("name"), Value::from(*name)),
+                (Value::from("blanket"), Value::from(true)),
+            ])
+        })
+        .collect();
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::Init,
+        Value::Map(vec![
+            (Value::from("config"), config),
+            (Value::from("registrations"), Value::Array(registrations)),
+        ]),
+    )
+}
+
+/// A `config` carrying one integer under `budget.<key>`.
+#[cfg(unix)]
+fn budget_config(key: &str, value: i64) -> hexput_port::Value {
+    use hexput_port::Value;
+
+    Value::Map(vec![(
+        Value::from("budget"),
+        Value::Map(vec![(Value::from(key), Value::from(value))]),
+    )])
+}
+
+/// A `PluginRegister` request as `id` for `source`, declaring each name in `events` returning
+/// `null` (any shape).
+#[cfg(unix)]
+fn register_declaring(
+    id: u64,
+    source: &str,
+    events: &[&str],
+) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    let events = events
+        .iter()
+        .map(|name| {
+            (
+                Value::from(*name),
+                Value::Map(vec![(Value::from("returns"), Value::from("null"))]),
+            )
+        })
+        .collect();
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::PluginRegister,
+        Value::Map(vec![
+            (Value::from("source"), Value::from(source)),
+            (Value::from("events"), Value::Map(events)),
+        ]),
+    )
+}
+
+/// An `EventFire` request as `id` for `event` of the Plugin `x`, with no params.
+#[cfg(unix)]
+fn fire_x(id: u64, event: &str) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::{CorrelationId, Envelope, MessageType, Value};
+
+    Envelope::new(
+        CorrelationId(id),
+        MessageType::EventFire,
+        Value::Map(vec![
+            (Value::from("plugin"), Value::from("x")),
+            (Value::from("event"), Value::from(event)),
+            (Value::from("params"), Value::Map(vec![])),
+        ]),
+    )
+}
+
+/// The one entry of a fire's `Result` reply to `id`: `Ok(value)` for a handler that ran, or
+/// `Err(code)` for its error entry.
+#[cfg(unix)]
+fn fired_entry(
+    reply: &hexput_port::Envelope<hexput_port::Value>,
+    id: u64,
+) -> Result<hexput_port::Value, String> {
+    use hexput_port::{CorrelationId, MessageType, Value};
+
+    assert_eq!(reply.id, Some(CorrelationId(id)), "{:?}", reply.payload);
+    assert_eq!(
+        reply.message_type,
+        MessageType::Result,
+        "{:?}",
+        reply.payload
+    );
+    let field = |value: &Value, key: &str| -> Option<Value> {
+        value
+            .as_map()?
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, v)| v.clone())
+    };
+    let Some(Value::Array(entries)) = field(&reply.payload, "results") else {
+        panic!("a fire answers `results`: {:?}", reply.payload);
+    };
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    match field(&entries[0], "error") {
+        Some(error) => Err(field(&error, "code")
+            .and_then(|code| code.as_str().map(str::to_owned))
+            .expect("an error names its code")),
+        None => Ok(field(&entries[0], "value").expect("an entry has a value")),
+    }
+}
+
+/// The integer a fire's one handler returned to request `id`, which must have run.
+#[cfg(unix)]
+fn fired_int(reply: &hexput_port::Envelope<hexput_port::Value>, id: u64) -> i64 {
+    fired_entry(reply, id)
+        .unwrap_or_else(|code| panic!("the handler failed with {code}"))
+        .as_i64()
+        .expect("an integer value")
+}
+
+/// Reads the next reply on `stream`, which must be a `Result` for `id` after a successful `Init`.
+#[cfg(unix)]
+fn init_answered(stream: &mut std::os::unix::net::UnixStream, id: u64) -> (String, String) {
+    use hexput_port::CorrelationId;
+
+    let reply = wire::reply(stream).expect("an init reply");
+    assert_eq!(reply.id, Some(CorrelationId(id)));
+    credentials_of(&reply)
+}
+
+/// Reconnects `stream` to the Session `client_id` with `secret`, and reads the `Result`.
+#[cfg(unix)]
+fn reconnected(
+    stream: &mut std::os::unix::net::UnixStream,
+    id: u64,
+    client_id: &str,
+    secret: &str,
+) {
+    use hexput_port::MessageType;
+
+    wire::send(stream, &reconnect_request(id, client_id, secret));
+    let reply = wire::reply(stream).expect("a reconnect reply");
+    assert_eq!(
+        reply.message_type,
+        MessageType::Result,
+        "{:?}",
+        reply.payload
+    );
+}
+
+/// `source` declaring `Ping`, `Pong` and `Read`: the Plugin shared by the Story 6.7 tests.
+#[cfg(unix)]
+const GLOBAL_EVENTS: [&str; 3] = ["Ping", "Pong", "Read"];
+
+#[cfg(unix)]
+#[test]
+fn a_global_written_by_one_fire_is_read_by_the_next_so_state_persists_across_invocations() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let n = 0;\n\
+                  @Event(Ping) fn h(p) { n = n + 1; return n; }";
+    let mut client = serving.connect();
+    wire::send(&mut client, &init_granting(1, Value::Map(vec![]), &[]));
+    init_answered(&mut client, 1);
+    wire::send(&mut client, &register_declaring(2, source, &["Ping"]));
+    assert_eq!(
+        plugin_name_reply(&wire::reply(&mut client).expect("a reply")),
+        "x"
+    );
+    for (id, expected) in [(3, 1), (4, 2), (5, 3)] {
+        wire::send(&mut client, &fire_x(id, "Ping"));
+        let reply = wire::reply(&mut client).expect("a reply");
+        assert_eq!(fired_int(&reply, id), expected);
+    }
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_init_handler_seeds_a_global_that_a_later_fire_reads_on_any_connection() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { ready: false };\n\
+                  @Event(BackendRegisteredInit) fn boot(p) { g.ready = true; return 1; }\n\
+                  @Event(Ping) fn h(p) { return g.ready; }";
+    let mut first = serving.connect();
+    wire::send(&mut first, &init_granting(1, Value::Map(vec![]), &[]));
+    let (client_id, secret) = init_answered(&mut first, 1);
+    wire::send(&mut first, &register_declaring(2, source, &["Ping"]));
+    assert_eq!(
+        plugin_name_reply(&wire::reply(&mut first).expect("a reply")),
+        "x"
+    );
+    wire::send(&mut first, &fire_x(3, "Ping"));
+    let reply = wire::reply(&mut first).expect("a reply");
+    assert_eq!(fired_entry(&reply, 3), Ok(Value::Boolean(true)));
+
+    // Another Connection of the same Session reads the same seeded value.
+    let mut second = serving.connect();
+    reconnected(&mut second, 1, &client_id, &secret);
+    wire::send(&mut second, &fire_x(2, "Ping"));
+    let reply = wire::reply(&mut second).expect("a reply");
+    assert_eq!(fired_entry(&reply, 2), Ok(Value::Boolean(true)));
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fire_on_one_connection_sees_the_latest_global_written_by_a_fire_on_another() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { v: 0 };\n\
+                  @Event(Ping) fn set(p) { g.v = 9; return 1; }\n\
+                  @Event(Read) fn read(p) { return g.v; }";
+    let mut first = serving.connect();
+    wire::send(&mut first, &init_granting(1, Value::Map(vec![]), &[]));
+    let (client_id, secret) = init_answered(&mut first, 1);
+    wire::send(
+        &mut first,
+        &register_declaring(2, source, &["Ping", "Read"]),
+    );
+    wire::reply(&mut first).expect("a reply");
+
+    let mut second = serving.connect();
+    reconnected(&mut second, 1, &client_id, &secret);
+    wire::send(&mut second, &fire_x(2, "Read"));
+    assert_eq!(fired_int(&wire::reply(&mut second).expect("a reply"), 2), 0);
+
+    wire::send(&mut first, &fire_x(3, "Ping"));
+    assert_eq!(fired_int(&wire::reply(&mut first).expect("a reply"), 3), 1);
+
+    wire::send(&mut second, &fire_x(4, "Read"));
+    assert_eq!(fired_int(&wire::reply(&mut second).expect("a reply"), 4), 9);
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn two_fires_on_two_connections_touching_different_keys_neither_waits_on_the_other() {
+    use hexput_port::{Envelope, MessageType};
+
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { a: 0, b: 0 };\n\
+                  @Event(Ping) fn ha(p) { g.a = stall(); return g.a; }\n\
+                  @Event(Pong) fn hb(p) { g.b = 2; return g.b; }\n\
+                  @Event(Read) fn hr(p) { return g.a + g.b; }";
+    let mut first = serving.connect();
+    wire::send(
+        &mut first,
+        &init_granting(1, Value::Map(vec![]), &["stall"]),
+    );
+    let (client_id, secret) = init_answered(&mut first, 1);
+    wire::send(&mut first, &register_declaring(2, source, &GLOBAL_EVENTS));
+    wire::reply(&mut first).expect("a reply");
+
+    let mut second = serving.connect();
+    reconnected(&mut second, 1, &client_id, &secret);
+
+    // The first Connection's handler stalls inside its host call: the Backend has not answered.
+    wire::send(&mut first, &fire_x(3, "Ping"));
+    let call = wire::reply(&mut first).expect("the stalled call");
+    assert_eq!(call.message_type, MessageType::Call, "{:?}", call.payload);
+    let name = call
+        .payload
+        .as_map()
+        .and_then(|fields| fields.iter().find(|(k, _)| k.as_str() == Some("name")))
+        .and_then(|(_, v)| v.as_str().map(str::to_owned));
+    assert_eq!(name.as_deref(), Some("stall"));
+
+    // While it is stalled, the second Connection's write to another key is answered at once.
+    wire::send(&mut second, &fire_x(2, "Pong"));
+    assert_eq!(fired_int(&wire::reply(&mut second).expect("a reply"), 2), 2);
+
+    // Answering the stalled call lets its own handler finish and its write stand.
+    let answer = Envelope::new(
+        call.id.expect("a call has an id"),
+        MessageType::Result,
+        Value::Map(vec![(Value::from("value"), Value::from(1))]),
+    );
+    wire::send(&mut first, &answer);
+    assert_eq!(fired_int(&wire::reply(&mut first).expect("a reply"), 3), 1);
+
+    // Both writes are visible to a fire on either Connection.
+    wire::send(&mut second, &fire_x(4, "Read"));
+    assert_eq!(fired_int(&wire::reply(&mut second).expect("a reply"), 4), 3);
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn eight_connections_each_firing_a_call_free_increment_fifty_times_lose_no_update() {
+    use std::os::unix::net::UnixStream;
+
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { c: 0 };\n\
+                  @Event(Bump) fn b(p) { g.c = g.c + 1; return 1; }\n\
+                  @Event(Read) fn r(p) { return g.c; }";
+    let mut first = serving.connect();
+    wire::send(&mut first, &init_granting(1, Value::Map(vec![]), &[]));
+    let (client_id, secret) = init_answered(&mut first, 1);
+    wire::send(
+        &mut first,
+        &register_declaring(2, source, &["Bump", "Read"]),
+    );
+    wire::reply(&mut first).expect("a reply");
+
+    let mut streams: Vec<UnixStream> = Vec::new();
+    for n in 0..8 {
+        let mut stream = serving.connect();
+        reconnected(&mut stream, 10 + n, &client_id, &secret);
+        streams.push(stream);
+    }
+    let handles: Vec<_> = streams
+        .into_iter()
+        .map(|mut stream| {
+            std::thread::spawn(move || {
+                for id in 1..=50 {
+                    wire::send(&mut stream, &fire_x(id, "Bump"));
+                    let reply = wire::reply(&mut stream).expect("a reply");
+                    assert_eq!(fired_int(&reply, id), 1);
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("no connection panicked");
+    }
+
+    wire::send(&mut first, &fire_x(3, "Read"));
+    assert_eq!(
+        fired_int(&wire::reply(&mut first).expect("a reply"), 3),
+        400
+    );
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failure_after_a_write_keeps_the_write_and_the_next_fire_sees_it() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let n = 0;\n\
+                  @Event(Ping) fn h(p) { n = 5; return f(); }\n\
+                  @Event(Read) fn r(p) { return n; }";
+    let mut client = serving.connect();
+    wire::send(&mut client, &init_granting(1, Value::Map(vec![]), &[]));
+    init_answered(&mut client, 1);
+    wire::send(
+        &mut client,
+        &register_declaring(2, source, &["Ping", "Read"]),
+    );
+    wire::reply(&mut client).expect("a reply");
+
+    // The unregistered call fails the handler; it is reported as its entry, as any handler's is.
+    wire::send(&mut client, &fire_x(3, "Ping"));
+    let reply = wire::reply(&mut client).expect("a reply");
+    assert_eq!(
+        fired_entry(&reply, 3),
+        Err("capability.unknown_function".to_owned())
+    );
+
+    wire::send(&mut client, &fire_x(4, "Read"));
+    assert_eq!(fired_int(&wire::reply(&mut client).expect("a reply"), 4), 5);
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_global_access_needs_no_capability_and_consumes_no_rpc_call() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { a: 0 };\n\
+                  @Event(Ping) fn h(p) { g.a = 1; return g.a; }";
+    let mut client = serving.connect();
+    // No RPC call is allowed at all, and nothing is granted: a Global still works.
+    wire::send(
+        &mut client,
+        &init_granting(1, budget_config("rpc_calls", 0), &[]),
+    );
+    init_answered(&mut client, 1);
+    wire::send(&mut client, &register_declaring(2, source, &["Ping"]));
+    wire::reply(&mut client).expect("a reply");
+    wire::send(&mut client, &fire_x(3, "Ping"));
+    assert_eq!(fired_int(&wire::reply(&mut client).expect("a reply"), 3), 1);
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn each_global_write_is_one_side_effect_and_the_writes_before_the_refused_one_stand() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { a: 0 };\n\
+                  @Event(Set) fn s(p) { g.a = 1; g.a = 2; g.a = 3; return 1; }\n\
+                  @Event(Read) fn r(p) { return g.a; }";
+    let mut client = serving.connect();
+    wire::send(
+        &mut client,
+        &init_granting(1, budget_config("side_effects", 2), &[]),
+    );
+    init_answered(&mut client, 1);
+    wire::send(
+        &mut client,
+        &register_declaring(2, source, &["Set", "Read"]),
+    );
+    wire::reply(&mut client).expect("a reply");
+
+    wire::send(&mut client, &fire_x(3, "Set"));
+    let reply = wire::reply(&mut client).expect("a reply");
+    assert_eq!(
+        fired_entry(&reply, 3),
+        Err("budget.side_effects_exceeded".to_owned())
+    );
+
+    // The third write was refused; the two before it stand for the next invocation.
+    wire::send(&mut client, &fire_x(4, "Read"));
+    assert_eq!(fired_int(&wire::reply(&mut client).expect("a reply"), 4), 2);
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_global_initializer_runs_once_so_the_init_and_every_fire_build_on_one_run() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let n = 0;\n\
+                  @Event(BackendRegisteredInit) fn boot(p) { n = n + 10; return 1; }\n\
+                  @Event(Ping) fn h(p) { n = n + 1; return n; }";
+    let mut client = serving.connect();
+    wire::send(&mut client, &init_granting(1, Value::Map(vec![]), &[]));
+    init_answered(&mut client, 1);
+    wire::send(&mut client, &register_declaring(2, source, &["Ping"]));
+    wire::reply(&mut client).expect("a reply");
+    // Re-evaluating `let n = 0;` per invocation would answer 1, 1, 1.
+    for (id, expected) in [(3, 11), (4, 12), (5, 13)] {
+        wire::send(&mut client, &fire_x(id, "Ping"));
+        assert_eq!(
+            fired_int(&wire::reply(&mut client).expect("a reply"), id),
+            expected
+        );
+    }
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_registration_leaves_no_store_and_a_same_name_registration_starts_fresh() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let failing = "plugin { name = \"x\" }\n\
+                   let n = 0;\n\
+                   @Event(BackendRegisteredInit) fn boot(p) { n = 5; return f(); }\n\
+                   @Event(Read) fn r(p) { return n; }";
+    let mut client = serving.connect();
+    wire::send(&mut client, &init_granting(1, Value::Map(vec![]), &[]));
+    init_answered(&mut client, 1);
+    wire::send(&mut client, &register_declaring(2, failing, &["Read"]));
+    assert_eq!(
+        wire::refusal(&mut client),
+        (Some(2), "capability.unknown_function".to_owned())
+    );
+
+    let fresh = "plugin { name = \"x\" }\n\
+                 let n = 10;\n\
+                 @Event(Read) fn r(p) { return n; }";
+    wire::send(&mut client, &register_declaring(3, fresh, &["Read"]));
+    assert_eq!(
+        plugin_name_reply(&wire::reply(&mut client).expect("a reply")),
+        "x"
+    );
+    wire::send(&mut client, &fire_x(4, "Read"));
+    assert_eq!(
+        fired_int(&wire::reply(&mut client).expect("a reply"), 4),
+        10
+    );
+    serving.stop().exit(0);
+}
+
+/// A `config` switching the feature toggle `name` off.
+#[cfg(unix)]
+fn feature_off(name: &str) -> hexput_port::Value {
+    use hexput_port::Value;
+
+    Value::Map(vec![(
+        Value::from("features"),
+        Value::Map(vec![(Value::from(name), Value::Boolean(false))]),
+    )])
+}
+
+/// The code and message of the one entry of a fire's reply to `id`, which must be an error.
+#[cfg(unix)]
+fn fired_error(reply: &hexput_port::Envelope<hexput_port::Value>, id: u64) -> (String, String) {
+    use hexput_port::Value;
+
+    let code = fired_entry(reply, id).expect_err("the handler failed");
+    let field = |value: &Value, key: &str| -> Option<Value> {
+        value
+            .as_map()?
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, v)| v.clone())
+    };
+    let results = field(&reply.payload, "results").expect("results");
+    let error = field(&results.as_array().expect("an array")[0], "error").expect("an error");
+    let message = field(&error, "message")
+        .and_then(|message| message.as_str().map(str::to_owned))
+        .expect("an error has a message");
+    (code, message)
+}
+
+/// Reads the next message on `stream`, which must be a `Call` of `stall`.
+#[cfg(unix)]
+fn stalled_call(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> hexput_port::Envelope<hexput_port::Value> {
+    use hexput_port::MessageType;
+
+    let call = wire::reply(stream).expect("the stalled call");
+    assert_eq!(call.message_type, MessageType::Call, "{:?}", call.payload);
+    let name = call
+        .payload
+        .as_map()
+        .and_then(|fields| fields.iter().find(|(k, _)| k.as_str() == Some("name")))
+        .and_then(|(_, v)| v.as_str().map(str::to_owned));
+    assert_eq!(name.as_deref(), Some("stall"));
+    call
+}
+
+/// Answers the stalled `call` on `stream` with `value`.
+#[cfg(unix)]
+fn answer_stall(
+    stream: &mut std::os::unix::net::UnixStream,
+    call: &hexput_port::Envelope<hexput_port::Value>,
+    value: i64,
+) {
+    use hexput_port::{Envelope, MessageType};
+
+    let answer = Envelope::new(
+        call.id.expect("a call has an id"),
+        MessageType::Result,
+        Value::Map(vec![(Value::from("value"), Value::from(value))]),
+    );
+    wire::send(stream, &answer);
+}
+
+/// Registers `source` (the Plugin `x`, declaring `events`) on a fresh Session granting `stall`,
+/// and returns the first Connection with the Session's credentials.
+#[cfg(unix)]
+fn registered_x(
+    serving: &Serving,
+    source: &str,
+    events: &[&str],
+) -> (std::os::unix::net::UnixStream, String, String) {
+    let mut first = serving.connect();
+    wire::send(
+        &mut first,
+        &init_granting(1, Value::Map(vec![]), &["stall"]),
+    );
+    let (client_id, secret) = init_answered(&mut first, 1);
+    wire::send(&mut first, &register_declaring(2, source, events));
+    assert_eq!(
+        plugin_name_reply(&wire::reply(&mut first).expect("a reply")),
+        "x"
+    );
+    (first, client_id, secret)
+}
+
+/// Fires `event` `times` times on each of `streams`, concurrently, each fire's handler returning
+/// 1.
+#[cfg(unix)]
+fn fire_concurrently(streams: Vec<(std::os::unix::net::UnixStream, &'static str)>, times: u64) {
+    let handles: Vec<_> = streams
+        .into_iter()
+        .map(|(mut stream, event)| {
+            std::thread::spawn(move || {
+                for id in 1..=times {
+                    wire::send(&mut stream, &fire_x(id, event));
+                    let reply = wire::reply(&mut stream).expect("a reply");
+                    assert_eq!(fired_int(&reply, id), 1);
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("no connection panicked");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_binding_shadowing_a_global_is_local_so_its_writes_neither_reach_the_store_nor_count() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let n = 0;\n\
+                  @Event(Ping) fn h(p) { let n = 99; n = 100; return n; }\n\
+                  @Event(Pong) fn k(n) { n = 5; return 7; }\n\
+                  @Event(Read) fn r(p) { return n; }";
+    let mut client = serving.connect();
+    // No side effect is allowed: a write to a shadowing binding is no Global write.
+    wire::send(
+        &mut client,
+        &init_granting(1, budget_config("side_effects", 0), &[]),
+    );
+    init_answered(&mut client, 1);
+    wire::send(&mut client, &register_declaring(2, source, &GLOBAL_EVENTS));
+    wire::reply(&mut client).expect("a reply");
+    wire::send(&mut client, &fire_x(3, "Ping"));
+    assert_eq!(
+        fired_int(&wire::reply(&mut client).expect("a reply"), 3),
+        100
+    );
+    wire::send(&mut client, &fire_x(4, "Pong"));
+    assert_eq!(fired_int(&wire::reply(&mut client).expect("a reply"), 4), 7);
+    wire::send(&mut client, &fire_x(5, "Read"));
+    assert_eq!(fired_int(&wire::reply(&mut client).expect("a reply"), 5), 0);
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn eight_connections_each_firing_a_computed_key_increment_lose_no_update() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { c: 0, d: 0 };\n\
+                  @Event(Bump) fn b(p) { let k = \"c\"; g[k] = g[k] + 1; return 1; }\n\
+                  @Event(Read) fn r(p) { return g.c * 1000 + g.d; }";
+    let (mut first, client_id, secret) = registered_x(&serving, source, &["Bump", "Read"]);
+    let streams = (0..8)
+        .map(|n| {
+            let mut stream = serving.connect();
+            reconnected(&mut stream, 10 + n, &client_id, &secret);
+            (stream, "Bump")
+        })
+        .collect();
+    fire_concurrently(streams, 25);
+    // The computed key wrote its property alone: `d` is untouched.
+    wire::send(&mut first, &fire_x(3, "Read"));
+    assert_eq!(
+        fired_int(&wire::reply(&mut first).expect("a reply"), 3),
+        200_000
+    );
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_whole_write_racing_property_increments_loses_none_of_them() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { c: 0 };\n\
+                  @Event(Bump) fn b(p) { g.c = g.c + 1; return 1; }\n\
+                  @Event(Touch) fn t(p) { g = g; return 1; }\n\
+                  @Event(Read) fn r(p) { return g.c; }";
+    let (mut first, client_id, secret) = registered_x(&serving, source, &["Bump", "Touch", "Read"]);
+    let streams = (0..8)
+        .map(|n| {
+            let mut stream = serving.connect();
+            reconnected(&mut stream, 10 + n, &client_id, &secret);
+            (stream, if n % 2 == 0 { "Bump" } else { "Touch" })
+        })
+        .collect();
+    fire_concurrently(streams, 50);
+    // A whole write rewrites `c` from its copy; it holds off every increment while it does.
+    wire::send(&mut first, &fire_x(3, "Read"));
+    assert_eq!(
+        fired_int(&wire::reply(&mut first).expect("a reply"), 3),
+        200
+    );
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_handler_reads_what_another_invocation_wrote_while_it_was_suspended() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { a: 0, b: 0 };\n\
+                  let n = 0;\n\
+                  @Event(Ping) fn w(p) { let x = stall(); return g.b * 100 + n + x; }\n\
+                  @Event(Pong) fn s(p) { g.b = 2; n = 3; return 1; }";
+    let (mut first, client_id, secret) = registered_x(&serving, source, &["Ping", "Pong"]);
+    let mut second = serving.connect();
+    reconnected(&mut second, 1, &client_id, &secret);
+
+    // The first handler binds `g` and `n`, then suspends in its host call.
+    wire::send(&mut first, &fire_x(3, "Ping"));
+    let call = stalled_call(&mut first);
+    // Meanwhile another invocation writes a property of `g` and the whole of `n`.
+    wire::send(&mut second, &fire_x(2, "Pong"));
+    assert_eq!(fired_int(&wire::reply(&mut second).expect("a reply"), 2), 1);
+    // Resumed, the first handler reads both new values.
+    answer_stall(&mut first, &call, 0);
+    assert_eq!(
+        fired_int(&wire::reply(&mut first).expect("a reply"), 3),
+        203
+    );
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_global_replaced_whole_after_an_assignments_receiver_was_read_still_takes_the_write() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { a: 0 };\n\
+                  @Event(Bump) fn b(p) { g.a = stall() + g.a; return g.a; }\n\
+                  @Event(Swap) fn s(p) { g = { a: 100, c: 1 }; return 1; }\n\
+                  @Event(Read) fn r(p) { return g.a * 10 + g.c; }";
+    let (mut first, client_id, secret) = registered_x(&serving, source, &["Bump", "Swap", "Read"]);
+    let mut second = serving.connect();
+    reconnected(&mut second, 1, &client_id, &secret);
+
+    // `g`, the assignment's receiver, is read before the host call suspends the handler...
+    wire::send(&mut first, &fire_x(3, "Bump"));
+    let call = stalled_call(&mut first);
+    // ...and replaced whole, with a new property, while it is suspended.
+    wire::send(&mut second, &fire_x(2, "Swap"));
+    assert_eq!(fired_int(&wire::reply(&mut second).expect("a reply"), 2), 1);
+    // Reading `g.a` catches the copy up in place, so the write lands on the Global.
+    answer_stall(&mut first, &call, 1);
+    assert_eq!(
+        fired_int(&wire::reply(&mut first).expect("a reply"), 3),
+        101
+    );
+    wire::send(&mut second, &fire_x(3, "Read"));
+    assert_eq!(
+        fired_int(&wire::reply(&mut second).expect("a reply"), 3),
+        1011
+    );
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_function_or_a_cycle_cannot_be_stored_in_a_global_and_the_stored_value_stays() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let g = { a: 1 };\n\
+                  @Event(Ping) fn f(p) { g.f = fn(x) { return x; }; return 1; }\n\
+                  @Event(Pong) fn c(p) { let o = {}; o.me = o; g.k = o; return 1; }\n\
+                  @Event(Read) fn r(p) { return [g.a, g.f == null, g.k == null]; }";
+    let (mut client, _, _) = registered_x(&serving, source, &GLOBAL_EVENTS);
+    wire::send(&mut client, &fire_x(3, "Ping"));
+    let (code, message) = fired_error(&wire::reply(&mut client).expect("a reply"), 3);
+    assert_eq!(code, "type.function_result");
+    assert_eq!(
+        message,
+        "cannot store a function in a Global Variable: it holds data only"
+    );
+    wire::send(&mut client, &fire_x(4, "Pong"));
+    let (code, message) = fired_error(&wire::reply(&mut client).expect("a reply"), 4);
+    assert_eq!(code, "type.cyclic_result");
+    assert_eq!(
+        message,
+        "cannot store this value in a Global Variable: it contains a value that refers back to \
+         itself, and a Global Variable holds a finite tree of values"
+    );
+    wire::send(&mut client, &fire_x(5, "Read"));
+    assert_eq!(
+        fired_entry(&wire::reply(&mut client).expect("a reply"), 5),
+        Ok(Value::Array(vec![
+            Value::from(1),
+            Value::Boolean(true),
+            Value::Boolean(true)
+        ]))
+    );
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_global_initializer_that_fails_fails_the_registration_and_frees_the_name() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let failing = "plugin { name = \"x\" }\n\
+                   let g = { a: 1 };\n\
+                   @Event(Read) fn r(p) { return 1; }";
+    let mut client = serving.connect();
+    wire::send(
+        &mut client,
+        &init_granting(1, feature_off("object_literals"), &[]),
+    );
+    init_answered(&mut client, 1);
+    // The Plugin has no init handler: its seeding run alone fails the registration.
+    wire::send(&mut client, &register_declaring(2, failing, &["Read"]));
+    assert_eq!(
+        wire::refusal(&mut client),
+        (Some(2), "policy.construct_disabled".to_owned())
+    );
+    let fresh = "plugin { name = \"x\" }\n\
+                 let n = 4;\n\
+                 @Event(Read) fn r(p) { return n; }";
+    wire::send(&mut client, &register_declaring(3, fresh, &["Read"]));
+    assert_eq!(
+        plugin_name_reply(&wire::reply(&mut client).expect("a reply")),
+        "x"
+    );
+    wire::send(&mut client, &fire_x(4, "Read"));
+    assert_eq!(fired_int(&wire::reply(&mut client).expect("a reply"), 4), 4);
+    serving.stop().exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn seeding_hoists_no_function_so_disabled_callbacks_refuse_only_the_handlers() {
+    let sandbox = Sandbox::new();
+    let serving = Serving::start(&sandbox, &sandbox.valid());
+    let source = "plugin { name = \"x\" }\n\
+                  let n = 1;\n\
+                  @Event(Read) fn r(p) { return n; }";
+    let mut client = serving.connect();
+    wire::send(
+        &mut client,
+        &init_granting(1, feature_off("callbacks"), &[]),
+    );
+    init_answered(&mut client, 1);
+    // The Globals are seeded without running any `fn`, so the registration succeeds...
+    wire::send(&mut client, &register_declaring(2, source, &["Read"]));
+    assert_eq!(
+        plugin_name_reply(&wire::reply(&mut client).expect("a reply")),
+        "x"
+    );
+    // ...and the handler, a top-level `fn`, is what the toggle refuses.
+    wire::send(&mut client, &fire_x(3, "Read"));
+    assert_eq!(
+        fired_entry(&wire::reply(&mut client).expect("a reply"), 3),
+        Err("policy.construct_disabled".to_owned())
     );
     serving.stop().exit(0);
 }

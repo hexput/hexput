@@ -3431,6 +3431,7 @@ fn invoke(
         empty_params(),
         host,
         limits,
+        None,
     ))
 }
 
@@ -3478,6 +3479,7 @@ fn invoke_hosted(
         empty_params(),
         host,
         Limits::default(),
+        None,
     ));
     let made = seen.lock().unwrap().clone();
     (result, made)

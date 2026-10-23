@@ -1209,6 +1209,9 @@ mod engine {
                 Outcome::AllocationsExceeded(_) => {
                     panic!("{}: the rule made too many allocations", student.id)
                 }
+                Outcome::GlobalWrite(_) => {
+                    panic!("{}: a Script has no Global Variables", student.id)
+                }
             }
         }
     }

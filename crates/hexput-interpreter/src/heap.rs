@@ -693,6 +693,16 @@ impl Heap {
         }
     }
 
+    /// Forget the secret of the property `key` of the object at `id` — a Global's property
+    /// another invocation rewrote with a value that carries none (Story 6.7).
+    pub(crate) fn clear_property_secret(&mut self, id: SlotId, key: &str) {
+        let freed = match self.slot_mut(id) {
+            Some(Slot::Object { meta, .. }) => meta.clear_location(key),
+            _ => 0,
+        };
+        self.shrink(freed);
+    }
+
     /// The secret of the place `at`.
     pub(crate) fn location_secret(&self, at: &Location) -> Option<&Secret> {
         match at {

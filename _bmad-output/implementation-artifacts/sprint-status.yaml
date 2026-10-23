@@ -102,13 +102,13 @@ development_status:
   6-4-run-initialization-handlers-before-the-plugin-serves-anythin: review
   6-5-fire-an-event-and-run-its-handlers: review
   6-6-hold-handler-results-to-their-declared-shape: review
-  6-7-share-plugin-state-across-invocations-without-stalling-sibli: backlog
+  6-7-share-plugin-state-across-invocations-without-stalling-sibli: review
   6-8-choose-the-locking-strategy: backlog
   6-9-keep-a-global-variable-forever-or-let-it-expire: backlog
   6-10-isolate-state-per-trigger-or-per-key: backlog
   6-11-order-handlers-on-one-event: backlog
   6-12-let-a-handler-skip-the-queue: backlog
-  6-13-keep-plugin-state-for-the-life-of-the-session: backlog
+  6-13-keep-plugin-state-for-the-life-of-the-session: backlog  # Story 6.7 already wires hexput-session teardown/release_plugin to hexput_globalvar teardown (its 2nd AC); plan only what remains
   6-14-finish-in-flight-work-when-the-backend-vanishes: backlog
   epic-6-retrospective: optional
 

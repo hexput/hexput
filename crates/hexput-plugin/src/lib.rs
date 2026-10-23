@@ -84,8 +84,17 @@
 //! own copy of `params`, under the Session's live settings and registrations; a handler's
 //! failure is its [`HandlerOutcome`] and never stops the next one. [`fire_reply`] builds the one
 //! `Result {results}` payload, an entry per handler in the order they ran. `priority` and `async`
-//! have no effect yet (Stories 6.11, 6.12), and until the Global Variable store lands (Story
-//! 6.7) each invocation evaluates the Global Variable initializers afresh.
+//! have no effect yet (Stories 6.11, 6.12).
+//!
+//! # What Story 6.7 adds
+//!
+//! Global Variables persist (FR-20). Every Plugin has one store, a `hexput-globalvar`
+//! `PluginStore` ([`Plugin::globals`]): [`prepare`] makes it empty and unregistered,
+//! [`initialize`] seeds it — every Global Variable initializer runs once, before the first init
+//! handler, and never again — and [`finish`] registers it in [`Plugins::global_variables`] as it
+//! stores the Plugin, so a registration that fails leaves no store behind. Every handler
+//! invocation, init or fire, reads and writes the Globals through it, on any Connection of the
+//! Session; only `hexput-session` tears a store down (AD-4).
 //!
 //! # What Story 6.6 adds
 //!
@@ -114,8 +123,8 @@ use hexput_exec::wire::{
     self as exec_wire, MAX_RESULT_DEPTH, MODIFICATIONS_KEY, Path, Unsendable, bounded,
 };
 use hexput_exec::{
-    Caller, Code, Diagnostic, Finished, Held, Host, Limits, Object, Program, Registration,
-    Value as ExecValue,
+    Caller, Code, Diagnostic, Finished, GlobalStore, GlobalVariables, Held, Host, Limits, Object,
+    Program, Registration, Value as ExecValue,
 };
 use hexput_parser::{BACKEND_REGISTERED_INIT, Category, PluginProgram, Shape, Span};
 use hexput_port::findings::{self, Rejection};
@@ -178,6 +187,9 @@ pub struct Plugin {
     program: PluginProgram,
     /// The program its handlers run against (Story 6.4), shared by every invocation.
     executable: Arc<Program>,
+    /// Its Global Variable store (Story 6.7), shared by every invocation; the Daemon's
+    /// [`GlobalVariables`] registry holds it too, until its Session tears it down.
+    globals: Arc<GlobalStore>,
     events: Vec<EventDeclaration>,
     /// Each declared Event's index in `events`, by name.
     index: HashMap<String, usize>,
@@ -208,6 +220,13 @@ impl Plugin {
     #[must_use]
     pub const fn executable(&self) -> &Arc<Program> {
         &self.executable
+    }
+
+    /// Its Global Variable store (Story 6.7): what every invocation of its handlers reads and
+    /// writes its Global Variables through.
+    #[must_use]
+    pub const fn globals(&self) -> &Arc<GlobalStore> {
+        &self.globals
     }
 
     /// Every Event the Backend declared at registration, in payload order. Empty when it declared
@@ -273,6 +292,9 @@ impl Plugin {
 #[derive(Debug, Default)]
 pub struct Plugins {
     clients: RwLock<HashMap<ClientId, ClientPlugins>>,
+    /// Every ready Plugin's Global Variable store (Story 6.7), by id. Only `hexput-session` tears
+    /// one down (AD-4), through [`Plugins::global_variables`] as the Daemon wires it.
+    globals: Arc<GlobalVariables>,
 }
 
 /// The Plugins one open Client ID holds: by id, and each id by its name (Story 6.5), kept in
@@ -288,6 +310,13 @@ impl Plugins {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The Global Variable stores of the Plugins this registry holds (Story 6.7): what the Daemon
+    /// hands `hexput-session`, the only caller of their teardown (AD-4).
+    #[must_use]
+    pub fn global_variables(&self) -> Arc<GlobalVariables> {
+        Arc::clone(&self.globals)
     }
 
     /// Accept registrations for `client_id`, whose Session has just been created. Opening one
@@ -357,11 +386,16 @@ impl Plugins {
 
     /// Store `plugin` for `client_id`, returning whether it was stored: `false`, storing
     /// nothing, when `client_id` is not open. The plugin is dropped outside the lock either way.
+    ///
+    /// Its Global Variable store joins [`Plugins::global_variables`] under the same lock, so once
+    /// [`Plugins::close`] has run for a Client ID no store of it can join: the Session's teardown
+    /// closes this registry before it tears the stores down.
     fn insert(&self, client_id: ClientId, plugin: Plugin) -> bool {
         let plugin = Arc::new(plugin);
         let mut clients = self.write();
         match clients.get_mut(&client_id) {
             Some(plugins) => {
+                self.globals.insert(plugin.id, Arc::clone(&plugin.globals));
                 plugins.by_name.insert(plugin.name().to_owned(), plugin.id);
                 plugins.by_id.insert(plugin.id, plugin);
                 true
@@ -434,6 +468,9 @@ pub struct Prepared {
     program: PluginProgram,
     /// The program the handlers run against, shared by every invocation.
     executable: Arc<Program>,
+    /// Its Global Variable store (Story 6.7): seeded by [`initialize`], held by no registry until
+    /// [`finish`] — so a registration that fails leaves none behind.
+    globals: Arc<GlobalStore>,
     events: Vec<EventDeclaration>,
     /// The static check's findings, as the success reply carries them.
     found: Vec<ErrorBody>,
@@ -532,6 +569,7 @@ pub fn prepare(
         id,
         program,
         executable,
+        globals: Arc::new(GlobalStore::new()),
         events,
         found,
     })
@@ -550,8 +588,11 @@ pub fn prepare(
 /// function, a cycle) or past the output size budget still fails the handler. Every handler and
 /// helper of a Plugin is a top-level named `fn`, so under a disabled `features.callbacks` every
 /// handler is refused (`policy.construct_disabled`), as the static check reports at registration.
-/// Until the Global Variable store lands (Story 6.7), every handler evaluates the Global Variable
-/// initializers afresh and its writes end with it. A Plugin with no init handler makes no call.
+/// First, before any handler, the Global Variables are initialized (Story 6.7): every Global
+/// Variable initializer runs once, in source order, seeding the Plugin's store
+/// ([`hexput_exec::seed_globals`], under the same limits and no host); no invocation runs one
+/// again. Every handler then reads and writes the Globals through that store, so a value an init
+/// handler writes is what the first fire reads. A Plugin with no init handler makes no call.
 /// Makes nothing ready: [`finish`] does. The settings are read when it is called; the future
 /// borrows only `prepared`.
 ///
@@ -573,6 +614,13 @@ pub fn initialize<'p>(
     // Read now, as the call is made: the future borrows nothing of `settings`.
     let limits = Limits::from_settings(settings);
     async move {
+        hexput_exec::seed_globals(
+            Arc::clone(&prepared.executable),
+            Arc::clone(&prepared.globals),
+            limits,
+        )
+        .await
+        .map_err(|diagnostic| Box::new(ErrorBody::from(&diagnostic)))?;
         for function in prepared.init_handlers() {
             let host = Host::new(registrations.clone(), caller.clone());
             let params = Held::plain(ExecValue::Object(Object::from_entries(Vec::<(
@@ -586,6 +634,7 @@ pub fn initialize<'p>(
                 params,
                 host,
                 limits,
+                Some(Arc::clone(&prepared.globals)),
             )
             .await;
             if let Err(diagnostic) = invoked {
@@ -622,6 +671,7 @@ pub fn finish(
         id,
         program,
         executable,
+        globals,
         events,
         found,
     } = prepared;
@@ -635,6 +685,7 @@ pub fn finish(
         id,
         program,
         executable,
+        globals,
         events,
         index,
     };
@@ -787,6 +838,7 @@ pub fn run_fire<'f>(
                 fire.params.clone(),
                 host,
                 limits,
+                Some(Arc::clone(fire.plugin.globals())),
             )
             .await;
             outcomes.push(HandlerOutcome {

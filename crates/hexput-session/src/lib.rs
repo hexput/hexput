@@ -124,6 +124,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use hexput_globalvar::Teardown;
 pub use hexput_shared::ids::{ClientId, PluginId};
 
 use credential::Credential;
@@ -227,6 +228,9 @@ pub struct Sessions {
     on_teardown: Option<TeardownHook>,
     /// The last Plugin id issued (Story 6.2); the next is one more, so the first is 1.
     last_plugin: AtomicU64,
+    /// The Plugins' Global Variable stores (Story 6.7), which this registry alone tears down
+    /// (AD-4), if set.
+    global_variables: Option<Arc<dyn Teardown>>,
 }
 
 /// The function [`Sessions::with_teardown`] stores.
@@ -241,6 +245,7 @@ impl core::fmt::Debug for Sessions {
             .field("next_generation", &self.next_generation)
             .field("on_teardown", &self.on_teardown.is_some())
             .field("last_plugin", &self.last_plugin)
+            .field("global_variables", &self.global_variables.is_some())
             .finish()
     }
 }
@@ -261,6 +266,19 @@ impl Sessions {
     #[must_use]
     pub fn with_teardown(mut self, hook: impl Fn(ClientId) + Send + Sync + 'static) -> Self {
         self.on_teardown = Some(Arc::new(hook));
+        self
+    }
+
+    /// This registry, tearing down the Global Variable store of every Plugin of a Session it
+    /// tears down (Story 6.7, AD-4) through `stores` — `hexput_globalvar::GlobalVariables`'s
+    /// `teardown(plugin_id)`, called for each of the Session's Plugin ids before anything else is
+    /// released and again after the teardown hook, which closes the Plugin registry so no store
+    /// of the Session can join after it — and the
+    /// store of a registration whose name [`release_plugin`](Self::release_plugin) frees. This
+    /// registry is the only caller of that teardown. A later call replaces an earlier one.
+    #[must_use]
+    pub fn with_global_variables(mut self, stores: Arc<dyn Teardown>) -> Self {
+        self.global_variables = Some(stores);
         self
     }
 
@@ -375,7 +393,12 @@ impl Sessions {
                 session.connections.remove(&connection) && session.connections.is_empty()
             });
             if let Some((client_id, session)) = removed {
-                teardown(client_id, session, self.on_teardown.as_deref());
+                teardown(
+                    client_id,
+                    session,
+                    self.on_teardown.as_deref(),
+                    self.global_variables.as_deref(),
+                );
             }
             return None;
         }
@@ -407,7 +430,12 @@ impl Sessions {
         });
         match removed {
             Some((client_id, session)) => {
-                teardown(client_id, session, self.on_teardown.as_deref());
+                teardown(
+                    client_id,
+                    session,
+                    self.on_teardown.as_deref(),
+                    self.global_variables.as_deref(),
+                );
                 true
             }
             None => false,
@@ -599,7 +627,14 @@ impl Sessions {
         };
         let before = session.plugins.len();
         session.plugins.retain(|_, held| *held != id);
-        session.plugins.len() != before
+        let released = session.plugins.len() != before;
+        drop(session);
+        // A registration that never became ready holds no store in the registry; one that did and
+        // is released anyway loses it here (AD-4).
+        if released && let Some(stores) = &self.global_variables {
+            stores.teardown(id);
+        }
+        released
     }
 
     /// The Session's Plugins as `(name, id)` pairs, sorted by id (so in registration order);
@@ -648,17 +683,21 @@ fn generate_client_id() -> ClientId {
 /// [`Sessions::expire`] (after the TTL, Story 5.8) once the Session is already out of the
 /// registry — never from a `Drop` impl, never under a lock.
 ///
-/// Today it releases the Config, the reconnect credential, the Registered Functions and the
-/// Session's Plugin names (Story 6.2). Story 6.13 calls `hexput_globalvar::teardown(plugin_id)`
-/// here for each of those Plugin ids first, before its actor is dropped (AD-4); the parsed
-/// Plugins themselves are released by the hook, which the Daemon wires to `hexput-plugin`. Story
-/// 5.8's TTL delays the call to this function, not moves it — and the teardown hook with it.
+/// It releases the Config, the reconnect credential, the Registered Functions and the Session's
+/// Plugin names (Story 6.2). The parsed Plugins themselves are released by the hook, which the
+/// Daemon wires to `hexput-plugin`. Story 5.8's TTL delays the call to this function, not moves
+/// it — and the teardown hook with it.
 ///
-/// The hook, when the registry has one, is called last, with the Session's Client ID (Story 4.3).
+/// `stores.teardown(plugin_id)` runs for each of the Session's Plugin ids (Story 6.7, AD-4) — the
+/// stores' only lifecycle exit — before anything else is released; then the hook, when the
+/// registry has one, is called with the Session's Client ID (Story 4.3); then the stores'
+/// teardown runs once more, since only the hook closes the Plugin registry to a registration
+/// still finishing (a teardown of an id with no store does nothing).
 fn teardown(
     client_id: ClientId,
     session: Session,
     hook: Option<&(dyn Fn(ClientId) + Send + Sync)>,
+    stores: Option<&dyn Teardown>,
 ) {
     let Session {
         config,
@@ -669,8 +708,22 @@ fn teardown(
         expiring: _,
     } = session;
     debug_assert!(connections.is_empty(), "a Session is torn down unattached");
+    let ids: Vec<PluginId> = plugins.values().copied().collect();
+    let release_stores = || {
+        if let Some(stores) = stores {
+            for &id in &ids {
+                stores.teardown(id);
+            }
+        }
+    };
+    // The stores go first, before anything of the Session's Plugins drops (AD-4)...
+    release_stores();
     drop((config, credential, registrations, plugins));
     if let Some(hook) = hook {
         hook(client_id);
     }
+    // ...and once more after the hook closed the Plugin registry: a registration that was
+    // finishing as the Session ended may have joined its store between the two, and none can
+    // join after.
+    release_stores();
 }

@@ -230,7 +230,8 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The Daemon's Session registry over `cache` and `plugins`: a Session's teardown releases its
 /// cache entries (Story 4.3) and then its parsed Plugins (Story 6.2) through the registry's hook,
-/// so `hexput-session` never reaches `hexput-script` or `hexput-plugin`. The one place this
+/// so `hexput-session` never reaches `hexput-script` or `hexput-plugin`. It is also handed the
+/// Plugins' Global Variable stores (Story 6.7), which it alone tears down (AD-4), after the hook. The one place this
 /// pairing is made — the connection opens a Session in both at init, and this hook closes it,
 /// the cache first — so a test can check the Daemon's own wiring. `ttl` is how long a Session
 /// outlives its last Connection before that teardown (Story 5.8): System Config's
@@ -241,10 +242,12 @@ fn registry(
     ttl: Duration,
 ) -> Arc<Sessions> {
     let released = Arc::clone(cache);
+    let stores = plugins.global_variables();
     let plugins = Arc::clone(plugins);
     Arc::new(
         Sessions::new()
             .with_ttl(ttl)
+            .with_global_variables(stores)
             .with_teardown(move |client_id| {
                 released.close(client_id);
                 plugins.close(client_id);
@@ -772,6 +775,12 @@ mod tests {
         assert_eq!(cache.entry_count(), 2);
         assert_eq!(plugins.ids(ended).len(), 1);
         assert_eq!(plugins.len(), 2);
+        // Each Plugin's Global Variable store joined the registry with it (Story 6.7).
+        let stores = plugins.global_variables();
+        let ended_plugin = plugins.ids(ended)[0];
+        let kept_plugin = plugins.ids(kept)[0];
+        assert!(stores.get(ended_plugin).is_some());
+        assert!(stores.get(kept_plugin).is_some());
         // ...and everything once it expires.
         assert!(sessions.expire(&expiry));
         assert!(cache.handles(ended).is_empty());
@@ -781,6 +790,9 @@ mod tests {
         assert!(plugins.ids(ended).is_empty());
         assert_eq!(plugins.ids(kept).len(), 1);
         assert_eq!(plugins.len(), 1);
+        // Its Plugin's store too, and no other Session's (AD-4).
+        assert!(stores.get(ended_plugin).is_none());
+        assert!(stores.get(kept_plugin).is_some());
         // And a registration arriving after the teardown leaves nothing behind.
         let late = register(&cache, ended).unwrap_err();
         assert_eq!(late.code, "protocol.init_not_completed");

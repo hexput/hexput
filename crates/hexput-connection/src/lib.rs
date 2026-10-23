@@ -1014,10 +1014,19 @@ async fn register_plugin(
         tracing::debug!(code = %body.code, "a plugin registration failed");
         return error_response(id, &body);
     }
-    match on_blocking_pool(move || hexput_plugin::finish(prepared, client_id, &plugins)).await {
+    // The reservation goes with the store into the blocking closure, which runs to its end even
+    // when this task is abandoned meanwhile: the name is released only if the Plugin was not
+    // stored, never while a store is about to join the registry under it.
+    let finished = on_blocking_pool(move || {
+        let finished = hexput_plugin::finish(prepared, client_id, &plugins);
+        // Stored: the name now belongs to the Plugin, released with its Session.
+        reservation.armed = finished.is_err();
+        drop(reservation);
+        finished
+    })
+    .await;
+    match finished {
         Ok(payload) => {
-            // Stored: the name now belongs to the Plugin, released with its Session.
-            reservation.armed = false;
             tracing::debug!(plugin = name, plugin_id = %plugin_id, "plugin registered");
             Envelope {
                 id,
@@ -1026,8 +1035,7 @@ async fn register_plugin(
             }
         }
         Err(refusal) => {
-            // The Session ended during the initialization: whatever is left of it lets go.
-            drop(reservation);
+            // The Session ended during the initialization: the guard has let the name go.
             plugin_refused(id, refusal)
         }
     }

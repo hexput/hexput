@@ -94,6 +94,7 @@ use hexput_ast::{
 use indexmap::IndexMap;
 
 use crate::convert::{number_to_string, to_number, to_string};
+use crate::globals::{self, Changes, Globals};
 use crate::heap::{DetachFailure, Heap, Location, Referent, RtValue, SlotId, TEXT_OVERHEAD, Text};
 use crate::value::{Finished, Held, Modification, SECRET_KEY, Secret};
 use crate::{CALL_DEPTH_LIMIT, Meter, Value};
@@ -240,6 +241,11 @@ enum Frame {
     /// `links[index]` names a method of a keyed receiver and `links[index + 1]` calls it.
     /// [`Machine::resume`] continues the chain after the call.
     MethodCall(Box<MethodAt>),
+    /// `[key]` → `[key]`: takes the writer intent of the Global unit the single-link index
+    /// assignment `target` writes, now that its key is known (Story 6.7).
+    Intent {
+        target: ExprId,
+    },
     /// `[]` → calls the top-level named function declared at this position with one argument,
     /// once the top level has run (Story 6.4). It sits at the bottom of the frame stack of a
     /// handler invocation, and its body runs at call depth 0, so the function's `return` — or its
@@ -344,6 +350,9 @@ pub(crate) enum Stop {
     /// The Script made more allocations than the [`Meter`]'s allocation ceiling. The span is the
     /// construct whose allocation crossed it. The machine must be dropped.
     AllocationsExceeded(Span),
+    /// The Script is about to write a Global Variable (Story 6.7); running the machine again
+    /// makes the write. The span is the assignment target's.
+    GlobalWrite(Span),
 }
 
 /// What frame is running, cheaply: resolved to a span only when a metering stop needs one.
@@ -449,6 +458,17 @@ pub(crate) struct Machine<P> {
     /// Every referenced place and collection the Script wrote, by Reference ID, in the order of
     /// the first write (Story 3.13): what its result reports.
     written: IndexMap<Arc<str>, Referent>,
+    /// The Plugin's Global Variable store, when this execution is a Plugin's (Story 6.7).
+    globals: Option<Box<dyn Globals>>,
+    /// The Program's top-level `let` names: its Global Variables, when `globals` is set.
+    global_names: HashSet<String>,
+    /// The writer intent the running assignment holds on a Global unit, released after its write.
+    intent: Option<Box<dyn Send>>,
+    /// Whether the Global write the next assignment frame makes was already charged.
+    write_charged: bool,
+    /// Whether this run only seeds a Plugin's Global Variables: no function is hoisted, so none
+    /// is checked against the toggles either.
+    seeding: bool,
 }
 
 /// Why a host call's modifications cannot be applied (Story 3.13): one names an array or object
@@ -504,10 +524,26 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         program: P,
         variables: impl IntoIterator<Item = (N, Held)>,
     ) -> Self {
+        let tree = program.clone();
+        let mut machine = Self::empty(program);
+        let scope = machine.root;
+        for (name, held) in variables {
+            let attached = machine.heap.attach(&held.value);
+            // A scalar's secret names the variable it arrived in; a collection carries its own.
+            let secret = held.secret.filter(|_| !held.value.is_collection());
+            machine
+                .heap
+                .declare_held(scope, name.as_ref(), attached, secret);
+        }
+        machine.hoist(&tree, None);
+        machine
+    }
+
+    /// A machine with an empty root scope and nothing scheduled.
+    fn empty(program: P) -> Self {
         let mut heap = Heap::default();
         let scope = heap.push_scope(None);
-        let tree = program.clone();
-        let mut machine = Self {
+        Self {
             program,
             frames: Vec::new(),
             values: Vec::new(),
@@ -533,17 +569,12 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             methods: HashMap::new(),
             chain_place: None,
             written: IndexMap::new(),
-        };
-        for (name, held) in variables {
-            let attached = machine.heap.attach(&held.value);
-            // A scalar's secret names the variable it arrived in; a collection carries its own.
-            let secret = held.secret.filter(|_| !held.value.is_collection());
-            machine
-                .heap
-                .declare_held(scope, name.as_ref(), attached, secret);
+            globals: None,
+            global_names: HashSet::new(),
+            intent: None,
+            write_charged: false,
+            seeding: false,
         }
-        machine.hoist(&tree, None);
-        machine
     }
 
     /// A machine that runs the top level — the Global Variable initializers and the hoisting of
@@ -563,6 +594,23 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 at: StmtAt { block: None, index },
                 argument,
             })),
+        );
+        machine
+    }
+
+    /// A machine that runs only the top-level `let`s — a Plugin's Global Variable initializers —
+    /// and hoists nothing (Story 6.7): with a store set, the run that seeds it.
+    pub(crate) fn seeding(program: P) -> Self {
+        let mut machine = Self::empty(program.clone());
+        machine.seeding = true;
+        machine.frames.extend(
+            program
+                .statements
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, statement)| matches!(statement.kind, StatementKind::Let { .. }))
+                .map(|(index, _)| Frame::Statement(StmtAt { block: None, index })),
         );
         machine
     }
@@ -636,6 +684,198 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         self.meter = meter;
     }
 
+    /// Read and write the Program's top-level `let`s through `store` (Story 6.7). Set before the
+    /// first run.
+    pub(crate) fn set_globals(&mut self, store: Box<dyn Globals>) {
+        debug_assert!(!self.started, "Global Variables set on a running execution");
+        self.global_names = globals::names(&self.program).into_iter().collect();
+        self.globals = Some(store);
+    }
+
+    /// Whether `name`, seen from the current scope, is one of the Plugin's Global Variables: a
+    /// top-level `let` no inner binding shadows.
+    fn is_global(&self, name: &str) -> bool {
+        self.globals.is_some()
+            && self.global_names.contains(name)
+            && self.heap.binding_owner(self.scope, name) == Some(self.root)
+    }
+
+    /// The Global Variable an assignment target starts at — `n` in `n = …`, `g` in `g.k.x = …` —
+    /// when it starts at one.
+    fn global_target(&self, tree: &Program, target: ExprId) -> Option<String> {
+        let name = match &tree.expression(target).kind {
+            ExpressionKind::Identifier(name) => name,
+            ExpressionKind::Access { base, .. } => match &tree.expression(*base).kind {
+                ExpressionKind::Identifier(name) => name,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        self.is_global(&name.name).then(|| name.name.clone())
+    }
+
+    /// Bring the execution's copy of the Global `name` up to date with the store.
+    ///
+    /// A copy holding an object keeps its identity whenever the new value is an object too: the
+    /// changed properties are replaced in place, or — when the change adds a property or replaces
+    /// the whole variable — its contents are. So a receiver an assignment already evaluated, a
+    /// `for … in` iterating it, or a name bound to it, still sees the Global afterwards.
+    fn sync_global(&mut self, name: &str) {
+        let Some(changes) = self.globals.as_mut().and_then(|store| store.changes(name)) else {
+            return;
+        };
+        let current = match self.heap.binding_value(self.root, name) {
+            Some(RtValue::Object(object)) => Some(object),
+            _ => None,
+        };
+        let held = match changes {
+            Changes::Whole(held) => held,
+            Changes::Properties(properties) => {
+                if let Some(object) = current
+                    && properties
+                        .iter()
+                        .all(|(key, _)| self.heap.object_get(object, key).is_some())
+                {
+                    for (key, held) in properties {
+                        let value = self.heap.attach(&held.value);
+                        // The place takes the stored value's secret, or none.
+                        self.heap.clear_property_secret(object, &key);
+                        let place = Location::Property(object, key);
+                        self.heap.set_place(&place, value);
+                        if let Some(secret) = held.secret.filter(|_| !held.value.is_collection()) {
+                            self.heap.set_location_secret(&place, secret);
+                        }
+                    }
+                    return;
+                }
+                // A property the copy does not have yet: the whole value is brought over.
+                match self.globals.as_mut().and_then(|store| store.current(name)) {
+                    Some(held) => held,
+                    None => return,
+                }
+            }
+        };
+        let value = self.heap.attach(&held.value);
+        if let (Some(object), RtValue::Object(source)) = (current, &value)
+            && self.heap.replace_contents(object, *source)
+        {
+            return;
+        }
+        // A fresh place: the stored value's secret, or none.
+        let secret = held.secret.filter(|_| !held.value.is_collection());
+        self.heap.declare_held(self.root, name, value, secret);
+    }
+
+    /// Detach `value`, the new value of a Global unit, as the store keeps it; `span` is the
+    /// assignment target, which an error points at.
+    fn global_value(
+        &self,
+        value: &RtValue,
+        secret: Option<Secret>,
+        span: Span,
+    ) -> Result<Held, Diagnostic> {
+        match self.heap.detach(value) {
+            Ok(detached) => {
+                let secret = secret.filter(|_| !detached.is_collection());
+                Ok(Held::new(detached, secret))
+            }
+            Err(DetachFailure::Cycle) => Err(Diagnostic::new(
+                Category::Type,
+                Code::CYCLIC_RESULT,
+                "cannot store this value in a Global Variable: it contains a value that refers \
+                 back to itself, and a Global Variable holds a finite tree of values"
+                    .to_owned(),
+                span,
+            )),
+            Err(DetachFailure::Function) => Err(Diagnostic::new(
+                Category::Type,
+                Code::FUNCTION_RESULT,
+                "cannot store a function in a Global Variable: it holds data only".to_owned(),
+                span,
+            )),
+        }
+    }
+
+    /// Take the writer intent of the Global unit the assignment to `target` writes, when its
+    /// value expression `value` — and its target's keys — make no call and create no function
+    /// (Story 6.7). A single-link index target under a computed key takes it once the key is
+    /// known instead ([`Frame::Intent`]); returns whether that is still to come.
+    fn begin_global_update(&mut self, tree: &Program, target: ExprId, value: ExprId) -> bool {
+        let Some(name) = self.global_target(tree, target) else {
+            return false;
+        };
+        if !globals::calls_nothing(tree, value) || !globals::calls_nothing(tree, target) {
+            return false;
+        }
+        let key = match &tree.expression(target).kind {
+            ExpressionKind::Access { links, .. } => match links.first() {
+                Some(first) => match globals::static_key(tree, &first.kind) {
+                    Some(key) => Some(key.to_owned()),
+                    None if links.len() == 1 => return true,
+                    None => None,
+                },
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(store) = self.globals.as_mut() {
+            self.intent = Some(store.begin_update(&name, key.as_deref()));
+        }
+        false
+    }
+
+    /// After an assignment to `target` wrote the heap, write the Global unit it changed back to
+    /// the store (Story 6.7) and release the writer intent the assignment held. `key` is a
+    /// single-link index target's key, which the frame no longer holds.
+    fn write_back(
+        &mut self,
+        tree: &Program,
+        name: &str,
+        target: ExprId,
+        key: Option<RtValue>,
+    ) -> Result<(), Diagnostic> {
+        let expression = tree.expression(target);
+        let span = expression.span;
+        let whole = self.heap.binding_value(self.root, name);
+        let property = match (&expression.kind, &whole) {
+            (ExpressionKind::Access { links, .. }, Some(RtValue::Object(object))) => {
+                let first = links.first().and_then(|link| {
+                    globals::static_key(tree, &link.kind)
+                        .map(Arc::<str>::from)
+                        .or_else(|| match (&key, links.len()) {
+                            (Some(RtValue::String(key)), 1) => Some(key.shared()),
+                            _ => None,
+                        })
+                });
+                first.map(|key| (*object, key))
+            }
+            _ => None,
+        };
+        let written = match property {
+            // `__secret` is never a property: writing it changed nothing.
+            Some((_, key)) if &*key == SECRET_KEY => None,
+            Some((object, key)) => match self.heap.object_get(object, &key) {
+                Some(value) => {
+                    let secret = self.heap.property_secret(object, &key).cloned();
+                    Some((Some(key), self.global_value(&value, secret, span)?))
+                }
+                None => None,
+            },
+            None => match whole {
+                Some(value) => {
+                    let secret = self.heap.binding_secret(self.root, name).cloned();
+                    Some((None, self.global_value(&value, secret, span)?))
+                }
+                None => None,
+            },
+        };
+        if let (Some((key, held)), Some(store)) = (written, self.globals.as_mut()) {
+            store.write(name, key.as_deref(), held);
+        }
+        self.intent = None;
+        Ok(())
+    }
+
     /// Know the Session's Registered Methods, as `(key, name)` pairs (Story 3.12).
     pub(crate) fn set_methods(&mut self, methods: impl IntoIterator<Item = (Arc<str>, Arc<str>)>) {
         for (key, name) in methods {
@@ -676,7 +916,9 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         let tree: &Program = &program;
         if !self.started {
             self.started = true;
-            self.allow_hoisting(tree, None)?;
+            if !self.seeding {
+                self.allow_hoisting(tree, None)?;
+            }
         }
         // A ceiling the starting variables or a host call's value already crossed stops the
         // machine before it runs a step.
@@ -881,7 +1123,8 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             | Frame::BuildArray { array: id, .. }
             | Frame::BuildObject(id)
             | Frame::AssignName { target: id, .. }
-            | Frame::AssignMember { target: id, .. } => Site::Expression(*id),
+            | Frame::AssignMember { target: id, .. }
+            | Frame::Intent { target: id } => Site::Expression(*id),
             Frame::Unary { operator, .. } => Site::Span(operator.span),
             Frame::BinaryRight { operator, .. } | Frame::Binary { operator, .. } => {
                 Site::Span(operator.span)
@@ -1040,6 +1283,14 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                     name, initializer, ..
                 } = &statement(tree, at).kind
                 {
+                    // A Global the store held no value for: its initializer's value seeds it
+                    // (Story 6.7).
+                    if at.block.is_none()
+                        && let Some(store) = self.globals.as_mut()
+                        && let Ok(detached) = self.heap.detach(&value)
+                    {
+                        store.seed(&name.name, Held::plain(detached));
+                    }
                     // A fresh place: plain, unless it stores a host call's value that came with
                     // a secret.
                     let secret = self.take_reply_secret(*initializer);
@@ -1208,6 +1459,17 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 target,
                 value: stored,
             } => {
+                // A Global write stops first, for the Executor to charge it (Story 6.7).
+                let global = self.global_target(tree, target);
+                if global.is_some() && !self.write_charged {
+                    self.write_charged = true;
+                    self.frames.push(Frame::AssignName {
+                        target,
+                        value: stored,
+                    });
+                    return Ok(Some(Stop::GlobalWrite(tree.expression(target).span)));
+                }
+                self.write_charged = false;
                 let value = self.pop();
                 let expression = tree.expression(target);
                 let ExpressionKind::Identifier(name) = &expression.kind else {
@@ -1239,8 +1501,53 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                         name.span,
                     ));
                 }
+                if let Some(name) = global {
+                    self.write_back(tree, &name, target, None)?;
+                }
             }
-            Frame::AssignMember { target, value } => self.assign_member(tree, target, value)?,
+            Frame::AssignMember { target, value } => {
+                // A Global write stops first, for the Executor to charge it (Story 6.7).
+                let global = self.global_target(tree, target);
+                if global.is_some() && !self.write_charged {
+                    self.write_charged = true;
+                    self.frames.push(Frame::AssignMember { target, value });
+                    return Ok(Some(Stop::GlobalWrite(tree.expression(target).span)));
+                }
+                self.write_charged = false;
+                // A single-link index target's key, which the store write needs once the frame
+                // has consumed it: `[receiver, key, value]`.
+                let key = match &tree.expression(target).kind {
+                    ExpressionKind::Access { links, .. }
+                        if global.is_some()
+                            && matches!(
+                                links.last().map(|link| &link.kind),
+                                Some(AccessKind::Index { .. })
+                            ) =>
+                    {
+                        self.values
+                            .len()
+                            .checked_sub(2)
+                            .and_then(|at| self.values.get(at))
+                            .cloned()
+                    }
+                    _ => None,
+                };
+                self.assign_member(tree, target, value)?;
+                if let Some(name) = global {
+                    self.write_back(tree, &name, target, key)?;
+                }
+            }
+            Frame::Intent { target } => {
+                let key = match self.values.last() {
+                    Some(RtValue::String(key)) => Some(key.shared()),
+                    _ => None,
+                };
+                if let Some(name) = self.global_target(tree, target)
+                    && let Some(store) = self.globals.as_mut()
+                {
+                    self.intent = Some(store.begin_update(&name, key.as_deref()));
+                }
+            }
             Frame::Branch { at, index } => {
                 let taken = self.pop();
                 if self.heap.is_truthy(&taken) {
@@ -1925,7 +2232,23 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
 
     fn statement(&mut self, tree: &Program, at: StmtAt) -> Result<Option<Value>, Diagnostic> {
         match &statement(tree, at).kind {
-            StatementKind::Let { initializer, .. } => {
+            StatementKind::Let {
+                name, initializer, ..
+            } => {
+                // A Global Variable the store holds binds its stored value; its initializer never
+                // runs again (Story 6.7).
+                if at.block.is_none()
+                    && let Some(held) = self
+                        .globals
+                        .as_mut()
+                        .and_then(|store| store.current(&name.name))
+                {
+                    let value = self.heap.attach(&held.value);
+                    let secret = held.secret.filter(|_| !held.value.is_collection());
+                    self.heap
+                        .declare_held(self.scope, &name.name, value, secret);
+                    return Ok(None);
+                }
                 self.frames.push(Frame::Declare(at));
                 self.frames.push(Frame::Eval(*initializer));
             }
@@ -1991,6 +2314,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         value: ExprId,
     ) -> Result<(), Diagnostic> {
         let target_expression = tree.expression(target);
+        let deferred_intent = self.begin_global_update(tree, target, value);
         match &target_expression.kind {
             ExpressionKind::Identifier(_) => {
                 self.frames.push(Frame::AssignName { target, value });
@@ -2009,6 +2333,9 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 match &link.kind {
                     AccessKind::Property(_) => {}
                     AccessKind::Index { expression, .. } => {
+                        if deferred_intent {
+                            self.frames.push(Frame::Intent { target });
+                        }
                         self.frames.push(Frame::Eval(*expression));
                     }
                     AccessKind::Call { .. } => return Err(invalid_target(target_expression.span)),
@@ -2033,6 +2360,10 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 }
             }),
             ExpressionKind::Identifier(name) => {
+                // A Global Variable's copy catches up with the store before it is read (Story 6.7).
+                if self.is_global(&name.name) {
+                    self.sync_global(&name.name);
+                }
                 // A host function is not a value (§8): only calling a bare undeclared name
                 // reaches the host, so naming one without calling it is still undeclared.
                 let Some(value) = self.heap.lookup(self.scope, &name.name) else {
@@ -3025,6 +3356,7 @@ mod tests {
             Stop::Paused(_) | Stop::OutOfMemory(_) | Stop::AllocationsExceeded(_) => {
                 panic!("these machines are unmetered")
             }
+            Stop::GlobalWrite(_) => panic!("these machines have no Global Variables"),
         }
     }
 

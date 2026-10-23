@@ -126,6 +126,7 @@
 
 mod convert;
 mod environment;
+mod globals;
 mod heap;
 mod machine;
 mod value;
@@ -134,6 +135,7 @@ use std::sync::Arc;
 
 use hexput_ast::StatementKind;
 
+pub use globals::{Changes, Globals};
 pub use machine::{Argument, ModificationMismatch};
 pub use value::{Array, Finished, Held, Modification, Object, Secret, Value};
 
@@ -269,7 +271,9 @@ pub fn evaluate_with_variables<N: AsRef<str>>(
         machine::Stop::Finished(finished) => Ok(finished.result.value),
         // Unreachable: an unmetered machine has no ceiling to stop at, and pauses are looped
         // over above. Limits and their errors are the Executor's, so this is no budget error.
+        // Unreachable too: no store is set, so no Global is ever written.
         machine::Stop::Paused(span)
+        | machine::Stop::GlobalWrite(span)
         | machine::Stop::OutOfMemory(span)
         | machine::Stop::AllocationsExceeded(span) => Err(machine::internal(span)),
         machine::Stop::HostCall(call) => Err(Diagnostic::new(
@@ -360,14 +364,14 @@ impl Execution {
     }
 
     /// An invocation of one Plugin handler (Story 6.4): the execution runs `program`'s top level
-    /// — its Global Variable initializers, evaluated afresh, and the hoisting of every top-level
-    /// named function — and then calls the top-level named function `function` with `argument`
+    /// — its Global Variable initializers (or, with a store set, the Globals' stored values,
+    /// Story 6.7) and the hoisting of every top-level named function — and then calls the top-level named function `function` with `argument`
     /// as its one parameter. The result ([`Finished::result`]) is that call's `return`, or `null`
     /// when its body runs off its end; it is detached exactly as a Script result is, so a
     /// function or a cycle is refused the same way. Nothing runs until [`Execution::run`], and
     /// everything else — metering, feature toggles, methods, Reference IDs, host calls — is as
-    /// for any execution. Nothing outlives it: a write to a Global Variable ends with the
-    /// invocation.
+    /// for any execution. Without a store ([`Execution::with_globals`]) nothing outlives it: a
+    /// write to a Global Variable ends with the invocation.
     ///
     /// A scalar `argument` arriving with a secret gives it to the parameter, as a starting
     /// variable's does (Story 3.11).
@@ -396,6 +400,18 @@ impl Execution {
         })
     }
 
+    /// A run of `program`'s top-level `let`s alone — a Plugin's Global Variable initializers, in
+    /// source order — hoisting no function (Story 6.7). With a store set
+    /// ([`Execution::with_globals`]), each Global the store holds no value for is seeded with its
+    /// initializer's: the one run at registration that initializes a Plugin's Globals. Its result
+    /// is `null`.
+    #[must_use]
+    pub fn seeding(program: Arc<Program>) -> Self {
+        Self {
+            machine: Box::new(machine::Machine::seeding(program)),
+        }
+    }
+
     /// The names bound in this execution's root scope, sorted. Before it runs: its starting
     /// variables and its top-level named functions (hoisted, §6) — and, by construction, no
     /// builtin but [`BUILTINS`]; once it has run up to a host call, also the top-level `let`s
@@ -411,6 +427,18 @@ impl Execution {
     #[must_use]
     pub fn metered(mut self, meter: Meter) -> Self {
         self.machine.set_meter(meter);
+        self
+    }
+
+    /// Read and write the Program's top-level `let`s — a Plugin's Global Variables — through
+    /// `store` (Story 6.7; see [`Globals`]): a top-level `let` the store holds a value for binds
+    /// it without running its initializer, one it holds none for seeds it, every read of a
+    /// Global catches up with the store, every write to one stops first with
+    /// [`Outcome::GlobalWrite`] and then writes its unit back, and a call-free update holds the
+    /// unit's writer intent. Set before the first [`Execution::run`].
+    #[must_use]
+    pub fn with_globals(mut self, store: Box<dyn Globals>) -> Self {
+        self.machine.set_globals(store);
         self
     }
 
@@ -490,6 +518,10 @@ impl Execution {
                 span,
                 execution: Self { machine },
             })),
+            machine::Stop::GlobalWrite(span) => Ok(Outcome::GlobalWrite(GlobalWrite {
+                span,
+                execution: Self { machine },
+            })),
             machine::Stop::OutOfMemory(span) => {
                 let used = machine.memory_used();
                 // The heap goes here, before the driver hears of it.
@@ -519,6 +551,10 @@ pub enum Outcome {
     HostCall(HostCall),
     /// The slice its [`Meter`] allows is done; [`Paused::resume`] hands the execution back.
     Paused(Paused),
+    /// It is about to write one of a Plugin's Global Variables (Story 6.7): the Executor charges
+    /// the write as a side effect, then [`GlobalWrite::resume`] hands the execution back to make
+    /// it. Only an execution [`with_globals`](Execution::with_globals) stops here.
+    GlobalWrite(GlobalWrite),
     /// Its values came to hold more than its [`Meter`]'s memory ceiling. The execution is gone,
     /// its heap already freed.
     OutOfMemory(OutOfMemory),
@@ -541,6 +577,27 @@ impl Paused {
     }
 
     /// The execution, ready to [`run`](Execution::run) on from where it paused.
+    #[must_use]
+    pub fn resume(self) -> Execution {
+        self.execution
+    }
+}
+
+/// An [`Execution`] stopped just before writing a Global Variable (Story 6.7). It may hold the
+/// unit's writer intent: run it on at once, or drop it, never park it.
+pub struct GlobalWrite {
+    span: Span,
+    execution: Execution,
+}
+
+impl GlobalWrite {
+    /// The assignment target being written.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+
+    /// The execution, ready to [`run`](Execution::run) on and make the write.
     #[must_use]
     pub fn resume(self) -> Execution {
         self.execution

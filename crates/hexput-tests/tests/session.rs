@@ -1826,3 +1826,62 @@ fn releasing_after_the_session_is_torn_down_is_false() {
     assert!(!sessions.release_plugin(id, held));
     assert_eq!(plugin_names(&sessions, id), None);
 }
+
+// --- Story 6.7: the Session alone tears its Plugins' Global Variable stores down (AD-4) ---
+
+/// A registry wired to `stores`, as the Daemon wires it.
+fn with_stores(stores: &std::sync::Arc<hexput_globalvar::GlobalVariables<i64>>) -> Sessions {
+    Sessions::new().with_global_variables(std::sync::Arc::clone(stores) as _)
+}
+
+#[test]
+fn tearing_a_session_down_removes_every_store_of_its_plugins_and_no_other() {
+    let stores = std::sync::Arc::new(hexput_globalvar::GlobalVariables::<i64>::new());
+    let sessions = with_stores(&stores);
+    let (id, connection) = create(&sessions, valid(&[]));
+    let (other, _) = create(&sessions, valid(&[]));
+    let a = sessions.register_plugin(id, "a").unwrap();
+    let b = sessions.register_plugin(id, "b").unwrap();
+    let kept = sessions.register_plugin(other, "a").unwrap();
+    for plugin in [a, b, kept] {
+        stores.create(plugin).write("n", None, 1);
+    }
+    // No TTL: the last detach tears the Session down at once.
+    assert!(sessions.detach(id, connection).is_none());
+    assert!(stores.get(a).is_none(), "its Plugins' stores are gone");
+    assert!(stores.get(b).is_none());
+    assert_eq!(
+        stores
+            .get(kept)
+            .expect("another Session's store stays")
+            .read("n", None),
+        Some(1)
+    );
+}
+
+#[test]
+fn an_expired_session_removes_its_plugins_stores_after_its_ttl() {
+    let stores = std::sync::Arc::new(hexput_globalvar::GlobalVariables::<i64>::new());
+    let sessions = with_stores(&stores).with_ttl(Duration::from_secs(1));
+    let (id, connection) = create(&sessions, valid(&[]));
+    let plugin = sessions.register_plugin(id, "a").unwrap();
+    let _store = stores.create(plugin);
+    let expiry = sessions.detach(id, connection).expect("a countdown");
+    assert!(
+        stores.get(plugin).is_some(),
+        "the store outlives the last detach"
+    );
+    assert!(sessions.expire(&expiry));
+    assert!(stores.get(plugin).is_none(), "expiry tears the store down");
+}
+
+#[test]
+fn releasing_a_failed_registration_removes_its_store() {
+    let stores = std::sync::Arc::new(hexput_globalvar::GlobalVariables::<i64>::new());
+    let sessions = with_stores(&stores);
+    let (id, _connection) = create(&sessions, valid(&[]));
+    let plugin = sessions.register_plugin(id, "a").unwrap();
+    let _store = stores.create(plugin);
+    assert!(sessions.release_plugin(id, plugin));
+    assert!(stores.get(plugin).is_none());
+}

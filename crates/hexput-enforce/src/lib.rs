@@ -481,6 +481,31 @@ impl Budget {
         Ok(())
     }
 
+    /// Charge one write of a Plugin's Global Variable (Story 6.7), `span` being the assignment
+    /// target's: one side effect, and no RPC call — a Global is the language's own state, reached
+    /// with no capability. Charged before the write is made.
+    ///
+    /// # Errors
+    /// `budget.side_effects_exceeded` when this write would take the side-effect count past
+    /// [`Limits::side_effects`], spanned on the target, which must then not be written. Nothing is
+    /// charged for a refused write; the writes already charged stand.
+    pub fn charge_side_effect(&mut self, span: Span) -> Result<(), Exceeded> {
+        if self.side_effects >= self.limits.side_effects {
+            return Err(exceeded(
+                Dimension::SideEffects,
+                Code::SIDE_EFFECTS_EXCEEDED,
+                format!(
+                    "the Script tried to perform more than its side-effect budget of {} side \
+                     effects",
+                    self.limits.side_effects
+                ),
+                span,
+            ));
+        }
+        self.side_effects += 1;
+        Ok(())
+    }
+
     /// Charge the Script's result, whose `{value}` payload encodes to `bytes` bytes of
     /// MessagePack; `span` is where the error points (the whole Script).
     ///

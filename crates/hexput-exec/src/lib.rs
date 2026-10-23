@@ -142,11 +142,25 @@
 //! argument, through exactly the loop [`execute_held`] drives a Script with, so a handler is
 //! metered, budgeted and capability-checked like any Script, as its own execution with its own
 //! budget. A Plugin's `BackendRegisteredInit` handlers run through it at registration, and every
-//! later handler (Story 6.5) will too.
+//! later handler (Story 6.5) does too.
+//!
+//! # Global Variables (Story 6.7)
+//!
+//! A Plugin's Global Variables live in its `hexput-globalvar` store ([`GlobalStore`]), which
+//! [`seed_globals`] initializes once at registration and every [`invoke_handler`] reads and
+//! writes through the interpreter's `Globals`, implemented here one lock unit at a time — a
+//! Global holding an object is a unit per top-level property, any other value one unit. Every
+//! access is a short synchronous critical section on the blocking thread, never held across an
+//! `.await` or a host call; a value crosses the store detached. A Global write needs no
+//! capability and is no RPC call: it is one side effect, charged by `hexput-enforce` before it is
+//! made, and it stands even if the handler later fails.
 //!
 //! Binds: AD-3, AD-6.
 
+mod globals;
 pub mod wire;
+
+pub use globals::{GlobalStore, GlobalVariables, Stored};
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -400,22 +414,29 @@ pub async fn execute_held(
         whole,
         host,
         limits,
+        None,
     )
     .await
 }
 
-/// Invoke one Plugin handler (Story 6.4): run `program`'s top level — its Global Variable
-/// initializers, evaluated afresh, and its top-level named functions — then call its top-level
-/// named function `function` with `argument` as its one parameter, reaching the host through
-/// `host`, under a Resource Budget of its own with `limits`. Returns the handler's `return` (or
-/// `null`) and the referenced places and collections it wrote.
+/// Invoke one Plugin handler (Story 6.4): run `program`'s top level — binding its Global
+/// Variables and its top-level named functions — then call its top-level named function
+/// `function` with `argument` as its one parameter, reaching the host through `host`, under a
+/// Resource Budget of its own with `limits`. Returns the handler's `return` (or `null`) and the
+/// referenced places and collections it wrote.
+///
+/// With `globals`, the Plugin's Global Variable store (Story 6.7), every Global binds the value
+/// the store holds — its initializer never runs again — every read of one catches up with what
+/// other invocations wrote, and every write to one is charged as one side effect (no RPC call, no
+/// capability) and then written back to its lock unit at once, so it stands even if the handler
+/// later fails. Without it, the initializers run afresh and nothing the handler writes outlives
+/// it.
 ///
 /// The one handler-invocation function (AD-3): every Plugin handler — the `BackendRegisteredInit`
 /// handlers a registration runs, and (Story 6.5) every handler a fire runs — goes through it, and
 /// it runs exactly as [`execute_held`] runs a Script: metered in slices, every host call measured,
 /// charged and decided by `hexput-enforce` before anything is sent, the reply converted back on
-/// the blocking pool. Each invocation is its own execution, with its own budget. Until the Global
-/// Variable store lands (Story 6.7), nothing it writes outlives it.
+/// the blocking pool. Each invocation is its own execution, with its own budget.
 ///
 /// # Errors
 /// As [`execute`]; `function` not being a top-level one-parameter function of `program` — which a
@@ -429,6 +450,7 @@ pub async fn invoke_handler(
     argument: Held,
     host: Host,
     limits: Limits,
+    globals: Option<Arc<GlobalStore>>,
 ) -> Result<Finished, Diagnostic> {
     let whole = program.span;
     let function = function.to_owned();
@@ -437,19 +459,50 @@ pub async fn invoke_handler(
         whole,
         host,
         limits,
+        globals,
     )
     .await
+}
+
+/// Seed a Plugin's Global Variable store `globals` (Story 6.7): run `program`'s Global Variable
+/// initializers once, in source order, each storing its value for a Global the store holds none
+/// for, under a Resource Budget with `limits` and no host. What a registration runs before its
+/// first `BackendRegisteredInit` handler; the initializers never run again.
+///
+/// # Errors
+/// An initializer's failure — a construct the feature toggles disable, a budget limit — as
+/// [`execute`] reports one.
+///
+/// # Panics
+/// As [`execute`].
+pub async fn seed_globals(
+    program: Arc<Program>,
+    globals: Arc<GlobalStore>,
+    limits: Limits,
+) -> Result<(), Diagnostic> {
+    let whole = program.span;
+    drive(
+        move || Ok(Execution::seeding(program)),
+        whole,
+        Host::none(),
+        limits,
+        Some(globals),
+    )
+    .await
+    .map(drop)
 }
 
 /// Drive the execution `build` makes — on the blocking pool, timed with the first slice — to its
 /// end under `limits`, reaching the host through `host`: the loop every entry point shares, so
 /// what it enforces reaches every execution mode at once (AD-3). `whole` is the Program's span,
-/// where a charge with no construct of its own points.
+/// where a charge with no construct of its own points. `globals` is a Plugin's Global Variable
+/// store, for an invocation of its handlers (Story 6.7).
 async fn drive(
     build: impl FnOnce() -> Result<Execution, Diagnostic> + Send + 'static,
     whole: Span,
     host: Host,
     limits: Limits,
+    globals: Option<Arc<GlobalStore>>,
 ) -> Result<Finished, Diagnostic> {
     let Host {
         capabilities,
@@ -475,11 +528,14 @@ async fn drive(
                 .methods()
                 .map(|(key, name)| (Arc::from(key), Arc::from(name)))
                 .collect();
-            let execution = build()?
+            let mut execution = build()?
                 .metered(meter)
                 .with_features(limits.features())
                 .with_methods(methods)
                 .with_reference_prefix(reference_prefix());
+            if let Some(store) = globals {
+                execution = execution.with_globals(Box::new(globals::PluginGlobals::new(store)));
+            }
             let step = segment(execution, &mut budget, &capabilities, whole, started)?;
             Ok((step, budget))
         })
@@ -560,6 +616,14 @@ fn segment(
                     .map_err(Halt::Exceeded)?;
                 started = Instant::now();
                 execution = paused.resume();
+            }
+            // A Global Variable write (Story 6.7) is one side effect, charged before it is made;
+            // the execution runs on at once, so a writer intent it holds is never parked.
+            Outcome::GlobalWrite(write) => {
+                budget
+                    .charge_side_effect(write.span())
+                    .map_err(Halt::Exceeded)?;
+                execution = write.resume();
             }
             Outcome::OutOfMemory(stopped) => {
                 return Err(Halt::Exceeded(budget.memory_exceeded(stopped.span())));

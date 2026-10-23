@@ -1721,6 +1721,7 @@ mod host_calls {
                 Outcome::Paused(_) | Outcome::OutOfMemory(_) | Outcome::AllocationsExceeded(_) => {
                     panic!("an unmetered execution never stops at a meter")
                 }
+                Outcome::GlobalWrite(_) => panic!("a Script has no Global Variables"),
             }
         }
     }
@@ -3884,6 +3885,7 @@ fn handle(source: &str, function: &str, argument: Value) -> Result<Value, Diagno
         Outcome::Paused(_) | Outcome::OutOfMemory(_) | Outcome::AllocationsExceeded(_) => {
             panic!("an unmetered handler never stops at a meter")
         }
+        Outcome::GlobalWrite(_) => panic!("a handler with no store writes no Global Variable"),
     }
 }
 

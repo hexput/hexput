@@ -586,6 +586,7 @@ dependencies = [
 name = "hexput-globalvar"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "hexput-shared",
 ]
 
@@ -702,6 +703,7 @@ dependencies = [
  "hexput-daemon",
  "hexput-enforce",
  "hexput-exec",
+ "hexput-globalvar",
  "hexput-interpreter",
  "hexput-lexer",
  "hexput-parser",

@@ -3401,3 +3401,207 @@ mod modifications {
         );
     }
 }
+
+// --- Story 6.4: invoking one Plugin handler through the one Executor path (AD-3) ---
+
+/// The program of a Plugin `source`, as a Plugin holds it.
+fn handler_program(source: &str) -> Arc<hexput_exec::Program> {
+    let plugin = hexput_parser::parse_plugin(source)
+        .unwrap_or_else(|e| panic!("`{source}` should parse as a Plugin: {e}"));
+    Arc::new(plugin.program)
+}
+
+/// The params every init handler receives: the empty object `{}`.
+fn empty_params() -> Held {
+    Held::plain(Value::Object(hexput_interpreter::Object::from_entries(
+        Vec::<(&str, Value)>::new(),
+    )))
+}
+
+/// Invoke `function` of the Plugin `source` with `host` under `limits`, to its end.
+fn invoke(
+    source: &str,
+    function: &str,
+    host: Host,
+    limits: Limits,
+) -> Result<hexput_exec::Finished, Diagnostic> {
+    runtime().block_on(hexput_exec::invoke_handler(
+        handler_program(source),
+        function,
+        empty_params(),
+        host,
+        limits,
+    ))
+}
+
+/// [`invoke`] with the Session's `registered` functions — `(name, blanket)` pairs — as the host,
+/// every call answered `Result {value: null}`. Returns the outcome and every `Call` the stand-in
+/// saw, in order, with its arguments' holders stripped.
+fn invoke_hosted(
+    source: &str,
+    function: &str,
+    registered: &[(&str, bool)],
+) -> (Result<hexput_exec::Finished, Diagnostic>, Vec<Made>) {
+    let seen: Seen = Arc::default();
+    let runtime = runtime();
+    let (mut calls, caller) = Calls::new();
+    let log = Arc::clone(&seen);
+    runtime.spawn(async move {
+        while let Some(call) = calls.submitted().await {
+            let envelope = calls.issue(call).expect("the handler waits for it");
+            let id = envelope.id.unwrap();
+            let Wire::Map(fields) = &envelope.payload else {
+                panic!("a Call payload is a map");
+            };
+            let name = fields[0].1.as_str().unwrap().to_owned();
+            let Wire::Array(arguments) = fields[1].1.clone() else {
+                panic!("`arguments` is an array");
+            };
+            log.lock()
+                .unwrap()
+                .push((name, arguments.iter().map(unheld).collect()));
+            calls
+                .complete(Envelope::new(
+                    id,
+                    MessageType::Result,
+                    map(vec![("value", Wire::Nil)]),
+                ))
+                .unwrap();
+        }
+    });
+    let registrations: Vec<Registration> =
+        registered.iter().copied().map(Registration::from).collect();
+    let host = Host::new(registrations, caller);
+    let result = runtime.block_on(hexput_exec::invoke_handler(
+        handler_program(source),
+        function,
+        empty_params(),
+        host,
+        Limits::default(),
+    ));
+    let made = seen.lock().unwrap().clone();
+    (result, made)
+}
+
+#[test]
+fn a_handler_invocation_returns_the_value_its_function_returns() {
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return 5; }";
+    let finished = invoke(source, "boot", Host::none(), Limits::default()).unwrap();
+    assert_eq!(finished.result.value.as_number(), Some(5.0));
+}
+
+#[test]
+fn a_handler_invocation_runs_the_top_level_first_so_its_globals_and_helpers_are_bound() {
+    let source = "plugin { name = \"x\" }\nlet total = 7;\n\
+                  fn helper() { return total + 1; }\n\
+                  @Event(BackendRegisteredInit) fn boot(p) { return helper(); }";
+    let finished = invoke(source, "boot", Host::none(), Limits::default()).unwrap();
+    assert_eq!(finished.result.value.as_number(), Some(8.0));
+}
+
+#[test]
+fn the_params_are_the_empty_object_and_a_handler_without_return_returns_null() {
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return p; }";
+    let finished = invoke(source, "boot", Host::none(), Limits::default()).unwrap();
+    let Value::Object(params) = &finished.result.value else {
+        panic!("the params are an object: {:?}", finished.result.value);
+    };
+    assert!(params.is_empty(), "params are {{}}");
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { let a = 1; }";
+    let finished = invoke(source, "boot", Host::none(), Limits::default()).unwrap();
+    assert!(matches!(finished.result.value, Value::Null));
+}
+
+#[test]
+fn each_invocation_evaluates_the_globals_fresh_and_a_write_does_not_persist_into_the_next() {
+    // Pre-6.7 decision: `n` is 0 for every invocation whatever an earlier one wrote.
+    let source = "plugin { name = \"x\" }\nlet n = 0;\n\
+                  @Event(BackendRegisteredInit) fn a(p) { n = n + 1; return n; }\n\
+                  @Event(BackendRegisteredInit) fn b(p) { return n; }";
+    let first = invoke(source, "a", Host::none(), Limits::default()).unwrap();
+    assert_eq!(first.result.value.as_number(), Some(1.0));
+    let second = invoke(source, "b", Host::none(), Limits::default()).unwrap();
+    assert_eq!(second.result.value.as_number(), Some(0.0));
+    let again = invoke(source, "a", Host::none(), Limits::default()).unwrap();
+    assert_eq!(again.result.value.as_number(), Some(1.0));
+}
+
+#[test]
+fn a_blanket_granted_host_call_from_a_handler_is_sent_and_its_reply_resumes_it() {
+    let source =
+        "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return log(1); }";
+    let (result, made) = invoke_hosted(source, "boot", &[("log", true)]);
+    assert!(matches!(result.unwrap().result.value, Value::Null));
+    assert_eq!(made, vec![("log".to_owned(), vec![Wire::from(1)])]);
+}
+
+#[test]
+fn an_unregistered_host_call_from_a_handler_is_a_capability_error_and_nothing_is_sent() {
+    let source =
+        "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return f(); }";
+    let (result, made) = invoke_hosted(source, "boot", &[]);
+    let diagnostic = result.unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "capability.unknown_function");
+    assert!(made.is_empty(), "nothing was sent: {made:?}");
+}
+
+#[test]
+fn a_handler_runtime_failure_is_its_diagnostic() {
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { let n = null; return n.x; }";
+    let diagnostic = invoke(source, "boot", Host::none(), Limits::default()).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "reference.null_access");
+}
+
+#[test]
+fn a_handler_past_its_cpu_time_budget_is_budget_cpu_time_exceeded() {
+    let source =
+        "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { while (true) {} }";
+    let limits = Limits::default().with_cpu_time(std::time::Duration::from_millis(50));
+    let diagnostic = invoke(source, "boot", Host::none(), limits).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "budget.cpu_time_exceeded");
+}
+
+#[test]
+fn a_handler_runs_under_the_session_feature_toggles_it_is_given() {
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { while (false) {}; return 1; }";
+    let limits = Limits::default().with_features(
+        hexput_interpreter::Features::ALL_ENABLED.with(hexput_interpreter::Feature::Loops, false),
+    );
+    let diagnostic = invoke(source, "boot", Host::none(), limits).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "policy.construct_disabled");
+}
+
+#[test]
+fn a_handler_name_that_is_not_a_top_level_one_parameter_function_is_an_internal_syntax_error() {
+    let source = "plugin { name = \"x\" }\nfn helper() { return 1; }\n\
+                  @Event(BackendRegisteredInit) fn boot(p) { return 1; }";
+    for function in ["missing", "helper"] {
+        let diagnostic = invoke(source, function, Host::none(), Limits::default()).unwrap_err();
+        assert_eq!(
+            diagnostic.code.as_str(),
+            "syntax.expected_syntax",
+            "{function}"
+        );
+    }
+}
+
+#[test]
+fn under_disabled_callbacks_every_handler_is_refused_as_construct_disabled() {
+    // Every handler is a top-level named `fn`, and the top level hoists it first.
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return 1; }";
+    let limits = Limits::default().with_features(
+        hexput_interpreter::Features::ALL_ENABLED
+            .with(hexput_interpreter::Feature::Callbacks, false),
+    );
+    let diagnostic = invoke(source, "boot", Host::none(), limits).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "policy.construct_disabled");
+}
+
+#[test]
+fn a_handler_returning_a_function_fails_as_any_execution_would() {
+    // Discarded by an init, a result is still produced as any execution's is.
+    let source =
+        "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return boot; }";
+    let diagnostic = invoke(source, "boot", Host::none(), Limits::default()).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "type.function_result");
+}

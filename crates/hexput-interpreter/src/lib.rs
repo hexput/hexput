@@ -359,6 +359,43 @@ impl Execution {
         })
     }
 
+    /// An invocation of one Plugin handler (Story 6.4): the execution runs `program`'s top level
+    /// — its Global Variable initializers, evaluated afresh, and the hoisting of every top-level
+    /// named function — and then calls the top-level named function `function` with `argument`
+    /// as its one parameter. The result ([`Finished::result`]) is that call's `return`, or `null`
+    /// when its body runs off its end; it is detached exactly as a Script result is, so a
+    /// function or a cycle is refused the same way. Nothing runs until [`Execution::run`], and
+    /// everything else — metering, feature toggles, methods, Reference IDs, host calls — is as
+    /// for any execution. Nothing outlives it: a write to a Global Variable ends with the
+    /// invocation.
+    ///
+    /// A scalar `argument` arriving with a secret gives it to the parameter, as a starting
+    /// variable's does (Story 3.11).
+    ///
+    /// # Errors
+    /// `function` is not a top-level named function of `program` taking exactly one parameter —
+    /// which a Plugin's parsed handler always is — as an internal `syntax.expected_syntax`
+    /// ("malformed syntax tree") spanned on the whole Program.
+    pub fn handler(
+        program: Arc<Program>,
+        function: &str,
+        argument: Held,
+    ) -> Result<Self, Diagnostic> {
+        let index = program
+            .statements
+            .iter()
+            .position(|statement| match &statement.kind {
+                StatementKind::Function { name, function: f } => {
+                    name.name == function && f.parameters.len() == 1
+                }
+                _ => false,
+            })
+            .ok_or_else(|| machine::internal(program.span))?;
+        Ok(Self {
+            machine: Box::new(machine::Machine::handler(program, index, argument)),
+        })
+    }
+
     /// The names bound in this execution's root scope, sorted. Before it runs: its starting
     /// variables and its top-level named functions (hoisted, §6) — and, by construction, no
     /// builtin but [`BUILTINS`]; once it has run up to a host call, also the top-level `let`s

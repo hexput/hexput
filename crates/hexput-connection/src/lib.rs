@@ -63,21 +63,30 @@
 //!   is logged at `debug` as "an unregister failed", with its `code` and, when the payload names
 //!   a well-formed one, its `handle`.
 //! * `PluginRegister` — `protocol.init_not_completed` before init. After init, a Plugin
-//!   registration (FR-17, FR-19, Stories 6.2, 6.3), marked as one by its message type alone:
-//!   [`hexput_plugin::try_register`] decodes `{source, events}` (the Event declarations with
-//!   their return shapes), parses the Plugin source, runs the static check when the Session's
-//!   Config — read at dispatch like a `CodeRegister`'s (AD-5) — sets a check mode other than
-//!   `off`, with the Session's Registered Function names as the callable list, then reserves its
-//!   metadata `name` in this Session through [`Sessions::register_plugin`] (unique per Client ID,
-//!   under a fresh `PluginId`) and stores the Plugin in the Daemon's one [`Plugins`] registry
-//!   under this Session's Client ID; the connection answers `Result { name }` (with `findings`
-//!   when the pass found anything), or the `Error` it returns — `protocol.invalid_payload`, the
-//!   parser's diagnostic, a static check rejection with its `findings`,
-//!   `protocol.duplicate_plugin_name` — with nothing registered. Dispatched as its own task, its
-//!   work on the blocking pool, so a large source never stalls the loop or an execution. Logged at
-//!   `debug`: "plugin registered" with its `plugin` name and `plugin_id`, or "a plugin
-//!   registration failed" with its `code` — after "rejected by the static check" with its `code`
-//!   and `findings` count for a rejection.
+//!   registration (FR-17, FR-18, FR-19, Stories 6.2–6.4), marked as one by its message type
+//!   alone, in three phases. [`hexput_plugin::prepare`] decodes `{source, events}` (the Event
+//!   declarations with their return shapes), parses the Plugin source, runs the static check when
+//!   the Session's Config — read at dispatch like a `CodeRegister`'s (AD-5) — sets a check mode
+//!   other than `off`, with the Session's Registered Function names as the callable list, then
+//!   reserves its metadata `name` in this Session through [`Sessions::register_plugin`] (unique
+//!   per Client ID, under a fresh `PluginId`). [`hexput_plugin::initialize`] then runs each
+//!   `BackendRegisteredInit` handler once, in source order, one after another, through the
+//!   Executor under the Session's settings and registrations read at dispatch, its host calls
+//!   going out on this connection as `Call`s naming the registration's id as their `execution`.
+//!   Last, [`hexput_plugin::finish`] stores the Plugin in the Daemon's one [`Plugins`] registry
+//!   under this Session's Client ID — only then is it ready — and the connection answers
+//!   `Result { name }` (with `findings` when the pass found anything). Otherwise it answers the
+//!   `Error` — `protocol.invalid_payload`, the parser's diagnostic, a static check rejection with
+//!   its `findings`, `protocol.duplicate_plugin_name`, the failing init handler's diagnostic
+//!   unchanged, or `protocol.init_not_completed` when the Session (or this connection, before
+//!   the Backend answered an init handler's `Call`) ended first — with nothing registered; a
+//!   failure after the reservation — or the task being abandoned with a lost stream — releases
+//!   the name ([`Sessions::release_plugin`]). Dispatched
+//!   as its own task, its synchronous work on the blocking pool, so a large source never stalls
+//!   the loop or an execution. Logged at `debug`: "plugin registered" with its `plugin` name and
+//!   `plugin_id`, or "a plugin registration failed" with its `code` for every failure — after
+//!   "plugin init failed" with its `code` when an init handler failed, and after "rejected by the
+//!   static check" with its `code` and `findings` count for a rejection.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
@@ -211,14 +220,14 @@ use std::sync::Arc;
 
 use hexput_plugin::{Plugins, Refusal, Reservation};
 use hexput_port::{
-    CorrelationId, Envelope, ErrorBody, Inbound, MessageType, Outbound, PluginId, Port,
-    ProtocolCode, ProtocolError, Received, ScriptHandle, Value, error_response,
+    CorrelationId, Envelope, ErrorBody, Inbound, MessageType, Outbound, Port, ProtocolCode,
+    ProtocolError, Received, ScriptHandle, Value, error_response,
 };
 use hexput_rpc::{Call, Caller, Calls};
 use hexput_script::{AstCache, Registration};
 use hexput_session::{
-    ClientId, Config, ConnectionId, InitRequest, PluginNameError, ReconnectRequest, Sessions,
-    Settings,
+    ClientId, Config, ConnectionId, InitRequest, PluginId, PluginNameError, ReconnectRequest,
+    Sessions, Settings,
 };
 use tokio::task::{JoinError, JoinSet};
 use tracing::{Instrument, Span};
@@ -443,15 +452,12 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         continue;
                     }
                     Answer::RegisterPlugin(id, payload, client_id) => {
-                        // The Session's live Config and Registered Functions, read at dispatch
-                        // like a Script registration's (AD-5), for the static check (Story 6.3).
+                        // The Session's live Config and registrations, read at dispatch like a
+                        // Script registration's (AD-5): for the static check (Story 6.3), and as
+                        // the limits and host its init handlers run under (Story 6.4).
                         let (registrations, settings) = session_now(connection);
-                        let callables = registrations
-                            .into_iter()
-                            .filter(|r| r.key.is_none())
-                            .map(|r| r.name)
-                            .collect();
-                        // Like a Script registration: its own task, carrying the request's span.
+                        // Like an execution: its own task, carrying the request's span, its init
+                        // handlers' calls naming this request as their execution.
                         running.spawn(
                             register_plugin(
                                 id,
@@ -459,8 +465,9 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                                 client_id,
                                 Arc::clone(connection.sessions),
                                 Arc::clone(connection.plugins),
-                                callables,
+                                registrations,
                                 settings,
+                                caller.for_execution(id),
                             )
                             .instrument(span),
                         );
@@ -889,54 +896,83 @@ async fn register(
     }
 }
 
-/// Run one Plugin registration to its reply (Story 6.2). Decoding, parsing, reserving the name in
-/// the Session and storing the Plugin all run on the blocking pool; this task only waits. A panic
-/// there continues here, ending this task alone.
+/// Run one Plugin registration to its reply (Stories 6.2–6.4).
+///
+/// Three phases. Decoding, parsing, checking and reserving the name in the Session run on the
+/// blocking pool ([`hexput_plugin::prepare`]). Then every `BackendRegisteredInit` handler runs
+/// through the Executor ([`hexput_plugin::initialize`]) under the Session's `registrations` and
+/// `settings` as they were at dispatch, its host calls carried by `caller` — this task only
+/// awaits. Last, storing the Plugin — which makes it ready — runs on the blocking pool again
+/// ([`hexput_plugin::finish`]). A failure after the reservation releases the name
+/// ([`Sessions::release_plugin`]) before the reply is written, so the same name can be registered
+/// again; so does a panic on the blocking pool — which continues here, ending this task alone —
+/// and the connection dropping this task when its stream is lost.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what one registration is dispatched with, each from a different owner"
+)]
 async fn register_plugin(
     id: Option<CorrelationId>,
     payload: Value,
     client_id: ClientId,
     sessions: Arc<Sessions>,
     plugins: Arc<Plugins>,
-    callables: Vec<String>,
+    registrations: Vec<Registration>,
     settings: Settings,
+    caller: Caller,
 ) -> Envelope<Value> {
-    let work = move || {
-        // What the success log names: the reserved id and the name, bounded like every name a
-        // message echoes, since only the frame limit bounds the Backend's.
-        let mut reserved: Option<(PluginId, String)> = None;
-        let reply = hexput_plugin::try_register(
-            &payload,
-            client_id,
-            &plugins,
-            |name| match sessions.register_plugin(client_id, name) {
-                Ok(plugin_id) => {
-                    reserved = Some((plugin_id, logged_name(name)));
-                    Reservation::Reserved(plugin_id)
-                }
-                Err(PluginNameError::Taken) => Reservation::NameTaken,
-                Err(PluginNameError::NoSession) => Reservation::SessionEnded,
-            },
-            &callables,
-            &settings,
-        );
-        reply.map(|payload| (payload, reserved))
+    // The static check's callable list: the Session's Registered Function names (Story 6.3).
+    let callables: Vec<String> = registrations
+        .iter()
+        .filter(|r| r.key.is_none())
+        .map(|r| r.name.clone())
+        .collect();
+    let prepared = {
+        let sessions = Arc::clone(&sessions);
+        on_blocking_pool(move || {
+            hexput_plugin::prepare(
+                &payload,
+                |name| match sessions.register_plugin(client_id, name) {
+                    Ok(plugin_id) => Reservation::Reserved(plugin_id),
+                    Err(PluginNameError::Taken) => Reservation::NameTaken,
+                    Err(PluginNameError::NoSession) => Reservation::SessionEnded,
+                },
+                &callables,
+                &settings,
+            )
+        })
+        .await
     };
-    let outcome = match tokio::task::spawn_blocking(work).await {
-        Ok(outcome) => outcome,
-        Err(error) => match error.try_into_panic() {
-            Ok(panic) => std::panic::resume_unwind(panic),
-            // Only a runtime shutting down cancels a blocking task, and it is dropping this
-            // future too.
-            Err(error) => panic!("a Plugin registration was cancelled: {error}"),
-        },
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(refusal) => return plugin_refused(id, refusal),
     };
-    match outcome {
-        Ok((payload, reserved)) => {
-            // A successful registration always reserved its name.
-            if let Some((plugin_id, name)) = reserved {
-                tracing::debug!(plugin = name, plugin_id = %plugin_id, "plugin registered");
-            }
+    let plugin_id = prepared.id();
+    // What the success log names: the name, bounded like every name a message echoes, since only
+    // the frame limit bounds the Backend's.
+    let name = logged_name(prepared.name());
+    // From here until the Plugin is stored, the reservation is released however this task ends —
+    // an `Err` below, a panic resumed from the blocking pool, or the connection dropping this
+    // future when its stream is lost — so a reconnecting Backend finds the name free again.
+    let mut reservation = ReleaseOnDrop {
+        sessions: Arc::clone(&sessions),
+        client_id,
+        plugin_id,
+        armed: true,
+    };
+    if let Err(body) = hexput_plugin::initialize(&prepared, registrations, caller, &settings).await
+    {
+        // Nothing was stored; the guard frees the name, and the parsed Plugin goes with this task.
+        drop(reservation);
+        tracing::debug!(code = %body.code, "plugin init failed");
+        tracing::debug!(code = %body.code, "a plugin registration failed");
+        return error_response(id, &body);
+    }
+    match on_blocking_pool(move || hexput_plugin::finish(prepared, client_id, &plugins)).await {
+        Ok(payload) => {
+            // Stored: the name now belongs to the Plugin, released with its Session.
+            reservation.armed = false;
+            tracing::debug!(plugin = name, plugin_id = %plugin_id, "plugin registered");
             Envelope {
                 id,
                 message_type: MessageType::Result,
@@ -944,18 +980,56 @@ async fn register_plugin(
             }
         }
         Err(refusal) => {
-            // Logged here, on the async task, so the event carries the request span.
-            if let Refusal::Rejected(rejection) = &refusal {
-                tracing::debug!(
-                    code = %rejection.body.code,
-                    findings = rejection.found,
-                    "rejected by the static check"
-                );
-            }
-            let body = refusal.into_body();
-            tracing::debug!(code = %body.code, "a plugin registration failed");
-            error_response(id, &body)
+            // The Session ended during the initialization: whatever is left of it lets go.
+            drop(reservation);
+            plugin_refused(id, refusal)
         }
+    }
+}
+
+/// A Plugin name reserved in its Session but not yet stored with its Plugin: released
+/// ([`Sessions::release_plugin`]) when dropped while `armed`, so no way out of a registration —
+/// a failure, a panic, or the connection abandoning the task — leaves the name taken with no
+/// Plugin behind it.
+struct ReleaseOnDrop {
+    sessions: Arc<Sessions>,
+    client_id: ClientId,
+    plugin_id: PluginId,
+    armed: bool,
+}
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.sessions.release_plugin(self.client_id, self.plugin_id);
+        }
+    }
+}
+
+/// The `Error` reply to a Plugin registration that registered nothing, logged here, on the async
+/// task, so the event carries the request span.
+fn plugin_refused(id: Option<CorrelationId>, refusal: Refusal) -> Envelope<Value> {
+    if let Refusal::Rejected(rejection) = &refusal {
+        tracing::debug!(
+            code = %rejection.body.code,
+            findings = rejection.found,
+            "rejected by the static check"
+        );
+    }
+    let body = refusal.into_body();
+    tracing::debug!(code = %body.code, "a plugin registration failed");
+    error_response(id, &body)
+}
+
+/// Run `work` on the blocking pool and wait for it. A panic there continues here; only a runtime
+/// shutting down cancels a blocking task, and it is dropping this future too.
+async fn on_blocking_pool<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(done) => done,
+        Err(error) => match error.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            Err(error) => panic!("work on the blocking pool was cancelled: {error}"),
+        },
     }
 }
 

@@ -1777,3 +1777,52 @@ fn concurrent_registrations_of_one_name_on_one_session_let_exactly_one_succeed()
     );
     assert_eq!(plugin_names(&sessions, id).unwrap().len(), 1);
 }
+
+// --- Story 6.4: releasing the name of a registration whose initialization failed ---
+
+#[test]
+fn releasing_a_reserved_name_frees_it_for_a_fresh_registration_and_its_id_is_never_reused() {
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, valid(&[]));
+    let first = sessions.register_plugin(id, "x").unwrap();
+    assert!(sessions.release_plugin(id, first));
+    assert_eq!(plugin_names(&sessions, id), Some(vec![]));
+    let second = sessions.register_plugin(id, "x").unwrap();
+    assert_ne!(first, second, "a released id is not handed out again");
+    assert_eq!(second, PluginId::new(2));
+}
+
+#[test]
+fn releasing_under_another_id_leaves_the_name_held_by_its_first_registration() {
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, valid(&[]));
+    let held = sessions.register_plugin(id, "x").unwrap();
+    assert!(!sessions.release_plugin(id, PluginId::new(held.get() + 7)));
+    assert_eq!(
+        plugin_names(&sessions, id),
+        Some(vec![("x".to_owned(), held)])
+    );
+    assert_eq!(
+        sessions.register_plugin(id, "x"),
+        Err(PluginNameError::Taken)
+    );
+}
+
+#[test]
+fn releasing_a_name_that_is_not_held_or_a_session_that_is_missing_is_false() {
+    let sessions = Sessions::new();
+    let (id, _) = create(&sessions, valid(&[]));
+    assert!(!sessions.release_plugin(id, PluginId::new(1)));
+    assert!(!sessions.release_plugin(unknown_client(), PluginId::new(1)));
+    assert_eq!(plugin_names(&sessions, id), Some(vec![]));
+}
+
+#[test]
+fn releasing_after_the_session_is_torn_down_is_false() {
+    let sessions = Sessions::new();
+    let (id, connection) = create(&sessions, valid(&[]));
+    let held = sessions.register_plugin(id, "x").unwrap();
+    sessions.detach(id, connection);
+    assert!(!sessions.release_plugin(id, held));
+    assert_eq!(plugin_names(&sessions, id), None);
+}

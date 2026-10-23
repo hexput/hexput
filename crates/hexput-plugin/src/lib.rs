@@ -7,7 +7,7 @@
 //!
 //! Registration. A Backend registers a Plugin with a `PluginRegister` request — its message
 //! type alone marks it as one, so nothing is inferred from the payload's shape — whose payload is
-//! exactly `{source}`. [`register`] decodes it, parses the source with
+//! exactly `{source}`. Registration decodes it, parses the source with
 //! `hexput_parser::parse_plugin`, reserves the Plugin's metadata `name` in its Session through a
 //! caller-supplied closure (the Session owns the set of its Plugins' names, each under a
 //! [`PluginId`], and a name is unique per Client ID), stores the parsed [`Plugin`] in the per-run
@@ -42,10 +42,30 @@
 //! It adds the Plugin-only warning `reference.undeclared_event` and never reports a Global
 //! Variable or a handler unused. Its findings are shaped, bounded and fitted by
 //! `hexput_port::findings`, the rule every submission path shares; a rejection under `error`
-//! reserves nothing ([`try_register`] tells it apart so the connection can log it).
+//! reserves nothing ([`Refusal::Rejected`] tells it apart so the connection can log it).
 //!
-//! This crate has no async runtime: [`register`] is synchronous, and the connection runs it on
-//! the blocking pool. No lock here is held while calling code outside this crate's own types.
+//! # What Story 6.4 adds
+//!
+//! Initialization (FR-18): a Plugin is ready only once every `@Event(BackendRegisteredInit)`
+//! handler has run to completion. Registration is three phases. [`prepare`] — synchronous, run
+//! on the blocking pool — decodes, parses, checks and reserves the name, making a [`Prepared`]
+//! registration that no registry holds. [`initialize`] runs each init handler exactly once, in
+//! source order, one after another, through the one handler-invocation function
+//! `hexput_exec::invoke_handler` (AD-3) under the Session's live settings and registrations, with
+//! `{}` as `params`, discarding each result; the first failure stops the rest and is the
+//! registration's error. [`finish`] — synchronous again — stores the Plugin in [`Plugins`], which
+//! is what makes it ready: until then [`Plugins::get`] and [`Plugins::ids`] do not return it, so
+//! no Event can run ahead of its initialization. A failed initialization stores nothing, and the
+//! caller releases the reserved name (`hexput_session::Sessions::release_plugin`). A [`Plugin`]
+//! keeps its program shared ([`Plugin::executable`]) for Story 6.5's fires.
+//!
+//! `BackendRegisteredInit` stays reserved: declaring it in `events` is refused and
+//! [`Plugin::event`] refuses it as a fire target.
+//!
+//! This crate has no async runtime of its own: [`prepare`] and [`finish`] are synchronous, and
+//! the connection runs them on the blocking pool; [`initialize`] is `async` and needs the Tokio
+//! runtime the Executor runs on. No lock here is held while calling code outside this crate's own
+//! types, nor across an `.await`.
 //!
 //! Binds: AD-3, AD-4, AD-6, AD-8.
 
@@ -54,6 +74,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use hexput_check::{Environment, Policy};
 use hexput_exec::wire::{MAX_RESULT_DEPTH, bounded};
+use hexput_exec::{
+    Caller, Code, Held, Host, Limits, Object, Program, Registration, Value as ExecValue,
+};
 use hexput_parser::{BACKEND_REGISTERED_INIT, PluginProgram, Shape};
 use hexput_port::findings::{self, Rejection};
 use hexput_port::{
@@ -92,6 +115,8 @@ pub struct EventDeclaration {
 pub struct Plugin {
     id: PluginId,
     program: PluginProgram,
+    /// The program its handlers run against (Story 6.4), shared by every invocation.
+    executable: Arc<Program>,
     events: Vec<EventDeclaration>,
     /// Each declared Event's index in `events`, by name.
     index: HashMap<String, usize>,
@@ -115,6 +140,13 @@ impl Plugin {
     #[must_use]
     pub const fn program(&self) -> &PluginProgram {
         &self.program
+    }
+
+    /// The program its handlers run against, as [`hexput_exec::invoke_handler`] takes it: shared,
+    /// so any number of invocations run against one copy (Story 6.4).
+    #[must_use]
+    pub const fn executable(&self) -> &Arc<Program> {
+        &self.executable
     }
 
     /// Every Event the Backend declared at registration, in payload order. Empty when it declared
@@ -251,7 +283,7 @@ impl Plugins {
 }
 
 /// What reserving a Plugin's name in its Session came to, as the `reserve` closure of
-/// [`register`] reports it.
+/// [`prepare`] reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reservation {
     /// The name was free in the Session and is now reserved under this id.
@@ -262,7 +294,7 @@ pub enum Reservation {
     SessionEnded,
 }
 
-/// Why [`try_register`] registered nothing: a refusal, or a rejection by the static check that
+/// Why [`prepare`] or [`finish`] registered nothing: a refusal, or a rejection by the static check that
 /// the caller logs before sending its body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
@@ -291,29 +323,50 @@ impl From<Box<ErrorBody>> for Refusal {
     }
 }
 
-/// Serve one Plugin registration (FR-17, FR-19, FR-25; Stories 6.2, 6.3): `payload` is a
-/// `PluginRegister` payload, exactly `{source, events}` — the Plugin source as a string, and the
-/// Events the Backend may fire, each with its return shape and partition-key flag.
-///
-/// [`try_register`] with its refusal turned into the body to send; see it for everything else.
-///
-/// # Errors
-///
-/// As [`try_register`], each as the `Error` payload to send.
-pub fn register(
-    payload: &Value,
-    client_id: ClientId,
-    plugins: &Plugins,
-    reserve: impl FnOnce(&str) -> Reservation,
-    callables: &[String],
-    settings: &Settings,
-) -> Result<Value, Box<ErrorBody>> {
-    try_register(payload, client_id, plugins, reserve, callables, settings)
-        .map_err(Refusal::into_body)
+/// A Plugin registration that has passed every check and reserved its name, but is not ready
+/// yet (Story 6.4): what [`prepare`] makes, [`initialize`] runs the `BackendRegisteredInit`
+/// handlers of, and [`finish`] stores. Until it is finished it is in no [`Plugins`] registry, so
+/// nothing can look it up — no Event can run ahead of its initialization. Dropping it stores
+/// nothing; the reserved name is the caller's to release.
+#[derive(Debug)]
+pub struct Prepared {
+    id: PluginId,
+    program: PluginProgram,
+    /// The program the handlers run against, shared by every invocation.
+    executable: Arc<Program>,
+    events: Vec<EventDeclaration>,
+    /// The static check's findings, as the success reply carries them.
+    found: Vec<ErrorBody>,
 }
 
-/// Serve one Plugin registration, telling a rejection by the static check apart so the caller can
-/// log it.
+impl Prepared {
+    /// The id the Session reserved its name under.
+    #[must_use]
+    pub const fn id(&self) -> PluginId {
+        self.id
+    }
+
+    /// Its metadata `name`, reserved in its Session.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.program.metadata.name()
+    }
+
+    /// The function names of its `BackendRegisteredInit` handlers, in source order: what
+    /// [`initialize`] runs.
+    pub fn init_handlers(&self) -> impl Iterator<Item = &str> {
+        self.program
+            .handlers
+            .iter()
+            .filter(|handler| handler.event.name == BACKEND_REGISTERED_INIT)
+            .map(|handler| handler.function.name.as_str())
+    }
+}
+
+/// The first phase of one Plugin registration (FR-17, FR-19, FR-25; Stories 6.2–6.4): decode
+/// `payload` — a `PluginRegister` payload, exactly `{source, events}` — parse and check the
+/// source, and reserve its metadata `name` through `reserve`. Synchronous, and as expensive as
+/// the parse and the check: the connection runs it on the blocking pool.
 ///
 /// `events` is a map from Event name to declaration: each name a §2 identifier given once and
 /// never `BackendRegisteredInit`; each declaration a map with exactly `returns` (required, a
@@ -326,21 +379,14 @@ pub fn register(
 /// `hexput_parser::parse_plugin`; when the `check` mode in `settings` — the Session's Config as it
 /// is now (AD-5) — is not `off`, the static check runs ([`hexput_check::check_plugin`]) with no
 /// starting variables, `callables` (the Session's Registered Function names) as the callable
-/// list, the declared Event names and the policy the feature toggles describe; its metadata
-/// `name` is handed to `reserve`, which reserves it in `client_id`'s Session (the connection wires
-/// it to `hexput_session::Sessions::register_plugin`); and the Plugin is stored in `plugins` under
-/// `client_id` and the reserved id. Nothing is reserved for a payload, source or check that
-/// refuses, and nothing is stored unless the reservation succeeded. `reserve` is called with no
-/// lock of `plugins` held.
-///
-/// Returns the `Result` payload `{name}`, the metadata `name` echoed — with `findings` after it
-/// when the pass ran and found anything (at most `hexput_port::MAX_FINDINGS`, in source order,
-/// left out if they would not fit a frame). Synchronous, and as expensive as the parse and the
-/// check: the connection runs it on the blocking pool.
+/// list, the declared Event names and the policy the feature toggles describe; and its metadata
+/// `name` is handed to `reserve`, which reserves it in the Session (the connection wires it to
+/// `hexput_session::Sessions::register_plugin`). Nothing is reserved for a payload, source or
+/// check that refuses.
 ///
 /// # Errors
 ///
-/// Each exactly one of, and in every case nothing is stored:
+/// Each exactly one of, and in every case nothing is reserved:
 ///
 /// * `protocol.invalid_payload` — the payload is not a map (nil reads as missing), `source` or
 ///   `events` is missing (absent or nil) or mistyped, a key is unknown, repeated or not a string,
@@ -348,42 +394,138 @@ pub fn register(
 ///   (`` `events.OrderPlaced.keyed` ``); a refused shape is
 ///   `` `events.X.returns` is not a return shape: <parser message> (line L, column C) ``.
 /// * The parser's [`Diagnostic`](hexput_parser::Diagnostic) — `lexical.*` or `syntax.*`, with
-///   its span. Nothing is reserved.
+///   its span.
 /// * [`Refusal::Rejected`] — under check mode `error`, a source with an error-severity finding:
-///   the first one's body with every finding (warnings too) under `findings`. Nothing is
-///   reserved.
+///   the first one's body with every finding (warnings too) under `findings`.
 /// * `protocol.duplicate_plugin_name` — the Session already holds a Plugin with this name; that
 ///   Plugin is untouched.
-/// * `protocol.init_not_completed` — the Session has ended, before the reservation or before the
-///   insert (`client_id` is not open in `plugins`): "the Session has ended; nothing was
+/// * `protocol.init_not_completed` — the Session has ended: "the Session has ended; nothing was
 ///   registered".
-pub fn try_register(
+pub fn prepare(
     payload: &Value,
-    client_id: ClientId,
-    plugins: &Plugins,
     reserve: impl FnOnce(&str) -> Reservation,
     callables: &[String],
     settings: &Settings,
-) -> Result<Value, Refusal> {
+) -> Result<Prepared, Refusal> {
     let (source, events) =
         decode(payload).map_err(|message| protocol(ProtocolCode::InvalidPayload, message))?;
     let program = hexput_parser::parse_plugin(source).map_err(|d| Box::new(ErrorBody::from(&d)))?;
     let found = check(&program, &events, callables, settings).map_err(Refusal::Rejected)?;
-    let name = program.metadata.name().to_owned();
-    let id = match reserve(&name) {
+    let id = match reserve(program.metadata.name()) {
         Reservation::Reserved(id) => id,
         Reservation::NameTaken => {
             return Err(protocol(
                 ProtocolCode::DuplicatePluginName,
                 format!(
                     "this Session already has a Plugin named `{}`; nothing was registered",
-                    bounded(&name)
+                    bounded(program.metadata.name())
                 ),
             )
             .into());
         }
         Reservation::SessionEnded => return Err(session_ended().into()),
     };
+    // One copy the handlers share (Story 6.5 invokes them from it, any number at once); the
+    // parsed `PluginProgram` keeps its own for its side tables' indices.
+    let executable = Arc::new(program.program.clone());
+    Ok(Prepared {
+        id,
+        program,
+        executable,
+        events,
+        found,
+    })
+}
+
+/// The second phase (Story 6.4, FR-18): run every `BackendRegisteredInit` handler of `prepared`
+/// exactly once, in source order, one after another — the next starts only once the previous one
+/// finished — each through the one handler-invocation function,
+/// [`hexput_exec::invoke_handler`] (AD-3), as its own execution with its own Resource Budget.
+///
+/// Each runs under `settings` — the Session's live Config at registration (AD-5) — as
+/// [`Limits::from_settings`] computes the limits and feature toggles from it, and reaches the
+/// host through the Session's `registrations` and `caller`, exactly as a Script would. Its
+/// argument (`params`) is the empty object `{}`; its result and modifications are discarded —
+/// once the execution produced them as any execution does, so a result with no wire form (a
+/// function, a cycle) or past the output size budget still fails the handler. Every handler and
+/// helper of a Plugin is a top-level named `fn`, so under a disabled `features.callbacks` every
+/// handler is refused (`policy.construct_disabled`), as the static check reports at registration.
+/// Until the Global Variable store lands (Story 6.7), every handler evaluates the Global Variable
+/// initializers afresh and its writes end with it. A Plugin with no init handler makes no call.
+/// Makes nothing ready: [`finish`] does. The settings are read when it is called; the future
+/// borrows only `prepared`.
+///
+/// # Errors
+///
+/// The first failing handler's [`Diagnostic`](hexput_exec::Diagnostic), as an `ErrorBody`
+/// unchanged — code, message and span; the handlers after it do not run. One exception: a
+/// handler that failed with `host.no_reply` — its connection stopped reading before the Backend
+/// answered its `Call` — is `protocol.init_not_completed` ("the connection stopped reading before
+/// the Plugin's initialization completed; nothing was registered"), as a registration whose
+/// Session ends before it completes is. An `Authorize` question left unanswered that way is a
+/// denial, `capability.unknown_function`, exactly as for a Script (Story 3.3).
+pub fn initialize<'p>(
+    prepared: &'p Prepared,
+    registrations: Vec<Registration>,
+    caller: Caller,
+    settings: &Settings,
+) -> impl Future<Output = Result<(), Box<ErrorBody>>> + Send + 'p {
+    // Read now, as the call is made: the future borrows nothing of `settings`.
+    let limits = Limits::from_settings(settings);
+    async move {
+        for function in prepared.init_handlers() {
+            let host = Host::new(registrations.clone(), caller.clone());
+            let params = Held::plain(ExecValue::Object(Object::from_entries(Vec::<(
+                &str,
+                ExecValue,
+            )>::new(
+            ))));
+            let invoked = hexput_exec::invoke_handler(
+                Arc::clone(&prepared.executable),
+                function,
+                params,
+                host,
+                limits,
+            )
+            .await;
+            if let Err(diagnostic) = invoked {
+                if diagnostic.code == Code::NO_REPLY {
+                    return Err(protocol(
+                        ProtocolCode::InitNotCompleted,
+                        "the connection stopped reading before the Plugin's initialization \
+                         completed; nothing was registered",
+                    ));
+                }
+                return Err(Box::new(ErrorBody::from(&diagnostic)));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The last phase (Story 6.4): store `prepared` in `plugins` under `client_id`, which makes it
+/// ready — from here [`Plugins::get`] and [`Plugins::ids`] return it — and return the `Result`
+/// payload `{name}`, the metadata `name` echoed, with `findings` after it when the static check
+/// ran and found anything (at most `hexput_port::MAX_FINDINGS`, in source order, left out if they
+/// would not fit a frame). Called only once [`initialize`] succeeded.
+///
+/// # Errors
+///
+/// `protocol.init_not_completed` when the Session has ended (`client_id` is not open in
+/// `plugins`): "the Session has ended; nothing was registered". Nothing is stored.
+pub fn finish(
+    prepared: Prepared,
+    client_id: ClientId,
+    plugins: &Plugins,
+) -> Result<Value, Refusal> {
+    let Prepared {
+        id,
+        program,
+        executable,
+        events,
+        found,
+    } = prepared;
+    let name = program.metadata.name().to_owned();
     let index = events
         .iter()
         .enumerate()
@@ -392,6 +534,7 @@ pub fn try_register(
     let plugin = Plugin {
         id,
         program,
+        executable,
         events,
         index,
     };

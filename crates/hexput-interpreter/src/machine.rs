@@ -240,6 +240,18 @@ enum Frame {
     /// `links[index]` names a method of a keyed receiver and `links[index + 1]` calls it.
     /// [`Machine::resume`] continues the chain after the call.
     MethodCall(Box<MethodAt>),
+    /// `[]` → calls the top-level named function declared at this position with one argument,
+    /// once the top level has run (Story 6.4). It sits at the bottom of the frame stack of a
+    /// handler invocation, and its body runs at call depth 0, so the function's `return` — or its
+    /// running off its end — is the execution's result.
+    Handler(Box<HandlerAt>),
+}
+
+/// The handler a handler invocation calls (Story 6.4): the top-level `fn` statement, and the one
+/// argument it receives, attached into the heap only when the call begins.
+struct HandlerAt {
+    at: StmtAt,
+    argument: Held,
 }
 
 /// A keyed receiver (Story 3.12): its object key, and — for a receiver that is not an array or
@@ -534,6 +546,50 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
         machine
     }
 
+    /// A machine that runs the top level — the Global Variable initializers and the hoisting of
+    /// every top-level named function — and then calls the top-level named function declared at
+    /// statement `index` with `argument` (Story 6.4). That call's `return`, or `null` when its
+    /// body runs off its end, is the result.
+    ///
+    /// The handler's body runs in a fresh scope whose parent is the root scope — the scope every
+    /// top-level function captures — at call depth 0: a call it makes counts from there, exactly
+    /// like one the top level makes.
+    pub(crate) fn handler(program: P, index: usize, argument: Held) -> Self {
+        let mut machine = Self::with_variables(program, Vec::<(&str, Held)>::new());
+        // Below every top-level statement, so it runs once they all have.
+        machine.frames.insert(
+            0,
+            Frame::Handler(Box::new(HandlerAt {
+                at: StmtAt { block: None, index },
+                argument,
+            })),
+        );
+        machine
+    }
+
+    /// Begin the handler call [`Machine::handler`] scheduled: bind its parameter to the argument
+    /// in a fresh scope under the root one and schedule its body.
+    fn call_handler(&mut self, tree: &Program, handler: HandlerAt) -> Result<(), Diagnostic> {
+        let HandlerAt { at, argument } = handler;
+        let Some(function) = function(tree, FnAt::Declared(at)) else {
+            return Err(internal(tree.span));
+        };
+        let inner = self.heap.push_scope(Some(self.root));
+        self.scope = inner;
+        let attached = self.heap.attach(&argument.value);
+        // A scalar's secret names the parameter it arrives in; a collection carries its own.
+        let secret = argument.secret.filter(|_| !argument.value.is_collection());
+        match function.parameters.as_slice() {
+            [parameter] => {
+                self.heap
+                    .declare_held(inner, &parameter.name, attached, secret);
+            }
+            // A Plugin handler takes exactly one parameter; the parser refuses any other.
+            _ => return Err(internal(statement(tree, at).span)),
+        }
+        self.open(tree, Some(function.body))
+    }
+
     /// Run the rest of the Script under the toggles `features`.
     /// Does nothing once the machine has started running: toggles cannot change mid-run, and the
     /// top-level hoist check has already been made against the ones in force.
@@ -819,6 +875,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
             | Frame::Declare(at)
             | Frame::Branch { at, .. }
             | Frame::ForStart(at) => Site::Statement(*at),
+            Frame::Handler(handler) => Site::Statement(handler.at),
             Frame::Eval(id)
             | Frame::Return(id)
             | Frame::BuildArray { array: id, .. }
@@ -1234,6 +1291,7 @@ impl<P: Deref<Target = Program> + Clone> Machine<P> {
                 return self.host_call(tree, chain, in_target).map(Some);
             }
             Frame::MethodCall(at) => return self.method_call(tree, *at).map(Some),
+            Frame::Handler(handler) => self.call_handler(tree, *handler)?,
         }
         Ok(None)
     }

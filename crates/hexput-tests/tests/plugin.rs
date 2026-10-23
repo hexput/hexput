@@ -1,6 +1,6 @@
 //! Story 6.2 and Story 6.3: registering a Plugin's source and its Event declarations, and holding
-//! them per Client ID, driven directly through `hexput_plugin::register` with a stub (or a real
-//! Session's) reservation.
+//! them per Client ID, driven directly through `hexput_plugin`'s registration phases (`prepare`,
+//! `initialize`, `finish`; Story 6.4) with a stub (or a real Session's) reservation.
 //!
 //! The wire rows and the Connection's routing live in `connection.rs`; the Session's name set in
 //! `session.rs`; the Plugin-only findings of the check in `check.rs`. Nothing here touches a
@@ -8,10 +8,13 @@
 
 use std::cell::Cell;
 
+use hexput_exec::Registration;
 use hexput_exec::wire::{MAX_RESULT_DEPTH, bounded};
 use hexput_parser::parse_shape;
-use hexput_plugin::{Plugins, Reservation, register};
+use hexput_plugin::{Plugins, Refusal, Reservation, finish, initialize, prepare};
 use hexput_port::{CheckMode, ErrorBody, Feature, ProtocolCode, Settings, Value};
+use hexput_port::{Envelope, MessageType};
+use hexput_rpc::Calls;
 use hexput_script::MAX_FINDINGS;
 use hexput_session::ClientId;
 use hexput_shared::ids::PluginId;
@@ -86,7 +89,15 @@ fn register_under(
     settings: &Settings,
 ) -> Result<Value, Box<ErrorBody>> {
     let callables: Vec<String> = callables.iter().map(|name| (*name).to_owned()).collect();
-    register(payload, client, plugins, reserve, &callables, settings)
+    // Story 6.4: the three phases, run as a registration runs them. These Plugins have no init
+    // handler, so `initialize` makes no call; the Calls table is dropped unanswered.
+    let prepared = prepare(payload, reserve, &callables, settings).map_err(Refusal::into_body)?;
+    let (_calls, caller) = Calls::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(initialize(&prepared, Vec::new(), caller, settings))?;
+    finish(prepared, client, plugins).map_err(Refusal::into_body)
 }
 
 /// [`register_under`] with no callable names and every Setting at its default (check `off`).
@@ -1006,4 +1017,131 @@ fn findings_are_bounded_to_max_findings_in_source_order_and_a_rejection_keeps_it
         vec![PluginId::new(1)],
         "the rejection held nothing"
     );
+}
+
+// --- Story 6.4: prepare, initialize, finish — a Plugin is ready only after its init completed ---
+
+/// A Plugin named `x` whose `BackendRegisteredInit` handlers are `handlers`, given as
+/// `(function name, body)` in source order.
+fn initialized(handlers: &[(&str, &str)]) -> String {
+    let mut source = String::from("plugin { name = \"x\" }\n");
+    for (name, body) in handlers {
+        source.push_str(&format!(
+            "@Event(BackendRegisteredInit) fn {name}(p) {{ {body} }}\n"
+        ));
+    }
+    source
+}
+
+#[test]
+fn a_prepared_plugin_is_not_held_until_it_is_finished() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    plugins.open(c);
+    let prepared = prepare(&payload(&named("x")), reserving(1), &[], &Settings::new()).unwrap();
+    assert!(plugins.ids(c).is_empty(), "a prepared Plugin is not ready");
+    assert!(plugins.get(c, PluginId::new(1)).is_none());
+    assert_eq!(plugins.len(), 0);
+    let reply = finish(prepared, c, &plugins)
+        .map_err(Refusal::into_body)
+        .unwrap();
+    assert_eq!(reply, map(vec![("name", s("x"))]));
+    assert_eq!(plugins.ids(c), vec![PluginId::new(1)]);
+}
+
+#[test]
+fn a_prepared_plugin_dropped_before_it_is_finished_is_never_held() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    plugins.open(c);
+    let prepared = prepare(&payload(&named("x")), reserving(1), &[], &Settings::new()).unwrap();
+    drop(prepared);
+    assert!(plugins.ids(c).is_empty());
+    assert!(plugins.is_empty());
+}
+
+#[test]
+fn a_plugin_is_not_ready_while_its_init_handler_is_pending_and_is_ready_once_it_completes() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    plugins.open(c);
+    let source = initialized(&[("boot", "return log(1);")]);
+    let prepared = prepare(&payload(&source), reserving(1), &[], &Settings::new()).unwrap();
+    let (mut calls, caller) = Calls::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let init = initialize(
+            &prepared,
+            vec![Registration::from(("log", true))],
+            caller,
+            &Settings::new(),
+        );
+        let answer = async {
+            let call = calls.submitted().await.expect("the init handler calls log");
+            assert!(
+                plugins.ids(c).is_empty() && plugins.get(c, PluginId::new(1)).is_none(),
+                "no Event can run ahead of init: the Plugin is not ready yet"
+            );
+            let envelope: Envelope<Value> = calls.issue(call).expect("the init waits for it");
+            calls
+                .complete(Envelope::new(
+                    envelope.id.unwrap(),
+                    MessageType::Result,
+                    map(vec![("value", Value::Nil)]),
+                ))
+                .unwrap();
+        };
+        let (outcome, ()) = tokio::join!(init, answer);
+        outcome.unwrap();
+    });
+    assert!(
+        plugins.ids(c).is_empty(),
+        "initialize alone does not make it ready"
+    );
+    let reply = finish(prepared, c, &plugins)
+        .map_err(Refusal::into_body)
+        .unwrap();
+    assert_eq!(reply, map(vec![("name", s("x"))]));
+    assert_eq!(plugins.ids(c), vec![PluginId::new(1)]);
+}
+
+#[test]
+fn a_failing_init_handler_yields_its_diagnostic_and_nothing_is_held() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    plugins.open(c);
+    let source = initialized(&[("boot", "return f();"), ("later", "return 2;")]);
+    let prepared = prepare(&payload(&source), reserving(1), &[], &Settings::new()).unwrap();
+    let (_calls, caller) = Calls::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let body = runtime
+        .block_on(initialize(&prepared, Vec::new(), caller, &Settings::new()))
+        .expect_err("the unregistered call fails the init");
+    assert_eq!(body.code, "capability.unknown_function");
+    drop(prepared);
+    assert!(plugins.ids(c).is_empty());
+    assert!(plugins.is_empty());
+}
+
+#[test]
+fn an_init_handler_whose_budget_is_spent_yields_its_diagnostic_and_nothing_is_held() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    plugins.open(c);
+    let source = initialized(&[("boot", "while (true) {}")]);
+    let prepared = prepare(&payload(&source), reserving(1), &[], &Settings::new()).unwrap();
+    let (_calls, caller) = Calls::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let body = runtime
+        .block_on(initialize(&prepared, Vec::new(), caller, &Settings::new()))
+        .expect_err("the runaway init is stopped");
+    assert_eq!(body.code, "budget.cpu_time_exceeded");
+    drop(prepared);
+    assert!(plugins.ids(c).is_empty());
 }

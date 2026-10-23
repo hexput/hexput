@@ -7,7 +7,8 @@
 //! budget-accounting handle, not a closed one.
 //! The only crate that depends on hexput-enforce.
 //!
-//! [`execute`] is the entry point. Every evaluation the Daemon performs enters here —
+//! [`execute`] is the entry point for a Script, [`invoke_handler`] for a Plugin handler; both
+//! drive the same loop. Every evaluation the Daemon performs enters here —
 //! `hexput-script` never calls the interpreter itself — so what this function enforces reaches
 //! every execution mode at once.
 //!
@@ -134,6 +135,15 @@
 //! output size budget charges the whole `{value, modifications}` payload
 //! ([`wire::result_payload_size`]). A failed execution reports none.
 //!
+//! # Plugin handlers (Story 6.4)
+//!
+//! [`invoke_handler`] is the one handler-invocation function: it runs a Plugin's top level — its
+//! Global Variable initializers and its top-level functions — and then calls one handler with one
+//! argument, through exactly the loop [`execute_held`] drives a Script with, so a handler is
+//! metered, budgeted and capability-checked like any Script, as its own execution with its own
+//! budget. A Plugin's `BackendRegisteredInit` handlers run through it at registration, and every
+//! later handler (Story 6.5) will too.
+//!
 //! Binds: AD-3, AD-6.
 
 pub mod wire;
@@ -147,10 +157,12 @@ use hexput_enforce::{Budget, Capabilities, Decision, Exceeded, HandlerAnswer, Qu
 /// The limits of an execution's Resource Budget, re-exported so a caller of
 /// [`execute_with_limits`] can state them. Only `hexput-enforce` decides anything from them.
 pub use hexput_enforce::Limits;
-use hexput_interpreter::{Category, Code, Execution, HostCall, Meter, Outcome, Span};
+use hexput_interpreter::{Category, Execution, HostCall, Meter, Outcome, Span};
 use hexput_rpc::{CallFailure, Reply};
 
-pub use hexput_interpreter::{Diagnostic, Finished, Held, Modification, Program, Secret, Value};
+pub use hexput_interpreter::{
+    Code, Diagnostic, Finished, Held, Modification, Object, Program, Secret, Value,
+};
 /// The handle a connection gives an execution for its host calls. Re-exported so
 /// `hexput-script`, which takes one and passes it on, can name it; the connection, which creates
 /// it, depends on `hexput-rpc` itself.
@@ -382,6 +394,63 @@ pub async fn execute_held(
     host: Host,
     limits: Limits,
 ) -> Result<Finished, Diagnostic> {
+    let whole = program.span;
+    drive(
+        move || Execution::with_variables(program, variables),
+        whole,
+        host,
+        limits,
+    )
+    .await
+}
+
+/// Invoke one Plugin handler (Story 6.4): run `program`'s top level — its Global Variable
+/// initializers, evaluated afresh, and its top-level named functions — then call its top-level
+/// named function `function` with `argument` as its one parameter, reaching the host through
+/// `host`, under a Resource Budget of its own with `limits`. Returns the handler's `return` (or
+/// `null`) and the referenced places and collections it wrote.
+///
+/// The one handler-invocation function (AD-3): every Plugin handler — the `BackendRegisteredInit`
+/// handlers a registration runs, and (Story 6.5) every handler a fire runs — goes through it, and
+/// it runs exactly as [`execute_held`] runs a Script: metered in slices, every host call measured,
+/// charged and decided by `hexput-enforce` before anything is sent, the reply converted back on
+/// the blocking pool. Each invocation is its own execution, with its own budget. Until the Global
+/// Variable store lands (Story 6.7), nothing it writes outlives it.
+///
+/// # Errors
+/// As [`execute`]; `function` not being a top-level one-parameter function of `program` — which a
+/// parsed Plugin's handler always is — is an internal `syntax.expected_syntax`.
+///
+/// # Panics
+/// As [`execute`].
+pub async fn invoke_handler(
+    program: Arc<Program>,
+    function: &str,
+    argument: Held,
+    host: Host,
+    limits: Limits,
+) -> Result<Finished, Diagnostic> {
+    let whole = program.span;
+    let function = function.to_owned();
+    drive(
+        move || Execution::handler(program, &function, argument),
+        whole,
+        host,
+        limits,
+    )
+    .await
+}
+
+/// Drive the execution `build` makes — on the blocking pool, timed with the first slice — to its
+/// end under `limits`, reaching the host through `host`: the loop every entry point shares, so
+/// what it enforces reaches every execution mode at once (AD-3). `whole` is the Program's span,
+/// where a charge with no construct of its own points.
+async fn drive(
+    build: impl FnOnce() -> Result<Execution, Diagnostic> + Send + 'static,
+    whole: Span,
+    host: Host,
+    limits: Limits,
+) -> Result<Finished, Diagnostic> {
     let Host {
         capabilities,
         caller,
@@ -394,8 +463,6 @@ pub async fn execute_held(
         memory_ceiling: Some(budget.memory_ceiling()),
         allocation_ceiling: Some(budget.allocation_ceiling()),
     };
-    // Where a charge with no construct of its own points: the whole Script.
-    let whole = program.span;
     let (mut step, mut budget) = {
         let capabilities = Arc::clone(&capabilities);
         blocking(move || {
@@ -408,7 +475,7 @@ pub async fn execute_held(
                 .methods()
                 .map(|(key, name)| (Arc::from(key), Arc::from(name)))
                 .collect();
-            let execution = Execution::with_variables(program, variables)?
+            let execution = build()?
                 .metered(meter)
                 .with_features(limits.features())
                 .with_methods(methods)

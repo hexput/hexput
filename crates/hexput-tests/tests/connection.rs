@@ -7440,3 +7440,477 @@ fn a_plugin_rejected_by_the_static_check_is_logged_at_debug_under_its_request_wi
     assert_eq!(event["span"]["name"], "request", "{event}");
     assert_eq!(event["span"]["id"], "9", "{event}");
 }
+
+// --- Story 6.4: a Plugin is ready only after its initialization handlers have completed ---
+
+/// A Plugin named `x` whose `BackendRegisteredInit` handlers are `handlers`, given as
+/// `(function name, body)` in source order.
+fn plugin_with_init(handlers: &[(&str, &str)]) -> String {
+    let mut source = String::from("plugin { name = \"x\" }\n");
+    for (name, body) in handlers {
+        source.push_str(&format!(
+            "@Event(BackendRegisteredInit) fn {name}(p) {{ {body} }}\n"
+        ));
+    }
+    source
+}
+
+/// The next `Call` an initialization makes: answered `Result {value: null}`, and its name and
+/// arguments returned.
+async fn answer_init_call(backend: &mut Backend) -> (String, Vec<Value>) {
+    let (id, name, arguments) = backend.call().await;
+    backend.reply(
+        id,
+        MessageType::Result,
+        Value::Map(vec![(string("value"), Value::Nil)]),
+    );
+    (name, arguments)
+}
+
+#[test]
+fn a_plugin_without_an_init_handler_is_answered_its_name_and_held() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        backend.send(plugin_register(2, &plugin_source("x")));
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(name_of(&reply), "x");
+        assert_eq!(plugins.ids(client_id).len(), 1);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn two_init_handlers_each_run_once_in_source_order_and_the_name_is_answered_after_both() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        let source = plugin_with_init(&[("a", "return log(1);"), ("b", "return log(2);")]);
+        backend.send(plugin_register(2, &source));
+        assert_eq!(
+            answer_init_call(&mut backend).await,
+            ("log".to_owned(), vec![Value::from(1)])
+        );
+        assert_eq!(
+            answer_init_call(&mut backend).await,
+            ("log".to_owned(), vec![Value::from(2)])
+        );
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(name_of(&reply), "x");
+        assert_eq!(plugins.ids(client_id).len(), 1);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn an_init_handler_is_called_with_empty_params_and_its_return_value_is_discarded() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        backend.send(plugin_register(
+            2,
+            &plugin_with_init(&[("boot", "return log(p);")]),
+        ));
+        // The handler's argument is `{}`, the empty object (`answer_init_call` strips its holder).
+        let (name, arguments) = answer_init_call(&mut backend).await;
+        assert_eq!(name, "log");
+        assert_eq!(arguments, vec![Value::Map(Vec::new())]);
+        // The handler's `return` (the Call's value) is discarded: the reply is exactly the name.
+        let reply = backend.next().await;
+        assert_eq!(name_of(&reply), "x");
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn an_init_handler_that_fails_is_answered_with_its_diagnostic_releases_the_name_and_runs_no_later_handler()
+ {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        let source =
+            plugin_with_init(&[("a", "let n = null; return n.x;"), ("b", "return log(2);")]);
+        backend.send(plugin_register(2, &source));
+        let failed = backend.next().await;
+        assert_eq!(failed.message_type, MessageType::Error, "{failed:?}");
+        assert_eq!(failed.id, Some(CorrelationId(2)));
+        assert_eq!(code_of(&failed), "reference.null_access");
+        assert!(has_span(&failed), "the handler's span travels with it");
+        assert!(plugins.ids(client_id).is_empty());
+        assert_eq!(plugin_id_of(&sessions, client_id, "x"), None);
+        // The name is free again, and `b` never ran: the next envelope is this registration's
+        // reply, not a `Call` for `log(2)`.
+        backend.send(plugin_register(3, &plugin_source("x")));
+        let again = backend.next().await;
+        assert_eq!(again.id, Some(CorrelationId(3)));
+        assert_eq!(name_of(&again), "x");
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn an_init_handler_past_its_budget_is_a_budget_error_and_the_name_is_free_again() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        backend.send(plugin_register(
+            2,
+            &plugin_with_init(&[("boot", "while (true) {}")]),
+        ));
+        let failed = backend.next().await;
+        assert_eq!(failed.id, Some(CorrelationId(2)));
+        assert_eq!(code_of(&failed), "budget.cpu_time_exceeded");
+        assert!(plugins.ids(client_id).is_empty());
+        backend.send(plugin_register(3, &plugin_source("x")));
+        assert_eq!(name_of(&backend.next().await), "x");
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn an_init_handler_calling_an_unregistered_function_is_an_error_and_the_name_is_free_again() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        backend.send(plugin_register(
+            2,
+            &plugin_with_init(&[("boot", "return f();")]),
+        ));
+        let failed = backend.next().await;
+        assert_eq!(failed.id, Some(CorrelationId(2)));
+        assert_eq!(code_of(&failed), "capability.unknown_function");
+        assert!(plugins.ids(client_id).is_empty());
+        backend.send(plugin_register(3, &plugin_source("x")));
+        assert_eq!(name_of(&backend.next().await), "x");
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_plugin_whose_init_is_pending_is_not_held_and_a_same_name_registration_is_a_duplicate() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        backend.send(plugin_register(
+            2,
+            &plugin_with_init(&[("boot", "return log(1);")]),
+        ));
+        // The init is pending on its own Call; nothing it does is answered yet.
+        let (call_id, name, _) = backend.call().await;
+        assert_eq!(name, "log");
+        assert!(
+            plugins.ids(client_id).is_empty(),
+            "a pending init is not ready"
+        );
+        backend.send(plugin_register(3, &plugin_source("x")));
+        let duplicate = backend.next().await;
+        assert_eq!(duplicate.id, Some(CorrelationId(3)));
+        assert_eq!(code_of(&duplicate), "protocol.duplicate_plugin_name");
+        assert!(plugins.ids(client_id).is_empty());
+        backend.reply(
+            call_id,
+            MessageType::Result,
+            Value::Map(vec![(string("value"), Value::Nil)]),
+        );
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(name_of(&reply), "x");
+        assert_eq!(plugins.ids(client_id).len(), 1);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_session_that_ends_while_its_init_is_pending_answers_init_not_completed_and_stores_nothing() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        backend.send(plugin_register(
+            2,
+            &plugin_with_init(&[("boot", "return log(1);")]),
+        ));
+        let _ = backend.call().await;
+        // The Session's only Connection leaves while the init waits on its reply.
+        backend.close();
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(code_of(&reply), "protocol.init_not_completed");
+        assert!(plugins.is_empty(), "nothing is stored");
+        assert_eq!(plugin_id_of(&sessions, client_id, "x"), None);
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_plugin_declaring_the_reserved_event_is_refused_and_no_init_handler_runs() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        let reserved = Value::Map(vec![(
+            string("BackendRegisteredInit"),
+            Value::Map(vec![(string("returns"), string("null"))]),
+        )]);
+        backend.send(plugin_register_declaring(
+            2,
+            &plugin_with_init(&[("boot", "return log(1);")]),
+            reserved,
+        ));
+        let refused = backend.next().await;
+        assert_eq!(refused.id, Some(CorrelationId(2)));
+        assert_eq!(code_of(&refused), "protocol.invalid_payload");
+        assert!(plugins.ids(client_id).is_empty());
+        // No `Call` came between: the next envelope answers the next registration.
+        backend.send(plugin_register(3, &plugin_source("x")));
+        let next = backend.next().await;
+        assert_eq!(next.id, Some(CorrelationId(3)));
+        assert_eq!(name_of(&next), "x");
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn an_init_handler_runs_under_the_sessions_live_feature_toggles() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let config = by_key(&[("features", by_key(&[("loops", Value::Boolean(false))]))]);
+        let (mut backend, serving, client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_configured(config, &[("log", true)]),
+            false,
+        )
+        .await;
+        backend.send(plugin_register(
+            2,
+            &plugin_with_init(&[("boot", "while (false) {}; return 1;")]),
+        ));
+        let refused = backend.next().await;
+        assert_eq!(refused.id, Some(CorrelationId(2)));
+        assert_eq!(
+            code_of(&refused),
+            "policy.construct_disabled",
+            "{refused:?}"
+        );
+        assert!(plugins.ids(client_id).is_empty());
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_lost_stream_mid_init_releases_the_name_for_another_connection_of_the_session() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let registry = Arc::clone(&sessions);
+    let held = Arc::clone(&plugins);
+    on_runtime(async move {
+        let (mut a, serving_a) = open_bare_with_plugins(&registry, &cache, &held);
+        a.reply(
+            CorrelationId(1),
+            MessageType::Init,
+            init_payload(&[("log", true)]),
+        );
+        let (client_id, secret) = init_reply_of(&a.next().await);
+        let (mut b, serving_b) = open_bare_with_plugins(&registry, &cache, &held);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        resumed(&mut b, 2, client_id).await;
+
+        a.send(plugin_register(
+            5,
+            &plugin_with_init(&[("boot", "return log(1);")]),
+        ));
+        // The init's `Call` names the registration as its `execution`.
+        let (_, name, _, execution) = a.request_from(MessageType::Call).await;
+        assert_eq!(name, "log");
+        assert_eq!(execution, 5);
+        // A's stream is lost while the init waits: the registration task is abandoned.
+        a.send(Received::Closed(Some(io::Error::from(
+            io::ErrorKind::ConnectionReset,
+        ))));
+        finished(serving_a).await;
+        assert_eq!(registry.attached(client_id), Some(1));
+        assert_eq!(plugin_id_of(&registry, client_id, "x"), None);
+
+        // The Session lives on through B, and the name is free there.
+        b.send(plugin_register(3, &plugin_source("x")));
+        assert_eq!(name_of(&b.next().await), "x");
+        b.close();
+        finished(serving_b).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn each_init_handler_has_a_resource_budget_of_its_own() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        // One RPC call per execution: two handlers each making one would cross a shared budget.
+        let config = by_key(&[("budget", by_key(&[("rpc_calls", Value::from(1))]))]);
+        let (mut backend, serving, client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_configured(config, &[("log", true)]),
+            false,
+        )
+        .await;
+        let source = plugin_with_init(&[("a", "return log(1);"), ("b", "return log(2);")]);
+        backend.send(plugin_register(2, &source));
+        assert_eq!(answer_init_call(&mut backend).await.1, vec![Value::from(1)]);
+        assert_eq!(answer_init_call(&mut backend).await.1, vec![Value::from(2)]);
+        let reply = backend.next().await;
+        assert_eq!(name_of(&reply), "x", "{reply:?}");
+        assert_eq!(plugins.ids(client_id).len(), 1);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn an_init_handler_whose_question_is_left_unanswered_by_a_close_is_a_denial() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", false)]),
+            false,
+        )
+        .await;
+        backend.send(plugin_register(
+            2,
+            &plugin_with_init(&[("boot", "return log(1);")]),
+        ));
+        let (_, name, _) = backend.question().await;
+        assert_eq!(name, "log");
+        // As for a Script: an `Authorize` question the Backend never answers is a denial.
+        backend.close();
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(code_of(&reply), "capability.unknown_function");
+        assert!(plugins.ids(client_id).is_empty());
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn an_init_handlers_modifications_never_reach_the_registration_reply() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _client_id) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("get", true)]),
+            false,
+        )
+        .await;
+        backend.send(plugin_register(
+            2,
+            &plugin_with_init(&[("boot", "let o = get(); o.a = 1;")]),
+        ));
+        // A referenced object, which the handler then writes.
+        let (call, name, _) = backend.call().await;
+        assert_eq!(name, "get");
+        let holder = by_key(&[
+            ("__secret", by_key(&[("ref", string("r1"))])),
+            ("value", Value::Map(vec![])),
+        ]);
+        backend.reply(call, MessageType::Result, by_key(&[("value", holder)]));
+        let reply = backend.next().await;
+        assert_eq!(reply.message_type, MessageType::Result, "{reply:?}");
+        assert_eq!(reply.payload, by_key(&[("name", string("x"))]));
+        backend.close();
+        finished(serving).await;
+    });
+}

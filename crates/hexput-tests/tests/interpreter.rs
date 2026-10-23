@@ -1,6 +1,7 @@
 use hexput_ast::{Category, Code, Diagnostic};
 use hexput_interpreter::{
-    Array, BUILTINS, Execution, Object, Value, evaluate, evaluate_with_variables,
+    Array, BUILTINS, Execution, Feature, Features, Object, Outcome, Value, evaluate,
+    evaluate_with_variables,
 };
 use hexput_parser::parse;
 
@@ -3862,4 +3863,125 @@ mod modifications {
         let program = hexput_parser::parse("let n = 1; n = 2; return n;").unwrap();
         assert_eq!(evaluate(&program).unwrap().as_number(), Some(2.0));
     }
+}
+
+// --- Story 6.4: a handler invocation, the entry the Executor uses to run one Plugin handler ---
+
+/// The program of a Plugin `source`, as a Plugin holds it.
+fn handler_program(source: &str) -> std::sync::Arc<hexput_ast::Program> {
+    let plugin = hexput_parser::parse_plugin(source)
+        .unwrap_or_else(|e| panic!("`{source}` should parse as a Plugin: {e}"));
+    std::sync::Arc::new(plugin.program)
+}
+
+/// Run `function` of the Plugin `source` to its end with `argument`, no host answering: the
+/// handler's result, or the diagnostic that stopped it.
+fn handle(source: &str, function: &str, argument: Value) -> Result<Value, Diagnostic> {
+    let execution = Execution::handler(handler_program(source), function, argument.into())?;
+    match execution.run()? {
+        Outcome::Finished(finished) => Ok(finished.result.value),
+        Outcome::HostCall(_) => panic!("no host answers this handler"),
+        Outcome::Paused(_) | Outcome::OutOfMemory(_) | Outcome::AllocationsExceeded(_) => {
+            panic!("an unmetered handler never stops at a meter")
+        }
+    }
+}
+
+/// The empty object: what an init handler receives as its `params` (Story 6.4).
+fn empty_params() -> Value {
+    Value::Object(Object::from_entries(Vec::<(&str, Value)>::new()))
+}
+
+#[test]
+fn a_handler_returns_the_value_its_function_returns() {
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return 5; }";
+    assert_eq!(
+        handle(source, "boot", empty_params()).unwrap().as_number(),
+        Some(5.0)
+    );
+}
+
+#[test]
+fn a_handler_without_a_return_returns_null() {
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { let a = 1; }";
+    assert!(matches!(
+        handle(source, "boot", empty_params()).unwrap(),
+        Value::Null
+    ));
+}
+
+#[test]
+fn a_handler_runs_the_top_level_first_so_its_globals_and_hoisted_helpers_are_bound() {
+    let source = "plugin { name = \"x\" }\nlet total = 7;\n\
+                  fn helper() { return total + 1; }\n\
+                  @Event(BackendRegisteredInit) fn boot(p) { return helper(); }";
+    assert_eq!(
+        handle(source, "boot", empty_params()).unwrap().as_number(),
+        Some(8.0)
+    );
+}
+
+#[test]
+fn a_handler_sees_the_global_variable_initializers_it_is_run_with() {
+    let source = "plugin { name = \"x\" }\nlet total = 7;\n\
+                  @Event(BackendRegisteredInit) fn boot(p) { return total; }";
+    assert_eq!(
+        handle(source, "boot", empty_params()).unwrap().as_number(),
+        Some(7.0)
+    );
+}
+
+#[test]
+fn a_handler_receives_its_argument_as_its_parameter() {
+    let source =
+        "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return p.k; }";
+    let argument = Value::Object(Object::from_entries(vec![("k", Value::Number(3.0))]));
+    assert_eq!(
+        handle(source, "boot", argument).unwrap().as_number(),
+        Some(3.0)
+    );
+}
+
+#[test]
+fn an_init_handler_given_empty_params_returns_an_empty_object() {
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { return p; }";
+    let Value::Object(params) = handle(source, "boot", empty_params()).unwrap() else {
+        panic!("the params are an object");
+    };
+    assert!(params.is_empty(), "params are {{}}: {} keys", params.len());
+}
+
+#[test]
+fn a_write_by_one_handler_invocation_does_not_persist_into_the_next() {
+    // Pre-6.7 decision: every invocation evaluates the Global Variable initializers fresh.
+    let source = "plugin { name = \"x\" }\nlet n = 0;\n\
+                  @Event(BackendRegisteredInit) fn a(p) { n = n + 1; return n; }\n\
+                  @Event(BackendRegisteredInit) fn b(p) { return n; }";
+    assert_eq!(
+        handle(source, "a", empty_params()).unwrap().as_number(),
+        Some(1.0)
+    );
+    assert_eq!(
+        handle(source, "b", empty_params()).unwrap().as_number(),
+        Some(0.0)
+    );
+    assert_eq!(
+        handle(source, "a", empty_params()).unwrap().as_number(),
+        Some(1.0)
+    );
+}
+
+#[test]
+fn a_handler_that_disables_a_construct_is_refused_as_the_runtime_would() {
+    // The handler path runs under the same feature rules as any Script: `loops` disabled refuses
+    // a loop when it is reached.
+    let source = "plugin { name = \"x\" }\n@Event(BackendRegisteredInit) fn boot(p) { while (false) {}; return 1; }";
+    let execution = Execution::handler(handler_program(source), "boot", empty_params().into())
+        .unwrap()
+        .with_features(Features::ALL_ENABLED.with(Feature::Loops, false));
+    let error = match execution.run() {
+        Ok(_) => panic!("a disabled loop must not run"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code.as_str(), "policy.construct_disabled");
 }

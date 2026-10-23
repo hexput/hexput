@@ -99,7 +99,7 @@ development_status:
   6-1-parse-plugin-source-with-metadata-globals-and-event-handlers: review
   6-2-register-a-plugin-as-its-own-kind-of-registration: review
   6-3-declare-every-event-and-its-return-shape-upfront: review
-  6-4-run-initialization-handlers-before-the-plugin-serves-anythin: backlog
+  6-4-run-initialization-handlers-before-the-plugin-serves-anythin: review
   6-5-fire-an-event-and-run-its-handlers: backlog
   6-6-hold-handler-results-to-their-declared-shape: backlog
   6-7-share-plugin-state-across-invocations-without-stalling-sibli: backlog

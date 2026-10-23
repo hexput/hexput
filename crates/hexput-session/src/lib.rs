@@ -102,6 +102,12 @@
 //! with the Session on the one teardown path, where Story 6.13 calls each id's
 //! `hexput_globalvar::teardown` first (AD-4).
 //!
+//! # What Story 6.4 adds
+//!
+//! A reserved name may be given back: a registration whose `BackendRegisteredInit` handlers fail
+//! calls [`Sessions::release_plugin`], which frees the name only while it still maps to that
+//! registration's id, so the same name can be registered afresh (under a new id).
+//!
 //! Nothing here is `async`, so no lock of this crate's can be held across an `.await`; nothing
 //! here writes to disk.
 //!
@@ -579,12 +585,31 @@ impl Sessions {
         Ok(id)
     }
 
+    /// Release the Plugin name reserved under `id` in the Session with this Client ID (Story 6.4):
+    /// what a registration whose initialization failed calls, so the name is free for a fresh
+    /// registration. Returns whether a name was released.
+    ///
+    /// A name is released only while it still maps to `id`, under the Session's shard lock, so a
+    /// release never frees a name another registration holds. The id itself is never handed out
+    /// again. `false`, changing nothing, when no name of the Session maps to `id` or no Session
+    /// has this Client ID — one already torn down released every name with it.
+    pub fn release_plugin(&self, client_id: ClientId, id: PluginId) -> bool {
+        let Some(mut session) = self.sessions.get_mut(&client_id) else {
+            return false;
+        };
+        let before = session.plugins.len();
+        session.plugins.retain(|_, held| *held != id);
+        session.plugins.len() != before
+    }
+
     /// The Session's Plugins as `(name, id)` pairs, sorted by id (so in registration order);
     /// `None` when the Session does not exist, an empty list when it holds none.
     ///
-    /// A name is listed from the moment it is reserved, which is before its parsed Plugin is
-    /// stored in `hexput-plugin`'s registry: a listed id may have no body yet, and a reader of
-    /// both (Story 6.5's firing) must treat such an id as not ready.
+    /// A name is listed from the moment it is reserved, which is before its initialization
+    /// handlers run and its parsed Plugin is stored in `hexput-plugin`'s registry (Story 6.4): a
+    /// listed id may have no body yet, and a reader of both (Story 6.5's firing) must treat such
+    /// an id as not ready. A registration whose initialization fails releases its name
+    /// ([`release_plugin`](Self::release_plugin)).
     #[must_use]
     pub fn plugins(&self, client_id: ClientId) -> Option<Vec<(Arc<str>, PluginId)>> {
         self.sessions.get(&client_id).map(|session| {

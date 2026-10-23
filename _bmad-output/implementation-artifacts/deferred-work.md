@@ -390,3 +390,7 @@ Append-only. Each entry is work identified during a build but deliberately not d
 - source_spec: `spec-6-2-register-a-plugin-as-its-own-kind-of-registration.md`
   summary: Nothing limits how many Plugins one Session (or the Daemon) holds; a Backend can register Plugins under fresh names until memory runs out.
   evidence: Review of Story 6.2, medium. `hexput_plugin::Plugins` keeps every parsed `PluginProgram` with no per-Session or Daemon-wide limit, unlike the AST Cache's `ast_cache_capacity`. The same gap already exists for Sessions (every `Init` creates one, unbounded), so it is a Daemon-wide question of per-Backend resource limits, not this story's. Settle it with a System Config limit (e.g. `max_plugins_per_session`) refused as a new `protocol.*` code, in an Epic 6 story or the hardening work.
+
+- source_spec: `spec-6-4-run-initialization-handlers-before-the-plugin-serves-anything.md`
+  summary: No test sends an Event fire while a Plugin's init is pending, nor fires `BackendRegisteredInit` over the wire; Story 6.4 pins "not executed ahead of init" and the reserved fire target only through `Plugins::get`/`ids` and `Plugin::event`.
+  evidence: Review finding (intent-alignment), low. No fire message exists before Story 6.5, so the wire-level case cannot be written yet. Story 6.5 must resolve fires through `hexput_plugin::Plugins` and add two connection tests: a fire for a Plugin whose init is pending is refused (never queued ahead of init), and a fire naming `BackendRegisteredInit` is `protocol.undeclared_event`.

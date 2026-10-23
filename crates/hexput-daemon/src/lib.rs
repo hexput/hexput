@@ -692,7 +692,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use hexput_plugin::{Plugins, Reservation};
+    use hexput_plugin::{Plugins, Refusal, Reservation};
     use hexput_script::AstCache;
     use hexput_session::{InitRequest, PluginNameError, Settings};
     use rmpv::Value;
@@ -725,15 +725,14 @@ mod tests {
         let cache = Arc::new(AstCache::with_capacity(16));
         let plugins = Arc::new(Plugins::new());
         let sessions = registry(&cache, &plugins, Duration::from_secs(300));
-        // As `hexput-connection` registers a Plugin (Stories 6.2, 6.3: `events` is required).
+        // As `hexput-connection` registers a Plugin (Stories 6.2–6.4: `events` is required; this
+        // Plugin has no init handler, so nothing runs between preparing and finishing it).
         let register_plugin = |client_id| {
-            hexput_plugin::register(
+            let prepared = hexput_plugin::prepare(
                 &map(vec![
                     ("source", Value::from("plugin { name = \"p\" }")),
                     ("events", map(Vec::new())),
                 ]),
-                client_id,
-                &plugins,
                 |name| match sessions.register_plugin(client_id, name) {
                     Ok(id) => Reservation::Reserved(id),
                     Err(PluginNameError::Taken) => Reservation::NameTaken,
@@ -742,6 +741,8 @@ mod tests {
                 &[],
                 &Settings::default(),
             )
+            .map_err(Refusal::into_body)?;
+            hexput_plugin::finish(prepared, client_id, &plugins).map_err(Refusal::into_body)
         };
         let init = map(vec![
             ("config", map(Vec::new())),

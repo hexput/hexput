@@ -111,6 +111,15 @@ impl<'a> Path<'a> {
         }
     }
 
+    /// The path of an `EventFire`'s parameters, `params` (Story 6.5).
+    #[must_use]
+    pub const fn params() -> Self {
+        Self {
+            root: "params",
+            segments: Vec::new(),
+        }
+    }
+
     /// The path of a reply's modification at `index`, `modifications[<index>]`.
     fn modification(index: usize) -> Self {
         Self {

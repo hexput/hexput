@@ -87,6 +87,23 @@
 //!   `plugin_id`, or "a plugin registration failed" with its `code` for every failure — after
 //!   "plugin init failed" with its `code` when an init handler failed, and after "rejected by the
 //!   static check" with its `code` and `findings` count for a rejection.
+//! * `EventFire` — `protocol.init_not_completed` before init. After init (FR-19, Story 6.5), a
+//!   fire of a declared Event of a ready Plugin. As the request is dispatched,
+//!   [`hexput_plugin::fetch`] looks the payload's `plugin` up in [`Plugins`] under this Session's
+//!   Client ID, so the fire takes effect in the order it was sent; a Plugin whose initialization
+//!   is pending is not there yet. On the blocking pool, [`hexput_plugin::prepare_fire`] decodes
+//!   `{plugin, event, params}` and refuses, in this order, a malformed payload
+//!   (`protocol.invalid_payload`), a Plugin not found (`protocol.unknown_plugin`) and an Event
+//!   its registration did not declare (`protocol.undeclared_event`), with nothing run. Then
+//!   [`hexput_plugin::run_fire`] runs every handler bound to the Event once, in source order,
+//!   through the Executor, each its own execution and Resource Budget, under the Session's
+//!   settings and registrations read at dispatch, their host calls going out on this connection
+//!   as `Call`s naming the fire's id as their `execution`; and the connection answers
+//!   `Result { results }` with one entry per handler ([`hexput_plugin::fire_reply`]), a failing
+//!   handler's entry carrying its error. Dispatched as its own task, like an execution, so fires
+//!   never wait on each other. Logged at `debug`: "event fired" with its `plugin`, `event`,
+//!   `handlers` and `failed` counts, "a handler failed" with its `handler` and `code` for each
+//!   failed entry, or "an event fire failed" with its `code` for a refused fire.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
@@ -218,7 +235,7 @@
 use std::io;
 use std::sync::Arc;
 
-use hexput_plugin::{Plugins, Refusal, Reservation};
+use hexput_plugin::{Plugin, Plugins, Refusal, Reservation};
 use hexput_port::{
     CorrelationId, Envelope, ErrorBody, Inbound, MessageType, Outbound, Port, ProtocolCode,
     ProtocolError, Received, ScriptHandle, Value, error_response,
@@ -451,6 +468,27 @@ async fn exchange<P: Port>(port: P, connection: &mut Connection<'_>) {
                         );
                         continue;
                     }
+                    Answer::Fire(id, payload, client_id) => {
+                        // Read at dispatch, like an execution's (AD-5).
+                        let (registrations, settings) = session_now(connection);
+                        // Fetched here, as the request is dispatched, so the fire takes effect in
+                        // the order it was sent (Story 6.5): only a ready Plugin is found.
+                        let fetched = hexput_plugin::fetch(&payload, client_id, connection.plugins);
+                        // Like an execution: its own task, carrying the request's span, its
+                        // handlers' calls naming this request as their execution.
+                        running.spawn(
+                            fire(
+                                id,
+                                payload,
+                                fetched,
+                                registrations,
+                                settings,
+                                caller.for_execution(id),
+                            )
+                            .instrument(span),
+                        );
+                        continue;
+                    }
                     Answer::RegisterPlugin(id, payload, client_id) => {
                         // The Session's live Config and registrations, read at dispatch like a
                         // Script registration's (AD-5): for the static check (Story 6.3), and as
@@ -647,6 +685,9 @@ enum Answer {
     /// By a Plugin registration of this payload for the Session with this Client ID, dispatched
     /// as its own task, replying to this id (Story 6.2).
     RegisterPlugin(Option<CorrelationId>, Value, ClientId),
+    /// By a fire of this payload's Event for the Session with this Client ID, dispatched as its
+    /// own task, replying to this id (Story 6.5).
+    Fire(Option<CorrelationId>, Value, ClientId),
 }
 
 /// How a connection came to be attached to its Session.
@@ -670,7 +711,8 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
         | MessageType::CodeRegister
         | MessageType::CachedExecutionStart
         | MessageType::CodeUnregister
-        | MessageType::PluginRegister => {}
+        | MessageType::PluginRegister
+        | MessageType::EventFire => {}
         other => {
             // A stray reply's id is the Daemon's call id, not a Backend request id: echoing it
             // would fail whatever Backend request shares the number. Nil is allowed on `Error`.
@@ -710,6 +752,7 @@ fn answer(request: Envelope<Value>, connection: &Connection<'_>) -> Answer {
         MessageType::PluginRegister => {
             Answer::RegisterPlugin(request.id, request.payload, client_id)
         }
+        MessageType::EventFire => Answer::Fire(request.id, request.payload, client_id),
         MessageType::CachedExecutionStart => {
             Answer::CachedExecute(request.id, request.payload, client_id)
         }
@@ -984,6 +1027,78 @@ async fn register_plugin(
             drop(reservation);
             plugin_refused(id, refusal)
         }
+    }
+}
+
+/// Run one fire to its reply (Story 6.5). Decoding and resolving the payload and building the
+/// reply run on the blocking pool; the handlers run through the Executor
+/// ([`hexput_plugin::run_fire`]) under the Session's `registrations` and `settings` as they were at
+/// dispatch, their host calls carried by `caller` — this task only awaits. `fetched` is the ready
+/// Plugin the payload named when the request was dispatched, if there was one.
+async fn fire(
+    id: Option<CorrelationId>,
+    payload: Value,
+    fetched: Option<Arc<Plugin>>,
+    registrations: Vec<Registration>,
+    settings: Settings,
+    caller: Caller,
+) -> Envelope<Value> {
+    let prepared = on_blocking_pool(move || hexput_plugin::prepare_fire(&payload, fetched)).await;
+    let fire = match prepared {
+        Ok(fire) => fire,
+        Err(body) => {
+            tracing::debug!(code = %body.code, "an event fire failed");
+            return error_response(id, &body);
+        }
+    };
+    let outcomes = hexput_plugin::run_fire(&fire, registrations, caller, &settings).await;
+    let plugin = logged_name(fire.plugin().name());
+    let event = logged_name(fire.event());
+    // The Plugin and the parameters go with the outcomes, off this task.
+    let payload = on_blocking_pool(move || {
+        let payload = hexput_plugin::fire_reply(&outcomes);
+        drop((outcomes, fire));
+        payload
+    })
+    .await;
+    // Every entry the reply carries as an error — a failed handler, or a result it could not
+    // carry — is logged with its handler and code.
+    let entries = payload
+        .as_map()
+        .and_then(|fields| fields.first())
+        .and_then(|(_, results)| results.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut failed = 0_usize;
+    for entry in entries {
+        let field = |key: &str| {
+            entry
+                .as_map()
+                .and_then(|fields| fields.iter().find(|(k, _)| k.as_str() == Some(key)))
+                .map(|(_, value)| value)
+        };
+        if let Some(error) = field("error") {
+            failed += 1;
+            let code = error
+                .as_map()
+                .and_then(|fields| fields.iter().find(|(k, _)| k.as_str() == Some("code")))
+                .and_then(|(_, code)| code.as_str())
+                .unwrap_or_default();
+            let handler = field("handler").and_then(Value::as_str).unwrap_or_default();
+            tracing::debug!(handler, code, "a handler failed");
+        }
+    }
+    tracing::debug!(
+        plugin,
+        event,
+        handlers = entries.len(),
+        failed,
+        "event fired"
+    );
+    Envelope {
+        id,
+        message_type: MessageType::Result,
+        payload,
     }
 }
 

@@ -67,20 +67,44 @@
 //! runtime the Executor runs on. No lock here is held while calling code outside this crate's own
 //! types, nor across an `.await`.
 //!
+//! # What Story 6.5 adds
+//!
+//! Firing (FR-19). A Backend fires a declared Event of a ready Plugin with an `EventFire`
+//! request, payload exactly `{plugin, event, params}`. Like registration, a fire is phases the
+//! connection drives. [`fetch`] runs as the connection dispatches the request: it looks the
+//! named Plugin up in [`Plugins`] ([`Plugins::named`]) without decoding anything, so a fire
+//! takes effect in the order it was sent. [`prepare_fire`] — synchronous, run on the blocking
+//! pool — decodes the payload in full (`params` converted like a starting variable, under the
+//! path root `params`, and required to be a map), then refuses a Plugin that was not found
+//! (`protocol.unknown_plugin`: never registered, another Session's, or still initializing —
+//! readiness is presence in [`Plugins`]) and then an undeclared or reserved Event
+//! ([`Plugin::event`]), making a [`Fire`]. [`run_fire`] runs every handler bound to the Event
+//! ([`Plugin::handlers_for`]) once, in source order, one after another, each through
+//! `hexput_exec::invoke_handler` (AD-3) as its own execution with its own Resource Budget and its
+//! own copy of `params`, under the Session's live settings and registrations; a handler's
+//! failure is its [`HandlerOutcome`] and never stops the next one. [`fire_reply`] builds the one
+//! `Result {results}` payload, an entry per handler in the order they ran. `priority` and `async`
+//! have no effect yet (Stories 6.11, 6.12), and until the Global Variable store lands (Story
+//! 6.7) each invocation evaluates the Global Variable initializers afresh.
+//!
 //! Binds: AD-3, AD-4, AD-6, AD-8.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use hexput_check::{Environment, Policy};
-use hexput_exec::wire::{MAX_RESULT_DEPTH, bounded};
-use hexput_exec::{
-    Caller, Code, Held, Host, Limits, Object, Program, Registration, Value as ExecValue,
+use hexput_exec::wire::{
+    self as exec_wire, MAX_RESULT_DEPTH, MODIFICATIONS_KEY, Path, Unsendable, bounded,
 };
-use hexput_parser::{BACKEND_REGISTERED_INIT, PluginProgram, Shape};
+use hexput_exec::{
+    Caller, Code, Diagnostic, Finished, Held, Host, Limits, Object, Program, Registration,
+    Value as ExecValue,
+};
+use hexput_parser::{BACKEND_REGISTERED_INIT, Category, PluginProgram, Shape, Span};
 use hexput_port::findings::{self, Rejection};
 use hexput_port::{
-    CheckMode, ClientId, ErrorBody, PluginId, ProtocolCode, ProtocolError, Settings, Value,
+    CheckMode, ClientId, ErrorBody, MAX_FRAME_LEN, PluginId, ProtocolCode, ProtocolError, Settings,
+    Value,
 };
 
 /// The `PluginRegister` payload's source key.
@@ -95,6 +119,26 @@ const KEYED: &str = "keyed";
 const NAME: &str = "name";
 /// The request's wire name, for messages.
 const REQUEST: &str = "PluginRegister";
+/// The `EventFire` request's wire name, for messages (Story 6.5).
+const FIRE_REQUEST: &str = "EventFire";
+/// The `EventFire` payload's Plugin name key.
+const PLUGIN: &str = "plugin";
+/// The `EventFire` payload's Event name key.
+const EVENT: &str = "event";
+/// The `EventFire` payload's parameters key.
+const PARAMS: &str = "params";
+/// The fire reply's one key.
+const RESULTS: &str = "results";
+/// A fire reply entry's handler name key.
+const HANDLER: &str = "handler";
+/// A successful fire reply entry's value key.
+const VALUE: &str = "value";
+/// A failed fire reply entry's error key.
+const ERROR: &str = "error";
+/// How many arrays or maps deep one handler's result, or its `modifications` array, may nest in
+/// a fire reply: two levels fewer than a Script's result ([`MAX_RESULT_DEPTH`]), since the
+/// `results` array and the entry's map sit between the payload and the value.
+const MAX_ENTRY_DEPTH: usize = MAX_RESULT_DEPTH - 2;
 
 /// One Event a Backend declared at Plugin registration (Story 6.3, FR-19, FR-25): its name, the
 /// shape every handler's result must have, and whether a fire must carry a partition key.
@@ -156,6 +200,16 @@ impl Plugin {
         &self.events
     }
 
+    /// The function names of the handlers bound to the Event `event`, in source order: what a
+    /// fire of it runs (Story 6.5). Empty for an Event no handler is bound to.
+    pub fn handlers_for<'a>(&'a self, event: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.program
+            .handlers
+            .iter()
+            .filter(move |handler| handler.event.name == event)
+            .map(|handler| handler.function.name.as_str())
+    }
+
     /// The declaration of the Event `name`, as a fire resolves it (Story 6.3; Story 6.5 wires the
     /// fire to it).
     ///
@@ -194,7 +248,15 @@ impl Plugin {
 /// Every operation takes the lock synchronously and releases it before returning.
 #[derive(Debug, Default)]
 pub struct Plugins {
-    clients: RwLock<HashMap<ClientId, HashMap<PluginId, Arc<Plugin>>>>,
+    clients: RwLock<HashMap<ClientId, ClientPlugins>>,
+}
+
+/// The Plugins one open Client ID holds: by id, and each id by its name (Story 6.5), kept in
+/// step by [`Plugins::insert`].
+#[derive(Debug, Default)]
+struct ClientPlugins {
+    by_id: HashMap<PluginId, Arc<Plugin>>,
+    by_name: HashMap<String, PluginId>,
 }
 
 impl Plugins {
@@ -223,7 +285,21 @@ impl Plugins {
     pub fn get(&self, client_id: ClientId, id: PluginId) -> Option<Arc<Plugin>> {
         self.read()
             .get(&client_id)
-            .and_then(|plugins| plugins.get(&id))
+            .and_then(|plugins| plugins.by_id.get(&id))
+            .map(Arc::clone)
+    }
+
+    /// The ready Plugin `client_id` holds under the metadata `name` (compared exactly, by bytes),
+    /// if it holds one — what a fire resolves (Story 6.5). A Plugin whose initialization has not
+    /// completed is not held yet, so it is not found.
+    #[must_use]
+    pub fn named(&self, client_id: ClientId, name: &str) -> Option<Arc<Plugin>> {
+        let clients = self.read();
+        let plugins = clients.get(&client_id)?;
+        plugins
+            .by_name
+            .get(name)
+            .and_then(|id| plugins.by_id.get(id))
             .map(Arc::clone)
     }
 
@@ -234,7 +310,7 @@ impl Plugins {
         let mut ids: Vec<PluginId> = self
             .read()
             .get(&client_id)
-            .map(|plugins| plugins.keys().copied().collect())
+            .map(|plugins| plugins.by_id.keys().copied().collect())
             .unwrap_or_default();
         ids.sort_unstable();
         ids
@@ -243,7 +319,10 @@ impl Plugins {
     /// How many Plugins are held, across every Client ID.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.read().values().map(HashMap::len).sum()
+        self.read()
+            .values()
+            .map(|plugins| plugins.by_id.len())
+            .sum()
     }
 
     /// Whether no Plugin is held.
@@ -259,7 +338,8 @@ impl Plugins {
         let mut clients = self.write();
         match clients.get_mut(&client_id) {
             Some(plugins) => {
-                plugins.insert(plugin.id, plugin);
+                plugins.by_name.insert(plugin.name().to_owned(), plugin.id);
+                plugins.by_id.insert(plugin.id, plugin);
                 true
             }
             None => false,
@@ -268,16 +348,12 @@ impl Plugins {
 
     /// The map for reading. A poisoned lock is still a consistent map: no code here panics
     /// halfway through changing it.
-    fn read(
-        &self,
-    ) -> std::sync::RwLockReadGuard<'_, HashMap<ClientId, HashMap<PluginId, Arc<Plugin>>>> {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<ClientId, ClientPlugins>> {
         self.clients.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The map for writing; see [`read`](Self::read).
-    fn write(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, HashMap<ClientId, HashMap<PluginId, Arc<Plugin>>>> {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<ClientId, ClientPlugins>> {
         self.clients.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -545,6 +621,340 @@ pub fn finish(
     let size = findings::encoded_len(&Value::Map(fields.clone()));
     findings::push_findings(&mut fields, size, &found);
     Ok(Value::Map(fields))
+}
+
+/// One accepted `EventFire` (Story 6.5): the ready Plugin, the declared Event and the converted
+/// `params`, as [`prepare_fire`] makes it and [`run_fire`] runs it.
+#[derive(Debug)]
+pub struct Fire {
+    plugin: Arc<Plugin>,
+    event: String,
+    params: Held,
+}
+
+impl Fire {
+    /// The Plugin fired.
+    #[must_use]
+    pub fn plugin(&self) -> &Plugin {
+        &self.plugin
+    }
+
+    /// The Event fired, a name its registration declared.
+    #[must_use]
+    pub fn event(&self) -> &str {
+        &self.event
+    }
+
+    /// The parameters every handler receives its own copy of: an object.
+    #[must_use]
+    pub const fn params(&self) -> &Held {
+        &self.params
+    }
+
+    /// The function names of the handlers the fire runs, in source order.
+    pub fn handlers(&self) -> impl Iterator<Item = &str> {
+        self.plugin.handlers_for(&self.event)
+    }
+}
+
+/// How one handler of a fire ended (Story 6.5): its function name, and its execution's
+/// [`Finished`] or the [`Diagnostic`] it failed with.
+#[derive(Debug)]
+pub struct HandlerOutcome {
+    /// The handler's function name.
+    pub handler: String,
+    /// What its invocation returned.
+    pub result: Result<Finished, Diagnostic>,
+}
+
+/// The ready Plugin an `EventFire` `payload` names for `client_id`, looked up in `plugins` as the
+/// connection dispatches the request (Story 6.5) — so a fire takes effect in the order it was
+/// sent. Decodes nothing: it reads the first `plugin` key holding a string, and is `None` when
+/// there is none, or when `client_id` holds no ready Plugin by that name. [`prepare_fire`] judges
+/// the payload and gives every refusal.
+#[must_use]
+pub fn fetch(payload: &Value, client_id: ClientId, plugins: &Plugins) -> Option<Arc<Plugin>> {
+    let name = payload
+        .as_map()?
+        .iter()
+        .find(|(key, _)| key.as_str() == Some(PLUGIN))?
+        .1
+        .as_str()?;
+    plugins.named(client_id, name)
+}
+
+/// Accept one `EventFire` (Story 6.5, FR-19): decode `payload` — exactly
+/// `{plugin, event, params}` — and resolve the Plugin `fetched` ([`fetch`]'s result for it) and
+/// the Event. Synchronous: the connection runs it on the blocking pool, since converting `params`
+/// is as expensive as `params` is large.
+///
+/// `plugin` and `event` are strings, `params` a map converted exactly as a starting variable is
+/// (Value Secret holders honoured; refusals name the path under `params`, such as
+/// `` `params.user.tags[2]` ``) into the object every handler receives a copy of.
+///
+/// # Errors
+///
+/// In this order, each exactly one of, and nothing runs:
+///
+/// * `protocol.invalid_payload` — the payload is not a map (nil reads as missing), a key is
+///   missing (absent or nil; every missing key named together), unknown, repeated or not a
+///   string, `plugin` or `event` is not a string, or `params` is not a map or holds a value with
+///   no Hexput form (`` `params` must be a map ``, or the path).
+/// * `protocol.unknown_plugin` — `fetched` is `None`: this Session holds no ready Plugin by that
+///   name (never registered, another Session's, or its initialization not complete).
+/// * `protocol.undeclared_event` — the Plugin's registration did not declare `event`, or it is
+///   the reserved `BackendRegisteredInit` ([`Plugin::event`]).
+pub fn prepare_fire(payload: &Value, fetched: Option<Arc<Plugin>>) -> Result<Fire, Box<ErrorBody>> {
+    let (name, event, params) =
+        decode_fire(payload).map_err(|message| protocol(ProtocolCode::InvalidPayload, message))?;
+    let Some(plugin) = fetched.filter(|plugin| plugin.name() == name) else {
+        return Err(protocol(
+            ProtocolCode::UnknownPlugin,
+            format!(
+                "this Session has no ready Plugin named `{}`; nothing was fired",
+                bounded(name)
+            ),
+        ));
+    };
+    let event = plugin.event(event)?.name.clone();
+    Ok(Fire {
+        plugin,
+        event,
+        params,
+    })
+}
+
+/// Run `fire` (Story 6.5): every handler bound to its Event, once each, in source order, one
+/// after another, each through the one handler-invocation function,
+/// [`hexput_exec::invoke_handler`] (AD-3), as its own execution with its own Resource Budget and
+/// its own copy of the parameters.
+///
+/// Each runs under `settings` — the Session's live Config at dispatch (AD-5) — as
+/// [`Limits::from_settings`] computes the limits and feature toggles from it, and reaches the
+/// host through the Session's `registrations` and `caller`, exactly as a Script would. A
+/// handler's failure — runtime, budget, capability, host or policy — is its outcome, and the next
+/// handler still runs; nothing about the Plugin changes. An Event no handler is bound to makes
+/// no outcome. The settings are read when it is called; the future borrows only `fire`.
+pub fn run_fire<'f>(
+    fire: &'f Fire,
+    registrations: Vec<Registration>,
+    caller: Caller,
+    settings: &Settings,
+) -> impl Future<Output = Vec<HandlerOutcome>> + Send + 'f {
+    // Read now, as the call is made: the future borrows nothing of `settings`.
+    let limits = Limits::from_settings(settings);
+    async move {
+        let mut outcomes = Vec::new();
+        for function in fire.handlers() {
+            let host = Host::new(registrations.clone(), caller.clone());
+            let result = hexput_exec::invoke_handler(
+                Arc::clone(fire.plugin.executable()),
+                function,
+                fire.params.clone(),
+                host,
+                limits,
+            )
+            .await;
+            outcomes.push(HandlerOutcome {
+                handler: function.to_owned(),
+                result,
+            });
+        }
+        outcomes
+    }
+}
+
+/// The `Result` payload answering a fire (Story 6.5): `{results}`, one entry per outcome in the
+/// order given. A success is `{handler, value}`, with `modifications` after `value` when the
+/// handler wrote a referenced place — converted exactly as a Script's result and modifications
+/// are; a failure is `{handler, error}`, `error` the one wire error shape of its diagnostic (span
+/// included). The entries share one frame: each may take only what the entries before it left of
+/// [`MAX_FRAME_LEN`], so a large result costs its own entry, never its siblings'. A result an
+/// entry cannot carry is that entry's error instead: `protocol.result_too_deep`,
+/// `protocol.response_too_large` or `type.function_result`. Never carries `findings`.
+#[must_use]
+pub fn fire_reply(outcomes: &[HandlerOutcome]) -> Value {
+    // What the frame leaves the entries: the envelope's room, and the payload's map, `results`
+    // key and the array's header.
+    let mut left = MAX_FRAME_LEN - findings::ENVELOPE_ROOM - (RESULTS.len() + 1 + 1 + 5);
+    let entries = outcomes
+        .iter()
+        .map(|outcome| {
+            let handler = (Value::from(HANDLER), Value::from(outcome.handler.as_str()));
+            let failed = |body: &ErrorBody| {
+                Value::Map(vec![handler.clone(), (Value::from(ERROR), body.to_value())])
+            };
+            let mut entry = match &outcome.result {
+                Ok(finished) => match entry_value(finished, left) {
+                    Ok(mut fields) => {
+                        fields.insert(0, handler.clone());
+                        Value::Map(fields)
+                    }
+                    Err(body) => failed(&body),
+                },
+                Err(diagnostic) => failed(&ErrorBody::from(diagnostic)),
+            };
+            let mut size = findings::encoded_len(&entry);
+            if size > left {
+                entry = failed(&too_large());
+                size = findings::encoded_len(&entry);
+            }
+            left = left.saturating_sub(size);
+            entry
+        })
+        .collect();
+    Value::Map(vec![(Value::from(RESULTS), Value::Array(entries))])
+}
+
+/// The error of an entry whose result does not fit what is left of the reply's frame.
+fn too_large() -> Box<ErrorBody> {
+    protocol(
+        ProtocolCode::ResponseTooLarge,
+        format!(
+            "the handler's result and its modifications encode to more than what is left of the \
+             maximum frame of {MAX_FRAME_LEN} bytes beside the entries before it"
+        ),
+    )
+}
+
+/// A successful handler's `value` and, when it wrote a referenced place, `modifications` — taking
+/// at most `budget` bytes together — or the error its entry carries instead.
+fn entry_value(finished: &Finished, budget: usize) -> Result<Vec<(Value, Value)>, Box<ErrorBody>> {
+    let Finished {
+        result,
+        modifications,
+    } = finished;
+    let too_deep = |what: &str| {
+        protocol(
+            ProtocolCode::ResultTooDeep,
+            format!(
+                "the handler's {what} nests more than {MAX_ENTRY_DEPTH} arrays or objects deep \
+                 (counting its Value Secret holders), past what a fire reply's entry may carry"
+            ),
+        )
+    };
+    let unsendable = |unsendable: Unsendable, what: &str| match unsendable {
+        Unsendable::TooDeep => too_deep(what),
+        Unsendable::TooLarge => too_large(),
+        Unsendable::Unrepresentable => Box::new(ErrorBody::from(&Diagnostic::new(
+            Category::Type,
+            Code::FUNCTION_RESULT,
+            "the handler's result holds a value with no wire representation",
+            Span::new(0, 0, 1, 1),
+        ))),
+    };
+    // The result and its modifications share what the frame has left, as a Script's do.
+    let mut budget = budget;
+    let value = exec_wire::result_to_wire_within(result, &mut budget)
+        .map_err(|u| unsendable(u, "result"))?;
+    if exec_wire::wire_depth(&value) > MAX_ENTRY_DEPTH {
+        return Err(too_deep("result"));
+    }
+    let mut fields = vec![(Value::from(VALUE), value)];
+    if !modifications.is_empty() {
+        let what = "`modifications` list";
+        let listed = exec_wire::modifications_to_wire(modifications, &mut budget)
+            .map_err(|u| unsendable(u, what))?;
+        if exec_wire::wire_depth(&listed) > MAX_ENTRY_DEPTH {
+            return Err(too_deep(what));
+        }
+        fields.push((Value::from(MODIFICATIONS_KEY), listed));
+    }
+    Ok(fields)
+}
+
+/// Decode an `EventFire` payload by hand: exactly `{plugin, event, params}`, `params` converted.
+fn decode_fire(payload: &Value) -> Result<(&str, &str, Held), String> {
+    let fields: &[(Value, Value)] = match payload {
+        Value::Nil => &[],
+        Value::Map(fields) => fields,
+        _ => {
+            return Err(format!(
+                "the `{FIRE_REQUEST}` payload must be a map with `{PLUGIN}`, `{EVENT}` and \
+                 `{PARAMS}`"
+            ));
+        }
+    };
+    let mut plugin = None;
+    let mut event = None;
+    let mut params = None;
+    for (key, value) in fields {
+        let slot = match key.as_str() {
+            Some(PLUGIN) => &mut plugin,
+            Some(EVENT) => &mut event,
+            Some(PARAMS) => &mut params,
+            Some(other) => {
+                return Err(format!(
+                    "the `{FIRE_REQUEST}` payload has an unknown key `{}`; it holds exactly \
+                     `{PLUGIN}`, `{EVENT}` and `{PARAMS}`",
+                    bounded(other)
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "the `{FIRE_REQUEST}` payload has a key that is not a string"
+                ));
+            }
+        };
+        if slot.is_some() {
+            return Err(format!(
+                "the `{FIRE_REQUEST}` payload repeats the key `{}`",
+                key.as_str().unwrap_or_default()
+            ));
+        }
+        *slot = Some(value);
+    }
+    let plugin = plugin.filter(|value| !value.is_nil());
+    let event = event.filter(|value| !value.is_nil());
+    let params = params.filter(|value| !value.is_nil());
+    let missing: Vec<String> = [
+        (PLUGIN, plugin.is_none()),
+        (EVENT, event.is_none()),
+        (PARAMS, params.is_none()),
+    ]
+    .into_iter()
+    .filter(|(_, missing)| *missing)
+    .map(|(key, _)| format!("`{key}`"))
+    .collect();
+    let (Some(plugin), Some(event), Some(params)) = (plugin, event, params) else {
+        let named = match missing.as_slice() {
+            [one] => one.clone(),
+            [first, second] => format!("{first} and {second}"),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+            [] => String::new(),
+        };
+        return Err(format!("the `{FIRE_REQUEST}` payload is missing {named}"));
+    };
+    let text = |value: &'_ Value, key: &str, what: &str| -> Result<(), String> {
+        match value {
+            Value::String(text) if text.as_str().is_some() => Ok(()),
+            Value::String(_) => Err(format!(
+                "the `{FIRE_REQUEST}` payload's `{key}` is not valid UTF-8"
+            )),
+            _ => Err(format!(
+                "the `{FIRE_REQUEST}` payload's `{key}` must be a string ({what})"
+            )),
+        }
+    };
+    text(plugin, PLUGIN, "the Plugin's name")?;
+    text(event, EVENT, "the Event's name")?;
+    let must_be_a_map = || format!("`{PARAMS}` must be a map, the object every handler receives");
+    if !matches!(params, Value::Map(_)) {
+        return Err(must_be_a_map());
+    }
+    let params = exec_wire::to_hexput(params, &mut Path::params())?;
+    // A holder around a scalar is a map on the wire but no object once converted.
+    if !matches!(params.value, ExecValue::Object(_)) {
+        return Err(format!(
+            "{}; a Value Secret holder around anything but a map is not one",
+            must_be_a_map()
+        ));
+    }
+    Ok((
+        plugin.as_str().unwrap_or_default(),
+        event.as_str().unwrap_or_default(),
+        params,
+    ))
 }
 
 /// Run the static check the `check` mode in `settings` asks for (AD-8, FR-26) over `program`,

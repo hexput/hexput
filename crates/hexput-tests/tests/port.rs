@@ -477,6 +477,7 @@ fn protocol_codes_are_stable_and_in_the_protocol_category() {
         "protocol.reconnect_denied",
         "protocol.duplicate_plugin_name",
         "protocol.undeclared_event",
+        "protocol.unknown_plugin",
     ];
     let actual: Vec<_> = ProtocolCode::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);

@@ -72,6 +72,10 @@ pub enum ProtocolCode {
     /// the Event (bounded) — or of `BackendRegisteredInit`, which is reserved and which a Backend
     /// can never fire. Nothing runs.
     UndeclaredEvent,
+    /// An `EventFire` naming a Plugin this Session holds no ready Plugin under (Story 6.5): never
+    /// registered, another Session's, or one whose initialization has not completed. Naming the
+    /// Plugin (bounded); one message for every such case. Nothing runs.
+    UnknownPlugin,
 }
 
 impl ProtocolCode {
@@ -95,6 +99,7 @@ impl ProtocolCode {
         Self::ReconnectDenied,
         Self::DuplicatePluginName,
         Self::UndeclaredEvent,
+        Self::UnknownPlugin,
     ];
 
     /// The code's stable string form.
@@ -116,6 +121,7 @@ impl ProtocolCode {
             Self::ReconnectDenied => "protocol.reconnect_denied",
             Self::DuplicatePluginName => "protocol.duplicate_plugin_name",
             Self::UndeclaredEvent => "protocol.undeclared_event",
+            Self::UnknownPlugin => "protocol.unknown_plugin",
         }
     }
 }

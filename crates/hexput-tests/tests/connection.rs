@@ -7914,3 +7914,1114 @@ fn an_init_handlers_modifications_never_reach_the_registration_reply() {
         finished(serving).await;
     });
 }
+
+// --- Story 6.5: firing an Event runs every handler bound to it ---
+
+/// A Plugin named `x` with one handler per `(event, function, body)`, in source order.
+fn firing_source(handlers: &[(&str, &str, &str)]) -> String {
+    let mut source = String::from("plugin { name = \"x\" }\n");
+    for (event, function, body) in handlers {
+        source.push_str(&format!("@Event({event}) fn {function}(p) {{ {body} }}\n"));
+    }
+    source
+}
+
+/// The declarations of `names`, each returning `null`, in order.
+fn events_of(names: &[&str]) -> Value {
+    Value::Map(
+        names
+            .iter()
+            .map(|name| {
+                (
+                    string(name),
+                    Value::Map(vec![(string("returns"), string("null"))]),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The `{plugin, event, params}` payload of an `EventFire`.
+fn fire_payload(plugin: Value, event: Value, params: Value) -> Value {
+    Value::Map(vec![
+        (string("plugin"), plugin),
+        (string("event"), event),
+        (string("params"), params),
+    ])
+}
+
+/// An `EventFire` request as `id`, for `event` of the Plugin `plugin` with `params`.
+fn fire(id: u64, plugin: &str, event: &str, params: Value) -> Received {
+    fire_raw(id, fire_payload(string(plugin), string(event), params))
+}
+
+/// An `EventFire` request as `id` carrying exactly `payload`, whatever it is.
+fn fire_raw(id: u64, payload: Value) -> Received {
+    Received::Message(Envelope::new(
+        CorrelationId(id),
+        MessageType::EventFire,
+        payload,
+    ))
+}
+
+/// The value under `key` of a map, if it has one.
+fn member(value: &Value, key: &str) -> Option<Value> {
+    value
+        .as_map()?
+        .iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v.clone())
+}
+
+/// Registers `source` as Plugin `x` on request `id`, declaring `Ping` and `Pong`, and reads its
+/// name reply.
+async fn ready_x(backend: &mut Backend, id: u64, source: &str) {
+    backend.send(plugin_register_declaring(
+        id,
+        source,
+        events_of(&["Ping", "Pong"]),
+    ));
+    let reply = backend.next().await;
+    assert_eq!(reply.id, Some(CorrelationId(id)), "{:?}", reply.payload);
+    assert_eq!(name_of(&reply), "x");
+}
+
+/// The `results` of an `EventFire`'s `Result` reply to `id`, after asserting the reply is exactly
+/// `{results}` (no `findings` ever, Story 6.5): one entry per handler, in the order they ran.
+fn results_of(reply: &Envelope<Value>, id: u64) -> Vec<Value> {
+    assert_eq!(reply.id, Some(CorrelationId(id)), "{:?}", reply.payload);
+    assert_eq!(
+        reply.message_type,
+        MessageType::Result,
+        "{:?}",
+        reply.payload
+    );
+    assert_eq!(keys_of(reply), ["results"], "{:?}", reply.payload);
+    match member(&reply.payload, "results") {
+        Some(Value::Array(entries)) => entries,
+        other => panic!("`results` is an array: {other:?}"),
+    }
+}
+
+/// The `code` of an entry's `error`.
+fn entry_error(entry: &Value) -> String {
+    let error =
+        member(entry, "error").unwrap_or_else(|| panic!("an entry with an error: {entry:?}"));
+    member(&error, "code")
+        .and_then(|code| code.as_str().map(str::to_owned))
+        .expect("an error entry names its code")
+}
+
+/// A `{handler, value}` entry.
+fn valued(handler: &str, value: Value) -> Value {
+    by_key(&[("handler", string(handler)), ("value", value)])
+}
+
+#[test]
+fn a_fire_runs_its_one_bound_handler_and_answers_one_entry_with_its_value() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        ready_x(
+            &mut backend,
+            2,
+            &firing_source(&[("Ping", "h", "return p.n + 1;")]),
+        )
+        .await;
+        backend.send(fire(3, "x", "Ping", by_key(&[("n", Value::from(1))])));
+        let results = results_of(&backend.next().await, 3);
+        assert_eq!(results, vec![valued("h", Value::from(2))]);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn two_handlers_run_in_source_order_and_each_call_is_answered_before_the_next_begins() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        let source = firing_source(&[
+            ("Ping", "a", "return log(1);"),
+            ("Ping", "b", "return log(2);"),
+        ]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        // `a`'s call is made first and names this fire as its execution.
+        let (first, name, arguments, execution) = backend.request_from(MessageType::Call).await;
+        assert_eq!(name, "log");
+        assert_eq!(execution, 3);
+        assert_eq!(
+            arguments.iter().map(unheld).collect::<Vec<_>>(),
+            vec![Value::from(1)]
+        );
+        // Until `a`'s call is answered nothing more of the fire is written: a `Call` from `b`
+        // running beside `a` would arrive ahead of the sentinel's reply.
+        assert_silent(&mut backend, "the fire before `a`'s answer").await;
+        backend.reply(
+            first,
+            MessageType::Result,
+            by_key(&[("value", Value::from(10))]),
+        );
+        // `b`'s call comes only after `a`'s answer.
+        let (second, name, arguments, execution) = backend.request_from(MessageType::Call).await;
+        assert_eq!(name, "log");
+        assert_eq!(execution, 3);
+        assert_eq!(
+            arguments.iter().map(unheld).collect::<Vec<_>>(),
+            vec![Value::from(2)]
+        );
+        backend.reply(
+            second,
+            MessageType::Result,
+            by_key(&[("value", Value::from(20))]),
+        );
+        let results = results_of(&backend.next().await, 3);
+        assert_eq!(
+            results,
+            vec![valued("a", Value::from(10)), valued("b", Value::from(20))]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn an_event_with_no_bound_handler_is_answered_with_no_results_and_the_plugin_still_fires() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        ready_x(
+            &mut backend,
+            2,
+            &firing_source(&[("Ping", "h", "return 1;")]),
+        )
+        .await;
+        backend.send(fire(3, "x", "Pong", Value::Map(vec![])));
+        assert_eq!(results_of(&backend.next().await, 3), Vec::<Value>::new());
+        backend.send(fire(4, "x", "Ping", Value::Map(vec![])));
+        assert_eq!(
+            results_of(&backend.next().await, 4),
+            vec![valued("h", Value::from(1))]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_failing_handler_is_its_entry_error_and_its_sibling_still_runs_and_answers() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[
+            ("Ping", "a", "let n = null; return n.x;"),
+            ("Ping", "b", "return 1;"),
+        ]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let results = results_of(&backend.next().await, 3);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(member(&results[0], "handler"), Some(string("a")));
+        assert_eq!(entry_error(&results[0]), "reference.null_access");
+        assert_eq!(
+            results[0].as_map().map(Vec::len),
+            Some(2),
+            "exactly `handler` and `error`: {:?}",
+            results[0]
+        );
+        let error = member(&results[0], "error").unwrap();
+        assert!(
+            matches!(member(&error, "span"), Some(Value::Map(_))),
+            "the failure's span travels with it: {error:?}"
+        );
+        assert_eq!(results[1], valued("b", Value::from(1)));
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_handler_over_its_budget_is_its_entry_error_and_a_later_fire_still_works() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[("Ping", "a", "while (true) {}"), ("Ping", "b", "return 1;")]);
+        ready_x(&mut backend, 2, &source).await;
+        for id in [3, 4] {
+            backend.send(fire(id, "x", "Ping", Value::Map(vec![])));
+            let results = results_of(&backend.next().await, id);
+            assert_eq!(results.len(), 2, "{results:?}");
+            assert_eq!(entry_error(&results[0]), "budget.cpu_time_exceeded");
+            assert_eq!(results[1], valued("b", Value::from(1)));
+        }
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_handler_calling_an_unregistered_function_is_its_entry_error_and_nothing_is_sent() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[("Ping", "a", "return f();"), ("Ping", "b", "return 1;")]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        // The next envelope is the fire's own reply: no `Call` was written before it.
+        let reply = backend.next().await;
+        let results = results_of(&reply, 3);
+        assert_eq!(entry_error(&results[0]), "capability.unknown_function");
+        assert_eq!(results[1], valued("b", Value::from(1)));
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_handler_writing_into_a_referenced_parameter_is_its_entry_modifications() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[("Ping", "h", "p.user.n = 2; return 1;")]);
+        ready_x(&mut backend, 2, &source).await;
+        let user = holder(
+            vec![("ref", string("r1"))],
+            by_key(&[("n", Value::from(1))]),
+        );
+        backend.send(fire(3, "x", "Ping", by_key(&[("user", user)])));
+        let results = results_of(&backend.next().await, 3);
+        assert_eq!(
+            results,
+            vec![by_key(&[
+                ("handler", string("h")),
+                ("value", Value::from(1)),
+                (
+                    "modifications",
+                    Value::Array(vec![modification_entry(
+                        "r1",
+                        by_key(&[("n", Value::from(2))]),
+                    )]),
+                ),
+            ])]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_fire_for_a_plugin_this_session_has_no_ready_plugin_for_is_unknown_and_runs_nothing() {
+    let sessions = Arc::new(Sessions::new());
+    let other = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        // A name nobody registered.
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        backend.send(fire(2, "nope", "Ping", Value::Map(vec![])));
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(reply.message_type, MessageType::Error, "{reply:?}");
+        assert_eq!(code_of(&reply), "protocol.unknown_plugin");
+        assert!(message_of(&reply).contains("`nope`"), "{reply:?}");
+        // Names match exactly, by bytes: one differing only in case, or in Unicode
+        // normalization, is another name.
+        ready_x(
+            &mut backend,
+            3,
+            &firing_source(&[("Ping", "h", "return 1;")]),
+        )
+        .await;
+        for (id, near) in [(4, "X"), (5, "x "), (6, "\u{ff58}")] {
+            backend.send(fire(id, near, "Ping", Value::Map(vec![])));
+            let reply = backend.next().await;
+            assert_eq!(reply.id, Some(CorrelationId(id)));
+            assert_eq!(code_of(&reply), "protocol.unknown_plugin", "{near:?}");
+        }
+        backend.close();
+        finished(serving).await;
+
+        // A Plugin another Session holds: the same name is unknown here.
+        let (mut owner, owner_serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        ready_x(&mut owner, 2, &firing_source(&[("Ping", "h", "return 1;")])).await;
+        let (mut stranger, stranger_serving, _) =
+            connect_with_plugins(&other, &cache, &plugins, init_payload(&[]), false).await;
+        stranger.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let reply = stranger.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(3)));
+        assert_eq!(code_of(&reply), "protocol.unknown_plugin");
+        stranger.close();
+        finished(stranger_serving).await;
+        owner.close();
+        finished(owner_serving).await;
+    });
+}
+
+#[test]
+fn a_fire_while_the_init_is_pending_is_unknown_and_the_same_fire_after_it_completes_runs() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        let source = format!(
+            "{}@Event(Ping) fn h(p) {{ return 1; }}\n",
+            plugin_with_init(&[("boot", "return log(1);")])
+        );
+        backend.send(plugin_register_declaring(2, &source, events_of(&["Ping"])));
+        let (init_call, name, _) = backend.call().await;
+        assert_eq!(name, "log");
+        // Not queued: the Plugin is not ready, so the fire is refused at once.
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let refused = backend.next().await;
+        assert_eq!(refused.id, Some(CorrelationId(3)));
+        assert_eq!(code_of(&refused), "protocol.unknown_plugin");
+        backend.reply(
+            init_call,
+            MessageType::Result,
+            by_key(&[("value", Value::Nil)]),
+        );
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(2)));
+        assert_eq!(name_of(&reply), "x");
+        backend.send(fire(4, "x", "Ping", Value::Map(vec![])));
+        assert_eq!(
+            results_of(&backend.next().await, 4),
+            vec![valued("h", Value::from(1))]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_fire_before_init_is_init_not_completed_and_runs_nothing() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    on_runtime(async {
+        let (mut backend, serving) = open_bare(&sessions, &cache);
+        backend.send(fire(1, "x", "Ping", Value::Map(vec![])));
+        let reply = backend.next().await;
+        assert_eq!(reply.id, Some(CorrelationId(1)));
+        assert_eq!(code_of(&reply), "protocol.init_not_completed");
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_fire_of_an_undeclared_or_reserved_event_is_undeclared_event() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        ready_x(
+            &mut backend,
+            2,
+            &firing_source(&[("Ping", "h", "return 1;")]),
+        )
+        .await;
+        for (id, event) in [(3, "Nope"), (4, "BackendRegisteredInit")] {
+            backend.send(fire(id, "x", event, Value::Map(vec![])));
+            let refused = backend.next().await;
+            assert_eq!(refused.id, Some(CorrelationId(id)));
+            assert_eq!(code_of(&refused), "protocol.undeclared_event", "{event}");
+        }
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_malformed_fire_payload_is_refused_naming_what_is_wrong_and_no_handler_runs() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        // A handler that would call `log`: a fire that ran would write a `Call` first, and the
+        // refusal read below would be that `Call`.
+        ready_x(
+            &mut backend,
+            2,
+            &firing_source(&[("Ping", "h", "return log(1);")]),
+        )
+        .await;
+        let ok = string("x");
+        let ping = string("Ping");
+        let deep = by_key(&[(
+            "user",
+            by_key(&[(
+                "tags",
+                Value::Array(vec![Value::from(1), Value::from(9_007_199_254_740_993_u64)]),
+            )]),
+        )]);
+        let cases: Vec<(Value, Vec<&str>)> = vec![
+            (Value::Map(vec![]), vec!["`plugin`", "`event`", "`params`"]),
+            (Value::Nil, vec!["`plugin`", "`event`", "`params`"]),
+            (
+                Value::Map(vec![
+                    (string("plugin"), ok.clone()),
+                    (string("event"), ping.clone()),
+                ]),
+                vec!["`params`"],
+            ),
+            (
+                fire_payload(ok.clone(), ping.clone(), Value::from(1)),
+                vec!["`params`", "must be a map"],
+            ),
+            (
+                fire_payload(ok.clone(), ping.clone(), Value::Array(vec![Value::from(1)])),
+                vec!["`params`", "must be a map"],
+            ),
+            (
+                Value::Map(vec![
+                    (string("plugin"), ok.clone()),
+                    (string("event"), ping.clone()),
+                    (string("params"), Value::Map(vec![])),
+                    (string("key"), string("k")),
+                ]),
+                vec!["`key`"],
+            ),
+            (
+                fire_payload(Value::from(3), ping.clone(), Value::Map(vec![])),
+                vec!["`plugin`"],
+            ),
+            (
+                fire_payload(ok.clone(), Value::from(3), Value::Map(vec![])),
+                vec!["`event`"],
+            ),
+            (
+                Value::Map(vec![
+                    (string("plugin"), ok.clone()),
+                    (string("plugin"), ok.clone()),
+                    (string("event"), ping.clone()),
+                    (string("params"), Value::Map(vec![])),
+                ]),
+                vec!["`plugin`"],
+            ),
+            (
+                fire_payload(ok.clone(), ping.clone(), deep),
+                vec!["`params.user.tags[1]`"],
+            ),
+            // A Value Secret holder is a map on the wire, but one around a scalar is no object.
+            (
+                fire_payload(
+                    ok.clone(),
+                    ping.clone(),
+                    holder(vec![("ref", string("r"))], Value::from(1)),
+                ),
+                vec!["`params` must be a map", "Value Secret holder"],
+            ),
+            // The payload is judged before the Plugin is looked for: a malformed fire naming an
+            // unknown Plugin is the payload's refusal, not `protocol.unknown_plugin`.
+            (
+                Value::Map(vec![
+                    (string("plugin"), string("nope")),
+                    (string("event"), ping.clone()),
+                    (string("params"), Value::Map(vec![])),
+                    (string("key"), string("k")),
+                ]),
+                vec!["`key`"],
+            ),
+        ];
+        for (offset, (payload, needles)) in cases.into_iter().enumerate() {
+            let id = 10 + offset as u64;
+            backend.send(fire_raw(id, payload.clone()));
+            let refused = backend.next().await;
+            assert_eq!(refused.id, Some(CorrelationId(id)), "{payload:?}");
+            assert_eq!(code_of(&refused), "protocol.invalid_payload", "{payload:?}");
+            for needle in needles {
+                assert!(
+                    message_of(&refused).contains(needle),
+                    "{needle} in {}",
+                    message_of(&refused)
+                );
+            }
+        }
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn each_handler_of_a_fire_has_a_resource_budget_of_its_own() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        // One RPC call per execution: two handlers each making one would cross a shared budget.
+        let config = by_key(&[("budget", by_key(&[("rpc_calls", Value::from(1))]))]);
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_configured(config, &[("log", true)]),
+            false,
+        )
+        .await;
+        let source = firing_source(&[
+            ("Ping", "a", "return log(1);"),
+            ("Ping", "b", "return log(2);"),
+        ]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let (first, _, _, _) = backend.request_from(MessageType::Call).await;
+        backend.reply(
+            first,
+            MessageType::Result,
+            by_key(&[("value", Value::from(1))]),
+        );
+        let (second, _, _, _) = backend.request_from(MessageType::Call).await;
+        backend.reply(
+            second,
+            MessageType::Result,
+            by_key(&[("value", Value::from(2))]),
+        );
+        let results = results_of(&backend.next().await, 3);
+        assert_eq!(
+            results,
+            vec![valued("a", Value::from(1)), valued("b", Value::from(2))]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn each_handler_gets_its_own_copy_of_the_parameters() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[
+            ("Ping", "a", "p.x = 2; return 1;"),
+            ("Ping", "b", "return p.x;"),
+        ]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", by_key(&[("x", Value::from(1))])));
+        // `b` reads the parameter as the fire sent it, not as `a` wrote it.
+        assert_eq!(
+            results_of(&backend.next().await, 3),
+            vec![valued("a", Value::from(1)), valued("b", Value::from(1))]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn two_fires_on_one_connection_are_each_answered_with_their_id_whatever_order_they_finish_in() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        let source = firing_source(&[("Ping", "h", "return log(1);"), ("Pong", "k", "return 2;")]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        // Fire 3 waits on its call; fire 4 is answered while it waits.
+        let (call, _, _, execution) = backend.request_from(MessageType::Call).await;
+        assert_eq!(execution, 3);
+        backend.send(fire(4, "x", "Pong", Value::Map(vec![])));
+        assert_eq!(
+            results_of(&backend.next().await, 4),
+            vec![valued("k", Value::from(2))]
+        );
+        backend.reply(
+            call,
+            MessageType::Result,
+            by_key(&[("value", Value::from(7))]),
+        );
+        assert_eq!(
+            results_of(&backend.next().await, 3),
+            vec![valued("h", Value::from(7))]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_failed_handler_leaves_the_plugin_firable_and_its_next_fire_succeeds() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, client_id) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[(
+            "Ping",
+            "h",
+            "if (p.go) { return 1; }; let n = null; return n.x;",
+        )]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(
+            3,
+            "x",
+            "Ping",
+            by_key(&[("go", Value::Boolean(false))]),
+        ));
+        let failed = results_of(&backend.next().await, 3);
+        assert_eq!(entry_error(&failed[0]), "reference.null_access");
+        backend.send(fire(
+            4,
+            "x",
+            "Ping",
+            by_key(&[("go", Value::Boolean(true))]),
+        ));
+        assert_eq!(
+            results_of(&backend.next().await, 4),
+            vec![valued("h", Value::from(1))]
+        );
+        assert_eq!(plugins.ids(client_id).len(), 1);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_fire_runs_under_the_sessions_live_feature_toggles_and_a_refusal_is_its_entry_error() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let config = by_key(&[("features", by_key(&[("loops", Value::Boolean(false))]))]);
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_configured(config, &[]),
+            false,
+        )
+        .await;
+        let source = firing_source(&[
+            ("Ping", "a", "while (false) {}; return 1;"),
+            ("Ping", "b", "return 2;"),
+        ]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let results = results_of(&backend.next().await, 3);
+        assert_eq!(entry_error(&results[0]), "policy.construct_disabled");
+        assert_eq!(results[1], valued("b", Value::from(2)));
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_fire_of_a_plugin_with_warnings_carries_no_findings_in_its_reply() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let config = check_of(string("warn"));
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_configured(config, &[]),
+            false,
+        )
+        .await;
+        // An unused local is a warning: the registration is accepted with it under `findings`,
+        // and no fire reply gains `findings` (Story 6.5 never carries them).
+        backend.send(plugin_register_declaring(
+            2,
+            &firing_source(&[("Ping", "h", "let unused = 1; return 1;")]),
+            events_of(&["Ping", "Pong"]),
+        ));
+        let registered = backend.next().await;
+        assert_eq!(registered.id, Some(CorrelationId(2)));
+        assert_eq!(keys_of(&registered), ["name", "findings"], "{registered:?}");
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        assert_eq!(
+            results_of(&backend.next().await, 3),
+            vec![valued("h", Value::from(1))]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_result_that_is_no_wire_value_is_its_entry_error_and_its_sibling_still_answers() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        // A function is no wire value: `type.function_result` is this entry's error.
+        let source = firing_source(&[
+            ("Ping", "a", "return fn() { return 1; };"),
+            ("Ping", "b", "return 2;"),
+        ]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let results = results_of(&backend.next().await, 3);
+        assert_eq!(entry_error(&results[0]), "type.function_result");
+        assert_eq!(results[1], valued("b", Value::from(2)));
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_fire_is_logged_at_debug_under_its_request_and_a_refusal_names_its_code() {
+    let log = Captured::default();
+    let writer = log.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(writer))
+            .finish(),
+    );
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let runtime = wired_runtime();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let (mut backend, serving, _) =
+                connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+            let source = firing_source(&[
+                ("Ping", "a", "let n = null; return n.x;"),
+                ("Ping", "b", "return 1;"),
+            ]);
+            ready_x(&mut backend, 2, &source).await;
+            backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+            let _ = results_of(&backend.next().await, 3);
+            backend.send(fire(4, "nope", "Ping", Value::Map(vec![])));
+            assert_eq!(code_of(&backend.next().await), "protocol.unknown_plugin");
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    let fired: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "event fired")
+        .collect();
+    assert_eq!(fired.len(), 1, "{text}");
+    assert_eq!(fired[0]["level"], "DEBUG", "{}", fired[0]);
+    assert_eq!(fired[0]["fields"]["plugin"], "x", "{}", fired[0]);
+    assert_eq!(fired[0]["fields"]["event"], "Ping", "{}", fired[0]);
+    assert_eq!(fired[0]["fields"]["handlers"], 2, "{}", fired[0]);
+    assert_eq!(fired[0]["fields"]["failed"], 1, "{}", fired[0]);
+    assert_eq!(fired[0]["span"]["name"], "request", "{}", fired[0]);
+    assert_eq!(fired[0]["span"]["id"], "3", "{}", fired[0]);
+    let failed: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "a handler failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{text}");
+    assert_eq!(failed[0]["fields"]["handler"], "a", "{}", failed[0]);
+    assert_eq!(
+        failed[0]["fields"]["code"], "reference.null_access",
+        "{}",
+        failed[0]
+    );
+    let refused: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "an event fire failed")
+        .collect();
+    assert_eq!(refused.len(), 1, "{text}");
+    assert_eq!(refused[0]["fields"]["code"], "protocol.unknown_plugin");
+    assert_eq!(refused[0]["span"]["id"], "4", "{}", refused[0]);
+}
+
+#[test]
+fn a_fire_of_an_ordinary_event_never_runs_the_init_handlers() {
+    // A Plugin whose init handler calls `log` and whose `Ping` handler does not: a fire of
+    // `Ping` runs exactly the `Ping` handler and never the init's `Call`.
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_payload(&[("log", true)]),
+            false,
+        )
+        .await;
+        let source = format!(
+            "{}@Event(Ping) fn h(p) {{ return 1; }}\n",
+            plugin_with_init(&[("boot", "return log(1);")])
+        );
+        backend.send(plugin_register_declaring(2, &source, events_of(&["Ping"])));
+        answer_init_call(&mut backend).await;
+        assert_eq!(name_of(&backend.next().await), "x");
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        assert_eq!(
+            results_of(&backend.next().await, 3),
+            vec![valued("h", Value::from(1))]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_too_deep_handler_result_is_its_entry_error_and_its_sibling_still_answers() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        // A result nesting one level less than a Script's result may is still two levels too deep
+        // for a fire reply's entry, which sits inside the `results` array and its own map; so is
+        // a write whose `modifications` list (array, `{ref, value}` map, then the value) would.
+        let nested = |depth: usize| {
+            format!("let v = 0; let i = 0; while (i < {depth}) {{ v = [v]; i = i + 1; }};")
+        };
+        let source = firing_source(&[
+            (
+                "Ping",
+                "a",
+                &format!(
+                    "{} return v;",
+                    nested(hexput_exec::wire::MAX_RESULT_DEPTH - 1)
+                ),
+            ),
+            (
+                "Ping",
+                "b",
+                &format!(
+                    "{} p.user.n = v; return 1;",
+                    nested(hexput_exec::wire::MAX_RESULT_DEPTH - 4)
+                ),
+            ),
+            ("Ping", "c", "return 2;"),
+        ]);
+        ready_x(&mut backend, 2, &source).await;
+        let user = holder(
+            vec![("ref", string("r1"))],
+            by_key(&[("n", Value::from(1))]),
+        );
+        backend.send(fire(3, "x", "Ping", by_key(&[("user", user)])));
+        let reply = backend.next().await;
+        let results = results_of(&reply, 3);
+        assert_eq!(entry_error(&results[0]), "protocol.result_too_deep");
+        assert_eq!(entry_error(&results[1]), "protocol.result_too_deep");
+        assert!(
+            format!("{:?}", results[1]).contains("`modifications` list"),
+            "{:?}",
+            results[1]
+        );
+        assert_eq!(results[2], valued("c", Value::from(2)));
+        // The reply as sent stays within what a frame may nest.
+        let encoded = hexput_port::encode(&reply).expect("the reply encodes");
+        assert_eq!(hexput_port::decode(&encoded).expect("it decodes"), reply);
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn the_entries_of_a_fire_reply_share_one_frame_and_a_large_result_costs_only_its_own_entry() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        // Output as large as a frame per handler: each result fits its own budget, but two do not
+        // fit one reply together.
+        let config = by_key(&[(
+            "budget",
+            by_key(&[(
+                "output_size_bytes",
+                Value::from(hexput_port::MAX_FRAME_LEN as u64),
+            )]),
+        )]);
+        let (mut backend, serving, _) = connect_with_plugins(
+            &sessions,
+            &cache,
+            &plugins,
+            init_configured(config, &[]),
+            false,
+        )
+        .await;
+        // 8 bytes doubled 20 times: 8 MiB each.
+        let big = "let s = \"xxxxxxxx\"; let i = 0; while (i < 20) { s = s + s; i = i + 1; }; \
+                   return s;";
+        let source = firing_source(&[
+            ("Ping", "a", big),
+            ("Ping", "b", big),
+            ("Ping", "c", "return 3;"),
+        ]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let reply = backend.next().await;
+        let results = results_of(&reply, 3);
+        assert_eq!(results.len(), 3);
+        let Some(Value::String(first)) = member(&results[0], "value") else {
+            panic!("`a` carries its value: {:?}", member(&results[0], "error"));
+        };
+        assert_eq!(first.as_str().map(str::len), Some(8 << 20));
+        assert_eq!(entry_error(&results[1]), "protocol.response_too_large");
+        assert_eq!(results[2], valued("c", Value::from(3)));
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_fire_from_another_connection_of_the_session_runs_there_and_its_calls_go_to_it_alone() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let registry = Arc::clone(&sessions);
+    let held = Arc::clone(&plugins);
+    on_runtime(async move {
+        let (mut a, serving_a) = open_bare_with_plugins(&registry, &cache, &held);
+        a.reply(
+            CorrelationId(1),
+            MessageType::Init,
+            init_payload(&[("log", true)]),
+        );
+        let (client_id, secret) = init_reply_of(&a.next().await);
+        ready_x(
+            &mut a,
+            2,
+            &firing_source(&[("Ping", "h", "return log(1);")]),
+        )
+        .await;
+
+        // A Connection attached by `Reconnect` fires the Plugin registered on the first one: the
+        // handler's call goes to the firing Connection, naming its request, and so does the reply.
+        let (mut b, serving_b) = open_bare_with_plugins(&registry, &cache, &held);
+        b.send(reconnect(2, &client_id.to_string(), &secret));
+        resumed(&mut b, 2, client_id).await;
+        b.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let (call, name, _, execution) = b.request_from(MessageType::Call).await;
+        assert_eq!((name.as_str(), execution), ("log", 3));
+        b.reply(
+            call,
+            MessageType::Result,
+            by_key(&[("value", Value::from(7))]),
+        );
+        assert_eq!(
+            results_of(&b.next().await, 3),
+            vec![valued("h", Value::from(7))]
+        );
+        assert_silent(&mut a, "the registering Connection").await;
+
+        b.close();
+        finished(serving_b).await;
+        a.close();
+        finished(serving_a).await;
+    });
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn a_fire_after_a_config_update_runs_under_the_updated_settings() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[("Ping", "h", "while (false) {}; return 1;")]);
+        ready_x(&mut backend, 2, &source).await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        assert_eq!(
+            results_of(&backend.next().await, 3),
+            vec![valued("h", Value::from(1))]
+        );
+
+        // Loops switched off after the registration: the next fire runs under the update.
+        let off = by_key(&[("features", by_key(&[("loops", Value::Boolean(false))]))]);
+        backend.send(config_update(4, off));
+        assert_updated(&backend.next().await, 4);
+        backend.send(fire(5, "x", "Ping", Value::Map(vec![])));
+        let results = results_of(&backend.next().await, 5);
+        assert_eq!(entry_error(&results[0]), "policy.construct_disabled");
+
+        // And back on: the update replaces the Config, so the default holds again.
+        backend.send(config_update(6, Value::Map(vec![])));
+        assert_updated(&backend.next().await, 6);
+        backend.send(fire(7, "x", "Ping", Value::Map(vec![])));
+        assert_eq!(
+            results_of(&backend.next().await, 7),
+            vec![valued("h", Value::from(1))]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}

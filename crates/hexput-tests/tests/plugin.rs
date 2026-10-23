@@ -11,7 +11,10 @@ use std::cell::Cell;
 use hexput_exec::Registration;
 use hexput_exec::wire::{MAX_RESULT_DEPTH, bounded};
 use hexput_parser::parse_shape;
-use hexput_plugin::{Plugins, Refusal, Reservation, finish, initialize, prepare};
+use hexput_plugin::{
+    Plugins, Refusal, Reservation, fetch, finish, fire_reply, initialize, prepare, prepare_fire,
+    run_fire,
+};
 use hexput_port::{CheckMode, ErrorBody, Feature, ProtocolCode, Settings, Value};
 use hexput_port::{Envelope, MessageType};
 use hexput_rpc::Calls;
@@ -1144,4 +1147,233 @@ fn an_init_handler_whose_budget_is_spent_yields_its_diagnostic_and_nothing_is_he
     assert_eq!(body.code, "budget.cpu_time_exceeded");
     drop(prepared);
     assert!(plugins.ids(c).is_empty());
+}
+
+// --- Story 6.5: firing an Event resolves its Plugin and Event, then runs each bound handler ---
+
+/// A Plugin named `x` with one handler per `(event, function, body)`, in source order.
+fn firing(handlers: &[(&str, &str, &str)]) -> String {
+    let mut source = String::from("plugin { name = \"x\" }\n");
+    for (event, function, body) in handlers {
+        source.push_str(&format!("@Event({event}) fn {function}(p) {{ {body} }}\n"));
+    }
+    source
+}
+
+/// A `{plugin, event, params}` payload.
+fn fire_of(plugin: &str, event: &str, params: Value) -> Value {
+    map(vec![
+        ("plugin", s(plugin)),
+        ("event", s(event)),
+        ("params", params),
+    ])
+}
+
+/// Registers `source` as `x` for `c`, declaring `Ping` and `Pong`, so it is ready.
+fn ready_x(plugins: &Plugins, c: ClientId, source: &str) {
+    plugins.open(c);
+    let events = events_map(vec![("Ping", declare("null")), ("Pong", declare("null"))]);
+    reg(&payload_with(source, events), c, plugins, reserving(1)).expect("registered");
+}
+
+/// The refusal `prepare_fire` gives `payload` for `c`'s Plugins.
+fn fire_refusal(payload: &Value, c: ClientId, plugins: &Plugins) -> Box<ErrorBody> {
+    prepare_fire(payload, fetch(payload, c, plugins)).expect_err("the fire is refused")
+}
+
+/// The value under `key` of a map.
+fn member(value: &Value, key: &str) -> Option<Value> {
+    value
+        .as_map()?
+        .iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .map(|(_, v)| v.clone())
+}
+
+/// Runs `payload`'s fire of `plugins`' Plugin to `c` with no Backend behind it, and returns its
+/// reply, which is `fire_reply` of the outcomes.
+fn fired(payload: &Value, c: ClientId, plugins: &Plugins) -> Value {
+    let fire = prepare_fire(payload, fetch(payload, c, plugins)).expect("the fire is accepted");
+    let (_calls, caller) = Calls::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let outcomes = runtime.block_on(run_fire(&fire, Vec::new(), caller, &Settings::new()));
+    fire_reply(&outcomes)
+}
+
+#[test]
+fn a_fire_is_refused_bad_payload_first_then_unknown_plugin_then_undeclared_event() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_x(&plugins, c, &named("x"));
+    // Missing `params`, an unknown Plugin and an undeclared Event at once: the payload speaks first.
+    let all_wrong = map(vec![("plugin", s("nope")), ("event", s("Nope"))]);
+    assert_eq!(
+        fire_refusal(&all_wrong, c, &plugins).code,
+        "protocol.invalid_payload"
+    );
+    let unknown = fire_of("nope", "Nope", map(vec![]));
+    assert_eq!(
+        fire_refusal(&unknown, c, &plugins).code,
+        "protocol.unknown_plugin"
+    );
+    let undeclared = fire_of("x", "Nope", map(vec![]));
+    assert_eq!(
+        fire_refusal(&undeclared, c, &plugins).code,
+        "protocol.undeclared_event"
+    );
+    let reserved = fire_of("x", "BackendRegisteredInit", map(vec![]));
+    assert_eq!(
+        fire_refusal(&reserved, c, &plugins).code,
+        "protocol.undeclared_event"
+    );
+    // A Plugin known and a payload right, but another Session's Client ID: unknown.
+    let good = fire_of("x", "Ping", map(vec![]));
+    assert_eq!(
+        fire_refusal(&good, client(2), &plugins).code,
+        "protocol.unknown_plugin"
+    );
+    assert!(prepare_fire(&good, fetch(&good, c, &plugins)).is_ok());
+}
+
+#[test]
+fn a_non_map_params_and_a_nested_bad_integer_are_refused_naming_their_path() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_x(&plugins, c, &named("x"));
+    let not_a_map = fire_of("x", "Ping", Value::from(1));
+    let refused = fire_refusal(&not_a_map, c, &plugins);
+    assert_eq!(refused.code, "protocol.invalid_payload");
+    assert!(
+        refused.message.contains("`params` must be a map"),
+        "{}",
+        refused.message
+    );
+    let nested = fire_of(
+        "x",
+        "Ping",
+        map(vec![(
+            "user",
+            map(vec![(
+                "tags",
+                Value::Array(vec![Value::from(1), Value::from(9_007_199_254_740_993_u64)]),
+            )]),
+        )]),
+    );
+    let refused = fire_refusal(&nested, c, &plugins);
+    assert_eq!(refused.code, "protocol.invalid_payload");
+    assert!(
+        refused.message.contains("`params.user.tags[1]`"),
+        "{}",
+        refused.message
+    );
+}
+
+#[test]
+fn fetch_finds_only_a_ready_plugin_of_the_callers_session_and_never_decodes_the_payload() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_x(&plugins, c, &named("x"));
+    let good = fire_of("x", "Ping", map(vec![]));
+    assert!(fetch(&good, c, &plugins).is_some());
+    assert!(fetch(&good, client(2), &plugins).is_none());
+    assert!(fetch(&fire_of("nope", "Ping", map(vec![])), c, &plugins).is_none());
+    // A non-string `plugin` names no Plugin; the decoding refusal is `prepare_fire`'s to give.
+    assert!(fetch(&map(vec![("plugin", Value::from(3))]), c, &plugins).is_none());
+    assert!(fetch(&Value::Nil, c, &plugins).is_none());
+    assert_eq!(
+        fire_refusal(&map(vec![("plugin", Value::from(3))]), c, &plugins).code,
+        "protocol.invalid_payload"
+    );
+}
+
+#[test]
+fn named_finds_a_plugin_by_its_client_and_name_and_closing_the_client_forgets_it() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_x(&plugins, c, &named("x"));
+    assert!(plugins.named(c, "x").is_some());
+    assert!(plugins.named(client(2), "x").is_none());
+    assert!(plugins.named(c, "nope").is_none());
+    plugins.close(c);
+    assert!(plugins.named(c, "x").is_none());
+    assert!(plugins.is_empty());
+}
+
+#[test]
+fn handlers_for_lists_the_handlers_bound_to_an_event_in_source_order() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    let source = "plugin { name = \"x\" }\n\
+                  @Event(Ping) fn h1(p) { return 1; }\n\
+                  @Event(Pong) fn h2(p) { return 2; }\n\
+                  @Event(Ping) fn h3(p) { return 3; }";
+    ready_x(&plugins, c, source);
+    let plugin = plugins.named(c, "x").expect("ready");
+    assert_eq!(
+        plugin.handlers_for("Ping").collect::<Vec<_>>(),
+        ["h1", "h3"]
+    );
+    assert_eq!(plugin.handlers_for("Pong").collect::<Vec<_>>(), ["h2"]);
+    assert!(plugin.handlers_for("Nope").next().is_none());
+}
+
+#[test]
+fn a_fire_runs_each_bound_handler_once_and_its_reply_has_one_entry_per_handler_in_order() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_x(
+        &plugins,
+        c,
+        &firing(&[("Ping", "a", "return 1;"), ("Ping", "b", "return 2;")]),
+    );
+    let reply = fired(&fire_of("x", "Ping", map(vec![])), c, &plugins);
+    assert_eq!(
+        reply,
+        map(vec![(
+            "results",
+            Value::Array(vec![
+                map(vec![("handler", s("a")), ("value", Value::from(1))]),
+                map(vec![("handler", s("b")), ("value", Value::from(2))]),
+            ]),
+        )])
+    );
+}
+
+#[test]
+fn an_event_with_no_bound_handler_fires_to_an_empty_results_list() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_x(&plugins, c, &firing(&[("Ping", "a", "return 1;")]));
+    assert_eq!(
+        fired(&fire_of("x", "Pong", map(vec![])), c, &plugins),
+        map(vec![("results", Value::Array(vec![]))])
+    );
+}
+
+#[test]
+fn a_failing_handler_is_an_error_entry_and_its_sibling_still_has_its_value() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_x(
+        &plugins,
+        c,
+        &firing(&[("Ping", "a", "return f();"), ("Ping", "b", "return 2;")]),
+    );
+    let reply = fired(&fire_of("x", "Ping", map(vec![])), c, &plugins);
+    let Some(Value::Array(entries)) = member(&reply, "results") else {
+        panic!("results is an array: {reply:?}");
+    };
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(member(&entries[0], "handler"), Some(s("a")));
+    let error = member(&entries[0], "error").expect("an error entry");
+    assert_eq!(
+        member(&error, "code"),
+        Some(s("capability.unknown_function"))
+    );
+    assert_eq!(
+        entries[1],
+        map(vec![("handler", s("b")), ("value", Value::from(2))])
+    );
 }

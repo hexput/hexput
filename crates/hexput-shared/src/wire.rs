@@ -115,6 +115,19 @@ pub enum MessageType {
     /// `protocol.init_not_completed` when the Session has ended before the Plugin is stored, with
     /// nothing registered.
     PluginRegister,
+    /// Request: fire a declared Event of a ready Plugin (Story 6.5, FR-19). The payload is exactly
+    /// `{plugin, event, params}`: `plugin` the Plugin's metadata `name` (as its `PluginRegister`
+    /// answered), `event` an Event its registration declared, `params` a map handed to every
+    /// handler as its one argument. Every handler bound to the Event runs once, in source order,
+    /// each its own execution with its own Resource Budget. Answered `Result {results}`, one
+    /// entry per handler in the order they ran — `{handler, value}` (with `modifications` after
+    /// `value` when the handler wrote a referenced place) or `{handler, error}`, `error` the one
+    /// wire error shape — so one handler's failure never hides another's; `results: []` when no
+    /// handler is bound. Or `Error`: `protocol.invalid_payload` (naming the key or path),
+    /// `protocol.unknown_plugin` for a name this Session holds no ready Plugin under,
+    /// `protocol.undeclared_event` for an Event its registration did not declare (or the reserved
+    /// `BackendRegisteredInit`), with nothing run.
+    EventFire,
     /// Response: a request succeeded; the payload is its result.
     Result,
     /// Request, from the Daemon to the Backend: a Script called a Registered Function (Story
@@ -145,6 +158,7 @@ impl MessageType {
         Self::CachedExecutionStart,
         Self::CodeUnregister,
         Self::PluginRegister,
+        Self::EventFire,
         Self::Result,
         Self::Call,
         Self::Authorize,
@@ -163,6 +177,7 @@ impl MessageType {
             Self::CachedExecutionStart => "CachedExecutionStart",
             Self::CodeUnregister => "CodeUnregister",
             Self::PluginRegister => "PluginRegister",
+            Self::EventFire => "EventFire",
             Self::Result => "Result",
             Self::Call => "Call",
             Self::Authorize => "Authorize",

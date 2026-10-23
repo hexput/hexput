@@ -9025,3 +9025,243 @@ fn a_fire_after_a_config_update_runs_under_the_updated_settings() {
         finished(serving).await;
     });
 }
+
+// --- Story 6.6: a fire's results are held to the fired Event's declared return shape ---
+
+/// Registers `source` as Plugin `x` on request `id`, declaring `Ping` to return `ping` (and
+/// nothing else), and reads its name reply.
+async fn ready_returning(backend: &mut Backend, id: u64, source: &str, ping: &str) {
+    let events = Value::Map(vec![(
+        string("Ping"),
+        Value::Map(vec![(string("returns"), string(ping))]),
+    )]);
+    backend.send(plugin_register_declaring(id, source, events));
+    let reply = backend.next().await;
+    assert_eq!(reply.id, Some(CorrelationId(id)), "{:?}", reply.payload);
+    assert_eq!(name_of(&reply), "x");
+}
+
+/// Asserts `entry` is `{handler, error}` for `handler` whose error is a `protocol.shape_mismatch`
+/// with exactly `message`, and carries no `modifications`.
+fn assert_shape_mismatch(entry: &Value, handler: &str, message: &str) {
+    assert_eq!(member(entry, "handler"), Some(string(handler)), "{entry:?}");
+    assert_eq!(
+        entry.as_map().map(Vec::len),
+        Some(2),
+        "exactly handler and error: {entry:?}"
+    );
+    let error = member(entry, "error").unwrap_or_else(|| panic!("an error entry: {entry:?}"));
+    assert_eq!(
+        member(&error, "code"),
+        Some(string("protocol.shape_mismatch")),
+        "{entry:?}"
+    );
+    assert_eq!(
+        member(&error, "message"),
+        Some(string(message)),
+        "{entry:?}"
+    );
+}
+
+#[test]
+fn a_fire_answers_a_conforming_entry_unchanged_and_a_mismatch_as_its_own_shape_mismatch() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[
+            ("Ping", "h1", "return {ok: true};"),
+            ("Ping", "h2", "return {ok: 1};"),
+            ("Ping", "h3", "return f();"),
+        ]);
+        ready_returning(&mut backend, 2, &source, "{ ok: true }").await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let results = results_of(&backend.next().await, 3);
+        assert_eq!(results.len(), 3, "{results:?}");
+        assert_eq!(
+            results[0],
+            valued("h1", by_key(&[("ok", Value::from(true))]))
+        );
+        assert_shape_mismatch(
+            &results[1],
+            "h2",
+            "the handler's result does not conform to the `Ping` return shape: `value.ok` must be a boolean; found a number",
+        );
+        assert_eq!(member(&results[2], "handler"), Some(string("h3")));
+        assert_eq!(entry_error(&results[2]), "capability.unknown_function");
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_missing_key_and_an_extra_key_are_each_a_shape_mismatch_naming_their_path() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[
+            ("Ping", "missing", "return {};"),
+            ("Ping", "extra", "return {ok: true, \"b-c\": 2};"),
+        ]);
+        ready_returning(&mut backend, 2, &source, "{ ok: true }").await;
+        backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+        let results = results_of(&backend.next().await, 3);
+        assert_shape_mismatch(
+            &results[0],
+            "missing",
+            "the handler's result does not conform to the `Ping` return shape: `value.ok` is missing",
+        );
+        assert_shape_mismatch(
+            &results[1],
+            "extra",
+            "the handler's result does not conform to the `Ping` return shape: `value[\"b-c\"]` is not a key of the shape",
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_holder_that_conforms_is_kept_as_it_is_in_the_entry() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        ready_returning(
+            &mut backend,
+            2,
+            &firing_source(&[("Ping", "h", "return p.n;")]),
+            "0",
+        )
+        .await;
+        let param = holder(vec![("ref", string("r1"))], Value::from(1));
+        backend.send(fire(3, "x", "Ping", by_key(&[("n", param)])));
+        let results = results_of(&backend.next().await, 3);
+        assert_eq!(
+            results,
+            vec![valued(
+                "h",
+                holder(vec![("ref", string("r1"))], Value::from(1))
+            )]
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_holder_around_a_string_under_a_number_key_is_a_shape_mismatch_naming_the_key() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        ready_returning(
+            &mut backend,
+            2,
+            &firing_source(&[("Ping", "h", "return p;")]),
+            "{ n: 0 }",
+        )
+        .await;
+        let param = holder(vec![("ref", string("r1"))], string("a"));
+        backend.send(fire(3, "x", "Ping", by_key(&[("n", param)])));
+        let results = results_of(&backend.next().await, 3);
+        assert_shape_mismatch(
+            &results[0],
+            "h",
+            "the handler's result does not conform to the `Ping` return shape: `value.n` must be a number; found a string",
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_mismatch_that_wrote_a_referenced_parameter_is_an_error_entry_with_no_modifications() {
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    on_runtime(async {
+        let (mut backend, serving, _) =
+            connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+        let source = firing_source(&[("Ping", "h", "p.user.n = 2; return 1;")]);
+        ready_returning(&mut backend, 2, &source, "{ ok: true }").await;
+        let user = holder(
+            vec![("ref", string("r1"))],
+            by_key(&[("n", Value::from(1))]),
+        );
+        backend.send(fire(3, "x", "Ping", by_key(&[("user", user)])));
+        let results = results_of(&backend.next().await, 3);
+        assert_shape_mismatch(
+            &results[0],
+            "h",
+            "the handler's result does not conform to the `Ping` return shape: `value` must be an object; found a number",
+        );
+        backend.close();
+        finished(serving).await;
+    });
+}
+
+#[test]
+fn a_shape_mismatch_is_logged_as_a_failed_handler_with_its_code_and_counted_as_failed() {
+    let log = Captured::default();
+    let writer = log.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(writer))
+            .finish(),
+    );
+    let sessions = Arc::new(Sessions::new());
+    let cache = Arc::new(AstCache::with_capacity(10_000));
+    let plugins = Arc::new(Plugins::new());
+    let runtime = wired_runtime();
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(async {
+            let (mut backend, serving, _) =
+                connect_with_plugins(&sessions, &cache, &plugins, init_payload(&[]), false).await;
+            let source = firing_source(&[
+                ("Ping", "a", "return 1;"),
+                ("Ping", "b", "return {ok: true};"),
+            ]);
+            ready_returning(&mut backend, 2, &source, "{ ok: true }").await;
+            backend.send(fire(3, "x", "Ping", Value::Map(vec![])));
+            let _ = results_of(&backend.next().await, 3);
+            backend.close();
+            finished(serving).await;
+        });
+    });
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    let fired: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "event fired")
+        .collect();
+    assert_eq!(fired.len(), 1, "{text}");
+    assert_eq!(fired[0]["fields"]["handlers"], 2, "{}", fired[0]);
+    assert_eq!(fired[0]["fields"]["failed"], 1, "{}", fired[0]);
+    let failed: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "a handler failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{text}");
+    assert_eq!(failed[0]["fields"]["handler"], "a", "{}", failed[0]);
+    assert_eq!(
+        failed[0]["fields"]["code"], "protocol.shape_mismatch",
+        "{}",
+        failed[0]
+    );
+    assert_eq!(failed[0]["span"]["id"], "3", "{}", failed[0]);
+}

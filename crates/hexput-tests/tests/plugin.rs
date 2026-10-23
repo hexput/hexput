@@ -12,8 +12,8 @@ use hexput_exec::Registration;
 use hexput_exec::wire::{MAX_RESULT_DEPTH, bounded};
 use hexput_parser::parse_shape;
 use hexput_plugin::{
-    Plugins, Refusal, Reservation, fetch, finish, fire_reply, initialize, prepare, prepare_fire,
-    run_fire,
+    Plugins, Refusal, Reservation, conform, fetch, finish, fire_reply, initialize, prepare,
+    prepare_fire, run_fire,
 };
 use hexput_port::{CheckMode, ErrorBody, Feature, ProtocolCode, Settings, Value};
 use hexput_port::{Envelope, MessageType};
@@ -1199,7 +1199,7 @@ fn fired(payload: &Value, c: ClientId, plugins: &Plugins) -> Value {
         .build()
         .unwrap();
     let outcomes = runtime.block_on(run_fire(&fire, Vec::new(), caller, &Settings::new()));
-    fire_reply(&outcomes)
+    fire_reply(&fire, &outcomes)
 }
 
 #[test]
@@ -1375,5 +1375,576 @@ fn a_failing_handler_is_an_error_entry_and_its_sibling_still_has_its_value() {
     assert_eq!(
         entries[1],
         map(vec![("handler", s("b")), ("value", Value::from(2))])
+    );
+}
+
+// --- Story 6.6: a handler's result is held to its Event's declared return shape ---
+
+/// `conform(value, shape)`, with `shape` parsed as a return shape.
+fn conforms(value: &Value, shape: &str) -> Result<(), String> {
+    conform(value, &parse_shape(shape).expect("a return shape"))
+}
+
+/// A Value Secret holder around `value`, with Reference ID `r1`.
+fn held(value: Value) -> Value {
+    map(vec![
+        ("__secret", map(vec![("ref", s("r1"))])),
+        ("value", value),
+    ])
+}
+
+/// Registers `source` as `x` for `c`, declaring `Ping` to return `ping` and `Pong` to return
+/// `null`, so it is ready.
+fn ready_shaped(plugins: &Plugins, c: ClientId, source: &str, ping: &str) {
+    plugins.open(c);
+    let events = events_map(vec![("Ping", declare(ping)), ("Pong", declare("null"))]);
+    reg(&payload_with(source, events), c, plugins, reserving(1)).expect("registered");
+}
+
+/// Asserts `entry` is `{handler, error}` for `handler`, its error a `protocol.shape_mismatch`
+/// whose message is exactly `message`, and carrying no `modifications`.
+fn shape_mismatch(entry: &Value, handler: &str, message: &str) {
+    assert_eq!(member(entry, "handler"), Some(s(handler)), "{entry:?}");
+    assert_eq!(
+        entry.as_map().map(Vec::len),
+        Some(2),
+        "exactly handler and error: {entry:?}"
+    );
+    let error = member(entry, "error").unwrap_or_else(|| panic!("an error entry: {entry:?}"));
+    assert_eq!(
+        member(&error, "code"),
+        Some(s("protocol.shape_mismatch")),
+        "{entry:?}"
+    );
+    assert_eq!(member(&error, "message"), Some(s(message)), "{entry:?}");
+}
+
+#[test]
+fn a_conforming_object_result_is_accepted_and_a_missing_key_is_named() {
+    let shape = "{ points: 0, tags: [\"\"] }";
+    let ok = map(vec![
+        ("points", Value::from(3)),
+        ("tags", Value::Array(vec![s("a")])),
+    ]);
+    assert_eq!(conforms(&ok, shape), Ok(()));
+    let missing = map(vec![("points", Value::from(0))]);
+    assert_eq!(
+        conforms(&missing, shape),
+        Err("`value.tags` is missing".to_owned())
+    );
+    assert_eq!(
+        conforms(&map(vec![]), "{ points: 0 }"),
+        Err("`value.points` is missing".to_owned())
+    );
+}
+
+#[test]
+fn an_extra_key_the_object_shape_forbids_is_named_quoted_when_not_an_identifier() {
+    assert_eq!(
+        conforms(
+            &map(vec![("a", Value::from(1)), ("b-c", Value::from(2))]),
+            "{ a: 0 }"
+        ),
+        Err("`value[\"b-c\"]` is not a key of the shape".to_owned())
+    );
+    assert_eq!(
+        conforms(&map(vec![("a", Value::from(1))]), "{}"),
+        Err("`value.a` is not a key of the shape".to_owned())
+    );
+    assert_eq!(conforms(&map(vec![]), "{}"), Ok(()));
+}
+
+#[test]
+fn a_wrong_type_nested_in_an_array_is_named_by_its_full_path() {
+    assert_eq!(
+        conforms(
+            &map(vec![("tags", Value::Array(vec![s("a"), Value::from(2)]))]),
+            "{ tags: [\"\"] }"
+        ),
+        Err("`value.tags[1]` must be a string; found a number".to_owned())
+    );
+}
+
+#[test]
+fn a_root_of_the_wrong_kind_is_named_as_value_with_its_kind() {
+    assert_eq!(
+        conforms(&Value::Nil, "[0]"),
+        Err("`value` must be an array; found null".to_owned())
+    );
+    assert_eq!(
+        conforms(&s("x"), "{ a: 0 }"),
+        Err("`value` must be an object; found a string".to_owned())
+    );
+    assert_eq!(
+        conforms(&Value::Array(vec![]), "{ a: 0 }"),
+        Err("`value` must be an object; found an array".to_owned())
+    );
+}
+
+#[test]
+fn a_number_node_accepts_an_integer_and_a_float_and_refuses_other_kinds() {
+    assert_eq!(conforms(&Value::from(3), "0"), Ok(()));
+    assert_eq!(conforms(&Value::from(-2), "0"), Ok(()));
+    assert_eq!(conforms(&Value::F64(1.5), "0"), Ok(()));
+    assert_eq!(conforms(&Value::F32(2.5), "0"), Ok(()));
+    assert_eq!(
+        conforms(&s("3"), "0"),
+        Err("`value` must be a number; found a string".to_owned())
+    );
+    assert_eq!(
+        conforms(&Value::Boolean(true), "0"),
+        Err("`value` must be a number; found a boolean".to_owned())
+    );
+    assert_eq!(
+        conforms(&Value::Nil, "0"),
+        Err("`value` must be a number; found null".to_owned())
+    );
+}
+
+#[test]
+fn a_string_node_accepts_any_string_and_refuses_other_kinds() {
+    assert_eq!(conforms(&s(""), "\"\""), Ok(()));
+    assert_eq!(conforms(&s("abc"), "\"\""), Ok(()));
+    assert_eq!(
+        conforms(&Value::from(1), "\"\""),
+        Err("`value` must be a string; found a number".to_owned())
+    );
+}
+
+#[test]
+fn a_boolean_node_accepts_true_and_false_and_refuses_other_kinds() {
+    assert_eq!(conforms(&Value::Boolean(true), "true"), Ok(()));
+    assert_eq!(conforms(&Value::Boolean(false), "true"), Ok(()));
+    assert_eq!(
+        conforms(&Value::from(1), "true"),
+        Err("`value` must be a boolean; found a number".to_owned())
+    );
+}
+
+#[test]
+fn an_any_node_accepts_every_value_and_is_not_descended_into() {
+    assert_eq!(conforms(&Value::Nil, "null"), Ok(()));
+    assert_eq!(conforms(&s("x"), "null"), Ok(()));
+    assert_eq!(
+        conforms(
+            &map(vec![("a", Value::Array(vec![Value::from(1), Value::Nil]))]),
+            "null"
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn an_untyped_array_node_accepts_any_array_and_is_not_descended_into() {
+    assert_eq!(conforms(&Value::Array(vec![]), "[]"), Ok(()));
+    assert_eq!(
+        conforms(
+            &Value::Array(vec![
+                Value::from(1),
+                s("a"),
+                Value::Nil,
+                map(vec![("x", Value::from(1))]),
+            ]),
+            "[]"
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        conforms(&map(vec![]), "[]"),
+        Err("`value` must be an array; found an object".to_owned())
+    );
+}
+
+#[test]
+fn a_typed_array_node_accepts_every_element_conforming_and_the_empty_array() {
+    assert_eq!(conforms(&Value::Array(vec![]), "[0]"), Ok(()));
+    assert_eq!(
+        conforms(&Value::Array(vec![Value::from(1), Value::F64(2.0)]), "[0]"),
+        Ok(())
+    );
+}
+
+#[test]
+fn nested_arrays_are_checked_element_by_element_at_every_depth() {
+    let shape = "[[0]]";
+    assert_eq!(
+        conforms(
+            &Value::Array(vec![
+                Value::Array(vec![Value::from(1)]),
+                Value::Array(vec![Value::from(2), Value::from(3)]),
+            ]),
+            shape
+        ),
+        Ok(())
+    );
+    assert_eq!(conforms(&Value::Array(vec![]), shape), Ok(()));
+    assert_eq!(
+        conforms(
+            &Value::Array(vec![Value::Array(vec![Value::from(1)]), s("x")]),
+            shape
+        ),
+        Err("`value[1]` must be an array; found a string".to_owned())
+    );
+    assert_eq!(
+        conforms(
+            &Value::Array(vec![Value::Array(vec![Value::from(1), s("x")])]),
+            shape
+        ),
+        Err("`value[0][1]` must be a number; found a string".to_owned())
+    );
+}
+
+#[test]
+fn an_empty_object_shape_accepts_only_the_empty_object() {
+    assert_eq!(conforms(&map(vec![]), "{}"), Ok(()));
+    assert_eq!(
+        conforms(&Value::Array(vec![]), "{}"),
+        Err("`value` must be an object; found an array".to_owned())
+    );
+}
+
+#[test]
+fn a_non_identifier_key_of_the_shape_is_quoted_in_its_path() {
+    assert_eq!(
+        conforms(&map(vec![]), "{ \"b-c\": 0 }"),
+        Err("`value[\"b-c\"]` is missing".to_owned())
+    );
+    assert_eq!(
+        conforms(&map(vec![("b-c", s("x"))]), "{ \"b-c\": 0 }"),
+        Err("`value[\"b-c\"]` must be a number; found a string".to_owned())
+    );
+}
+
+#[test]
+fn an_overlong_key_in_a_path_is_bounded_with_an_ellipsis() {
+    let long = "a".repeat(100);
+    let value = map(vec![(long.as_str(), Value::from(1))]);
+    let expected = format!("`value.{}…` is not a key of the shape", "a".repeat(64));
+    assert_eq!(conforms(&value, "{}"), Err(expected));
+}
+
+#[test]
+fn an_own_failure_is_reported_before_the_failures_of_its_children() {
+    // `tags` is missing and `points` is the wrong kind: the missing key is the first failure.
+    assert_eq!(
+        conforms(
+            &map(vec![("points", s("x"))]),
+            "{ points: 0, tags: [\"\"] }"
+        ),
+        Err("`value.tags` is missing".to_owned())
+    );
+    // The root's own kind is wrong, so its children are never examined.
+    assert_eq!(
+        conforms(&s("x"), "{ a: [0] }"),
+        Err("`value` must be an object; found a string".to_owned())
+    );
+}
+
+#[test]
+fn children_are_checked_in_value_order_not_shape_order() {
+    assert_eq!(
+        conforms(
+            &map(vec![
+                ("tags", Value::Array(vec![Value::from(1)])),
+                ("points", s("x")),
+            ]),
+            "{ points: 0, tags: [\"\"] }"
+        ),
+        Err("`value.tags[0]` must be a string; found a number".to_owned())
+    );
+}
+
+#[test]
+fn a_missing_key_is_the_first_shape_key_in_shape_order_then_an_extra_key_in_value_order() {
+    assert_eq!(
+        conforms(&map(vec![]), "{ b: 0, a: 0 }"),
+        Err("`value.b` is missing".to_owned())
+    );
+    assert_eq!(
+        conforms(
+            &map(vec![("y", Value::from(1)), ("x", Value::from(2))]),
+            "{}"
+        ),
+        Err("`value.y` is not a key of the shape".to_owned())
+    );
+}
+
+#[test]
+fn missing_is_reported_before_an_extra_key() {
+    assert_eq!(
+        conforms(&map(vec![("extra", Value::from(1))]), "{ points: 0 }"),
+        Err("`value.points` is missing".to_owned())
+    );
+}
+
+#[test]
+fn the_walk_is_depth_first_so_the_first_failure_is_the_earliest_in_pre_order() {
+    // `a` is first in value order and its second element fails before `b` is looked at.
+    assert_eq!(
+        conforms(
+            &map(vec![
+                ("a", Value::Array(vec![Value::from(1), s("x")]),),
+                ("b", s("y")),
+            ]),
+            "{ a: [0], b: 0 }"
+        ),
+        Err("`value.a[1]` must be a number; found a string".to_owned())
+    );
+    assert_eq!(
+        conforms(&Value::Array(vec![s("x"), Value::from(1), s("y")]), "[0]"),
+        Err("`value[0]` must be a number; found a string".to_owned())
+    );
+}
+
+#[test]
+fn a_holder_is_seen_through_and_adds_no_path_segment_at_the_root_or_in_an_array() {
+    assert_eq!(conforms(&held(Value::from(1)), "0"), Ok(()));
+    assert_eq!(
+        conforms(&held(s("a")), "0"),
+        Err("`value` must be a number; found a string".to_owned())
+    );
+    assert_eq!(
+        conforms(&Value::Array(vec![held(s("a"))]), "[0]"),
+        Err("`value[0]` must be a number; found a string".to_owned())
+    );
+}
+
+#[test]
+fn a_holder_under_an_object_key_conforms_or_names_the_key_not_the_holder() {
+    assert_eq!(
+        conforms(&map(vec![("n", held(Value::from(1)))]), "{ n: 0 }"),
+        Ok(())
+    );
+    assert_eq!(
+        conforms(&map(vec![("n", held(s("a")))]), "{ n: 0 }"),
+        Err("`value.n` must be a number; found a string".to_owned())
+    );
+}
+
+#[test]
+fn a_holder_around_an_object_is_validated_in_its_place() {
+    assert_eq!(
+        conforms(&held(map(vec![("n", Value::from(1))])), "{ n: 0 }"),
+        Ok(())
+    );
+    assert_eq!(
+        conforms(&held(map(vec![])), "{ n: 0 }"),
+        Err("`value.n` is missing".to_owned())
+    );
+    assert_eq!(
+        conforms(&held(Value::Nil), "{}"),
+        Err("`value` must be an object; found null".to_owned())
+    );
+}
+
+#[test]
+fn a_holder_around_null_conforms_to_any_and_is_null_to_every_other_node() {
+    assert_eq!(conforms(&held(Value::Nil), "null"), Ok(()));
+    assert_eq!(
+        conforms(&held(Value::Nil), "0"),
+        Err("`value` must be a number; found null".to_owned())
+    );
+}
+
+#[test]
+fn a_fire_holds_a_shaped_result_to_its_own_events_shape_and_an_any_shaped_one_to_any() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    let source = firing(&[
+        ("Ping", "a", "return {ok: true};"),
+        ("Pong", "b", "return {a: 1};"),
+    ]);
+    ready_shaped(&plugins, c, &source, "{ ok: true }");
+    assert_eq!(
+        fired(&fire_of("x", "Ping", map(vec![])), c, &plugins),
+        map(vec![(
+            "results",
+            Value::Array(vec![map(vec![
+                ("handler", s("a")),
+                ("value", map(vec![("ok", Value::from(true))])),
+            ])]),
+        )])
+    );
+    assert_eq!(
+        fired(&fire_of("x", "Pong", map(vec![])), c, &plugins),
+        map(vec![(
+            "results",
+            Value::Array(vec![map(vec![
+                ("handler", s("b")),
+                ("value", map(vec![("a", Value::from(1))])),
+            ])]),
+        )])
+    );
+}
+
+#[test]
+fn a_mismatching_entry_is_only_its_own_and_its_siblings_are_exactly_what_they_are_alone() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    let source = firing(&[
+        ("Ping", "h1", "return {ok: true};"),
+        ("Ping", "h2", "return {ok: 1};"),
+        ("Ping", "h3", "return f();"),
+    ]);
+    ready_shaped(&plugins, c, &source, "{ ok: true }");
+    let reply = fired(&fire_of("x", "Ping", map(vec![])), c, &plugins);
+    let Some(Value::Array(entries)) = member(&reply, "results") else {
+        panic!("results is an array: {reply:?}");
+    };
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    assert_eq!(
+        entries[0],
+        map(vec![
+            ("handler", s("h1")),
+            ("value", map(vec![("ok", Value::from(true))])),
+        ])
+    );
+    shape_mismatch(
+        &entries[1],
+        "h2",
+        "the handler's result does not conform to the `Ping` return shape: `value.ok` must be a boolean; found a number",
+    );
+    let error = member(&entries[2], "error").expect("an error entry");
+    assert_eq!(member(&entries[2], "handler"), Some(s("h3")));
+    assert_eq!(
+        member(&error, "code"),
+        Some(s("capability.unknown_function"))
+    );
+}
+
+#[test]
+fn a_handler_that_failed_keeps_its_own_error_and_a_result_that_is_no_wire_value_keeps_its_code() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    let source = firing(&[
+        ("Ping", "a", "return fn() { return 1; };"),
+        ("Ping", "b", "return f();"),
+    ]);
+    ready_shaped(&plugins, c, &source, "{}");
+    let reply = fired(&fire_of("x", "Ping", map(vec![])), c, &plugins);
+    let Some(Value::Array(entries)) = member(&reply, "results") else {
+        panic!("results is an array: {reply:?}");
+    };
+    let code = |entry: &Value| {
+        let error = member(entry, "error").expect("an error entry");
+        member(&error, "code").expect("a code")
+    };
+    assert_eq!(code(&entries[0]), s("type.function_result"));
+    assert_eq!(code(&entries[1]), s("capability.unknown_function"));
+}
+
+#[test]
+fn a_root_mismatch_names_the_root_and_its_kind_in_the_entry_error() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_shaped(
+        &plugins,
+        c,
+        &firing(&[("Ping", "h", "return null;")]),
+        "{ ok: true }",
+    );
+    let reply = fired(&fire_of("x", "Ping", map(vec![])), c, &plugins);
+    let Some(Value::Array(entries)) = member(&reply, "results") else {
+        panic!("results is an array: {reply:?}");
+    };
+    shape_mismatch(
+        &entries[0],
+        "h",
+        "the handler's result does not conform to the `Ping` return shape: `value` must be an object; found null",
+    );
+}
+
+#[test]
+fn a_mismatch_that_wrote_a_referenced_place_is_an_error_entry_with_no_modifications() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_shaped(
+        &plugins,
+        c,
+        &firing(&[("Ping", "h", "p.user.n = 2; return 1;")]),
+        "{ ok: true }",
+    );
+    let params = map(vec![("user", held(map(vec![("n", Value::from(1))])))]);
+    let reply = fired(&fire_of("x", "Ping", params), c, &plugins);
+    let Some(Value::Array(entries)) = member(&reply, "results") else {
+        panic!("results is an array: {reply:?}");
+    };
+    shape_mismatch(
+        &entries[0],
+        "h",
+        "the handler's result does not conform to the `Ping` return shape: `value` must be an object; found a number",
+    );
+}
+
+#[test]
+fn a_conforming_result_that_wrote_a_referenced_place_keeps_its_value_and_modifications() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    ready_shaped(
+        &plugins,
+        c,
+        &firing(&[("Ping", "h", "p.user.n = 2; return {ok: true};")]),
+        "{ ok: true }",
+    );
+    let params = map(vec![("user", held(map(vec![("n", Value::from(1))])))]);
+    let reply = fired(&fire_of("x", "Ping", params), c, &plugins);
+    let Some(Value::Array(entries)) = member(&reply, "results") else {
+        panic!("results is an array: {reply:?}");
+    };
+    let entry = &entries[0];
+    assert_eq!(
+        entry.as_map().map(Vec::len),
+        Some(3),
+        "handler, value and modifications: {entry:?}"
+    );
+    assert_eq!(member(entry, "handler"), Some(s("h")));
+    assert_eq!(
+        member(entry, "value"),
+        Some(map(vec![("ok", Value::from(true))]))
+    );
+    let Some(Value::Array(modifications)) = member(entry, "modifications") else {
+        panic!("a conforming entry keeps its modifications: {entry:?}");
+    };
+    assert_eq!(modifications.len(), 1, "{modifications:?}");
+    assert_eq!(member(&modifications[0], "ref"), Some(s("r1")));
+    let value = member(&modifications[0], "value").expect("the written value");
+    assert_eq!(member(&value, "n"), Some(Value::from(2)), "{value:?}");
+}
+
+#[test]
+fn an_init_handler_result_is_never_held_to_any_declared_shape() {
+    let plugins = Plugins::new();
+    let c = client(1);
+    let source = "plugin { name = \"x\" }\n\
+                  @Event(BackendRegisteredInit) fn boot(p) { return \"not an object\"; }\n\
+                  @Event(Ping) fn h(p) { return \"not an object\"; }";
+    // Every declared Event returns an object, so the init handler's string would conform to none.
+    ready_shaped(&plugins, c, source, "{ ok: true }");
+    assert_eq!(
+        plugins.ids(c),
+        vec![PluginId::new(1)],
+        "registration succeeds"
+    );
+    let reply = fired(&fire_of("x", "Ping", map(vec![])), c, &plugins);
+    let Some(Value::Array(entries)) = member(&reply, "results") else {
+        panic!("results is an array: {reply:?}");
+    };
+    shape_mismatch(
+        &entries[0],
+        "h",
+        "the handler's result does not conform to the `Ping` return shape: `value` must be an object; found a string",
+    );
+}
+
+#[test]
+fn a_shape_key_named_secret_can_never_be_satisfied() {
+    // A Hexput object never carries `__secret`, and a map with it is a Value Secret holder.
+    assert_eq!(
+        conforms(&map(vec![]), "{ __secret: 0 }"),
+        Err("`value.__secret` is missing".to_owned())
+    );
+    assert_eq!(
+        conforms(&held(map(vec![])), "{ __secret: 0 }"),
+        Err("`value.__secret` is missing".to_owned())
     );
 }

@@ -3605,3 +3605,22 @@ fn a_handler_returning_a_function_fails_as_any_execution_would() {
     let diagnostic = invoke(source, "boot", Host::none(), Limits::default()).unwrap_err();
     assert_eq!(diagnostic.code.as_str(), "type.function_result");
 }
+
+// --- Story 6.6: one path rendering for every payload path, reusable from outside the crate ---
+
+#[test]
+fn a_result_path_renders_its_root_and_each_segment_as_a_payload_path_does() {
+    let mut path = hexput_exec::wire::Path::result();
+    assert_eq!(path.rendered(), "`value`");
+    path.push_key("tags");
+    assert_eq!(path.rendered(), "`value.tags`");
+    path.push_index(1);
+    assert_eq!(path.rendered(), "`value.tags[1]`");
+    path.push_key("b-c");
+    assert_eq!(path.rendered(), "`value.tags[1][\"b-c\"]`");
+    path.pop();
+    assert_eq!(path.rendered(), "`value.tags[1]`");
+    path.pop();
+    path.pop();
+    assert_eq!(path.rendered(), "`value`");
+}

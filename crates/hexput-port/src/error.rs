@@ -76,6 +76,12 @@ pub enum ProtocolCode {
     /// registered, another Session's, or one whose initialization has not completed. Naming the
     /// Plugin (bounded); one message for every such case. Nothing runs.
     UnknownPlugin,
+    /// A handler's result that does not conform to the fired Event's declared return shape
+    /// (Story 6.6, FR-19), naming the Event (bounded) and the first offending path under `value`.
+    /// The handler ran and its side effects stand; its result is not sent, and its fire reply
+    /// entry carries this error instead — never a sibling's. Like [`Self::ResultTooDeep`], a
+    /// result the reply refuses to carry, so it has no span.
+    ShapeMismatch,
 }
 
 impl ProtocolCode {
@@ -100,6 +106,7 @@ impl ProtocolCode {
         Self::DuplicatePluginName,
         Self::UndeclaredEvent,
         Self::UnknownPlugin,
+        Self::ShapeMismatch,
     ];
 
     /// The code's stable string form.
@@ -122,6 +129,7 @@ impl ProtocolCode {
             Self::DuplicatePluginName => "protocol.duplicate_plugin_name",
             Self::UndeclaredEvent => "protocol.undeclared_event",
             Self::UnknownPlugin => "protocol.unknown_plugin",
+            Self::ShapeMismatch => "protocol.shape_mismatch",
         }
     }
 }

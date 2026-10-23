@@ -87,7 +87,24 @@
 //! have no effect yet (Stories 6.11, 6.12), and until the Global Variable store lands (Story
 //! 6.7) each invocation evaluates the Global Variable initializers afresh.
 //!
+//! # What Story 6.6 adds
+//!
+//! Return shapes are enforced (FR-19). As [`fire_reply`] builds each successful entry, it holds
+//! the handler's converted result to the fired Event's declared shape ([`Fire::returns`]) with
+//! [`conform`]: a conforming result is sent exactly as before; one that does not conform makes
+//! that entry `{handler, error}` with `protocol.shape_mismatch`, naming the Event and the first
+//! offending path under `value` (`` `value.tags[1]` must be a string; found a number ``), and no
+//! `modifications`. Each entry is checked on its own, so a mismatch never touches a sibling. The
+//! check runs after conversion — a result an entry cannot carry keeps its own error — on the wire
+//! value, seeing through Value Secret holders without altering them; it is charged to no
+//! Resource Budget, and the handler's side effects stand. Init handlers' results are discarded,
+//! never checked.
+//!
 //! Binds: AD-3, AD-4, AD-6, AD-8.
+
+mod shape;
+
+pub use shape::conform;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -219,6 +236,12 @@ impl Plugin {
     /// (bounded) — or, for `BackendRegisteredInit`, saying that it is reserved and that a Backend
     /// cannot fire it.
     pub fn event(&self, name: &str) -> Result<&EventDeclaration, Box<ErrorBody>> {
+        self.declaration(name).map(|at| &self.events[at])
+    }
+
+    /// The index in [`Plugin::events`] of the Event `name` a Backend may fire, refused exactly as
+    /// [`Plugin::event`] refuses it.
+    fn declaration(&self, name: &str) -> Result<usize, Box<ErrorBody>> {
         if name == BACKEND_REGISTERED_INIT {
             return Err(protocol(
                 ProtocolCode::UndeclaredEvent,
@@ -227,7 +250,8 @@ impl Plugin {
         }
         self.index
             .get(name)
-            .and_then(|&at| self.events.get(at))
+            .copied()
+            .filter(|&at| at < self.events.len())
             .ok_or_else(|| {
                 protocol(
                     ProtocolCode::UndeclaredEvent,
@@ -629,6 +653,8 @@ pub fn finish(
 pub struct Fire {
     plugin: Arc<Plugin>,
     event: String,
+    /// The fired Event's index in the Plugin's declarations (Story 6.6).
+    declaration: usize,
     params: Held,
 }
 
@@ -643,6 +669,12 @@ impl Fire {
     #[must_use]
     pub fn event(&self) -> &str {
         &self.event
+    }
+
+    /// The fired Event's declared return shape, every handler's result is held to (Story 6.6).
+    #[must_use]
+    pub fn returns(&self) -> &Shape {
+        &self.plugin.events[self.declaration].returns
     }
 
     /// The parameters every handler receives its own copy of: an object.
@@ -716,10 +748,12 @@ pub fn prepare_fire(payload: &Value, fetched: Option<Arc<Plugin>>) -> Result<Fir
             ),
         ));
     };
-    let event = plugin.event(event)?.name.clone();
+    let declaration = plugin.declaration(event)?;
+    let event = plugin.events[declaration].name.clone();
     Ok(Fire {
         plugin,
         event,
+        declaration,
         params,
     })
 }
@@ -772,8 +806,13 @@ pub fn run_fire<'f>(
 /// [`MAX_FRAME_LEN`], so a large result costs its own entry, never its siblings'. A result an
 /// entry cannot carry is that entry's error instead: `protocol.result_too_deep`,
 /// `protocol.response_too_large` or `type.function_result`. Never carries `findings`.
+///
+/// A converted result is then held to `fire`'s declared return shape (Story 6.6, [`conform`]): one
+/// that does not conform makes its entry `{handler, error}` with `protocol.shape_mismatch` naming
+/// the Event and the first offending path, and no `modifications`; each entry is checked on its
+/// own.
 #[must_use]
-pub fn fire_reply(outcomes: &[HandlerOutcome]) -> Value {
+pub fn fire_reply(fire: &Fire, outcomes: &[HandlerOutcome]) -> Value {
     // What the frame leaves the entries: the envelope's room, and the payload's map, `results`
     // key and the array's header.
     let mut left = MAX_FRAME_LEN - findings::ENVELOPE_ROOM - (RESULTS.len() + 1 + 1 + 5);
@@ -785,7 +824,7 @@ pub fn fire_reply(outcomes: &[HandlerOutcome]) -> Value {
                 Value::Map(vec![handler.clone(), (Value::from(ERROR), body.to_value())])
             };
             let mut entry = match &outcome.result {
-                Ok(finished) => match entry_value(finished, left) {
+                Ok(finished) => match entry_value(finished, fire, left) {
                     Ok(mut fields) => {
                         fields.insert(0, handler.clone());
                         Value::Map(fields)
@@ -818,8 +857,13 @@ fn too_large() -> Box<ErrorBody> {
 }
 
 /// A successful handler's `value` and, when it wrote a referenced place, `modifications` — taking
-/// at most `budget` bytes together — or the error its entry carries instead.
-fn entry_value(finished: &Finished, budget: usize) -> Result<Vec<(Value, Value)>, Box<ErrorBody>> {
+/// at most `budget` bytes together — or the error its entry carries instead: a conversion's,
+/// then a mismatch with `fire`'s return shape (Story 6.6).
+fn entry_value(
+    finished: &Finished,
+    fire: &Fire,
+    budget: usize,
+) -> Result<Vec<(Value, Value)>, Box<ErrorBody>> {
     let Finished {
         result,
         modifications,
@@ -850,6 +894,15 @@ fn entry_value(finished: &Finished, budget: usize) -> Result<Vec<(Value, Value)>
     if exec_wire::wire_depth(&value) > MAX_ENTRY_DEPTH {
         return Err(too_deep("result"));
     }
+    shape::conform(&value, fire.returns()).map_err(|problem| {
+        protocol(
+            ProtocolCode::ShapeMismatch,
+            format!(
+                "the handler's result does not conform to the `{}` return shape: {problem}",
+                bounded(fire.event())
+            ),
+        )
+    })?;
     let mut fields = vec![(Value::from(VALUE), value)];
     if !modifications.is_empty() {
         let what = "`modifications` list";

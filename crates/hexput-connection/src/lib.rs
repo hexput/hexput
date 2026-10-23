@@ -100,10 +100,13 @@
 //!   settings and registrations read at dispatch, their host calls going out on this connection
 //!   as `Call`s naming the fire's id as their `execution`; and the connection answers
 //!   `Result { results }` with one entry per handler ([`hexput_plugin::fire_reply`]), a failing
-//!   handler's entry carrying its error. Dispatched as its own task, like an execution, so fires
-//!   never wait on each other. Logged at `debug`: "event fired" with its `plugin`, `event`,
-//!   `handlers` and `failed` counts, "a handler failed" with its `handler` and `code` for each
-//!   failed entry, or "an event fire failed" with its `code` for a refused fire.
+//!   handler's entry carrying its error. Each successful handler's result is held to the fired
+//!   Event's declared return shape as the reply is built (Story 6.6): one that does not conform
+//!   is that entry's own `protocol.shape_mismatch`, naming the first offending path. Dispatched
+//!   as its own task, like an execution, so fires never wait on each other. Logged at `debug`:
+//!   "event fired" with its `plugin`, `event`, `handlers` and `failed` counts, "a handler failed"
+//!   with its `handler` and `code` for each failed entry, or "an event fire failed" with its
+//!   `code` for a refused fire.
 //! * `Result` or `Error` from the Backend — the reply to a host call the Daemon made on this
 //!   connection, when its id names one still pending (see "Host calls"); otherwise
 //!   `protocol.unexpected_message` with a **nil** id: the Daemon asked nothing it could answer,
@@ -1056,13 +1059,14 @@ async fn fire(
     let event = logged_name(fire.event());
     // The Plugin and the parameters go with the outcomes, off this task.
     let payload = on_blocking_pool(move || {
-        let payload = hexput_plugin::fire_reply(&outcomes);
+        let payload = hexput_plugin::fire_reply(&fire, &outcomes);
         drop((outcomes, fire));
         payload
     })
     .await;
-    // Every entry the reply carries as an error — a failed handler, or a result it could not
-    // carry — is logged with its handler and code.
+    // Every entry the reply carries as an error — a failed handler, a result it could not carry,
+    // or one that does not conform to the Event's return shape — is logged with its handler and
+    // code.
     let entries = payload
         .as_map()
         .and_then(|fields| fields.first())

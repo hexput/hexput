@@ -62,7 +62,7 @@ pub const MAX_REFERENCE_LEN: usize = 256;
 /// The key a holder carries its Value Secret under.
 pub const SECRET_KEY: &str = "__secret";
 /// The key a holder carries its value under.
-const HOLDER_VALUE_KEY: &str = "value";
+pub const HOLDER_VALUE_KEY: &str = "value";
 /// The Reference ID's key inside `__secret`.
 const REF_KEY: &str = "ref";
 /// The object key's key inside `__secret`.
@@ -111,6 +111,31 @@ impl<'a> Path<'a> {
         }
     }
 
+    /// The path of a fire reply entry's result, `value` (Story 6.6): where a handler's result
+    /// sits in its entry, so a shape mismatch names it as the Backend reads it.
+    #[must_use]
+    pub const fn result() -> Self {
+        Self {
+            root: "value",
+            segments: Vec::new(),
+        }
+    }
+
+    /// Step into the object key `key` (`.key`, or `["key"]` when it is no plain identifier).
+    pub fn push_key(&mut self, key: &'a str) {
+        self.segments.push(Segment::Key(key));
+    }
+
+    /// Step into the array element at `index` (`[index]`).
+    pub fn push_index(&mut self, index: usize) {
+        self.segments.push(Segment::Index(index));
+    }
+
+    /// Step back out of the last key or element stepped into; nothing at the root.
+    pub fn pop(&mut self) {
+        self.segments.pop();
+    }
+
     /// The path of an `EventFire`'s parameters, `params` (Story 6.5).
     #[must_use]
     pub const fn params() -> Self {
@@ -128,8 +153,10 @@ impl<'a> Path<'a> {
         }
     }
 
-    /// `variables.user.tags[2]`, with non-identifier keys quoted and every part bounded.
-    fn render(&self) -> String {
+    /// The path rendered in backticks, such as `` `variables.user.tags[2]` ``: non-identifier keys
+    /// quoted (`["b-c"]`), every key bounded to 64 characters and the whole path to 256.
+    #[must_use]
+    pub fn rendered(&self) -> String {
         let mut out = format!("`{}", self.root);
         for segment in &self.segments {
             match segment {
@@ -198,10 +225,10 @@ fn convert<'a>(
     if path.segments.len() > MAX_NESTING_DEPTH {
         return Err(format!(
             "{} nests deeper than {MAX_NESTING_DEPTH} levels",
-            path.render()
+            path.rendered()
         ));
     }
-    let refuse = |path: &Path<'_>, what: &str| Err(format!("{} {what}", path.render()));
+    let refuse = |path: &Path<'_>, what: &str| Err(format!("{} {what}", path.rendered()));
     let scalar = |value: Hexput| Ok(Held::new(value, secret.clone()));
     match value {
         Wire::Nil => scalar(Hexput::Null),
@@ -328,7 +355,7 @@ pub fn modifications_to_hexput(value: &Wire) -> Result<Vec<Modification>, String
         let shape = |path: &Path<'_>| {
             format!(
                 "{} must be a map with exactly the keys `{REF_KEY}` and `{HOLDER_VALUE_KEY}`",
-                path.render()
+                path.rendered()
             )
         };
         let Wire::Map(fields) = entry else {
@@ -356,7 +383,7 @@ pub fn modifications_to_hexput(value: &Wire) -> Result<Vec<Modification>, String
                 path.segments.push(Segment::Key(REF_KEY));
                 return Err(format!(
                     "{} must be a non-empty string of at most {MAX_REFERENCE_LEN} bytes",
-                    path.render()
+                    path.rendered()
                 ));
             }
         };
@@ -369,7 +396,7 @@ pub fn modifications_to_hexput(value: &Wire) -> Result<Vec<Modification>, String
             return Err(format!(
                 "{} has a `__secret` key: a modification carries the value itself, never a Value \
                  Secret holder, and its `{REF_KEY}` names the place",
-                path.render()
+                path.rendered()
             ));
         }
         let held = convert(new, &mut path, None)?;
@@ -382,7 +409,7 @@ pub fn modifications_to_hexput(value: &Wire) -> Result<Vec<Modification>, String
 /// [`MAX_REFERENCE_LEN`] bytes), an optional string `key` and any further fields, every key a
 /// string appearing once. The further fields are kept in order, encoded as one MessagePack map.
 fn decode_secret(hidden: &Wire, path: &Path<'_>) -> Result<Secret, String> {
-    let refuse = |what: &str| Err(format!("{} {what}", path.render()));
+    let refuse = |what: &str| Err(format!("{} {what}", path.rendered()));
     let Wire::Map(fields) = hidden else {
         return refuse("must be a map with a string `ref`");
     };
@@ -436,7 +463,7 @@ fn finite(number: f64, path: &Path<'_>) -> Result<Hexput, String> {
     } else {
         Err(format!(
             "{} is {number}; a Hexput number is always finite",
-            path.render()
+            path.rendered()
         ))
     }
 }
